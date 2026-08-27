@@ -6,6 +6,12 @@
 - 기준 커밋: `f7181d900effe98fde30c43fff710374c1e56a58`
 - 핵심 질문: Claude Code, Codex, Qwen Code 같은 로컬 에이전트 하네스를 XGENy로 만들 때 무엇을 설치하고, 어디까지 포함하며, 기존 XGEN 모듈 중 무엇을 재사용할 것인가
 
+> **후속 결정 알림 (2026-08-27)**
+> 이 문서는 초기 조사 기록으로 보존한다. 이후 최신 XGEN·Connector·Runtime을 다시 대조하면서
+> “기존 XGEN 에이전트 코어를 공유한다”, “서버 연계는 나중의 선택 기능이다”라는 표현은 수정됐다.
+> 현재 정본은 [XGENy 독립 코어와 XGEN 무중단 진화](../architecture/2026-08-27-xgeny-xgen-evolution.md)다.
+> XGENy 코어는 XGEN 인프라나 Python 런타임에 의존하지 않으며, XGEN 호환 통합 E2E는 MVP 필수다.
+
 ## 1. 결론
 
 XGENy의 사용자 설치 계약은 다음 한 문장이어야 한다.
