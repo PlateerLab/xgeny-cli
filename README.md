@@ -1,15 +1,15 @@
 # XGENy CLI
 
-Local-first XGEN coding agent CLI and harness.
+Local-first general-purpose agent CLI and harness.
 
-> 현재 상태: 구현 전 아키텍처·제품 범위를 정리하는 단계입니다. 아직 설치하거나 실행할 수 있는 CLI는 없습니다.
+> 현재 상태: Rust 워크스페이스와 프로토콜 v0.1 검증 명령을 실행할 수 있습니다. 모델·도구 실행 런타임은 다음 단계에서 구현합니다.
 
 ## 제품 원칙
 
 - 사용자는 `xgeny` 하나만 설치합니다.
 - SQLite, PostgreSQL, Qdrant, Docker, Kubernetes, Python, Node.js 또는 별도 데몬을 기본 설치 조건으로 요구하지 않습니다.
 - 초기 세션은 JSONL, 사용자·프로젝트 메모리는 Markdown으로 저장합니다.
-- XGEN 서버 없이도 기본 로컬 코딩 작업과 세션 재개가 가능해야 합니다.
+- XGEN 서버 없이도 코딩을 포함한 범용 로컬 작업과 세션 재개가 가능해야 합니다.
 - XGENy 코어는 XGEN, Connector, PostgreSQL, MinIO, Kubernetes 또는 XGEN Python 패키지에 의존하지 않습니다.
 - 기존 XGEN 런타임은 실행 의존성이 아니라 의미 계약·회귀 테스트·검증 자산으로 활용합니다.
 - XGEN 연동은 코어 밖의 버전 계약과 선택형 원격 어댑터로만 수행합니다.
@@ -19,9 +19,25 @@ Local-first XGEN coding agent CLI and harness.
 ## Architecture
 
 - [XGENy 독립 코어와 XGEN 무중단 진화 정본](docs/architecture/2026-08-27-xgeny-xgen-evolution.md)
+- [XGENy Capability Runtime v0.1](docs/architecture/2026-08-28-xgeny-capability-runtime-v01.md)
 - [ADR-0001: XGEN 비의존 독립 코어](docs/adr/0001-xgen-independent-core.md)
 - [ADR-0002: WorkGraph 권위와 동기화](docs/adr/0002-workgraph-authority-and-sync.md)
 - [ADR-0003: 표준 프로토콜 투영과 XGEN 호환 셸](docs/adr/0003-protocol-projections-and-compatibility-shell.md)
+- [ADR-0004: Capability Definition과 Instance](docs/adr/0004-capability-definition-and-instance.md)
+- [ADR-0005: Permission broker와 critical action](docs/adr/0005-permission-broker-and-critical-actions.md)
+- [ADR-0006: 결정론적 router와 실행 mode](docs/adr/0006-deterministic-router-and-execution-modes.md)
+- [ADR-0007: Run Journal과 Execution Receipt](docs/adr/0007-run-journal-and-execution-receipt.md)
+
+## 개발 및 검증
+
+[rustup](https://rustup.rs/) 설치 후 저장소 루트에서 실행합니다. 저장소가 Rust 1.98.0 toolchain을 자동으로 선택합니다.
+
+```bash
+cargo test --workspace --locked
+cargo run --locked --quiet -p xgeny-cli -- protocol check
+```
+
+상세한 로컬·CI 검증 범위는 [Rust 워크스페이스 개발 환경](docs/development/rust-workspace.md)을 참고합니다.
 
 ## Research
 

@@ -1,0 +1,20 @@
+[package]
+name = "xgeny-protocol"
+description = "Offline schema, fixture, and digest validation for XGENy protocol v0.1"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+jsonschema.workspace = true
+serde.workspace = true
+serde_jcs.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+xgeny-domain = { path = "../xgeny-domain" }
+
+[lints]
+workspace = true
