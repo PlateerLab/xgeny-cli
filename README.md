@@ -7,8 +7,8 @@ Local-first general-purpose agent CLI and harness.
 ## 제품 원칙
 
 - 사용자는 `xgeny` 하나만 설치합니다.
-- SQLite, PostgreSQL, Qdrant, Docker, Kubernetes, Python, Node.js 또는 별도 데몬을 기본 설치 조건으로 요구하지 않습니다.
-- 초기 세션은 JSONL, 사용자·프로젝트 메모리는 Markdown으로 저장합니다.
+- SQLite server, PostgreSQL, Qdrant, Docker, Kubernetes, Python, Node.js 또는 별도 데몬을 기본 설치 조건으로 요구하지 않습니다.
+- 사용자·프로젝트 메모리는 검토 가능한 Markdown으로 유지합니다. Run의 물리 저장 형식은 ADR-0008의 3개 OS fault-injection 결과로 확정하며 JSONL export를 항상 제공합니다.
 - XGEN 서버 없이도 코딩을 포함한 범용 로컬 작업과 세션 재개가 가능해야 합니다.
 - XGENy 코어는 XGEN, Connector, PostgreSQL, MinIO, Kubernetes 또는 XGEN Python 패키지에 의존하지 않습니다.
 - 기존 XGEN 런타임은 실행 의존성이 아니라 의미 계약·회귀 테스트·검증 자산으로 활용합니다.
@@ -27,6 +27,7 @@ Local-first general-purpose agent CLI and harness.
 - [ADR-0005: Permission broker와 critical action](docs/adr/0005-permission-broker-and-critical-actions.md)
 - [ADR-0006: 결정론적 router와 실행 mode](docs/adr/0006-deterministic-router-and-execution-modes.md)
 - [ADR-0007: Run Journal과 Execution Receipt](docs/adr/0007-run-journal-and-execution-receipt.md)
+- [ADR-0008: Durable Run Store와 외부 effect 복구](docs/adr/0008-durable-run-store-and-effect-recovery.md)
 
 ## 개발 및 검증
 
@@ -42,5 +43,7 @@ cargo run --locked --quiet -p xgeny-cli -- protocol check
 ## Research
 
 - [XGENy 로컬 CLI 하네스 조사 메모](docs/research/2026-08-26-xgeny-local-cli-harness.md)
+- [Durable Agent Runtime 근거 검토](docs/research/2026-08-28-durable-agent-runtime-evidence.md)
+- [Durable Agent Runtime 평가 프로토콜](docs/research/2026-08-28-runtime-evaluation-protocol.md)
 
-조사 메모에는 Qwen Code, Claude Code, Codex, Gemini CLI, Goose, OpenCode, Aider와 XGEN 내부 하네스·런타임·메모리·샌드박스 모듈의 비교 및 MVP 범위가 기록돼 있습니다. 2026-08-27 이후의 제품 경계와 XGEN 연계 결정은 위 아키텍처 정본이 우선합니다.
+조사 문서에는 agent harness와 XGEN 내부 자산 비교, durable execution·memory 관련 논문 및 구현 감사, 사전등록형 평가 계획이 기록돼 있습니다. 2026-08-27 이후의 제품 경계와 XGEN 연계 결정은 위 아키텍처 정본이 우선하며, 물리 저장소와 effect 복구는 ADR-0008의 연구 gate를 통과하기 전까지 제안 상태입니다.

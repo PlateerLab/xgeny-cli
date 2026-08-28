@@ -17,11 +17,14 @@
 - 성공 Receipt에는 최소 하나의 검증 evidence가 필요하다.
 - credential과 민감 argument 원문은 저장하지 않는다.
 - MVP는 content hash와 chain을 구현하고 DSSE/in-toto 서명은 후속 adapter로 둔다.
+- hash chain은 누락·변조 탐지를 위한 무결성 증거이며 actor 인증, local transaction 원자성 또는 외부 effect exactly-once를 뜻하지 않는다.
+- RunJournal의 물리 저장 형식과 external effect recovery는 ADR-0008의 연구 gate에서 결정한다.
 
 ## 결과
 
 - context window를 넘어가는 Run을 active frontier에서 재개할 수 있다.
-- crash recovery, tamper detection, side-effect duplicate 방지, XGEN shadow 비교가 가능해진다.
+- crash recovery와 tamper detection에 필요한 증거, conservative duplicate 방지, XGEN shadow 비교가 가능해진다.
+- 실행 여부를 알 수 없는 effect를 성공·실패로 임의 확정하지 않고 reconcile/manual 경로로 보낼 수 있다.
 - canonicalization과 digest conformance fixture가 릴리스 차단 테스트가 된다.
 
 ## 폐기안

@@ -1,5 +1,7 @@
 # XGENy 로컬 CLI 하네스 조사 메모
 
+> 저장소 주의: 이 문서의 JSONL 물리 정본 제안은 초기 조사 결론이다. durable effect와 crash consistency를 추가 검토한 최신 판단은 `2026-08-28-durable-agent-runtime-evidence.md`와 ADR-0008이 우선한다.
+
 - 조사일: 2026-08-26 (Asia/Seoul)
 - 상태: 아키텍처 판단용 연구 메모. 제품 코드나 배포 설정은 변경하지 않음
 - XGEN 런타임 조사 기준: `PlateerLab/xgen-agent-runtime`

@@ -272,7 +272,16 @@ blocked
 cancelled
 ```
 
-RunJournal은 append-only 정본이며 graph snapshot은 파생 cache다.
+외부 effect 복구에는 다음 보수 상태가 추가로 필요하다. 정확한 wire 변경은 ADR-0008의 연구 gate 뒤에 확정한다.
+
+```text
+effect_unknown
+reconciling
+compensation_required
+manual_required
+```
+
+RunJournal은 특정 파일 형식의 이름이 아니라 committed `RunEvent` history라는 논리적 append-only 정본이다. graph snapshot과 JSONL export는 파생 projection이다. 물리 저장 후보는 ADR-0008에서 hardened JSONL과 per-Run embedded SQLite를 fault-injection으로 비교한다.
 
 - event는 `runId + sequence`로 정렬한다.
 - 각 event는 이전 event digest를 포함한다.
@@ -297,7 +306,7 @@ Receipt에는 최소 다음을 기록한다.
 - verification strategy, evidence, result
 - 이전 Receipt digest와 현재 Receipt digest
 
-MVP는 content digest와 hash chain까지만 구현한다. 전자서명은 추후 DSSE/in-toto envelope adapter로 추가한다. 민감한 argument나 credential은 Receipt·telemetry에 기록하지 않는다.
+MVP는 content digest와 hash chain까지만 구현한다. hash chain은 누락·변조 탐지 수단이며 actor 인증, transaction 원자성 또는 외부 effect의 exactly-once를 보장하지 않는다. 전자서명은 추후 DSSE/in-toto envelope adapter로 추가한다. 민감한 argument나 credential은 Receipt·telemetry에 기록하지 않는다.
 
 InvocationPlan의 raw argument는 실행 중에만 존재하며 canonical JSON 기준 최대 1 MiB로 제한한다. Journal에는 raw argument 대신 digest와 redacted summary만 기록한다. Capability의 내장 input/output schema도 별도 JSON Schema 2020-12 meta-schema 검증을 통과해야 한다.
 
@@ -355,18 +364,20 @@ Coding은 기본 acceptance scenario이지만 core domain identity가 아니다.
 
 1. JSON Schema와 golden fixture
 2. Rust domain type과 schema conformance
-3. Registry와 fake Instance
-4. Permission Broker와 concrete resource resolver
-5. Router와 deterministic golden test
-6. Direct executor, Journal, Receipt
-7. Tracked/Persistent WorkGraph와 crash recovery
-8. model provider와 ContextAssembler
-9. core OS Capability pack
-10. MCP adapter
-11. read-only·Artifact 생성형 XGEN capability live E2E
-12. OS별 package/install E2E
+3. model-free durable store + pure reducer + effect simulator vertical slice
+4. transaction/effect 경계 fault-injection과 3개 OS 저장 후보 평가
+5. Registry와 fake Instance
+6. Permission Broker와 concrete resource resolver
+7. Router와 deterministic golden test
+8. Direct executor, Journal, Receipt
+9. Tracked/Persistent WorkGraph와 crash recovery
+10. model provider와 ContextAssembler
+11. core OS Capability pack
+12. MCP adapter
+13. read-only·Artifact 생성형 XGEN capability live E2E
+14. OS별 package/install E2E
 
-서버에 effect를 만드는 XGEN workflow는 idempotency와 Receipt 검증 뒤에 연결한다.
+서버에 effect를 만드는 XGEN workflow는 idempotency, reconcile, Receipt 검증 뒤에 연결한다. 첫 vertical slice의 상세 실험 순서와 통계 기준은 `docs/research/2026-08-28-runtime-evaluation-protocol.md`를 따른다.
 
 ## 14. 릴리스 차단 검증
 
@@ -375,11 +386,11 @@ Coding은 기본 acceptance scenario이지만 core domain identity가 아니다.
 | schema | valid fixture PASS, invalid fixture FAIL, unknown optional extension 보존 |
 | permission | path traversal, symlink escape, credential redaction, critical action 차단 |
 | router | unavailable/auth/policy 후보 제거, 동일 입력 deterministic 선택 |
-| effect | 시작 전 fallback, 시작 후 중복 실행 금지, idempotency resume |
-| journal | 모든 event 경계 강제 종료 후 replay 결과 동일 |
+| effect | 시작 전 fallback, lost ack는 effect_unknown, sink 증거 없는 blind retry 금지 |
+| journal | 모든 transaction·effect 경계 강제 종료 후 replay 결과 동일 |
 | receipt | digest tamper 검출, success의 모든 필수 verification evidence PASS |
 | context | 모델 length를 넘는 Run에서 active frontier로 재개 |
-| standalone | XGEN·DB·MinIO·Python·Node 없이 core E2E |
+| standalone | XGEN·외부 DB service·MinIO·Python·Node 없이 core E2E |
 | integration | MCP dual fixture와 XGEN live E2E |
 | OS | macOS/Linux/Windows 깨끗한 환경 설치·실행 |
 
