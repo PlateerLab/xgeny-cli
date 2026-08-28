@@ -124,7 +124,7 @@ flowchart TB
     CLI[CLI / TUI / Headless]
     Kernel["XGENy Kernel\nGoal · WorkGraph · Loop · Policy · Receipt"]
     Ports["중립 Ports\nModel · Tool · Store · Artifact · Memory · Event"]
-    FS["Local FS\nRunJournal JSONL · WorkGraph snapshot\nArtifacts · Markdown memory"]
+    FS["Local durable state\ncommitted RunEvent · WorkGraph projection\nArtifacts · JSONL export · Markdown memory"]
     Providers[Model providers / Local tools / MCP clients]
     CLI --> Kernel --> Ports
     Ports --> FS
@@ -170,7 +170,7 @@ xgeny-cli/
     xgeny-workgraph/       # graph state machine, revision, authority, recovery
     xgeny-runtime/         # agent loop, context assembly, validation, cancellation
     xgeny-policy/          # allow/ask/deny, PolicyLease 교집합
-    xgeny-local-store/     # JSONL, snapshots, Markdown, file artifacts
+    xgeny-local-store/     # durable Run store, export, Markdown, file artifacts
     xgeny-tools/           # read/search/patch/shell; workspace boundary
     xgeny-providers/       # model provider adapters
     xgeny-mcp/             # MCP client/server projection
@@ -194,7 +194,7 @@ domain                   -> 아무 제품/전송/저장 구현에도 의존하�
 
 ## 6. 저장·메모리·Artifact 경계
 
-### 6.1 로컬 정본
+### 6.1 로컬 정본과 물리 저장 후보
 
 ```text
 ~/.xgeny/
@@ -203,23 +203,23 @@ domain                   -> 아무 제품/전송/저장 구현에도 의존하�
   projects/<project-id>/
     project.json
     runs/<run-id>/
-      journal.jsonl       # 정본 append-only event log
-      graph.json          # 빠른 복원용 snapshot; journal로 재구성 가능
-      state.json          # cursor, authority, schema version
-      artifacts/          # content-addressed local files
-      receipts/           # 단계·Run 완료 증거
+      run.db               # 후보: committed event, projection, effect intent, receipt index
+      artifacts/          # content-addressed immutable files
+      export/
+        journal.jsonl     # deterministic 교환·진단용 파생 export
     memory/
       MEMORY.md
       topics/
     index/                # 선택적 임베디드 검색 인덱스; 삭제·재생성 가능
 ```
 
-SQLite나 다른 임베디드 엔진을 나중에 사용해도 사용자가 설치하는 서비스가 아니다. 그러나 초기 원칙은 다음과 같다.
+Run별 committed `RunEvent` history가 논리적 source of truth다. 물리 저장은 hardened JSONL과 per-Run embedded SQLite를 Linux·macOS·Windows crash/power-loss 실험으로 비교한 뒤 ADR-0008에서 확정한다. embedded SQLite를 채택해도 사용자가 설치·운영하는 DB server나 daemon은 아니다.
 
-- RunJournal과 Markdown이 source of truth다.
+- WorkGraph snapshot, receipt index, JSONL export는 committed event에서 재구성 가능한 projection이다.
+- 사용자·프로젝트가 검토하는 Markdown memory는 별도 정본이며 Run transactional state와 혼합하지 않는다.
 - 검색 DB는 파생 인덱스다.
-- DB 파일을 삭제해도 정본에서 재구축 가능해야 한다.
 - XGEN의 `geny_memory_*` 테이블과 로컬 파일을 dual-write하지 않는다.
+- XGEN과 Connector는 로컬 Run store를 직접 열지 않고 versioned protocol만 사용한다.
 
 ### 6.2 XGEN 메모리와의 관계
 
@@ -481,7 +481,7 @@ existing web / Connector
 
 | 시나리오 | 필수 기대 결과 |
 |---|---|
-| XGENy standalone, 네트워크/DB/MinIO 없음 | 모든 기본 로컬 기능 PASS |
+| XGENy standalone, 네트워크/외부 DB/MinIO 없음 | 모든 기본 로컬 기능 PASS |
 | XGENy + 새 XGEN | capability 검색, Run, event resume, artifact, policy PASS |
 | XGENy + 구형 XGEN | 명확한 미지원 또는 XGEN 측 bridge 사용; core 내부 legacy fallback 없음 |
 | 현재 web + 새 XGEN | 기존 채팅·history·canvas·관리 기능 무회귀 |
@@ -526,7 +526,7 @@ existing web / Connector
 | D-006 | XGEN은 서버 측 Compatibility Shell로 새 계약을 수용 | 확정 |
 | D-007 | 기존 XGEN API와 Connector 경로는 additive migration으로 보존 | 확정 |
 | D-008 | MCP는 capability/tool 표면, A2A는 remote task 표면, XGEN 확장은 차별 기능에 한정 | 확정 |
-| D-009 | 로컬 JSONL·Markdown이 정본, 임베디드 DB는 재생성 가능한 인덱스 | MVP 확정 |
+| D-009 | 로컬 물리 정본을 JSONL로 확정한다는 가정은 재검토하고, RunEvent 논리 정본과 Markdown memory 정본을 분리 | ADR-0008 연구 gate |
 | D-010 | Connector에 XGENy runtime을 다시 내장하지 않음 | 확정 |
 | D-011 | 기존 XGEN runtime 코드는 직접 의존하지 않고 의미·fixture·conformance 자산으로 활용 | 확정 |
 | D-012 | OpenClaw 등 외부 에이전트는 XGEN generic MCP/A2A 표면을 사용 | 확정 |
@@ -536,7 +536,7 @@ existing web / Connector
 | D-016 | hard filter와 lexicographic ranking으로 Router 구성 | 확정 |
 | D-017 | Direct·Tracked·Persistent는 단일 Run/WorkGraph 엔진의 모드 | 확정 |
 | D-018 | 큰 catalog는 progressive disclosure하고 PATH 전체를 자동 노출하지 않음 | 확정 |
-| D-019 | RunJournal은 hash-chained append-only 정본, snapshot은 파생 cache | 확정 |
+| D-019 | committed RunEvent history는 hash-chained 논리 정본, snapshot·JSONL export는 파생 projection | 확정 |
 | D-020 | ExecutionReceipt는 input·policy·placement·artifact·verification digest를 보존 | 확정 |
 
 ### 폐기·수정된 과거 가정
@@ -558,6 +558,7 @@ existing web / Connector
 5. 조직 memory promotion의 승인 주체와 retention 정책
 6. PolicyLease의 offline grace와 clock skew 허용치
 7. Rust provider 구현 범위와 기존 Python provider conformance fixture 자동 생성 방식
+8. per-Run embedded SQLite와 hardened JSONL의 3개 OS crash·power-loss·성능 비교
 
 세부 허용치는 열려 있어도 안전 기본값은 확정한다. 서버의 절대 만료 시각을 로컬 monotonic deadline으로 변환하고, 허용 가능한 clock skew를 초과하면 더 일찍 만료된 것으로 처리한다. 만료 뒤에는 새 side effect를 시작하지 않는다.
 

@@ -20,7 +20,7 @@ crates/
 - Git
 - [rustup](https://rustup.rs/)
 
-저장소의 `rust-toolchain.toml`이 Rust 1.98.0과 `rustfmt`, `clippy`를 고정한다. SQLite, PostgreSQL, MinIO, Docker, Kubernetes, Python, Node.js 또는 별도 데몬은 필요하지 않다.
+저장소의 `rust-toolchain.toml`이 Rust 1.98.0과 `rustfmt`, `clippy`를 고정한다. 현재 기반 빌드에는 SQLite, PostgreSQL, MinIO, Docker, Kubernetes, Python, Node.js 또는 별도 데몬이 필요하지 않다. ADR-0008에서 embedded SQLite를 채택해도 library는 제품에 포함하며 사용자가 DB server를 별도 설치·운영하지 않는다.
 
 ## 검증
 
