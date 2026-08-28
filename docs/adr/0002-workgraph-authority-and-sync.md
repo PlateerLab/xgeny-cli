@@ -13,9 +13,12 @@ WorkGraph는 Run마다 단일 authority를 가진다.
 
 - 로컬에서 만든 Run: XGENy authority, XGEN은 선택적 mirror
 - XGEN이 만든 Run: XGEN authority, XGENy는 edge executor
-- 외부 에이전트가 XGEN을 통해 만든 Run: XGEN authority
+- 외부 harness가 만든 Parent session/Run: 외부 harness가 native plan을 소유하며 canonical XGENy WorkGraph는 만들지 않음
+- 외부 Parent가 XGEN capability를 호출해 만든 bounded child Run: XGEN authority
 
 동기화는 append-only `EventEnvelope`와 sequence cursor를 사용한다. mutation은 `expected_revision`과 `idempotency_key`를 요구한다. authority 변경은 명시적 handoff event다.
+
+외부 Parent correlation과 child는 별도 ID, revision, retry와 idempotency namespace를 가진다. XGEN child Run은 Task·Artifact·Receipt를 반환하지만 외부 host의 native plan을 수정하거나 Parent 완료를 판정하지 않는다. 세부 host mode와 logging 경계는 ADR-0009를 따른다.
 
 네트워크 단절 시 로컬 authority Run은 계속되고, 서버 authority Run은 승인된 in-flight step을 정리한 뒤 lease 경계에서 정지한다.
 

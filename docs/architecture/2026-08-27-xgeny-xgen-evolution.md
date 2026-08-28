@@ -101,6 +101,8 @@ XGENy는 XGEN의 DB·MinIO 위치를 알지 못한다. XGEN은 내부 객체를 
 
 동일 WorkGraph를 로컬과 서버가 동시에 수정하지 않는다. Run 생성 시 권위가 결정되고 명시적 handoff 전에는 바뀌지 않는다.
 
+외부 harness가 XGEN capability를 호출하면 외부 Parent Run과 XGEN bounded child Run을 별도 Run으로 만든다. XGEN은 child만 orchestration하며 Parent WorkGraph를 수정하지 않는다. XGENy는 자신이 authority일 때만 runtime mode로 동작하고, 외부 harness가 authority이면 observer mode에서 계획·실행·retry를 하지 않는다.
+
 ### I-06. 모델 컨텍스트와 작업 상태를 분리
 
 - Model context = 일시적인 작업 메모리
@@ -264,15 +266,17 @@ persisted `ArtifactRef`에는 저장 위치나 presigned URL을 넣지 않는다
 
 ### 7.1 Run 시작 위치별 권위
 
-| 시작 주체 | WorkGraph 권위 | 상대편 역할 |
+| 시작 주체 | 계획/WorkGraph 권위 | 상대편 역할 |
 |---|---|---|
 | XGENy 로컬 | XGENy | XGEN은 선택적 read-only mirror |
 | XGEN | XGEN | XGENy는 edge executor와 로컬 실행 journal 소유자 |
-| 외부 에이전트 → XGEN | XGEN | 외부에는 Task/Run 상태와 상호작용 표면 제공 |
+| 외부 harness Parent | 외부 harness의 native plan; canonical XGENy WorkGraph 없음 | XGENy는 선택적 observer, XGEN은 model/telemetry/capability provider |
+| 외부 Parent → XGEN bounded capability | XGEN child Run | 외부 Parent에는 Task·Artifact·Receipt 제공 |
 
 ### 7.2 충돌 방지
 
 - Run 생성 시 `authority = local:<device-id>` 또는 `authority = xgen:<tenant>`를 고정한다.
+- 외부 harness Parent identity와 session correlation은 observed event metadata에 보존하며, v0.1 `WorkGraph.authority`에 새 값을 억지로 넣지 않는다.
 - 그래프 mutation에는 `expected_revision`과 `idempotency_key`가 필요하다.
 - authority handoff는 양쪽이 기록하는 별도 이벤트다.
 - 같은 Run의 로컬·서버 dual-write는 금지한다.
@@ -538,6 +542,10 @@ existing web / Connector
 | D-018 | 큰 catalog는 progressive disclosure하고 PATH 전체를 자동 노출하지 않음 | 확정 |
 | D-019 | committed RunEvent history는 hash-chained 논리 정본, snapshot·JSONL export는 파생 projection | 확정 |
 | D-020 | ExecutionReceipt는 input·policy·placement·artifact·verification digest를 보존 | 확정 |
+| D-021 | XGENy는 native runtime mode와 non-orchestrating observer mode를 분리 | 확정 |
+| D-022 | XGEN 연동은 Model·Telemetry·Capability plane을 분리 | 확정 |
+| D-023 | 외부 Parent와 XGEN bounded child는 별도 Run·authority·retry namespace 사용 | 확정 |
+| D-024 | 외부 harness 로그는 L0~L3 완전성 등급과 observed provenance를 보존 | 확정 |
 
 ### 폐기·수정된 과거 가정
 
@@ -559,6 +567,7 @@ existing web / Connector
 6. PolicyLease의 offline grace와 clock skew 허용치
 7. Rust provider 구현 범위와 기존 Python provider conformance fixture 자동 생성 방식
 8. per-Run embedded SQLite와 hardened JSONL의 3개 OS crash·power-loss·성능 비교
+9. Codex·Claude Code adapter의 provider dialect·hook event 버전 지원 정책
 
 세부 허용치는 열려 있어도 안전 기본값은 확정한다. 서버의 절대 만료 시각을 로컬 monotonic deadline으로 변환하고, 허용 가능한 clock skew를 초과하면 더 일찍 만료된 것으로 처리한다. 만료 뒤에는 새 side effect를 시작하지 않는다.
 
