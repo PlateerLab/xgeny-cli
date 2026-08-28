@@ -37,7 +37,7 @@ cargo test --workspace --locked
 cargo run --locked --quiet -p xgeny-cli -- protocol check
 ```
 
-상세한 로컬·CI 검증 범위는 [Rust 워크스페이스 개발 환경](docs/development/rust-workspace.md)을 참고합니다.
+상세한 로컬·CI 검증 범위는 [Rust 워크스페이스 개발 환경](docs/development/rust-workspace.md)을 참고합니다. 기능 개발 순서, 테스트 계층과 완료 기준은 [XGENy 개발 방법론과 테스트 전략](docs/development/engineering-method.md)을 따릅니다.
 
 ## Research
 
