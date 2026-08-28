@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.xgeny.dev/v1alpha1/capability-definition.schema.json",
+  "title": "CapabilityDefinition",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": {"const": "xgeny.io/v1alpha1"},
+    "kind": {"const": "CapabilityDefinition"},
+    "extensions": {"$ref": "common.schema.json#/$defs/extensions"},
+    "requiredExtensions": {"$ref": "common.schema.json#/$defs/requiredExtensions"},
+    "metadata": {
+      "type": "object",
+      "required": ["id", "contractVersion", "displayName"],
+      "properties": {
+        "id": {"$ref": "common.schema.json#/$defs/capabilityId"},
+        "contractVersion": {"$ref": "common.schema.json#/$defs/semver"},
+        "displayName": {"type": "string", "minLength": 1, "maxLength": 120},
+        "labels": {
+          "type": "object",
+          "propertyNames": {"pattern": "^[a-z0-9][a-z0-9._/-]*$"},
+          "additionalProperties": {"type": "string", "maxLength": 200}
+        }
+      },
+      "additionalProperties": false
+    },
+    "spec": {
+      "type": "object",
+      "required": ["summary", "inputSchema", "outputSchema", "effect", "execution", "verification"],
+      "properties": {
+        "summary": {"type": "string", "minLength": 1, "maxLength": 1000},
+        "inputSchema": {
+          "oneOf": [{"type": "object"}, {"type": "boolean"}]
+        },
+        "outputSchema": {
+          "oneOf": [{"type": "object"}, {"type": "boolean"}]
+        },
+        "effect": {
+          "type": "object",
+          "required": ["class", "resourceSelectors", "criticalActions"],
+          "properties": {
+            "class": {"$ref": "common.schema.json#/$defs/effectClass"},
+            "resourceSelectors": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["scope", "argumentPointer"],
+                "properties": {
+                  "scope": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)+$"
+                  },
+                  "argumentPointer": {
+                    "type": "string",
+                    "pattern": "^(?:/(?:[^~/]|~[01])*)*$"
+                  }
+                },
+                "additionalProperties": false
+              },
+              "uniqueItems": true
+            },
+            "criticalActions": {
+              "type": "array",
+              "items": {"$ref": "common.schema.json#/$defs/criticalAction"},
+              "uniqueItems": true
+            }
+          },
+          "allOf": [
+            {
+              "if": {"properties": {"class": {"const": "read_only"}}},
+              "then": {"properties": {"criticalActions": {"maxItems": 0}}}
+            }
+          ],
+          "additionalProperties": false
+        },
+        "requiredCapabilities": {
+          "type": "array",
+          "items": {"$ref": "common.schema.json#/$defs/capabilityRef"},
+          "uniqueItems": true,
+          "default": []
+        },
+        "execution": {
+          "type": "object",
+          "required": ["styles", "cancellable", "idempotencyKeySupported", "defaultTimeoutMs", "maxTimeoutMs"],
+          "properties": {
+            "styles": {
+              "type": "array",
+              "items": {"enum": ["sync", "task"]},
+              "minItems": 1,
+              "uniqueItems": true
+            },
+            "cancellable": {"type": "boolean"},
+            "idempotencyKeySupported": {"type": "boolean"},
+            "defaultTimeoutMs": {"type": "integer", "minimum": 1},
+            "maxTimeoutMs": {"type": "integer", "minimum": 1}
+          },
+          "additionalProperties": false
+        },
+        "verification": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["strategy", "required"],
+            "properties": {
+              "strategy": {
+                "enum": ["output_schema", "postcondition", "artifact_digest", "receipt", "human"]
+              },
+              "required": {"type": "boolean"},
+              "description": {"type": "string", "minLength": 1, "maxLength": 1000}
+            },
+            "additionalProperties": false
+          },
+          "minItems": 1
+        },
+        "discovery": {
+          "type": "object",
+          "properties": {
+            "keywords": {
+              "type": "array",
+              "items": {"type": "string", "minLength": 1, "maxLength": 80},
+              "uniqueItems": true
+            },
+            "examples": {
+              "type": "array",
+              "items": {"type": "string", "minLength": 1, "maxLength": 500}
+            },
+            "detailsRef": {"type": "string", "minLength": 1, "maxLength": 1000}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

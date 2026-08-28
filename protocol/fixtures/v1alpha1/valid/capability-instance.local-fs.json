@@ -1,0 +1,34 @@
+{
+  "apiVersion": "xgeny.io/v1alpha1",
+  "kind": "CapabilityInstance",
+  "instanceId": "local.fs.builtin.v1",
+  "definition": {
+    "capabilityId": "xgeny.fs/read-text",
+    "contractVersion": "1.0.0"
+  },
+  "source": "builtin",
+  "placement": "local",
+  "platform": {"os": "linux", "arch": "x86_64"},
+  "trust": "verified",
+  "dataBoundary": "local",
+  "health": {
+    "status": "available",
+    "observedAt": "2026-08-28T01:00:00Z"
+  },
+  "auth": {"state": "not_required"},
+  "features": {
+    "sync": true,
+    "task": false,
+    "cancellable": true,
+    "idempotencyQuery": false
+  },
+  "hints": {
+    "latencyMs": 2,
+    "monetaryCost": 0,
+    "reliability": 0.999
+  },
+  "binding": {
+    "bindingRef": "builtin://core-os/filesystem",
+    "operationRef": "readText"
+  }
+}

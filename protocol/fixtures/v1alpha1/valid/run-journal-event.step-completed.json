@@ -1,0 +1,22 @@
+{
+  "apiVersion": "xgeny.io/v1alpha1",
+  "kind": "RunJournalEvent",
+  "schemaVersion": "1.0.0",
+  "eventId": "event-001",
+  "runId": "run-001",
+  "sequence": 1,
+  "timestamp": "2026-08-28T01:00:05Z",
+  "actor": {"kind": "runtime", "id": "xgeny-local"},
+  "eventType": "step.completed",
+  "idempotencyKey": null,
+  "causationId": "plan-001",
+  "correlationId": "run-001",
+  "requiredExtensions": [],
+  "previousEventDigest": null,
+  "payload": {
+    "stepId": "step-001",
+    "receiptId": "receipt-001",
+    "verificationStatus": "passed"
+  },
+  "eventDigest": "sha256:3fc817451b257bdff0e3b8ec83a1f58f849f7c9fb7b7e791ad3b019722cb6db4"
+}

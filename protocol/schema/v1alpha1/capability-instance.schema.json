@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.xgeny.dev/v1alpha1/capability-instance.schema.json",
+  "title": "CapabilityInstance",
+  "type": "object",
+  "required": ["apiVersion", "kind", "instanceId", "definition", "source", "placement", "platform", "trust", "dataBoundary", "health", "auth", "features", "binding"],
+  "properties": {
+    "apiVersion": {"const": "xgeny.io/v1alpha1"},
+    "kind": {"const": "CapabilityInstance"},
+    "extensions": {"$ref": "common.schema.json#/$defs/extensions"},
+    "requiredExtensions": {"$ref": "common.schema.json#/$defs/requiredExtensions"},
+    "instanceId": {"$ref": "common.schema.json#/$defs/identifier"},
+    "definition": {"$ref": "common.schema.json#/$defs/capabilityRef"},
+    "source": {"enum": ["builtin", "local_cli", "mcp", "connector", "xgen"]},
+    "placement": {"enum": ["local", "device", "remote"]},
+    "platform": {
+      "type": "object",
+      "required": ["os", "arch"],
+      "properties": {
+        "os": {"enum": ["linux", "macos", "windows", "any"]},
+        "arch": {"enum": ["x86_64", "aarch64", "any"]}
+      },
+      "additionalProperties": false
+    },
+    "trust": {"enum": ["untrusted", "configured", "verified", "managed"]},
+    "dataBoundary": {"enum": ["local", "device", "organization", "external"]},
+    "health": {
+      "type": "object",
+      "required": ["status", "observedAt"],
+      "properties": {
+        "status": {"enum": ["available", "degraded", "unavailable", "unknown"]},
+        "observedAt": {"$ref": "common.schema.json#/$defs/timestamp"},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 1000}
+      },
+      "additionalProperties": false
+    },
+    "auth": {
+      "type": "object",
+      "required": ["state"],
+      "properties": {
+        "state": {"enum": ["not_required", "available", "required", "expired"]},
+        "authRef": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000,
+          "pattern": "^(credential|config)://[A-Za-z0-9][A-Za-z0-9._/-]*$"
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"state": {"enum": ["available", "expired"]}}},
+          "then": {"required": ["authRef"]}
+        },
+        {
+          "if": {"properties": {"state": {"const": "not_required"}}},
+          "then": {"not": {"required": ["authRef"]}}
+        }
+      ],
+      "additionalProperties": false
+    },
+    "features": {
+      "type": "object",
+      "required": ["sync", "task", "cancellable", "idempotencyQuery"],
+      "properties": {
+        "sync": {"type": "boolean"},
+        "task": {"type": "boolean"},
+        "cancellable": {"type": "boolean"},
+        "idempotencyQuery": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "hints": {
+      "type": "object",
+      "properties": {
+        "latencyMs": {"type": "integer", "minimum": 0},
+        "monetaryCost": {"type": "number", "minimum": 0},
+        "reliability": {"type": "number", "minimum": 0, "maximum": 1}
+      },
+      "additionalProperties": false
+    },
+    "binding": {
+      "type": "object",
+      "description": "A secret-free reference to adapter-owned binding configuration.",
+      "required": ["bindingRef"],
+      "properties": {
+        "bindingRef": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000,
+          "pattern": "^(builtin|config|registry)://[A-Za-z0-9][A-Za-z0-9._/-]*$"
+        },
+        "operationRef": {"type": "string", "minLength": 1, "maxLength": 1000},
+        "protocolVersion": {"type": "string", "minLength": 1, "maxLength": 100}
+      },
+      "additionalProperties": false
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"source": {"enum": ["builtin", "local_cli"]}}},
+      "then": {"properties": {"placement": {"const": "local"}}}
+    },
+    {
+      "if": {"properties": {"source": {"const": "connector"}}},
+      "then": {"properties": {"placement": {"const": "device"}}}
+    },
+    {
+      "if": {"properties": {"source": {"const": "xgen"}}},
+      "then": {"properties": {"placement": {"const": "remote"}}}
+    }
+  ],
+  "additionalProperties": false
+}

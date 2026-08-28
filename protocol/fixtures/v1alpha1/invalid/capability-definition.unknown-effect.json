@@ -1,0 +1,29 @@
+{
+  "apiVersion": "xgeny.io/v1alpha1",
+  "kind": "CapabilityDefinition",
+  "metadata": {
+    "id": "xgeny.fs/read-text",
+    "contractVersion": "1.0.0",
+    "displayName": "Read text file"
+  },
+  "spec": {
+    "summary": "Invalid fixture with an unrecognized effect class.",
+    "inputSchema": {"type": "object"},
+    "outputSchema": {"type": "object"},
+    "effect": {
+      "class": "safe",
+      "resourceSelectors": [],
+      "criticalActions": []
+    },
+    "execution": {
+      "styles": ["sync"],
+      "cancellable": true,
+      "idempotencyKeySupported": false,
+      "defaultTimeoutMs": 1000,
+      "maxTimeoutMs": 1000
+    },
+    "verification": [
+      {"strategy": "output_schema", "required": true}
+    ]
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.xgeny.dev/v1alpha1/run-journal-event.schema.json",
+  "title": "RunJournalEvent",
+  "type": "object",
+  "required": ["apiVersion", "kind", "schemaVersion", "eventId", "runId", "sequence", "timestamp", "actor", "eventType", "idempotencyKey", "causationId", "correlationId", "requiredExtensions", "previousEventDigest", "payload", "eventDigest"],
+  "properties": {
+    "apiVersion": {"const": "xgeny.io/v1alpha1"},
+    "kind": {"const": "RunJournalEvent"},
+    "extensions": {"$ref": "common.schema.json#/$defs/extensions"},
+    "schemaVersion": {"const": "1.0.0"},
+    "eventId": {"$ref": "common.schema.json#/$defs/identifier"},
+    "runId": {"$ref": "common.schema.json#/$defs/identifier"},
+    "sequence": {"type": "integer", "minimum": 1},
+    "timestamp": {"$ref": "common.schema.json#/$defs/timestamp"},
+    "actor": {
+      "type": "object",
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": {"enum": ["user", "model", "runtime", "tool", "xgen", "connector"]},
+        "id": {"type": "string", "minLength": 1, "maxLength": 300}
+      },
+      "additionalProperties": false
+    },
+    "eventType": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)+$"
+    },
+    "idempotencyKey": {
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 300
+    },
+    "causationId": {
+      "oneOf": [
+        {"$ref": "common.schema.json#/$defs/identifier"},
+        {"type": "null"}
+      ]
+    },
+    "correlationId": {"$ref": "common.schema.json#/$defs/identifier"},
+    "requiredExtensions": {"$ref": "common.schema.json#/$defs/requiredExtensions"},
+    "previousEventDigest": {
+      "oneOf": [
+        {"$ref": "common.schema.json#/$defs/digest"},
+        {"type": "null"}
+      ]
+    },
+    "payload": {"type": "object", "additionalProperties": true},
+    "eventDigest": {"$ref": "common.schema.json#/$defs/digest"}
+  },
+  "additionalProperties": false
+}

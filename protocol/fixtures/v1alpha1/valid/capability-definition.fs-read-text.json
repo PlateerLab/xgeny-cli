@@ -1,0 +1,62 @@
+{
+  "apiVersion": "xgeny.io/v1alpha1",
+  "kind": "CapabilityDefinition",
+  "extensions": {
+    "https://xgeny.dev/extensions/fixture-note/v1": {
+      "note": "Unknown optional extension data must be preserved by readers."
+    }
+  },
+  "metadata": {
+    "id": "xgeny.fs/read-text",
+    "contractVersion": "1.0.0",
+    "displayName": "Read text file",
+    "labels": {
+      "xgeny.io/pack": "core-os"
+    }
+  },
+  "spec": {
+    "summary": "Read a UTF-8 text file and return its content digest.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "required": ["path"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "required": ["content", "digest"],
+      "properties": {
+        "content": {"type": "string"},
+        "digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "effect": {
+      "class": "read_only",
+      "resourceSelectors": [
+        {"scope": "filesystem.read", "argumentPointer": "/path"}
+      ],
+      "criticalActions": []
+    },
+    "requiredCapabilities": [],
+    "execution": {
+      "styles": ["sync"],
+      "cancellable": true,
+      "idempotencyKeySupported": true,
+      "defaultTimeoutMs": 30000,
+      "maxTimeoutMs": 120000
+    },
+    "verification": [
+      {"strategy": "output_schema", "required": true},
+      {"strategy": "postcondition", "required": true, "description": "Returned digest matches the bytes read from the normalized path."}
+    ],
+    "discovery": {
+      "keywords": ["file", "read", "text"],
+      "examples": ["Read README.md and summarize it."]
+    }
+  }
+}
