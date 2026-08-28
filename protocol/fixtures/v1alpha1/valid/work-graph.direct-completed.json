@@ -1,0 +1,31 @@
+{
+  "apiVersion": "xgeny.io/v1alpha1",
+  "kind": "WorkGraph",
+  "runId": "run-001",
+  "revision": 3,
+  "authority": "local:device-001",
+  "goal": "Read README.md and make its verified content available to the current task.",
+  "executionMode": "direct",
+  "status": "completed",
+  "steps": [
+    {
+      "stepId": "step-001",
+      "objective": "Read the normalized workspace README.md.",
+      "dependsOn": [],
+      "capability": {
+        "capabilityId": "xgeny.fs/read-text",
+        "contractVersion": "1.0.0"
+      },
+      "selectedInstanceId": "local.fs.builtin.v1",
+      "invocationPlanId": "plan-001",
+      "status": "completed",
+      "attempts": 1,
+      "verificationStatus": "passed",
+      "inputDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "outputDigest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    }
+  ],
+  "journalSequence": 1,
+  "journalHeadDigest": "sha256:3fc817451b257bdff0e3b8ec83a1f58f849f7c9fb7b7e791ad3b019722cb6db4",
+  "updatedAt": "2026-08-28T01:00:05Z"
+}

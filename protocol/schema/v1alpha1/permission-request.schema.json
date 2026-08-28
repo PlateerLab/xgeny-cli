@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.xgeny.dev/v1alpha1/permission-request.schema.json",
+  "title": "PermissionRequest",
+  "type": "object",
+  "required": ["apiVersion", "kind", "requestId", "runId", "stepId", "capability", "effectClass", "requestedScopes", "resolvedResources", "criticalActions", "requestedLifetime", "reason", "createdAt"],
+  "properties": {
+    "apiVersion": {"const": "xgeny.io/v1alpha1"},
+    "kind": {"const": "PermissionRequest"},
+    "extensions": {"$ref": "common.schema.json#/$defs/extensions"},
+    "requiredExtensions": {"$ref": "common.schema.json#/$defs/requiredExtensions"},
+    "requestId": {"$ref": "common.schema.json#/$defs/identifier"},
+    "runId": {"$ref": "common.schema.json#/$defs/identifier"},
+    "stepId": {"$ref": "common.schema.json#/$defs/identifier"},
+    "capability": {"$ref": "common.schema.json#/$defs/capabilityRef"},
+    "effectClass": {"$ref": "common.schema.json#/$defs/effectClass"},
+    "requestedScopes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)+$"
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "resolvedResources": {
+      "type": "array",
+      "items": {"$ref": "common.schema.json#/$defs/resolvedResource"},
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "criticalActions": {
+      "type": "array",
+      "items": {"$ref": "common.schema.json#/$defs/criticalAction"},
+      "uniqueItems": true
+    },
+    "requestedLifetime": {"enum": ["once", "run", "session", "project", "persistent"]},
+    "reason": {"type": "string", "minLength": 1, "maxLength": 2000},
+    "createdAt": {"$ref": "common.schema.json#/$defs/timestamp"}
+  },
+  "additionalProperties": false
+}

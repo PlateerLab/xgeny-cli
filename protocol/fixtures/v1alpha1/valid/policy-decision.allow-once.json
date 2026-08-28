@@ -1,0 +1,32 @@
+{
+  "apiVersion": "xgeny.io/v1alpha1",
+  "kind": "PolicyDecision",
+  "decisionId": "decision-001",
+  "requestId": "perm-001",
+  "decision": "allow",
+  "policySources": [
+    {
+      "kind": "host",
+      "id": "linux-user-boundary",
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "kind": "user_profile",
+      "id": "ask",
+      "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  ],
+  "grant": {
+    "lifetime": "once",
+    "scopes": ["filesystem.read"],
+    "resources": [
+      {
+        "scope": "filesystem.read",
+        "resource": "/workspace/README.md",
+        "normalized": true
+      }
+    ],
+    "criticalActions": []
+  },
+  "decidedAt": "2026-08-28T01:00:02Z"
+}

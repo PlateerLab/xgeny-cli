@@ -1,0 +1,54 @@
+{
+  "apiVersion": "xgeny.io/v1alpha1",
+  "kind": "ExecutionReceipt",
+  "receiptId": "receipt-001",
+  "runId": "run-001",
+  "stepId": "step-001",
+  "invocationId": "invoke-001",
+  "planId": "plan-001",
+  "capability": {
+    "capabilityId": "xgeny.fs/read-text",
+    "contractVersion": "1.0.0"
+  },
+  "instanceId": "local.fs.builtin.v1",
+  "inputDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "inputSummary": "Read the normalized workspace file /workspace/README.md.",
+  "policy": {
+    "decisionId": "decision-001",
+    "decisionDigest": "sha256:5e91bee68631c0ccf62624e5880035ee2dd5e5c14caf028a996da156dccec502"
+  },
+  "executor": {
+    "id": "xgeny-local",
+    "placement": "local",
+    "platform": "linux-x86_64"
+  },
+  "effect": {
+    "class": "read_only",
+    "started": true,
+    "startedAt": "2026-08-28T01:00:04Z",
+    "idempotencyKey": null
+  },
+  "status": "succeeded",
+  "startedAt": "2026-08-28T01:00:04Z",
+  "endedAt": "2026-08-28T01:00:05Z",
+  "outputDigest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "artifacts": [],
+  "verification": [
+    {
+      "strategy": "output_schema",
+      "required": true,
+      "result": "passed",
+      "summary": "The structured output conforms to the capability output schema."
+    },
+    {
+      "strategy": "postcondition",
+      "required": true,
+      "result": "passed",
+      "summary": "The returned digest matches the bytes read from the normalized path.",
+      "evidenceDigest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    }
+  ],
+  "redactionsApplied": [],
+  "previousReceiptDigest": null,
+  "receiptDigest": "sha256:2097c6c194600fe2b43bb9e99e0c8d85867cb358d4d9910f6edc92f7458234ca"
+}

@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.xgeny.dev/v1alpha1/invocation-plan.schema.json",
+  "title": "InvocationPlan",
+  "type": "object",
+  "required": ["apiVersion", "kind", "planId", "runId", "stepId", "capability", "selectedInstanceId", "arguments", "argumentsSizeBytes", "inputDigest", "resolvedResources", "effectClass", "executionMode", "policyDecisionId", "idempotencyKey", "verificationPlan", "candidates", "selectionReasons", "fallback", "createdAt"],
+  "properties": {
+    "apiVersion": {"const": "xgeny.io/v1alpha1"},
+    "kind": {"const": "InvocationPlan"},
+    "extensions": {"$ref": "common.schema.json#/$defs/extensions"},
+    "requiredExtensions": {"$ref": "common.schema.json#/$defs/requiredExtensions"},
+    "planId": {"$ref": "common.schema.json#/$defs/identifier"},
+    "runId": {"$ref": "common.schema.json#/$defs/identifier"},
+    "stepId": {"$ref": "common.schema.json#/$defs/identifier"},
+    "capability": {"$ref": "common.schema.json#/$defs/capabilityRef"},
+    "selectedInstanceId": {"$ref": "common.schema.json#/$defs/identifier"},
+    "arguments": {
+      "description": "Validated arguments. Credentials must be references, never secret values. Persisted journals use the digest and a redacted summary.",
+      "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
+    },
+    "argumentsSizeBytes": {
+      "description": "Runtime-calculated RFC 8785 canonical JSON byte size.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1048576
+    },
+    "inputDigest": {"$ref": "common.schema.json#/$defs/digest"},
+    "resolvedResources": {
+      "type": "array",
+      "items": {"$ref": "common.schema.json#/$defs/resolvedResource"},
+      "uniqueItems": true
+    },
+    "effectClass": {"$ref": "common.schema.json#/$defs/effectClass"},
+    "executionMode": {"enum": ["direct", "tracked", "persistent"]},
+    "policyDecisionId": {"$ref": "common.schema.json#/$defs/identifier"},
+    "idempotencyKey": {
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 300
+    },
+    "verificationPlan": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["strategy", "required"],
+        "properties": {
+          "strategy": {
+            "enum": ["output_schema", "postcondition", "artifact_digest", "receipt", "human"]
+          },
+          "required": {"type": "boolean"},
+          "description": {"type": "string", "minLength": 1, "maxLength": 1000}
+        },
+        "additionalProperties": false
+      },
+      "minItems": 1
+    },
+    "candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["instanceId", "eligible"],
+        "properties": {
+          "instanceId": {"$ref": "common.schema.json#/$defs/identifier"},
+          "eligible": {"type": "boolean"},
+          "reasons": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1, "maxLength": 1000}
+          }
+        },
+        "additionalProperties": false
+      },
+      "minItems": 1
+    },
+    "selectionReasons": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1, "maxLength": 1000},
+      "minItems": 1
+    },
+    "fallback": {
+      "type": "object",
+      "required": ["allowedConditions", "instanceIds"],
+      "properties": {
+        "allowedConditions": {
+          "type": "array",
+          "items": {"enum": ["read_only", "effect_not_started", "confirmed_not_executed"]},
+          "uniqueItems": true
+        },
+        "instanceIds": {
+          "type": "array",
+          "items": {"$ref": "common.schema.json#/$defs/identifier"},
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "createdAt": {"$ref": "common.schema.json#/$defs/timestamp"}
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "effectClass": {"enum": ["idempotent", "compensatable", "non_idempotent", "unknown"]}
+        }
+      },
+      "then": {
+        "properties": {"idempotencyKey": {"type": "string"}}
+      }
+    }
+  ],
+  "additionalProperties": false
+}

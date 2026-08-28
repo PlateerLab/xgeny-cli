@@ -5,6 +5,8 @@
 - 적용 범위: XGENy CLI, XGEN Workflow, XGen Dex(`xgen-connector`), XGEN Agent Runtime, Memory, MCP, Sandbox, 외부 에이전트 연동
 - 우선순위: 이 문서는 2026-08-26 초기 조사 메모보다 우선한다.
 
+Capability, 권한, routing, 실행 모드, Journal, Receipt의 세부 구현 계약은 `2026-08-28-xgeny-capability-runtime-v01.md`를 따른다. 두 문서가 충돌하면 독립성·무중단 진화는 이 문서가, runtime 세부 계약은 2026-08-28 문서가 우선한다.
+
 ## 1. 한 문장 결론
 
 > **XGENy는 XGEN 인프라 없이 완전 동작하는 독립 로컬 에이전트이며, XGEN은 XGENy의 미래형 의미 계약을 서버 측 호환 셸로 수용한다. 기존 XGEN 실행·데이터·권한·Connector 경로는 교체하지 않고 병행 보존한다.**
@@ -129,7 +131,7 @@ flowchart TB
     Ports --> Providers
   end
 
-  Protocol["Versioned Agent Contract\nJSON Schema / Protobuf + golden fixtures"]
+  Protocol["Versioned Agent Contract\nJSON Schema 2020-12 + golden fixtures"]
   XAdapter["optional xgen-remote adapter\nHTTPS · MCP · A2A only"]
   CAdapter["future connector capability adapter\nauthenticated loopback/MCP"]
 
@@ -247,17 +249,16 @@ XGENy는 MinIO bucket/key를 비즈니스 계약으로 사용하지 않는다.
 
 ```json
 {
-  "artifact_id": "art_...",
-  "media_type": "application/pdf",
+  "artifactId": "art_...",
+  "mediaType": "application/pdf",
   "size": 12345,
-  "sha256": "...",
+  "digest": "sha256:...",
   "name": "report.pdf",
-  "location": {"kind": "remote", "uri": "https://...short-lived..."},
-  "provenance": {"run_id": "run_...", "step_id": "step_..."}
+  "provenance": {"runId": "run_...", "stepId": "step_..."}
 }
 ```
 
-XGEN이 MinIO를 사용하더라도 서버가 짧은 수명의 다운로드/업로드 URL 또는 스트림으로 변환한다. XGENy는 digest와 크기를 검증한다.
+persisted `ArtifactRef`에는 저장 위치나 presigned URL을 넣지 않는다. XGEN이 MinIO를 사용하더라도 서버가 별도의 transient transfer 응답에서 짧은 수명의 다운로드/업로드 URL 또는 스트림으로 변환한다. transfer credential은 Journal·Receipt·Memory에 기록하지 않으며 XGENy는 수신한 digest와 크기를 검증한다.
 
 ## 7. WorkGraph 권위와 네트워크 단절
 
@@ -397,7 +398,7 @@ existing web / Connector
 | `node_status` | `legacy.node.status` 또는 WorkGraph step projection | canvas node와 canonical step을 강제 동일시하지 않음 |
 | `execution_io` | Run/turn receipt projection | 기존 감사·통계 쓰기 유지 |
 | `geny_memory_*` | organization/server memory adapter | 로컬 메모리와 dual-write 금지 |
-| MinIO object | `ArtifactRef` | signed URL/stream으로 숨김 |
+| MinIO object | `ArtifactRef` + transient transfer | persisted ref에는 위치를 숨기고 전송 시에만 signed URL/stream 사용 |
 | Connector `mcp_call` | authenticated local `ToolInvocation` | server-derived context 유지 |
 
 ### 9.3 Connector 원칙
@@ -437,7 +438,7 @@ existing web / Connector
 
 - `protocol/schema`와 fixture를 먼저 만든다.
 - Rust/TypeScript/Python 생성 타입의 round-trip을 검증한다.
-- unknown optional field, version mismatch, required extension 누락을 검증한다.
+- unknown core field 거부, unknown optional extension 보존, version mismatch, required extension 누락을 검증한다.
 - 제품 실행 경로는 바꾸지 않는다.
 
 ### Phase 2 — XGEN Agent Gateway 추가
@@ -529,6 +530,14 @@ existing web / Connector
 | D-010 | Connector에 XGENy runtime을 다시 내장하지 않음 | 확정 |
 | D-011 | 기존 XGEN runtime 코드는 직접 의존하지 않고 의미·fixture·conformance 자산으로 활용 | 확정 |
 | D-012 | OpenClaw 등 외부 에이전트는 XGEN generic MCP/A2A 표면을 사용 | 확정 |
+| D-013 | JSON Schema 2020-12를 v0.1 wire 정본으로 사용 | 확정 |
+| D-014 | CapabilityDefinition과 동적 CapabilityInstance를 분리 | 확정 |
+| D-015 | concrete resource 기반 Permission Broker와 critical action gate 사용 | 확정 |
+| D-016 | hard filter와 lexicographic ranking으로 Router 구성 | 확정 |
+| D-017 | Direct·Tracked·Persistent는 단일 Run/WorkGraph 엔진의 모드 | 확정 |
+| D-018 | 큰 catalog는 progressive disclosure하고 PATH 전체를 자동 노출하지 않음 | 확정 |
+| D-019 | RunJournal은 hash-chained append-only 정본, snapshot은 파생 cache | 확정 |
+| D-020 | ExecutionReceipt는 input·policy·placement·artifact·verification digest를 보존 | 확정 |
 
 ### 폐기·수정된 과거 가정
 
@@ -542,16 +551,13 @@ existing web / Connector
 
 다음은 구현 전에 spike 또는 별도 ADR이 필요하다.
 
-1. canonical schema를 JSON Schema 중심으로 둘지 Protobuf 중심으로 둘지
-2. A2A의 현재 버전과 MCP 2025/2026 dual-stack 지원 기간
-3. 로컬 sandbox의 OS별 최소 안전선과 remote sandbox 승격 조건
-4. WorkGraph step 모델과 `graph-tool-call` prerequisite graph의 정확한 결합 방식
-5. RunJournal compaction과 snapshot 검증 알고리즘
-6. XGEN server-side Compatibility Shell을 workflow 내부 모듈로 둘지 별도 gateway service로 둘지
-7. Connector v2 지원 종료 기간과 telemetry 기준
-8. 조직 memory promotion의 승인 주체와 retention 정책
-9. PolicyLease의 offline grace와 clock skew 허용치
-10. Rust provider 구현 범위와 기존 Python provider conformance fixture 자동 생성 방식
+1. XGENy MCP server의 2025-11-25 호환 제공 기간과 종료 기준
+2. 로컬 sandbox의 OS별 최소 안전선과 remote sandbox 승격 조건
+3. XGEN server-side Compatibility Shell을 workflow 내부 모듈로 둘지 별도 gateway service로 둘지
+4. Connector v2 지원 종료 기간과 telemetry 기준
+5. 조직 memory promotion의 승인 주체와 retention 정책
+6. PolicyLease의 offline grace와 clock skew 허용치
+7. Rust provider 구현 범위와 기존 Python provider conformance fixture 자동 생성 방식
 
 세부 허용치는 열려 있어도 안전 기본값은 확정한다. 서버의 절대 만료 시각을 로컬 monotonic deadline으로 변환하고, 허용 가능한 clock skew를 초과하면 더 일찍 만료된 것으로 처리한다. 만료 뒤에는 새 side effect를 시작하지 않는다.
 
@@ -565,5 +571,7 @@ existing web / Connector
 - XGEN MCP Harness: <https://github.com/PlateerLab/xgen-mcp-harness>
 - graph-tool-call: <https://github.com/SonAIengine/graph-tool-call>
 - MCP 2026-07-28 release: <https://blog.modelcontextprotocol.io/posts/2026-07-28/>
-- A2A specification: <https://a2a-protocol.org/dev/specification/>
+- A2A 1.0 specification: <https://a2a-protocol.org/latest/specification/>
+- MCP tool annotations: <https://modelcontextprotocol.io/specification/2025-06-18/server/tools>
+- in-toto Statement v1: <https://github.com/in-toto/attestation/blob/main/spec/v1/statement.md>
 - OpenClaw Gateway protocol: <https://docs.openclaw.ai/gateway/protocol>

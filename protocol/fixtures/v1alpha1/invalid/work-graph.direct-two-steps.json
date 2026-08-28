@@ -1,0 +1,33 @@
+{
+  "apiVersion": "xgeny.io/v1alpha1",
+  "kind": "WorkGraph",
+  "runId": "run-invalid-direct",
+  "revision": 1,
+  "authority": "local:device-001",
+  "goal": "Invalid Direct graph with two steps.",
+  "executionMode": "direct",
+  "status": "completed",
+  "steps": [
+    {
+      "stepId": "step-001",
+      "objective": "First step.",
+      "dependsOn": [],
+      "capability": {"capabilityId": "xgeny.fs/read-text", "contractVersion": "1.0.0"},
+      "status": "completed",
+      "attempts": 1,
+      "verificationStatus": "passed"
+    },
+    {
+      "stepId": "step-002",
+      "objective": "Second step.",
+      "dependsOn": ["step-001"],
+      "capability": {"capabilityId": "xgeny.fs/read-text", "contractVersion": "1.0.0"},
+      "status": "completed",
+      "attempts": 1,
+      "verificationStatus": "passed"
+    }
+  ],
+  "journalSequence": 0,
+  "journalHeadDigest": null,
+  "updatedAt": "2026-08-28T01:00:00Z"
+}

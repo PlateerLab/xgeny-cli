@@ -1,0 +1,50 @@
+{
+  "apiVersion": "xgeny.io/v1alpha1",
+  "kind": "InvocationPlan",
+  "planId": "plan-001",
+  "runId": "run-001",
+  "stepId": "step-001",
+  "capability": {
+    "capabilityId": "xgeny.fs/read-text",
+    "contractVersion": "1.0.0"
+  },
+  "selectedInstanceId": "local.fs.builtin.v1",
+  "arguments": {"path": "/workspace/README.md"},
+  "argumentsSizeBytes": 31,
+  "inputDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "resolvedResources": [
+    {
+      "scope": "filesystem.read",
+      "resource": "/workspace/README.md",
+      "normalized": true
+    }
+  ],
+  "effectClass": "read_only",
+  "executionMode": "direct",
+  "policyDecisionId": "decision-001",
+  "idempotencyKey": null,
+  "verificationPlan": [
+    {"strategy": "output_schema", "required": true},
+    {"strategy": "postcondition", "required": true, "description": "Verify the returned digest against the bytes read."}
+  ],
+  "candidates": [
+    {
+      "instanceId": "local.fs.builtin.v1",
+      "eligible": true,
+      "reasons": ["Exact contract match", "Local data boundary", "Verified implementation"]
+    },
+    {
+      "instanceId": "xgen.fs.remote.v1",
+      "eligible": false,
+      "reasons": ["Would move local workspace data outside the local boundary"]
+    }
+  ],
+  "selectionReasons": [
+    "Selected the exact verified local implementation with no data egress."
+  ],
+  "fallback": {
+    "allowedConditions": ["read_only", "effect_not_started"],
+    "instanceIds": []
+  },
+  "createdAt": "2026-08-28T01:00:03Z"
+}

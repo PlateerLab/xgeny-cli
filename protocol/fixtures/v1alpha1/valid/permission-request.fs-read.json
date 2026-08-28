@@ -1,0 +1,25 @@
+{
+  "apiVersion": "xgeny.io/v1alpha1",
+  "kind": "PermissionRequest",
+  "requestId": "perm-001",
+  "runId": "run-001",
+  "stepId": "step-001",
+  "capability": {
+    "capabilityId": "xgeny.fs/read-text",
+    "contractVersion": "1.0.0"
+  },
+  "effectClass": "read_only",
+  "requestedScopes": ["filesystem.read"],
+  "resolvedResources": [
+    {
+      "scope": "filesystem.read",
+      "resource": "/workspace/README.md",
+      "normalized": true,
+      "metadata": {"workspaceId": "workspace-001"}
+    }
+  ],
+  "criticalActions": [],
+  "requestedLifetime": "once",
+  "reason": "Read the requested project documentation.",
+  "createdAt": "2026-08-28T01:00:01Z"
+}

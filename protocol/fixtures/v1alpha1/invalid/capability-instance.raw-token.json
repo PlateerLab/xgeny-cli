@@ -1,0 +1,32 @@
+{
+  "apiVersion": "xgeny.io/v1alpha1",
+  "kind": "CapabilityInstance",
+  "instanceId": "remote.mcp.invalid",
+  "definition": {
+    "capabilityId": "vendor.search/web",
+    "contractVersion": "1.0.0"
+  },
+  "source": "mcp",
+  "placement": "remote",
+  "platform": {"os": "any", "arch": "any"},
+  "trust": "configured",
+  "dataBoundary": "external",
+  "health": {
+    "status": "available",
+    "observedAt": "2026-08-28T01:00:00Z"
+  },
+  "auth": {
+    "state": "available",
+    "authRef": "credential://mcp/vendor-search"
+  },
+  "features": {
+    "sync": true,
+    "task": false,
+    "cancellable": false,
+    "idempotencyQuery": false
+  },
+  "binding": {
+    "bindingRef": "config://mcp/vendor-search",
+    "rawToken": "must-not-be-stored"
+  }
+}

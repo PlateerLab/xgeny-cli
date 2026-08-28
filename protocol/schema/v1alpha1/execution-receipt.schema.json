@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.xgeny.dev/v1alpha1/execution-receipt.schema.json",
+  "title": "ExecutionReceipt",
+  "type": "object",
+  "required": ["apiVersion", "kind", "receiptId", "runId", "stepId", "invocationId", "planId", "capability", "instanceId", "inputDigest", "inputSummary", "policy", "executor", "effect", "status", "startedAt", "endedAt", "outputDigest", "artifacts", "verification", "redactionsApplied", "previousReceiptDigest", "receiptDigest"],
+  "properties": {
+    "apiVersion": {"const": "xgeny.io/v1alpha1"},
+    "kind": {"const": "ExecutionReceipt"},
+    "extensions": {"$ref": "common.schema.json#/$defs/extensions"},
+    "requiredExtensions": {"$ref": "common.schema.json#/$defs/requiredExtensions"},
+    "receiptId": {"$ref": "common.schema.json#/$defs/identifier"},
+    "runId": {"$ref": "common.schema.json#/$defs/identifier"},
+    "stepId": {"$ref": "common.schema.json#/$defs/identifier"},
+    "invocationId": {"$ref": "common.schema.json#/$defs/identifier"},
+    "planId": {"$ref": "common.schema.json#/$defs/identifier"},
+    "capability": {"$ref": "common.schema.json#/$defs/capabilityRef"},
+    "instanceId": {"$ref": "common.schema.json#/$defs/identifier"},
+    "inputDigest": {"$ref": "common.schema.json#/$defs/digest"},
+    "inputSummary": {"type": "string", "minLength": 1, "maxLength": 4000},
+    "policy": {
+      "type": "object",
+      "required": ["decisionId", "decisionDigest"],
+      "properties": {
+        "decisionId": {"$ref": "common.schema.json#/$defs/identifier"},
+        "decisionDigest": {"$ref": "common.schema.json#/$defs/digest"},
+        "leaseId": {"$ref": "common.schema.json#/$defs/identifier"},
+        "leaseDigest": {"$ref": "common.schema.json#/$defs/digest"}
+      },
+      "additionalProperties": false
+    },
+    "executor": {
+      "type": "object",
+      "required": ["id", "placement", "platform"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": 300},
+        "placement": {"enum": ["local", "device", "remote"]},
+        "platform": {"type": "string", "minLength": 1, "maxLength": 300}
+      },
+      "additionalProperties": false
+    },
+    "effect": {
+      "type": "object",
+      "required": ["class", "started", "idempotencyKey"],
+      "properties": {
+        "class": {"$ref": "common.schema.json#/$defs/effectClass"},
+        "started": {"type": "boolean"},
+        "startedAt": {"$ref": "common.schema.json#/$defs/timestamp"},
+        "idempotencyKey": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 300
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"started": {"const": true}}},
+          "then": {"required": ["startedAt"]},
+          "else": {"not": {"required": ["startedAt"]}}
+        },
+        {
+          "if": {"properties": {"class": {"const": "read_only"}}},
+          "else": {"properties": {"idempotencyKey": {"type": "string"}}}
+        }
+      ],
+      "additionalProperties": false
+    },
+    "status": {"enum": ["succeeded", "failed", "cancelled", "blocked", "unknown"]},
+    "startedAt": {"$ref": "common.schema.json#/$defs/timestamp"},
+    "endedAt": {"$ref": "common.schema.json#/$defs/timestamp"},
+    "outputDigest": {"$ref": "common.schema.json#/$defs/digest"},
+    "artifacts": {
+      "type": "array",
+      "items": {"$ref": "common.schema.json#/$defs/artifactRef"}
+    },
+    "verification": {
+      "type": "array",
+      "items": {"$ref": "common.schema.json#/$defs/verificationEvidence"}
+    },
+    "redactionsApplied": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1, "maxLength": 300},
+      "uniqueItems": true
+    },
+    "previousReceiptDigest": {
+      "oneOf": [
+        {"$ref": "common.schema.json#/$defs/digest"},
+        {"type": "null"}
+      ]
+    },
+    "receiptDigest": {"$ref": "common.schema.json#/$defs/digest"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "succeeded"}}},
+      "then": {
+        "properties": {
+          "verification": {
+            "minItems": 1,
+            "contains": {
+              "type": "object",
+              "properties": {"result": {"const": "passed"}},
+              "required": ["result"]
+            },
+            "not": {
+              "contains": {
+                "type": "object",
+                "properties": {
+                  "required": {"const": true},
+                  "result": {"enum": ["failed", "inconclusive"]}
+                },
+                "required": ["required", "result"]
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

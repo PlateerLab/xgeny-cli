@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.xgeny.dev/v1alpha1/work-graph.schema.json",
+  "title": "WorkGraph snapshot",
+  "type": "object",
+  "required": ["apiVersion", "kind", "runId", "revision", "authority", "goal", "executionMode", "status", "steps", "journalSequence", "journalHeadDigest", "updatedAt"],
+  "properties": {
+    "apiVersion": {"const": "xgeny.io/v1alpha1"},
+    "kind": {"const": "WorkGraph"},
+    "extensions": {"$ref": "common.schema.json#/$defs/extensions"},
+    "requiredExtensions": {"$ref": "common.schema.json#/$defs/requiredExtensions"},
+    "runId": {"$ref": "common.schema.json#/$defs/identifier"},
+    "revision": {"type": "integer", "minimum": 0},
+    "authority": {
+      "description": "Only XGENy local devices or XGEN may own a canonical WorkGraph. External A2A agents execute through XGEN authority.",
+      "type": "string",
+      "pattern": "^(local|xgen):[A-Za-z0-9._:-]+$"
+    },
+    "goal": {"type": "string", "minLength": 1, "maxLength": 10000},
+    "executionMode": {"enum": ["direct", "tracked", "persistent"]},
+    "status": {"enum": ["pending", "running", "waiting_input", "completed", "failed", "blocked", "cancelled"]},
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stepId", "objective", "dependsOn", "capability", "status", "attempts", "verificationStatus"],
+        "properties": {
+          "stepId": {"$ref": "common.schema.json#/$defs/identifier"},
+          "objective": {"type": "string", "minLength": 1, "maxLength": 5000},
+          "dependsOn": {
+            "type": "array",
+            "items": {"$ref": "common.schema.json#/$defs/identifier"},
+            "uniqueItems": true
+          },
+          "capability": {"$ref": "common.schema.json#/$defs/capabilityRef"},
+          "selectedInstanceId": {"$ref": "common.schema.json#/$defs/identifier"},
+          "invocationPlanId": {"$ref": "common.schema.json#/$defs/identifier"},
+          "status": {"enum": ["pending", "ready", "running", "waiting_input", "validating", "completed", "failed", "blocked", "cancelled"]},
+          "attempts": {"type": "integer", "minimum": 0},
+          "verificationStatus": {"$ref": "common.schema.json#/$defs/verificationState"},
+          "inputDigest": {"$ref": "common.schema.json#/$defs/digest"},
+          "outputDigest": {"$ref": "common.schema.json#/$defs/digest"},
+          "artifactRefs": {
+            "type": "array",
+            "items": {"$ref": "common.schema.json#/$defs/artifactRef"}
+          }
+        },
+        "additionalProperties": false
+      },
+      "minItems": 0
+    },
+    "journalSequence": {"type": "integer", "minimum": 0},
+    "journalHeadDigest": {
+      "oneOf": [
+        {"$ref": "common.schema.json#/$defs/digest"},
+        {"type": "null"}
+      ]
+    },
+    "updatedAt": {"$ref": "common.schema.json#/$defs/timestamp"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"executionMode": {"const": "direct"}}},
+      "then": {"properties": {"steps": {"minItems": 1, "maxItems": 1}}}
+    },
+    {
+      "if": {"properties": {"status": {"const": "completed"}}},
+      "then": {
+        "properties": {
+          "steps": {
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "properties": {"status": {"const": "completed"}},
+              "required": ["status"]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"journalSequence": {"const": 0}}},
+      "then": {"properties": {"journalHeadDigest": {"type": "null"}}},
+      "else": {"properties": {"journalHeadDigest": {"$ref": "common.schema.json#/$defs/digest"}}}
+    }
+  ],
+  "additionalProperties": false
+}

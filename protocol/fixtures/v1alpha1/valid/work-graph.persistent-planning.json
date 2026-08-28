@@ -1,0 +1,14 @@
+{
+  "apiVersion": "xgeny.io/v1alpha1",
+  "kind": "WorkGraph",
+  "runId": "run-planning-001",
+  "revision": 0,
+  "authority": "local:device-001",
+  "goal": "Organize the local research archive and produce a verified report.",
+  "executionMode": "persistent",
+  "status": "pending",
+  "steps": [],
+  "journalSequence": 0,
+  "journalHeadDigest": null,
+  "updatedAt": "2026-08-28T01:00:00Z"
+}

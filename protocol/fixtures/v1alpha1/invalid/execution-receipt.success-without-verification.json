@@ -1,0 +1,40 @@
+{
+  "apiVersion": "xgeny.io/v1alpha1",
+  "kind": "ExecutionReceipt",
+  "receiptId": "receipt-invalid",
+  "runId": "run-001",
+  "stepId": "step-001",
+  "invocationId": "invoke-001",
+  "planId": "plan-001",
+  "capability": {
+    "capabilityId": "xgeny.fs/read-text",
+    "contractVersion": "1.0.0"
+  },
+  "instanceId": "local.fs.builtin.v1",
+  "inputDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "inputSummary": "Invalid fixture with no verification evidence.",
+  "policy": {
+    "decisionId": "decision-001",
+    "decisionDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+  },
+  "executor": {
+    "id": "xgeny-local",
+    "placement": "local",
+    "platform": "linux-x86_64"
+  },
+  "effect": {
+    "class": "read_only",
+    "started": true,
+    "startedAt": "2026-08-28T01:00:04Z",
+    "idempotencyKey": null
+  },
+  "status": "succeeded",
+  "startedAt": "2026-08-28T01:00:04Z",
+  "endedAt": "2026-08-28T01:00:05Z",
+  "outputDigest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "artifacts": [],
+  "verification": [],
+  "redactionsApplied": [],
+  "previousReceiptDigest": null,
+  "receiptDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+}

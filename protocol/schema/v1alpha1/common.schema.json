@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.xgeny.dev/v1alpha1/common.schema.json",
+  "title": "XGENy v1alpha1 common definitions",
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "capabilityId": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 200,
+      "pattern": "^[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*$"
+    },
+    "semver": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "extensions": {
+      "type": "object",
+      "propertyNames": {"format": "uri"},
+      "additionalProperties": true
+    },
+    "requiredExtensions": {
+      "type": "array",
+      "items": {"type": "string", "format": "uri"},
+      "uniqueItems": true
+    },
+    "effectClass": {
+      "enum": [
+        "read_only",
+        "idempotent",
+        "compensatable",
+        "non_idempotent",
+        "unknown"
+      ]
+    },
+    "verificationResult": {
+      "enum": ["passed", "failed", "inconclusive"]
+    },
+    "verificationState": {
+      "enum": ["not_started", "running", "passed", "failed", "inconclusive"]
+    },
+    "credentialRef": {
+      "type": "object",
+      "required": ["credentialRef"],
+      "properties": {
+        "credentialRef": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000,
+          "pattern": "^(credential|config)://[A-Za-z0-9][A-Za-z0-9._/-]*$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "criticalAction": {
+      "enum": [
+        "irreversible_delete",
+        "credential_export",
+        "payment_or_purchase",
+        "external_publish_or_message",
+        "production_deploy",
+        "privilege_escalation",
+        "persistent_startup"
+      ]
+    },
+    "capabilityRef": {
+      "type": "object",
+      "required": ["capabilityId", "contractVersion"],
+      "properties": {
+        "capabilityId": {"$ref": "#/$defs/capabilityId"},
+        "contractVersion": {"$ref": "#/$defs/semver"}
+      },
+      "additionalProperties": false
+    },
+    "resolvedResource": {
+      "type": "object",
+      "required": ["scope", "resource", "normalized"],
+      "properties": {
+        "scope": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)+$"
+        },
+        "resource": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "normalized": {"const": true},
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "artifactRef": {
+      "type": "object",
+      "required": ["artifactId", "mediaType", "size", "digest"],
+      "properties": {
+        "artifactId": {"$ref": "#/$defs/identifier"},
+        "name": {"type": "string", "minLength": 1, "maxLength": 512},
+        "mediaType": {"type": "string", "minLength": 3, "maxLength": 200},
+        "size": {"type": "integer", "minimum": 0},
+        "digest": {"$ref": "#/$defs/digest"},
+        "provenance": {
+          "type": "object",
+          "required": ["runId", "stepId"],
+          "properties": {
+            "runId": {"$ref": "#/$defs/identifier"},
+            "stepId": {"$ref": "#/$defs/identifier"},
+            "receiptId": {"$ref": "#/$defs/identifier"}
+          },
+          "additionalProperties": false
+        },
+        "extensions": {"$ref": "#/$defs/extensions"},
+        "requiredExtensions": {"$ref": "#/$defs/requiredExtensions"}
+      },
+      "additionalProperties": false
+    },
+    "verificationEvidence": {
+      "type": "object",
+      "required": ["strategy", "required", "result", "summary"],
+      "properties": {
+        "strategy": {
+          "enum": ["output_schema", "postcondition", "artifact_digest", "receipt", "human"]
+        },
+        "required": {"type": "boolean"},
+        "result": {"$ref": "#/$defs/verificationResult"},
+        "summary": {"type": "string", "minLength": 1, "maxLength": 2000},
+        "evidenceDigest": {"$ref": "#/$defs/digest"},
+        "artifact": {"$ref": "#/$defs/artifactRef"}
+      },
+      "additionalProperties": false
+    }
+  }
+}

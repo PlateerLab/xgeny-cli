@@ -1,0 +1,38 @@
+{
+  "apiVersion": "xgeny.io/v1alpha1",
+  "kind": "InvocationPlan",
+  "planId": "plan-invalid",
+  "runId": "run-001",
+  "stepId": "step-001",
+  "capability": {
+    "capabilityId": "xgeny.fs/write-text",
+    "contractVersion": "1.0.0"
+  },
+  "selectedInstanceId": "local.fs.builtin.v1",
+  "arguments": {"path": "/workspace/output.txt", "content": "hello"},
+  "argumentsSizeBytes": 50,
+  "inputDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "resolvedResources": [
+    {
+      "scope": "filesystem.write",
+      "resource": "/workspace/output.txt",
+      "normalized": true
+    }
+  ],
+  "effectClass": "non_idempotent",
+  "executionMode": "direct",
+  "policyDecisionId": "decision-001",
+  "idempotencyKey": null,
+  "verificationPlan": [
+    {"strategy": "postcondition", "required": true}
+  ],
+  "candidates": [
+    {"instanceId": "local.fs.builtin.v1", "eligible": true}
+  ],
+  "selectionReasons": ["Invalid fixture: effectful calls require an idempotency key."],
+  "fallback": {
+    "allowedConditions": ["effect_not_started"],
+    "instanceIds": []
+  },
+  "createdAt": "2026-08-28T01:00:03Z"
+}

@@ -1,0 +1,16 @@
+{
+  "apiVersion": "xgeny.io/v1alpha1",
+  "kind": "PolicyDecision",
+  "decisionId": "decision-deny-001",
+  "requestId": "perm-outside-workspace-001",
+  "decision": "deny",
+  "policySources": [
+    {
+      "kind": "user_profile",
+      "id": "trusted-workspace",
+      "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+    }
+  ],
+  "denyReasons": ["The normalized resource is outside the trusted workspace."],
+  "decidedAt": "2026-08-28T01:00:02Z"
+}

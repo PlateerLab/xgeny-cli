@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.xgeny.dev/v1alpha1/policy-decision.schema.json",
+  "title": "PolicyDecision",
+  "type": "object",
+  "required": ["apiVersion", "kind", "decisionId", "requestId", "decision", "policySources", "decidedAt"],
+  "properties": {
+    "apiVersion": {"const": "xgeny.io/v1alpha1"},
+    "kind": {"const": "PolicyDecision"},
+    "extensions": {"$ref": "common.schema.json#/$defs/extensions"},
+    "requiredExtensions": {"$ref": "common.schema.json#/$defs/requiredExtensions"},
+    "decisionId": {"$ref": "common.schema.json#/$defs/identifier"},
+    "requestId": {"$ref": "common.schema.json#/$defs/identifier"},
+    "decision": {"enum": ["allow", "ask", "deny"]},
+    "policySources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "id", "digest"],
+        "properties": {
+          "kind": {"enum": ["host", "user_profile", "run_grant", "managed_lease"]},
+          "id": {"type": "string", "minLength": 1, "maxLength": 300},
+          "digest": {"$ref": "common.schema.json#/$defs/digest"}
+        },
+        "additionalProperties": false
+      },
+      "minItems": 1
+    },
+    "grant": {
+      "type": "object",
+      "required": ["lifetime", "scopes", "resources", "criticalActions"],
+      "properties": {
+        "lifetime": {"enum": ["once", "run", "session", "project", "persistent"]},
+        "expiresAt": {"$ref": "common.schema.json#/$defs/timestamp"},
+        "scopes": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 3},
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "resources": {
+          "type": "array",
+          "items": {"$ref": "common.schema.json#/$defs/resolvedResource"},
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "criticalActions": {
+          "type": "array",
+          "items": {"$ref": "common.schema.json#/$defs/criticalAction"},
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "interactionId": {"$ref": "common.schema.json#/$defs/identifier"},
+    "denyReasons": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1, "maxLength": 1000},
+      "minItems": 1
+    },
+    "decidedAt": {"$ref": "common.schema.json#/$defs/timestamp"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"decision": {"const": "allow"}}},
+      "then": {
+        "required": ["grant"],
+        "not": {"anyOf": [{"required": ["interactionId"]}, {"required": ["denyReasons"]}]}
+      }
+    },
+    {
+      "if": {"properties": {"decision": {"const": "ask"}}},
+      "then": {
+        "required": ["interactionId"],
+        "not": {"anyOf": [{"required": ["grant"]}, {"required": ["denyReasons"]}]}
+      }
+    },
+    {
+      "if": {"properties": {"decision": {"const": "deny"}}},
+      "then": {
+        "required": ["denyReasons"],
+        "not": {"anyOf": [{"required": ["grant"]}, {"required": ["interactionId"]}]}
+      }
+    }
+  ],
+  "additionalProperties": false
+}
