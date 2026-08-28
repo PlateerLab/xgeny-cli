@@ -34,6 +34,12 @@ fixtures/v1alpha1/
 
 `fixtures/v1alpha1/manifest.json`의 `expectedValid`이 검증 기대값이다. valid fixture는 모두 통과하고 invalid fixture는 지정 schema에서 반드시 실패해야 한다.
 
+Rust 정본 타입과 bundled/offline validator를 포함한 전체 conformance 검사는 저장소 루트에서 실행한다.
+
+```bash
+cargo run --locked --quiet -p xgeny-cli -- protocol check
+```
+
 ## 호환 규칙
 
 - core object의 unknown top-level field는 거부한다. 확장은 URI-keyed `extensions`에 넣고 reader는 이해하지 못한 optional extension을 보존한다.

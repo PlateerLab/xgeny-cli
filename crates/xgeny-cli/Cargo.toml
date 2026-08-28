@@ -1,0 +1,19 @@
+[package]
+name = "xgeny-cli"
+description = "Local-first general-purpose XGENy agent CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "xgeny"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+xgeny-protocol = { path = "../xgeny-protocol" }
+
+[lints]
+workspace = true
