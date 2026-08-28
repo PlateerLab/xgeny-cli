@@ -4,23 +4,38 @@
 
 ## 범위
 
-현재 워크스페이스는 다음 세 crate로 구성된다.
+현재 워크스페이스는 다음 다섯 crate로 구성된다.
 
 ```text
 crates/
-  xgeny-domain/    I/O 없는 정본 Rust 도메인 타입
-  xgeny-protocol/  bundled/offline schema·fixture·digest 검증
-  xgeny-cli/       xgeny 실행 파일과 protocol check 명령
+  xgeny-domain/       I/O 없는 정본 Rust 프로토콜 타입
+  xgeny-protocol/     bundled/offline schema·fixture·digest 검증
+  xgeny-workgraph/    model-free RunEvent 상태 전이·재생 실험
+  xgeny-local-store/  메모리 참조 구현과 embedded SQLite 후보
+  xgeny-cli/          xgeny 실행 파일과 protocol check 명령
 ```
 
-이 단계는 모델 호출, 파일 실행, MCP, Connector, XGEN 원격 연동을 구현하지 않는다. 대신 이후 모듈들이 공유할 프로토콜 경계와 검증 기준을 먼저 실행 가능한 상태로 만든다.
+`xgeny-workgraph`와 `xgeny-local-store`는 ADR-0008 연구 gate를 위한 내부 실험이며 공개 프로토콜 v0.1을 변경하지 않는다. 이 단계는 모델 호출, 실제 파일·process effect 실행, MCP, Connector, XGEN 원격 연동 또는 사용자용 resume 명령을 구현하지 않는다.
 
 ## 준비물
 
 - Git
 - [rustup](https://rustup.rs/)
+- 소스에서 전체 workspace를 빌드할 때 필요한 플랫폼 C build toolchain
 
-저장소의 `rust-toolchain.toml`이 Rust 1.98.0과 `rustfmt`, `clippy`를 고정한다. 현재 기반 빌드에는 SQLite, PostgreSQL, MinIO, Docker, Kubernetes, Python, Node.js 또는 별도 데몬이 필요하지 않다. ADR-0008에서 embedded SQLite를 채택해도 library는 제품에 포함하며 사용자가 DB server를 별도 설치·운영하지 않는다.
+저장소의 `rust-toolchain.toml`이 Rust 1.98.0과 `rustfmt`, `clippy`를 고정한다. `rusqlite`의 `bundled` 기능이 SQLite C source를 Rust build에 함께 링크하므로 소스 빌드에는 Linux C compiler, macOS Command Line Tools 또는 Windows MSVC Build Tools가 필요하다. 향후 `xgeny-local-store`를 연결한 배포 binary도 최종 사용자에게 SQLite 실행 파일, DB server 또는 daemon 설치를 요구하지 않는다. 현재 `xgeny` 실행 파일에는 이 저장소 후보를 아직 연결하지 않았다. PostgreSQL, MinIO, Docker, Kubernetes, Python, Node.js도 기본 실행 의존성이 아니다.
+
+## 현재 durable slice 검증 범위
+
+- RunEvent의 RFC 8785/SHA-256 hash chain과 I/O 없는 결정론적 replay
+- authority epoch와 journal head compare-and-swap을 통한 stale writer 거부
+- event, effect intent index, authorization consumption, projection의 단일 transaction
+- transaction 중간 오류와 자식 process 즉시 종료 후 전량 rollback·재개
+- lost acknowledgement 뒤 `effect_unknown` 복원과 비멱등 effect의 blind retry 거부
+- 메모리 참조 저장소와 SQLite 후보의 동일한 canonical JSONL export
+- 임의 길이 journal 재생과 event 변조 탐지 property test
+
+이는 현재 개발 호스트의 process-crash 검증 결과다. power-loss, filesystem 손상, 실제 tool effect, 설치 패키지, Linux/macOS/Windows 전체 반복 매트릭스는 아직 통과했다고 주장하지 않는다. SQLite 채택 여부도 ADR-0008의 hardened JSONL 비교와 나머지 gate가 끝난 뒤 확정한다.
 
 ## 검증
 
