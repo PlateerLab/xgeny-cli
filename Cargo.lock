@@ -1181,6 +1181,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "xgeny-policy"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror",
+ "xgeny-domain",
+]
+
+[[package]]
 name = "xgeny-protocol"
 version = "0.1.0"
 dependencies = [
