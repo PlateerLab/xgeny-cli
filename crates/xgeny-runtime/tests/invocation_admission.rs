@@ -1,5 +1,7 @@
 use std::cell::Cell;
 use std::fs;
+use std::ops::{Deref, DerefMut};
+use std::rc::Rc;
 
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
@@ -18,12 +20,13 @@ use xgeny_policy::{
 use xgeny_runtime::{
     AdmissionError, AdmissionOutcome, AdmissionRequest, CapabilityRegistry, EventFactory,
     EventFactoryError, EventMetadata, InvocationAdmission, InvocationMaterialProvider,
-    InvocationMaterialRecovery, LocalRunLease, MaterialProviderFailure, MaterialRecoveryError,
-    RequiredRouteFeatures, RouteOutcome, RouteRequest,
+    InvocationMaterialRecovery, LocalRunLease, MaterialProviderFailure, MaterialProviderRegistry,
+    MaterialRecoveryError, RequiredRouteFeatures, RouteOutcome, RouteRequest,
 };
 use xgeny_workgraph::{
     InvocationMaterialRecord, InvocationMaterialUnavailableReason,
     ReconstructableMaterialReference, RunEvent, RunEventBody, RunState, StepStatus,
+    invocation_material_digest,
 };
 
 const RUN_ID: &str = "run-admission-1";
@@ -52,36 +55,64 @@ impl ResourceResolver for CanonicalResolver {
 }
 
 #[derive(Debug)]
-struct FixedMaterialProvider {
-    provider_id: String,
+struct FixedProvider {
     material: Value,
-    result: Result<(), MaterialProviderFailure>,
-    calls: usize,
+    failure: Rc<Cell<Option<MaterialProviderFailure>>>,
+    calls: Rc<Cell<usize>>,
+}
+
+#[derive(Debug)]
+struct FixedMaterialProvider {
+    registry: MaterialProviderRegistry,
+    failure: Rc<Cell<Option<MaterialProviderFailure>>>,
+    calls: Rc<Cell<usize>>,
 }
 
 impl FixedMaterialProvider {
     fn available(provider_id: &str, material: Value) -> Self {
-        Self {
-            provider_id: provider_id.to_owned(),
+        let failure = Rc::new(Cell::new(None));
+        let calls = Rc::new(Cell::new(0));
+        let provider = FixedProvider {
             material,
-            result: Ok(()),
-            calls: 0,
+            failure: Rc::clone(&failure),
+            calls: Rc::clone(&calls),
+        };
+        let mut registry = MaterialProviderRegistry::new();
+        registry
+            .register(provider_id, provider)
+            .expect("fixture provider identifier should register");
+        Self {
+            registry,
+            failure,
+            calls,
         }
     }
 }
 
-impl InvocationMaterialProvider for FixedMaterialProvider {
-    fn provider_id(&self) -> &str {
-        &self.provider_id
-    }
+impl Deref for FixedMaterialProvider {
+    type Target = MaterialProviderRegistry;
 
+    fn deref(&self) -> &Self::Target {
+        &self.registry
+    }
+}
+
+impl DerefMut for FixedMaterialProvider {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.registry
+    }
+}
+
+impl InvocationMaterialProvider for FixedProvider {
     fn reconstruct(
         &mut self,
         _reference_id: &str,
         _revision: &str,
     ) -> Result<Value, MaterialProviderFailure> {
-        self.calls += 1;
-        self.result?;
+        self.calls.set(self.calls.get() + 1);
+        if let Some(failure) = self.failure.get() {
+            return Err(failure);
+        }
         Ok(self.material.clone())
     }
 }
@@ -432,12 +463,9 @@ fn exact_arguments_are_resolved_authorized_and_atomically_committed() {
 
     assert_eq!(admitted.selected_instance_id(), instance.instance_id);
     assert_eq!(
-        admitted.normalized_arguments()["path"],
-        json!(CANONICAL_PATH)
-    );
-    assert_eq!(
-        admitted.normalized_arguments()["marker"],
-        json!(SECRET_SENTINEL)
+        admitted.material_record().material_digest(),
+        invocation_material_digest(&arguments(CANONICAL_PATH, SECRET_SENTINEL))
+            .expect("canonical admitted material should hash")
     );
     let state = &admitted.commit().state;
     let step = &state.steps[STEP_ID];
@@ -474,8 +502,9 @@ fn exact_arguments_are_resolved_authorized_and_atomically_committed() {
         .into_ephemeral_material()
         .expect("same-process admitted arguments should become opaque material");
     assert_eq!(
-        material.normalized_arguments()["marker"],
-        json!(SECRET_SENTINEL)
+        material.record().material_digest(),
+        invocation_material_digest(&arguments(CANONICAL_PATH, SECRET_SENTINEL))
+            .expect("ephemeral material should retain the committed digest")
     );
     assert!(!format!("{material:?}").contains(SECRET_SENTINEL));
     assert!(!format!("{material:?}").contains(CANONICAL_PATH));
@@ -1104,8 +1133,12 @@ fn lost_commit_acknowledgement_does_not_mint_a_second_budget() {
     let material = InvocationMaterialRecovery::new()
         .recover(&store, &lease, &registry, &resolver, &mut provider, STEP_ID)
         .expect("lost acknowledgement should retain a recoverable material descriptor");
-    assert_eq!(material.normalized_arguments()["marker"], json!("lost-ack"));
-    assert_eq!(provider.calls, 1);
+    assert_eq!(
+        material.record().material_digest(),
+        invocation_material_digest(&arguments(CANONICAL_PATH, "lost-ack"))
+            .expect("recovered material should match the committed digest")
+    );
+    assert_eq!(provider.calls.get(), 1);
     assert_eq!(
         store
             .load()
@@ -1207,12 +1240,13 @@ fn sqlite_lost_ack_reopens_with_one_recoverable_material_and_no_plaintext_argume
         )
         .expect("reopened material should reconstruct");
     assert_eq!(
-        material.normalized_arguments()["marker"],
-        json!(SECRET_SENTINEL)
+        material.record().material_digest(),
+        invocation_material_digest(&arguments(CANONICAL_PATH, SECRET_SENTINEL))
+            .expect("recovered material should match the committed digest")
     );
     assert!(!format!("{material:?}").contains(SECRET_SENTINEL));
     assert!(!format!("{material:?}").contains(CANONICAL_PATH));
-    assert_eq!(provider.calls, 1);
+    assert_eq!(provider.calls.get(), 1);
 
     assert_sqlite_artifacts_exclude(
         directory.path(),
@@ -1263,7 +1297,7 @@ fn ephemeral_material_loss_is_explicitly_closed_to_manual_without_an_effect_star
         ),
         Err(MaterialRecoveryError::EphemeralMaterialUnavailable)
     ));
-    assert_eq!(provider.calls, 0);
+    assert_eq!(provider.calls.get(), 0);
 
     let commit = InvocationMaterialRecovery::new()
         .mark_unavailable(
@@ -1363,7 +1397,7 @@ fn reconstructable_material_revalidates_provider_payload_and_binding_before_retu
         ),
         Err(MaterialRecoveryError::LeaseRunMismatch { .. })
     ));
-    assert_eq!(lease_blocked_provider.calls, 0);
+    assert_eq!(lease_blocked_provider.calls.get(), 0);
 
     let mut wrong_provider = FixedMaterialProvider::available(
         "different-provider",
@@ -1378,9 +1412,9 @@ fn reconstructable_material_revalidates_provider_payload_and_binding_before_retu
             &mut wrong_provider,
             STEP_ID,
         ),
-        Err(MaterialRecoveryError::ProviderMismatch)
+        Err(MaterialRecoveryError::ProviderNotRegistered)
     ));
-    assert_eq!(wrong_provider.calls, 0);
+    assert_eq!(wrong_provider.calls.get(), 0);
 
     let mut changed_payload =
         FixedMaterialProvider::available("run-recipe", arguments(CANONICAL_PATH, "changed-marker"));
@@ -1395,7 +1429,7 @@ fn reconstructable_material_revalidates_provider_payload_and_binding_before_retu
         ),
         Err(MaterialRecoveryError::MaterialDigestMismatch)
     ));
-    assert_eq!(changed_payload.calls, 1);
+    assert_eq!(changed_payload.calls.get(), 1);
     let snapshot = store
         .load()
         .expect("store should load")
@@ -1425,7 +1459,9 @@ fn material_provider_failures_are_fixed_and_do_not_expose_invocation_data() {
     ));
     let mut provider =
         FixedMaterialProvider::available("run-recipe", arguments(CANONICAL_PATH, SECRET_SENTINEL));
-    provider.result = Err(MaterialProviderFailure::Unavailable);
+    provider
+        .failure
+        .set(Some(MaterialProviderFailure::Unavailable));
 
     let error = InvocationMaterialRecovery::new()
         .recover(&store, &lease, &registry, &resolver, &mut provider, STEP_ID)
@@ -1474,7 +1510,7 @@ fn recovery_rejects_definition_and_instance_drift_before_provider_access() {
         ),
         Err(MaterialRecoveryError::DefinitionChanged)
     ));
-    assert_eq!(provider.calls, 0);
+    assert_eq!(provider.calls.get(), 0);
 
     let mut changed_instance = instance_fixture(&definition);
     "builtin://test/retargeted-writer".clone_into(&mut changed_instance.binding.binding_ref);
@@ -1490,7 +1526,7 @@ fn recovery_rejects_definition_and_instance_drift_before_provider_access() {
         ),
         Err(MaterialRecoveryError::InstanceBindingChanged)
     ));
-    assert_eq!(provider.calls, 0);
+    assert_eq!(provider.calls.get(), 0);
 }
 
 #[test]
@@ -1608,7 +1644,7 @@ fn credential_identity_retarget_is_detected_before_material_provider_access() {
         ),
         Err(MaterialRecoveryError::InstanceBindingChanged)
     ));
-    assert_eq!(provider.calls, 0);
+    assert_eq!(provider.calls.get(), 0);
 }
 
 #[test]

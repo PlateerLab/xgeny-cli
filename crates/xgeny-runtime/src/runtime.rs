@@ -3,8 +3,8 @@ use std::num::NonZeroU32;
 use thiserror::Error;
 use xgeny_local_store::{Commit, ExpectedHead, RunStore, StoreError};
 use xgeny_workgraph::{
-    EffectIntent, ReconciliationResolution, RunEvent, RunEventBody, RunState, SinkGuarantee,
-    StepState, StepStatus,
+    EffectIntent, InvocationMaterialRecord, ReconciliationResolution, RunEvent, RunEventBody,
+    RunState, SinkGuarantee, StepState, StepStatus,
 };
 
 use crate::RunLease;
@@ -44,36 +44,87 @@ impl EventFactoryError {
 /// Implementations must classify transport errors after a request may have been sent as
 /// [`ExecutionObservation::Unknown`], never as a definite failure. `reconcile` must be a
 /// read-only query safe to repeat after process restart.
-pub trait EffectSink {
+pub(crate) trait EffectSink {
     type Prepared: PreparedEffect;
 
-    fn execute(&mut self, intent: &EffectIntent, prepared: &Self::Prepared)
-    -> ExecutionObservation;
+    fn execute(&mut self, intent: &EffectIntent, prepared: Self::Prepared) -> ExecutionObservation;
     fn reconcile(&mut self, intent: &EffectIntent) -> ReconciliationObservation;
 }
 
-/// Ephemeral, adapter-owned executable material.
+/// Core-owned identity for one prepared, consume-once adapter invocation.
 ///
-/// Raw arguments and resolved credentials remain outside the journal. The digest must identify
-/// the same canonical semantic action committed in [`EffectIntent::action_digest`].
-pub trait PreparedEffect {
-    fn action_digest(&self) -> &str;
-    fn capability_id(&self) -> &str;
-    fn contract_version(&self) -> &str;
-    fn definition_digest(&self) -> &str;
-    fn instance_id(&self) -> &str;
-    fn instance_binding_digest(&self) -> &str;
+/// This type and its constructor are crate-private so adapters cannot self-report or forge the
+/// durable identity they are about to execute.
+pub(crate) struct PreparedEffectBinding {
+    run_id: String,
+    authority: String,
+    authority_epoch: u64,
+    journal_sequence: u64,
+    journal_head_digest: String,
+    step_id: String,
+    effect_id: String,
+    material_record: InvocationMaterialRecord,
+}
+
+impl PreparedEffectBinding {
+    pub(crate) fn from_verified(
+        state: &RunState,
+        step_id: &str,
+        intent: &EffectIntent,
+        material_record: InvocationMaterialRecord,
+    ) -> Self {
+        Self {
+            run_id: state.run_id.clone(),
+            authority: state.authority.clone(),
+            authority_epoch: state.authority_epoch,
+            journal_sequence: state.journal_sequence,
+            journal_head_digest: state.journal_head_digest.clone(),
+            step_id: step_id.to_owned(),
+            effect_id: intent.effect_id.clone(),
+            material_record,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn corrupt_step_id_for_test(&mut self) {
+        self.step_id.push_str("-different");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn corrupt_effect_id_for_test(&mut self) {
+        self.effect_id.push_str("-different");
+    }
+}
+
+impl std::fmt::Debug for PreparedEffectBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedEffectBinding")
+            .field("run_id", &self.run_id)
+            .field("authority", &self.authority)
+            .field("authority_epoch", &self.authority_epoch)
+            .field("journal_sequence", &self.journal_sequence)
+            .field("journal_head_digest", &self.journal_head_digest)
+            .field("step_id", &self.step_id)
+            .field("effect_id", &self.effect_id)
+            .field("material_record", &self.material_record)
+            .finish()
+    }
+}
+
+pub(crate) trait PreparedEffect {
+    fn binding(&self) -> &PreparedEffectBinding;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExecutionObservation {
+pub(crate) enum ExecutionObservation {
     Succeeded { receipt_digest: String },
     Failed { receipt_digest: String },
     Unknown { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReconciliationObservation {
+pub(crate) enum ReconciliationObservation {
     Applied { evidence_digest: String },
     NotApplied { evidence_digest: String },
     Failed { evidence_digest: String },
@@ -111,6 +162,11 @@ impl RuntimePolicy {
             max_execution_attempts,
         }
     }
+
+    #[must_use]
+    pub const fn max_execution_attempts(self) -> u32 {
+        self.max_execution_attempts.get()
+    }
 }
 
 impl Default for RuntimePolicy {
@@ -119,7 +175,7 @@ impl Default for RuntimePolicy {
     }
 }
 
-pub struct DurableEffectRuntime<'a, S, E, F, L> {
+pub(crate) struct DurableEffectRuntime<'a, S, E, F, L> {
     store: &'a mut S,
     sink: &'a mut E,
     events: &'a mut F,
@@ -135,7 +191,7 @@ where
     L: RunLease,
 {
     #[must_use]
-    pub fn new(store: &'a mut S, sink: &'a mut E, events: &'a mut F, lease: &'a L) -> Self {
+    pub(crate) fn new(store: &'a mut S, sink: &'a mut E, events: &'a mut F, lease: &'a L) -> Self {
         Self {
             store,
             sink,
@@ -146,7 +202,7 @@ where
     }
 
     #[must_use]
-    pub const fn with_policy(mut self, policy: RuntimePolicy) -> Self {
+    pub(crate) const fn with_policy(mut self, policy: RuntimePolicy) -> Self {
         self.policy = policy;
         self
     }
@@ -161,10 +217,10 @@ where
     /// Returns an error for missing Run/step/intent, lease mismatch, event creation, or store
     /// failures. A store failure after the sink call intentionally leaves `Executing` for the
     /// next recovery pass.
-    pub fn drive_step(
+    pub(crate) fn drive_step(
         &mut self,
         step_id: &str,
-        prepared: Option<&E::Prepared>,
+        prepared: Option<E::Prepared>,
     ) -> Result<DriveReport, RuntimeError> {
         let snapshot = self.store.load()?.ok_or(RuntimeError::RunNotInitialized)?;
         self.verify_lease(&snapshot.state)?;
@@ -205,7 +261,7 @@ where
         &mut self,
         state: &RunState,
         step: &StepState,
-        prepared: Option<&E::Prepared>,
+        prepared: Option<E::Prepared>,
     ) -> Result<DriveReport, RuntimeError> {
         let intent = require_intent(step)?;
         if step.attempts >= self.policy.max_execution_attempts.get() {
@@ -218,14 +274,18 @@ where
         let prepared = prepared.ok_or_else(|| RuntimeError::PreparedEffectRequired {
             step_id: step.step_id.clone(),
         })?;
-        if prepared.action_digest() != intent.action_digest {
-            return Err(RuntimeError::PreparedEffectDigestMismatch {
+        verify_prepared_invocation(state, step, &intent, prepared.binding())?;
+        let current_record = self
+            .store
+            .load_invocation_material(&intent.effect_id)?
+            .ok_or_else(|| RuntimeError::PreparedMaterialRecordMissing {
+                effect_id: intent.effect_id.clone(),
+            })?;
+        if current_record != prepared.binding().material_record {
+            return Err(RuntimeError::PreparedMaterialRecordChanged {
                 step_id: step.step_id.clone(),
-                expected: intent.action_digest,
-                actual: prepared.action_digest().to_owned(),
             });
         }
-        verify_prepared_invocation(&step.step_id, &intent, prepared)?;
         let started = self.append_event(
             state,
             RunEventBody::EffectExecutionStarted {
@@ -448,47 +508,31 @@ where
     }
 }
 
-fn verify_prepared_invocation<P: PreparedEffect>(
-    step_id: &str,
+fn verify_prepared_invocation(
+    state: &RunState,
+    step: &StepState,
     intent: &EffectIntent,
-    prepared: &P,
+    binding: &PreparedEffectBinding,
 ) -> Result<(), RuntimeError> {
-    for (field, expected, actual) in [
-        (
-            "capability_id",
-            intent.invocation.capability_id.as_str(),
-            prepared.capability_id(),
-        ),
-        (
-            "contract_version",
-            intent.invocation.contract_version.as_str(),
-            prepared.contract_version(),
-        ),
-        (
-            "definition_digest",
-            intent.invocation.definition_digest.as_str(),
-            prepared.definition_digest(),
-        ),
-        (
-            "instance_id",
-            intent.invocation.instance_id.as_str(),
-            prepared.instance_id(),
-        ),
-        (
-            "instance_binding_digest",
-            intent.invocation.instance_binding_digest.as_str(),
-            prepared.instance_binding_digest(),
-        ),
-    ] {
-        if expected != actual {
-            return Err(RuntimeError::PreparedEffectBindingMismatch {
-                step_id: step_id.to_owned(),
-                field,
-                expected: expected.to_owned(),
-                actual: actual.to_owned(),
-            });
-        }
+    if binding.run_id != state.run_id
+        || binding.authority != state.authority
+        || binding.authority_epoch != state.authority_epoch
+        || binding.journal_sequence != state.journal_sequence
+        || binding.journal_head_digest != state.journal_head_digest
+    {
+        return Err(RuntimeError::PreparedEffectHeadChanged {
+            step_id: step.step_id.clone(),
+        });
     }
+    if binding.step_id != step.step_id || binding.effect_id != intent.effect_id {
+        return Err(RuntimeError::PreparedEffectBindingMismatch {
+            step_id: step.step_id.clone(),
+        });
+    }
+    binding
+        .material_record
+        .verify_for(&state.run_id, &step.step_id, intent)
+        .map_err(RuntimeError::PreparedMaterialRecordInvalid)?;
     Ok(())
 }
 
@@ -544,23 +588,16 @@ pub enum RuntimeError {
     IntentMissing(String),
     #[error("step `{step_id}` needs prepared effect material before execution")]
     PreparedEffectRequired { step_id: String },
-    #[error(
-        "step `{step_id}` prepared effect digest mismatch: expected `{expected}`, got `{actual}`"
-    )]
-    PreparedEffectDigestMismatch {
-        step_id: String,
-        expected: String,
-        actual: String,
-    },
-    #[error(
-        "step `{step_id}` prepared effect {field} mismatch: expected `{expected}`, got `{actual}`"
-    )]
-    PreparedEffectBindingMismatch {
-        step_id: String,
-        field: &'static str,
-        expected: String,
-        actual: String,
-    },
+    #[error("step `{step_id}` prepared effect was created for a different journal head")]
+    PreparedEffectHeadChanged { step_id: String },
+    #[error("step `{step_id}` prepared effect is bound to another Step or effect")]
+    PreparedEffectBindingMismatch { step_id: String },
+    #[error("prepared effect material record is invalid")]
+    PreparedMaterialRecordInvalid(xgeny_workgraph::InvocationMaterialError),
+    #[error("effect `{effect_id}` has no invocation material descriptor")]
+    PreparedMaterialRecordMissing { effect_id: String },
+    #[error("step `{step_id}` invocation material changed after adapter preparation")]
+    PreparedMaterialRecordChanged { step_id: String },
     #[error(
         "step `{step_id}` reached its execution attempt limit: {attempts} of {maximum} attempts"
     )]

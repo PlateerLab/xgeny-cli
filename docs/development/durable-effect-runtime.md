@@ -13,7 +13,7 @@
 ```text
 canonical Run lease 획득
   -> durable state와 lease Run ID 확인
-  -> ephemeral PreparedEffect의 action·Capability·Definition·Instance binding 확인
+  -> core-owned prepared binding의 Run·Step·effect·material·full head 확인
   -> EffectExecutionStarted commit (journal-head CAS)
   -> EffectSink.execute 1회
   -> succeeded | failed | effect_unknown commit
@@ -21,7 +21,7 @@ canonical Run lease 획득
 
 - Run lease는 시작 event transaction뿐 아니라 외부 호출과 outcome commit이 끝날 때까지 유지한다.
 - event factory는 ID와 시각만 만든다. run ID, authority, epoch와 event body는 runtime이 durable state에서 조립한다.
-- raw arguments와 resolved credential은 journal에 넣지 않는다. adapter가 가진 ephemeral `PreparedEffect`의 action digest, Capability contract, Definition digest, Instance ID와 executable-binding digest가 committed intent와 모두 일치할 때만 실행한다.
+- raw arguments와 resolved credential은 journal에 넣지 않는다. Direct Executor가 exact Definition·Instance·adapter를 검증해 만든 core-owned one-shot session이 committed Run·Step·effect·material·journal head와 모두 일치할 때만 실행한다.
 - sink가 요청 전송 여부를 확정할 수 없는 transport 오류는 definite failure가 아니라 `Unknown`으로 분류해야 한다.
 - success·failure의 receipt digest는 adapter가 durable receipt를 만든 뒤 반환해야 한다. 이 실험은 receipt body 저장소까지 구현하지 않는다.
 - 빈 receipt/evidence/reason은 확정 event로 기록하지 않는다. 외부 호출 뒤 이런 adapter 오류가 발생하면 `executing` 또는 `reconciling`을 유지해 다음 recovery가 보수적으로 판정하게 한다.
@@ -30,7 +30,7 @@ canonical Run lease 획득
 
 | 진입 상태 | runtime 동작 | 외부 effect 재실행 |
 |---|---|---|
-| `intent_committed` | matching PreparedEffect가 있을 때 시작 commit 후 실행 | 허용 |
+| `intent_committed` | matching core-owned prepared session이 있을 때 시작 commit 후 실행 | 허용 |
 | `executing` | 결과 미기록으로 보고 `effect_unknown` commit | 금지 |
 | `effect_unknown` + key query 지원 | `reconciling` commit 후 read-only query | 금지 |
 | `effect_unknown` + query 미지원 | `manual_required` commit | 금지 |
@@ -61,7 +61,7 @@ Run lease를 가진 worker만 `drive_step`을 호출한다. journal CAS는 stale
 - 빈 receipt/evidence를 확정 결과로 수용하지 않는 fail-closed 검증
 - not-applied 재시도에서 authorization 비중복 소비와 attempt 상한
 - 잘못된 Run의 lease로 event·effect 변경 0회
-- PreparedEffect의 Definition 또는 Instance binding 불일치 시 sink 호출 0회
+- Prepared session의 Run/Step/effect/material/head binding 불일치 시 sink 호출 0회
 
 ## 아직 포함하지 않는 범위
 
@@ -75,4 +75,4 @@ Run lease를 가진 worker만 `drive_step`을 호출한다. journal CAS는 stale
 
 따라서 이 slice는 실제 사용자 도구 실행 기능의 완료가 아니라, 다음 adapter가 반드시 통과해야 할 durable execution contract다.
 
-effect intent 앞단의 exact argument→permission→Router→one-shot authorization 계약은 [Run-bound Invocation Admission 기본형](invocation-admission.md)을 따른다. 재시작 전 material 확보와 fail-closed 전이는 [Recoverable Invocation Material 기본형](recoverable-invocation-material.md)을 따른다. 이 연결 이후에도 public 저수준 store/reducer API와 trusted adapter가 보안 sandbox가 되는 것은 아니며, recovered material을 exact adapter에 전달하는 Direct Executor는 아직 포함하지 않는다.
+effect intent 앞단의 exact argument→permission→Router→one-shot authorization 계약은 [Run-bound Invocation Admission 기본형](invocation-admission.md)을 따른다. 재시작 전 material 확보와 fail-closed 전이는 [Recoverable Invocation Material 기본형](recoverable-invocation-material.md), exact behavior dispatch와 core-owned one-shot session은 [Direct Executor 기본형](direct-executor.md)을 따른다. 이 연결 이후에도 public 저수준 store/reducer API와 trusted adapter가 hostile code용 보안 sandbox가 되는 것은 아니다.

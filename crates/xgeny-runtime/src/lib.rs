@@ -1,13 +1,18 @@
 #![doc = "Capability catalog and routing, durable effect execution, and conservative recovery for `XGENy`."]
 
 mod admission;
+mod executor;
 mod lease;
 mod material;
 mod registry;
 mod router;
 mod runtime;
 
+#[cfg(test)]
+mod runtime_tests;
+
 pub use admission::*;
+pub use executor::*;
 pub use lease::*;
 pub use material::*;
 pub use registry::*;

@@ -28,6 +28,9 @@ jobs:
       - name: Lint workspace
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Build release workspace
+        run: cargo build --workspace --release --locked
+
   platform:
     name: Protocol / ${{ matrix.os }}
     strategy:

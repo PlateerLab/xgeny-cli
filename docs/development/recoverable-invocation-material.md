@@ -9,7 +9,7 @@
 
 Admission이 commit한 exact effect를 process restart 뒤에도 안전하게 이어 갈 수 있도록 secret-free recovery sidecar를 둔다. 자동 복구가 불가능한 invocation은 `IntentCommitted`에 무한히 남기지 않고 effect 시작 전 durable `ManualRequired` 상태로 닫는다.
 
-이 slice는 actual adapter를 호출하지 않는다. 다음 Direct Executor가 사용할 material recovery와 검증 경계만 만든다.
+이 문서는 material recovery와 검증 경계를 설명한다. 후속 [Direct Executor 기본형](direct-executor.md)이 이 결과를 exact adapter의 side-effect-free prepare와 durable execution에 연결한다.
 
 ## 전체 흐름
 
@@ -85,7 +85,7 @@ ReconstructableReference {
 }
 ```
 
-`provider_id`는 trusted runtime이 선택한 reconstruction provider와 일치해야 한다. 실제 provider registry와 adapter dispatch는 다음 Direct Executor PR에서 연결한다. `reference_id`는 provider namespace 안의 opaque, secret-free, non-bearer identifier이고 `revision`은 같은 identifier의 mutable retarget을 막는다. 세 값 모두 길이와 문자 집합을 제한하며 `Debug`에는 reference ID 원문을 출력하지 않는다.
+`provider_id`는 trusted composition root가 `MaterialProviderRegistry`에 등록한 exact key와 일치해야 한다. Provider implementation의 자기보고 identity는 신뢰하지 않으며 missing·duplicate key에서 fallback하지 않는다. `reference_id`는 provider namespace 안의 opaque, secret-free, non-bearer identifier이고 `revision`은 같은 identifier의 mutable retarget을 막는다. 세 값 모두 길이와 문자 집합을 제한하며 `Debug`에는 reference ID 원문을 출력하지 않는다.
 
 다음 값은 record에 들어갈 수 없다.
 
@@ -220,7 +220,7 @@ Transient provider 장애의 retry/backoff와 장기 `Blocked` 상태는 이 기
 
 Credential은 material argument 안의 raw 문자열이 아니라 protocol의 typed `credentialRef`를 사용한다. Durable record가 보존할 수 있는 것은 secret-free reference identity뿐이다.
 
-실제 token resolution은 다음 Direct Executor의 별도 trusted port가 실행 직전에 수행한다. Resolved credential은 journal, sidecar, Receipt, material digest와 semantic action digest의 plaintext 입력으로 추가하지 않는다.
+실제 token resolution은 후속 credential witness/OS-store 설계의 별도 trusted port가 실행 직전에 수행한다. 현재 Direct Executor는 credential-bearing Instance를 fail closed한다. Resolved credential은 journal, sidecar, Receipt, material digest와 semantic action digest의 plaintext 입력으로 추가하지 않는다.
 
 현재 executable binding은 stable identity로 `auth_ref` 문자열까지 결합하지만, 같은 `auth_ref`가 다른 principal이나 credential version으로 retarget되는 것은 탐지하지 못한다. Credential-bearing adapter를 연결하기 전 resolver가 반환하는 stable principal/version digest를 intent에 결합하거나 retarget 시 새 admission을 강제해야 한다. 이 gate를 통과하기 전에는 credential-bearing actual effect를 지원한다고 주장하지 않는다.
 
@@ -275,9 +275,6 @@ Semantic action digest가 canonical argument의 public SHA-256 commitment를 포
 
 ## 현재 포함하지 않는 범위
 
-- `EffectSink`에 material을 전달하는 Direct Executor
-- Core-owned opaque `PreparedEffect`와 adapter registry
-- Exact `binding_ref + operation_ref` adapter dispatch
 - Filesystem/process/network/MCP/Connector/XGEN actual adapter
 - OS credential store와 credential injection
 - Sealed argument encryption
@@ -287,4 +284,4 @@ Semantic action digest가 canonical argument의 public SHA-256 commitment를 포
 - Managed/critical/reusable authorization
 - Public protocol의 material projection
 
-다음 PR은 이 recovery 결과를 exact selected adapter의 side-effect-free `prepare`에 연결하고, raw argument accessor를 trusted in-process Direct Executor 안으로 좁힌 뒤 core가 identity를 소유하는 consume-only prepared wrapper를 기존 durable effect runtime으로 전달한다. 그 전까지 이 slice는 material의 안전한 복구 또는 명시적 중단만 보장하며 public 저수준 API를 untrusted plugin 격리 경계로 주장하지 않는다.
+후속 ADR-0011은 이 recovery 결과를 exact selected adapter의 side-effect-free `prepare`에 연결하고, raw argument accessor를 trusted in-process Direct Executor 안으로 좁혔다. Core는 full Run head와 material에 결합한 consume-only prepared wrapper를 만든다. 이 두 slice를 합쳐도 public Rust trait을 hostile plugin 격리 경계로 주장하지 않는다.

@@ -6,14 +6,14 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::rc::Rc;
 
+use crate::{
+    DriveAction, DurableEffectRuntime, EffectSink, EventFactory, EventFactoryError, EventMetadata,
+    ExecutionObservation, LeaseError, LocalRunLease, PreparedEffect, PreparedEffectBinding,
+    ReconciliationObservation, RuntimeError, RuntimePolicy,
+};
 use tempfile::{TempDir, tempdir};
 use xgeny_local_store::{
     Commit, ExpectedHead, MemoryRunStore, RunSnapshot, RunStore, SqliteRunStore, StoreError,
-};
-use xgeny_runtime::{
-    DriveAction, DurableEffectRuntime, EffectSink, EventFactory, EventFactoryError, EventMetadata,
-    ExecutionObservation, LeaseError, LocalRunLease, PreparedEffect, ReconciliationObservation,
-    RuntimeError, RuntimePolicy,
 };
 use xgeny_workgraph::{
     AuthorizationBinding, AuthorizationUse, EffectClass, EffectIntent, InvocationBinding,
@@ -161,50 +161,33 @@ struct ScriptedSink {
 }
 
 #[derive(Debug)]
-struct TestPreparedEffect {
-    action_digest: String,
-    capability_id: String,
-    contract_version: String,
-    definition_digest: String,
-    instance_id: String,
-    instance_binding_digest: String,
-}
+struct TestPreparedEffect(PreparedEffectBinding);
 
 impl PreparedEffect for TestPreparedEffect {
-    fn action_digest(&self) -> &str {
-        &self.action_digest
-    }
-
-    fn capability_id(&self) -> &str {
-        &self.capability_id
-    }
-
-    fn contract_version(&self) -> &str {
-        &self.contract_version
-    }
-
-    fn definition_digest(&self) -> &str {
-        &self.definition_digest
-    }
-
-    fn instance_id(&self) -> &str {
-        &self.instance_id
-    }
-
-    fn instance_binding_digest(&self) -> &str {
-        &self.instance_binding_digest
+    fn binding(&self) -> &PreparedEffectBinding {
+        &self.0
     }
 }
 
-fn prepared_effect() -> TestPreparedEffect {
-    TestPreparedEffect {
-        action_digest: "sha256:action-1".to_owned(),
-        capability_id: "test.effect".to_owned(),
-        contract_version: "1.0.0".to_owned(),
-        definition_digest: "sha256:definition-1".to_owned(),
-        instance_id: "test.instance".to_owned(),
-        instance_binding_digest: "sha256:instance-1".to_owned(),
-    }
+fn prepared_effect<S: RunStore>(store: &S) -> TestPreparedEffect {
+    let snapshot = store
+        .load()
+        .expect("store should load")
+        .expect("Run should exist");
+    let intent = snapshot.state.steps[STEP_ID]
+        .intent
+        .as_ref()
+        .expect("intent should exist");
+    let record = store
+        .load_invocation_material(&intent.effect_id)
+        .expect("material should load")
+        .expect("material should exist");
+    TestPreparedEffect(PreparedEffectBinding::from_verified(
+        &snapshot.state,
+        STEP_ID,
+        intent,
+        record,
+    ))
 }
 
 impl ScriptedSink {
@@ -225,7 +208,7 @@ impl EffectSink for ScriptedSink {
     fn execute(
         &mut self,
         _intent: &EffectIntent,
-        _prepared: &Self::Prepared,
+        _prepared: Self::Prepared,
     ) -> ExecutionObservation {
         self.execute_calls += 1;
         self.trace.borrow_mut().push("sink:execute");
@@ -422,10 +405,10 @@ fn effect_call_happens_only_after_start_marker_is_committed() {
     });
     let mut events = DeterministicEvents::default();
     let (_directory, lease) = lease();
-    let prepared = prepared_effect();
+    let prepared = prepared_effect(&store);
 
     let report = DurableEffectRuntime::new(&mut store, &mut sink, &mut events, &lease)
-        .drive_step(STEP_ID, Some(&prepared))
+        .drive_step(STEP_ID, Some(prepared))
         .expect("effect should complete");
 
     assert_eq!(report.action, DriveAction::EffectSucceeded);
@@ -452,10 +435,10 @@ fn definite_effect_failure_commits_its_receipt() {
     });
     let mut events = DeterministicEvents::default();
     let (_directory, lease) = lease();
-    let prepared = prepared_effect();
+    let prepared = prepared_effect(&store);
 
     let report = DurableEffectRuntime::new(&mut store, &mut sink, &mut events, &lease)
-        .drive_step(STEP_ID, Some(&prepared))
+        .drive_step(STEP_ID, Some(prepared))
         .expect("definite failure should be committed");
 
     assert_eq!(report.action, DriveAction::EffectFailed);
@@ -486,10 +469,10 @@ fn empty_execution_receipt_fails_closed_and_recovers_as_unknown() {
     });
     let mut events = DeterministicEvents::default();
     let (_directory, lease) = lease();
-    let prepared = prepared_effect();
+    let prepared = prepared_effect(&store);
 
     let first = DurableEffectRuntime::new(&mut store, &mut sink, &mut events, &lease)
-        .drive_step(STEP_ID, Some(&prepared));
+        .drive_step(STEP_ID, Some(prepared));
 
     assert!(matches!(
         first,
@@ -526,10 +509,10 @@ fn failed_start_commit_prevents_physical_effect() {
     let mut sink = ScriptedSink::new(Rc::clone(&trace));
     let mut events = DeterministicEvents::default();
     let (_directory, lease) = lease();
-    let prepared = prepared_effect();
+    let prepared = prepared_effect(&store);
 
     let result = DurableEffectRuntime::new(&mut store, &mut sink, &mut events, &lease)
-        .drive_step(STEP_ID, Some(&prepared));
+        .drive_step(STEP_ID, Some(prepared));
 
     assert!(matches!(
         result,
@@ -557,10 +540,10 @@ fn failed_event_metadata_creation_prevents_start_and_physical_effect() {
     let mut sink = ScriptedSink::new(Rc::clone(&trace));
     let mut events = FailingEvents;
     let (_directory, lease) = lease();
-    let prepared = prepared_effect();
+    let prepared = prepared_effect(&store);
 
     let result = DurableEffectRuntime::new(&mut store, &mut sink, &mut events, &lease)
-        .drive_step(STEP_ID, Some(&prepared));
+        .drive_step(STEP_ID, Some(prepared));
 
     assert!(matches!(result, Err(RuntimeError::EventFactory(_))));
     assert_eq!(sink.execute_calls, 0);
@@ -579,10 +562,10 @@ fn lost_outcome_commit_recovers_to_unknown_without_duplicate_execution() {
     });
     let mut events = DeterministicEvents::default();
     let (_directory, lease) = lease();
-    let prepared = prepared_effect();
+    let prepared = prepared_effect(&store);
 
     let first = DurableEffectRuntime::new(&mut store, &mut sink, &mut events, &lease)
-        .drive_step(STEP_ID, Some(&prepared));
+        .drive_step(STEP_ID, Some(prepared));
     assert!(matches!(
         first,
         Err(RuntimeError::Store(StoreError::InjectedFault(_)))
@@ -621,10 +604,10 @@ fn ambiguous_live_result_is_committed_as_unknown() {
     });
     let mut events = DeterministicEvents::default();
     let (_directory, lease) = lease();
-    let prepared = prepared_effect();
+    let prepared = prepared_effect(&store);
 
     let report = DurableEffectRuntime::new(&mut store, &mut sink, &mut events, &lease)
-        .drive_step(STEP_ID, Some(&prepared))
+        .drive_step(STEP_ID, Some(prepared))
         .expect("unknown result should be durable");
 
     assert_eq!(report.action, DriveAction::EffectUnknown);
@@ -777,10 +760,7 @@ fn proved_not_applied_reuses_intent_without_reconsuming_authorization() {
     });
     let mut events = DeterministicEvents::default();
     let (_directory, lease) = lease();
-    let mut runtime = DurableEffectRuntime::new(&mut store, &mut sink, &mut events, &lease);
-    let prepared = prepared_effect();
-
-    let reconciled = runtime
+    let reconciled = DurableEffectRuntime::new(&mut store, &mut sink, &mut events, &lease)
         .drive_step(STEP_ID, None)
         .expect("not-applied evidence should allow resume");
     assert_eq!(reconciled.action, DriveAction::ReconciliationNotApplied);
@@ -788,8 +768,9 @@ fn proved_not_applied_reuses_intent_without_reconsuming_authorization() {
         reconciled.state.steps[STEP_ID].status,
         StepStatus::IntentCommitted
     );
-    let executed = runtime
-        .drive_step(STEP_ID, Some(&prepared))
+    let prepared = prepared_effect(&store);
+    let executed = DurableEffectRuntime::new(&mut store, &mut sink, &mut events, &lease)
+        .drive_step(STEP_ID, Some(prepared))
         .expect("same intent should execute after proof");
 
     assert_eq!(executed.action, DriveAction::EffectSucceeded);
@@ -821,14 +802,14 @@ fn proved_not_applied_still_respects_durable_attempt_limit() {
     let mut events = DeterministicEvents::default();
     let (_directory, lease) = lease();
     let policy = RuntimePolicy::new(NonZeroU32::new(1).expect("one is non-zero"));
-    let mut runtime =
-        DurableEffectRuntime::new(&mut store, &mut sink, &mut events, &lease).with_policy(policy);
-
-    runtime
+    DurableEffectRuntime::new(&mut store, &mut sink, &mut events, &lease)
+        .with_policy(policy)
         .drive_step(STEP_ID, None)
         .expect("reconciliation should prove not applied");
-    let prepared = prepared_effect();
-    let retry = runtime.drive_step(STEP_ID, Some(&prepared));
+    let prepared = prepared_effect(&store);
+    let retry = DurableEffectRuntime::new(&mut store, &mut sink, &mut events, &lease)
+        .with_policy(policy)
+        .drive_step(STEP_ID, Some(prepared));
 
     assert!(matches!(
         retry,
@@ -914,7 +895,7 @@ fn missing_prepared_effect_never_starts_execution() {
 }
 
 #[test]
-fn mismatched_prepared_effect_digest_never_starts_execution() {
+fn prepared_effect_from_an_older_head_never_starts_execution() {
     let trace = Rc::new(RefCell::new(Vec::new()));
     let mut store = RecordingStore::new(Rc::clone(&trace));
     seed_intent(&mut store, SinkGuarantee::None);
@@ -922,22 +903,36 @@ fn mismatched_prepared_effect_digest_never_starts_execution() {
     let mut sink = ScriptedSink::new(Rc::clone(&trace));
     let mut events = DeterministicEvents::default();
     let (_directory, lease) = lease();
-    let mut mismatched = prepared_effect();
-    mismatched.action_digest = "sha256:different-action".to_owned();
+    let prepared = prepared_effect(&store);
+    let current = store
+        .load()
+        .expect("store should load")
+        .expect("Run should exist")
+        .state;
+    append_body(
+        &mut store,
+        &current,
+        "seed-unrelated-step",
+        RunEventBody::StepPlanned {
+            step_id: "step-unrelated".to_owned(),
+            objective: "advance the journal head".to_owned(),
+        },
+    );
+    trace.borrow_mut().clear();
 
     let result = DurableEffectRuntime::new(&mut store, &mut sink, &mut events, &lease)
-        .drive_step(STEP_ID, Some(&mismatched));
+        .drive_step(STEP_ID, Some(prepared));
 
     assert!(matches!(
         result,
-        Err(RuntimeError::PreparedEffectDigestMismatch { .. })
+        Err(RuntimeError::PreparedEffectHeadChanged { .. })
     ));
     assert_eq!(sink.execute_calls, 0);
     assert!(trace.borrow().is_empty());
 }
 
 #[test]
-fn mismatched_prepared_instance_binding_never_starts_execution() {
+fn prepared_effect_bound_to_another_step_never_starts_execution() {
     let trace = Rc::new(RefCell::new(Vec::new()));
     let mut store = RecordingStore::new(Rc::clone(&trace));
     seed_intent(&mut store, SinkGuarantee::None);
@@ -945,25 +940,22 @@ fn mismatched_prepared_instance_binding_never_starts_execution() {
     let mut sink = ScriptedSink::new(Rc::clone(&trace));
     let mut events = DeterministicEvents::default();
     let (_directory, lease) = lease();
-    let mut mismatched = prepared_effect();
-    mismatched.instance_binding_digest = "sha256:redirected-instance".to_owned();
+    let mut mismatched = prepared_effect(&store);
+    mismatched.0.corrupt_step_id_for_test();
 
     let result = DurableEffectRuntime::new(&mut store, &mut sink, &mut events, &lease)
-        .drive_step(STEP_ID, Some(&mismatched));
+        .drive_step(STEP_ID, Some(mismatched));
 
     assert!(matches!(
         result,
-        Err(RuntimeError::PreparedEffectBindingMismatch {
-            field: "instance_binding_digest",
-            ..
-        })
+        Err(RuntimeError::PreparedEffectBindingMismatch { .. })
     ));
     assert_eq!(sink.execute_calls, 0);
     assert!(trace.borrow().is_empty());
 }
 
 #[test]
-fn mismatched_prepared_definition_never_starts_execution() {
+fn prepared_effect_bound_to_another_effect_never_starts_execution() {
     let trace = Rc::new(RefCell::new(Vec::new()));
     let mut store = RecordingStore::new(Rc::clone(&trace));
     seed_intent(&mut store, SinkGuarantee::None);
@@ -971,18 +963,15 @@ fn mismatched_prepared_definition_never_starts_execution() {
     let mut sink = ScriptedSink::new(Rc::clone(&trace));
     let mut events = DeterministicEvents::default();
     let (_directory, lease) = lease();
-    let mut mismatched = prepared_effect();
-    mismatched.definition_digest = "sha256:different-definition".to_owned();
+    let mut mismatched = prepared_effect(&store);
+    mismatched.0.corrupt_effect_id_for_test();
 
     let result = DurableEffectRuntime::new(&mut store, &mut sink, &mut events, &lease)
-        .drive_step(STEP_ID, Some(&mismatched));
+        .drive_step(STEP_ID, Some(mismatched));
 
     assert!(matches!(
         result,
-        Err(RuntimeError::PreparedEffectBindingMismatch {
-            field: "definition_digest",
-            ..
-        })
+        Err(RuntimeError::PreparedEffectBindingMismatch { .. })
     ));
     assert_eq!(sink.execute_calls, 0);
     assert!(trace.borrow().is_empty());
@@ -1013,10 +1002,10 @@ fn lease_for_another_run_is_rejected_before_any_effect() {
     let directory = tempdir().expect("temporary run directory should exist");
     let wrong_lease = LocalRunLease::try_acquire("another-run", directory.path().join("run.lock"))
         .expect("lease should be acquired");
-    let prepared = prepared_effect();
+    let prepared = prepared_effect(&store);
 
     let result = DurableEffectRuntime::new(&mut store, &mut sink, &mut events, &wrong_lease)
-        .drive_step(STEP_ID, Some(&prepared));
+        .drive_step(STEP_ID, Some(prepared));
 
     assert!(matches!(result, Err(RuntimeError::LeaseRunMismatch { .. })));
     assert_eq!(sink.execute_calls, 0);
@@ -1034,7 +1023,7 @@ impl EffectSink for CrashAfterCounterSink {
     fn execute(
         &mut self,
         _intent: &EffectIntent,
-        _prepared: &Self::Prepared,
+        _prepared: Self::Prepared,
     ) -> ExecutionObservation {
         let current: u64 = fs::read_to_string(&self.counter_path)
             .expect("counter should be readable")
@@ -1068,9 +1057,9 @@ fn process_exit_after_physical_effect_preserves_unknown_without_duplicate() {
             counter_path: counter_path.into(),
         };
         let mut events = DeterministicEvents::default();
-        let prepared = prepared_effect();
+        let prepared = prepared_effect(&store);
         let _never_returns = DurableEffectRuntime::new(&mut store, &mut sink, &mut events, &lease)
-            .drive_step(STEP_ID, Some(&prepared));
+            .drive_step(STEP_ID, Some(prepared));
         panic!("child must exit after applying the physical effect");
     }
 
@@ -1087,7 +1076,7 @@ fn process_exit_after_physical_effect_preserves_unknown_without_duplicate() {
     let status = Command::new(std::env::current_exe().expect("test executable should exist"))
         .args([
             "--exact",
-            "process_exit_after_physical_effect_preserves_unknown_without_duplicate",
+            "runtime_tests::process_exit_after_physical_effect_preserves_unknown_without_duplicate",
             "--test-threads=1",
         ])
         .env(CHILD_MARKER, "1")
