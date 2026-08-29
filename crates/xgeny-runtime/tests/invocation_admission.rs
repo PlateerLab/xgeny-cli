@@ -1248,10 +1248,11 @@ fn sqlite_lost_ack_reopens_with_one_recoverable_material_and_no_plaintext_argume
     assert!(!format!("{material:?}").contains(CANONICAL_PATH));
     assert_eq!(provider.calls.get(), 1);
 
-    assert_sqlite_artifacts_exclude(
-        directory.path(),
-        &[SECRET_SENTINEL.as_bytes(), CANONICAL_PATH.as_bytes()],
-    );
+    let sentinels = [SECRET_SENTINEL.as_bytes(), CANONICAL_PATH.as_bytes()];
+    #[cfg(not(windows))]
+    assert_sqlite_artifacts_exclude(directory.path(), &sentinels);
+    drop(reopened);
+    assert_sqlite_artifacts_exclude(directory.path(), &sentinels);
 }
 
 #[test]

@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::fs;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 
@@ -50,6 +50,25 @@ const CRASH_COUNTER_PATH: &str = "XGENY_DIRECT_CRASH_COUNTER";
 fn digest(byte: char) -> AdapterEvidenceDigest {
     AdapterEvidenceDigest::new(format!("sha256:{}", byte.to_string().repeat(64)))
         .expect("test digest should be canonical")
+}
+
+fn assert_persisted_artifacts_exclude(directory: &Path, sentinels: &[&[u8]]) {
+    for entry in fs::read_dir(directory).expect("Run directory should be readable") {
+        let path = entry.expect("directory entry should be readable").path();
+        if !path.is_file() {
+            continue;
+        }
+        let bytes = fs::read(&path).expect("persisted Run artifact should be readable");
+        for sentinel in sentinels {
+            assert!(
+                !bytes
+                    .windows(sentinel.len())
+                    .any(|window| window == *sentinel),
+                "plaintext material leaked into {}",
+                path.display()
+            );
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1482,27 +1501,17 @@ fn sqlite_restart_recovers_material_then_executes_without_plaintext_persistence(
     assert_eq!(rejected_provider_calls.get(), 0);
     assert_eq!(counters.prepares.get(), 1);
     assert_eq!(counters.executes.get(), 1);
-    for entry in fs::read_dir(directory.path()).expect("Run directory should be readable") {
-        let path = entry.expect("directory entry").path();
-        if !path.is_file() {
-            continue;
-        }
-        let bytes = fs::read(&path).expect("SQLite artifact should be readable");
-        for sentinel in [
-            SECRET_SENTINEL.as_bytes(),
-            RAW_PATH.as_bytes(),
-            CANONICAL_PATH.as_bytes(),
-        ] {
-            assert!(
-                !bytes
-                    .windows(sentinel.len())
-                    .any(|window| window == sentinel),
-                "plaintext material leaked into {}",
-                path.display()
-            );
-        }
-    }
+
+    let sentinels = [
+        SECRET_SENTINEL.as_bytes(),
+        RAW_PATH.as_bytes(),
+        CANONICAL_PATH.as_bytes(),
+    ];
+    #[cfg(not(windows))]
+    assert_persisted_artifacts_exclude(directory.path(), &sentinels);
     drop(store);
+    drop(lease);
+    assert_persisted_artifacts_exclude(directory.path(), &sentinels);
 }
 
 #[test]

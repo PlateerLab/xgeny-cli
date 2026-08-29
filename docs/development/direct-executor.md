@@ -113,7 +113,7 @@ cargo build --workspace --release --locked
 - Started commit 뒤 execute 순서
 - lost outcome commit과 child-process exit 뒤 duplicate execute 0회
 - SQLite restart reconstruct → execute E2E
-- Debug, JSONL과 SQLite artifact plaintext sentinel scan
+- Debug, JSONL과 SQLite artifact plaintext sentinel scan. POSIX에서는 열린 DB에서 현재 존재하는 WAL/SHM까지 검사하고, Windows에서는 store를 clean close해 SQLite byte-range lock을 해제한 뒤 남아 있는 DB/WAL/SHM artifact를 검사한다.
 
 ## 다음 수직 슬라이스
 

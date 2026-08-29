@@ -240,6 +240,8 @@ Semantic action digest가 canonical argument의 public SHA-256 commitment를 포
 - Manual transition reason
 - Receipt와 telemetry
 
+POSIX 테스트는 DB가 열린 동안 현재 존재하는 WAL/SHM을 포함해 원시 바이트를 검사한다. Windows는 SQLite의 byte-range lock 때문에 store를 clean close한 뒤 남아 있는 DB/WAL/SHM artifact를 검사한다. 따라서 Windows에서 열린 WAL을 읽지 못하는 제약을 검증 통과로 숨기지 않는다.
+
 진단에는 Effect ID, fixed reason code, material kind와 지원 version처럼 non-sensitive한 값만 사용한다. Provider가 반환한 arbitrary error text를 그대로 연결하지 않는다.
 
 ## 검증 항목
