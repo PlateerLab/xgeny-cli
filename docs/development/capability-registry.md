@@ -75,4 +75,4 @@ Definition의 `idempotencyKeySupported`와 Instance의 `idempotencyQuery` 사이
 
 성공적으로 등록된 snapshot의 조회 순서는 결정적이지만 등록 admission은 순서 독립적이지 않다. Instance보다 exact Definition을 먼저 등록해야 하며, discovery 결과의 순서 없는 batch finalization은 hot reload를 설계할 때 별도로 다룬다.
 
-따라서 fake Instance는 테스트 자료이며 production fake adapter 추상화가 아니다. 실제 adapter port와 공통 contract suite는 Executor 경계를 만들 때 추가한다.
+따라서 fake Instance는 테스트 자료이며 production fake adapter 추상화가 아니다. Adapter port는 Direct Executor가 소유하고, 별도 public-port reference suite가 exact binding과 actual I/O 순서를 검증한다. 공통 contract testkit 추출은 두 번째 adapter에서 구현별 fixture를 분리할 때 진행한다.

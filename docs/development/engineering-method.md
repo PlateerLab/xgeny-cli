@@ -97,6 +97,6 @@
 
 1. 모든 core state machine에 table-driven unit test를 둔다.
 2. WorkGraph와 Journal에는 재시작·중복 event·손상 tail property test를 추가한다.
-3. Capability executor 구현 전에 공통 adapter contract suite를 만든다.
+3. 첫 public-port 기준인 preopened reference adapter suite를 유지하고, 두 번째 adapter에서 구현별 fixture를 분리해 공통 contract testkit으로 추출한다.
 4. filesystem/process capability와 함께 3개 OS integration test를 추가한다.
 5. 설치 패키지가 생기면 깨끗한 VM의 install/run/uninstall smoke test를 release gate에 넣는다.

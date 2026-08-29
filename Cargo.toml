@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/xgeny-adapter-reference",
     "crates/xgeny-cli",
     "crates/xgeny-domain",
     "crates/xgeny-local-store",
