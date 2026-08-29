@@ -19,7 +19,7 @@
 - `RunEvent`의 committed history가 논리적 source of truth다.
 - 물리 저장 후보는 Run별 embedded SQLite다.
 - JSONL은 deterministic export, protocol interchange, debug, conformance artifact다.
-- WorkGraph, current step, receipt index는 event에서 재구성 가능한 projection이다.
+- WorkGraph, current step과 Receipt ID/digest index는 event에서 재구성 가능한 projection이다. ADR-0012의 complete Receipt body는 terminal event와 원자 commit되는 검증된 sidecar다.
 - 사용자·프로젝트가 검토하는 memory는 Markdown 정본을 유지할 수 있으며 Run transactional state와 분리한다.
 - artifact body는 content-addressed file로 저장하고 transaction에는 digest와 metadata만 기록한다.
 

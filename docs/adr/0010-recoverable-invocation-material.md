@@ -5,7 +5,7 @@
 - 적용 범위: local Run admission, embedded SQLite store, effect 실행 전 복구
 - 공개 protocol v0.1 변경: 없음
 
-> 후속 상태: ADR-0011이 trusted provider registry, exact adapter dispatch와 core-owned consume-once prepared 경계를 구현한다. 이 ADR의 material 저장·복구 결정은 그대로 유지된다.
+> 후속 상태: ADR-0011이 trusted provider registry, exact adapter dispatch와 core-owned consume-once prepared 경계를 구현했다. ADR-0012는 schema 3 journal bytes를 보존한 schema 4 migration과 Receipt sidecar를 추가했다. 이 ADR의 material 저장·복구 결정과 당시 schema 3 선택 기록은 그대로 유지된다.
 
 ## 문맥
 

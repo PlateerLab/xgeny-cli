@@ -66,7 +66,9 @@ ADR-0005의 완성형 교집합에는 current Run grant가 포함된다. `xgeny-
 - 만료와 취소
 - EffectIntent commit과 승인 예산의 원자적 소비
 - crash/replan/retry 뒤 semantic replay 차단
-- `PolicyDecision` wire 투영과 receipt digest 연결
+- reusable/critical `PolicyDecision` wire 투영과 Receipt 연결
+
+후단 local once Admission은 ADR-0012 Receipt provenance를 위해 canonical `PolicyDecisionBody`를 transient하게 조립하고 ID/digest commitment만 intent에 결합한다. 이 문서를 저장·노출하거나 reusable grant/PolicyLease 의미를 구현한 것은 아니다.
 
 ## 현재 테스트와 제외 범위
 
@@ -88,7 +90,7 @@ ADR-0005의 완성형 교집합에는 current Run grant가 포함된다. `xgeny-
 - 실제 filesystem/process/network resolver와 OS sandbox
 - profile 설정 parser와 permission prompt UI
 - reusable Run grant와 PolicyLease expiry·revocation·clock-skew 판정
-- `PolicyDecisionBody`의 ID·timestamp·interaction projection
+- 조회 가능한 `PolicyDecisionBody`, interaction과 reusable/managed decision lifecycle
 - critical approval를 Run/action에 결합하는 전달, CLI, MCP, Connector, XGEN 연결
 
 Router 기본형은 이 Broker의 bound request-wide outcome을 policy gate로 소비하지만 그 자체로 provisional allow를 실행 권한으로 승격하지 않는다. Admission 기본형만 지원 범위 안에서 별도 durable 권한을 발행한다. Permission Broker는 sandbox가 아니며 adapter는 결정된 exact resource를 실제 open/execute 시점에도 다시 강제해야 한다.

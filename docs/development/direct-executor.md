@@ -1,9 +1,9 @@
 # Direct Executor 기본형
 
 - 기준일: 2026-08-29
-- 상태: ADR-0011 연구 gate용 fake + public-port reference-adapter 수직 슬라이스
+- 상태: ADR-0011 실행 경계 + ADR-0012 Core verification 수직 슬라이스
 - 공개 protocol v0.1 변경: 없음
-- local store schema: 3
+- local store schema: 4
 
 ## 현재 가능한 경로
 
@@ -22,7 +22,12 @@ restart -> MaterialProviderRegistry exact ----+-> DirectExecutor
                                                   +-> head/material recheck
                                                   +-> Started commit
                                                   +-> one-shot execute
-                                                  +-> durable outcome
+                                                  +-> durable outcome evidence
+                                                  +-> Validating
+                                                       |
+                                                       +-> exact read-only verifier
+                                                       +-> Core ExecutionReceipt
+                                                       +-> Receipt + terminal event atomic commit
 ```
 
 이 단계는 runtime fake와 별도 workspace crate의 preopened reference adapter로 실행 순서와 복구 계약을 검증한다. 참조 adapter는 임시 일반 파일에 실제 I/O를 수행하지만 제품용 filesystem/process adapter는 아니다.
@@ -37,11 +42,14 @@ providers.register("run-recipe", provider)?;
 
 let mut adapters = EffectAdapterRegistry::new();
 adapters.register(&instance.binding, adapter)?;
+
+let mut verifiers = EffectVerifierRegistry::new();
+verifiers.register(&instance.binding, verifier)?;
 ```
 
-Provider ID와 adapter binding은 host가 부여한다. Provider/adapter implementation에는 identity getter가 없다. 같은 key의 두 번째 등록은 기존 entry를 교체하지 않는다.
+Provider ID와 adapter/verifier binding은 host가 부여한다. Provider/adapter/verifier implementation에는 identity getter가 없다. 같은 key의 두 번째 등록은 기존 entry를 교체하지 않는다.
 
-Adapter dispatch는 `binding_ref + operation_ref + protocol_version` 전체 exact key를 사용한다. `None`과 `Some`을 구분하며 default operation이나 compatible-version fallback을 하지 않는다.
+Adapter와 verifier dispatch는 `binding_ref + operation_ref + protocol_version` 전체 exact key를 사용한다. `None`과 `Some`을 구분하며 default operation이나 compatible-version fallback을 하지 않는다.
 
 ## Adapter 구현 계약
 
@@ -78,8 +86,12 @@ Invocation material 자체는 Direct Executor가 borrow한다. Prepare 실패, s
 | Health | `Available` | `Degraded`, `Unavailable`, `Unknown` |
 | Auth state | `NotRequired` | `Available`, `Required`, `Expired` |
 | Auth reference | `None` | `Some(_)` |
+| Placement | `Local` | `Device`, `Remote` |
+| Receipt provenance | admission에서 commit됨 | schema 3 legacy `None` |
 
 Credential-bearing adapter를 임시로 허용하거나 raw credential을 argument에 넣지 않는다. 후속 credential witness가 추가될 때 이 표와 executable-binding contract를 함께 갱신한다.
+
+Device/Remote는 실제 executor identity·platform·attestation을 아직 한 권위에서 만들 수 없어 admission에서 차단한다. Schema 3에서 migration된 provenance 없는 pending intent도 Started·prepare·execute 전에 거부하며 사실을 추측해 backfill하지 않는다.
 
 ## Crash 판정
 
@@ -90,6 +102,8 @@ Credential-bearing adapter를 임시로 허용하거나 raw credential을 argume
 | `Executing` | `EffectUnknown` 기록 | provider/prepare/execute 0 |
 | `EffectUnknown`, query 불가 | `ManualRequired` | adapter 0 |
 | `EffectUnknown`, query 가능 | exact adapter read-only reconcile | execute 0 |
+| `Validating` | exact verifier read-only verify 후 Receipt commit | provider/prepare/execute/reconcile 0 |
+| Receipt-bound terminal | no-op | verifier/adapter 0 |
 
 Started commit 실패 시 prepared session을 폐기하고 execute하지 않는다. Outcome commit이 실패하면 `Executing`을 유지하고 재개 시 blind retry하지 않는다.
 
@@ -99,7 +113,7 @@ Started commit 실패 시 prepared session을 폐기하고 execute하지 않는�
 
 `prepare`는 target을 변경하지 않는다. Started commit 뒤 `execute`가 canonical evidence marker를 seek·truncate·write·sync하고 bounded read-back으로 확인한다. Raw marker와 target reference는 기록하지 않으며 partial write·sync를 포함한 I/O 오류는 OS 문자열을 내보내지 않고 `ResponseUnverifiable` unknown으로 처리한다. 별도 process를 write·sync·read-back 뒤 outcome commit 전에 종료하는 SQLite test는 재시작 때 adapter/provider 없이 `EffectUnknown`으로 수렴하고 adapter execute가 0회인지 확인한다.
 
-현재 outcome의 `receipt_digest`는 물리 evidence byte의 digest일 뿐 protocol `ExecutionReceipt` body나 Artifact가 아니다. 상세 범위와 비보장은 [Preopened Reference Adapter Conformance](reference-adapter-conformance.md)를 따른다.
+Adapter outcome의 `evidence_digest`는 물리 evidence byte의 digest이며 protocol Receipt가 아니다. 성공 outcome 뒤 별도 `PreopenedMarkerVerifier`가 파일을 read-only로 다시 읽고, Core가 protocol `ExecutionReceipt`를 생성해 terminal event와 원자 commit한다. 상세 범위와 비보장은 [Preopened Reference Adapter Conformance](reference-adapter-conformance.md)와 [Core Verification과 Execution Receipt](execution-receipt.md)를 따른다.
 
 ## 검증 명령
 
@@ -123,8 +137,11 @@ cargo build --workspace --release --locked
 - SQLite restart reconstruct → execute E2E
 - 외부 crate의 preopened 일반 파일 actual I/O와 exact binding conformance
 - post-write/pre-outcome process exit + SQLite restart의 adapter execute 0회
+- `Validating` SQLite restart의 adapter execute 0회와 verifier-only 재개
+- 성공/검증 실패 Receipt, schema/digest와 journal·intent binding
+- Receipt commit acknowledgement 유실 뒤 effect·verifier 중복 0회
 - Debug, JSONL과 SQLite artifact plaintext sentinel scan. POSIX에서는 열린 DB에서 현재 존재하는 WAL/SHM까지 검사하고, Windows에서는 store를 clean close해 SQLite byte-range lock을 해제한 뒤 남아 있는 DB/WAL/SHM artifact를 검사한다.
 
 ## 다음 수직 슬라이스
 
-구현 순서상 다음 큰 slice는 같은 Run 엔진 위의 Tracked/Persistent WorkGraph와 crash recovery다. 제품용 read-only filesystem adapter는 참조 adapter의 단순 확장이 아니다. WorkGraph `ReadOnly`, bounded typed output, core-owned Receipt/Artifact, root directory capability와 symlink/junction/TOCTOU 규칙을 별도 ADR·gate에서 먼저 확정한다. Credential resolver와 process adapter도 각각 분리한다.
+구현 순서상 다음 큰 slice는 Receipt-bound terminal gate를 dependency release 조건으로 사용하는 Tracked/Persistent WorkGraph와 crash recovery다. 제품용 read-only filesystem adapter는 참조 adapter의 단순 확장이 아니다. WorkGraph `ReadOnly`, bounded typed output와 Artifact, root directory capability와 symlink/junction/TOCTOU 규칙을 별도 ADR·gate에서 먼저 확정한다. Adapter definite failure·unknown Receipt, credential resolver와 process adapter도 각각 분리한다.

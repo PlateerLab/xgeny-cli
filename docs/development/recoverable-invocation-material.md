@@ -3,7 +3,7 @@
 - 기준일: 2026-08-29
 - 상태: ADR-0010 연구 gate용 내부 구현
 - 공개 protocol v0.1 변경: 없음
-- local store schema: 3
+- local store schema: 4 (material sidecar는 schema 3에서 도입)
 
 ## 목적
 
@@ -118,20 +118,21 @@ COMMIT
 
 `Ephemeral` record는 argument를 durable store에 넣지 않는다. 정상 commit 뒤 같은 process에 남아 있는 opaque material handle만 사용할 수 있다. Commit 성공 여부가 불확실하거나 process가 재시작되어 handle을 찾을 수 없으면 자동으로 argument를 재생성하지 않는다.
 
-## SQLite schema 3
+## SQLite schema 4와 material 호환성
 
-Material sidecar가 없는 schema 1과 2 intent를 실행 가능하다고 해석할 수 없으므로 migration하지 않는다.
+Material sidecar가 없는 schema 1과 2 intent를 실행 가능하다고 해석할 수 없으므로 migration하지 않는다. Schema 3은 이 문서의 material 계약을 도입한 형식이며, ADR-0012가 Receipt table만 추가하는 schema 4로 기존 journal bytes를 바꾸지 않고 migration한다.
 
 | 발견한 `user_version` | 동작 |
 |---|---|
-| `0` | schema 3 신규 생성 |
-| `3` | 전체 record와 projection 검증 후 open |
+| `0` | schema 4 신규 생성 |
+| `3` | 전체 record와 projection 검증 후 schema 4로 원자 migration |
+| `4` | material·Receipt를 포함한 전체 derived state 검증 후 open |
 | `1`, `2` | mutation 없이 `UnsupportedSchemaVersion` |
-| `4+` | mutation 없이 `UnsupportedSchemaVersion` |
+| `5+` | mutation 없이 `UnsupportedSchemaVersion` |
 
 Version 2 record에 `Ephemeral`을 자동 backfill하지 않는다. 그렇게 하면 실제 material이 없는 legacy intent를 정상적인 same-process invocation처럼 보이게 할 수 있다. 연구 중 생성한 기존 database가 필요하면 deterministic JSONL export 등 명시적인 보존 절차를 거친 뒤 새 Run을 만든다.
 
-Schema 3 load는 최소 다음을 대조한다.
+Schema 4 load는 material에 대해 최소 다음을 대조한다.
 
 - 모든 effect intent에 정확히 하나의 material record가 있는가
 - Orphan material record가 없는가
@@ -270,7 +271,8 @@ POSIX 테스트는 DB가 열린 동안 현재 존재하는 WAL/SHM을 포함해 
 
 - Raw argument, canonical path와 credential sentinel이 DB/WAL/JSONL/Debug/Error에 없다.
 - Reference ID를 포함한 opaque type이 derived `Debug`로 원문을 노출하지 않는다.
-- Fresh database가 schema 3으로 생성되고 reopen된다.
+- Fresh database가 schema 4로 생성되고 reopen된다.
+- Schema 3 material Run이 journal bytes를 유지한 채 schema 4로 migration된다.
 - Schema 1과 2를 변경 없이 거부한다.
 - Future schema version을 변경 없이 거부한다.
 - Linux, macOS와 Windows CI에서 portable unit/contract test가 통과한다.
@@ -281,9 +283,9 @@ POSIX 테스트는 DB가 열린 동안 현재 존재하는 WAL/SHM을 포함해 
 - OS credential store와 credential injection
 - Sealed argument encryption
 - Provider retry/backoff와 durable Blocked 상태
-- Receipt body와 Artifact store
+- Adapter failure/unknown Receipt와 Artifact store
 - Symlink·TOCTOU, sandbox와 process tree 제어
 - Managed/critical/reusable authorization
 - Public protocol의 material projection
 
-후속 ADR-0011은 이 recovery 결과를 exact selected adapter의 side-effect-free `prepare`에 연결하고, raw argument accessor를 trusted in-process Direct Executor 안으로 좁혔다. Core는 full Run head와 material에 결합한 consume-only prepared wrapper를 만든다. 이 두 slice를 합쳐도 public Rust trait을 hostile plugin 격리 경계로 주장하지 않는다.
+후속 ADR-0011은 이 recovery 결과를 exact selected adapter의 side-effect-free `prepare`에 연결하고, raw argument accessor를 trusted in-process Direct Executor 안으로 좁혔다. ADR-0012는 provenance가 있는 새 intent의 성공 검증과 Receipt 종결을 추가했으며 schema 3의 pending intent는 실행 전에 닫는다. 이 slice들을 합쳐도 public Rust trait을 hostile plugin 격리 경계로 주장하지 않는다.

@@ -23,8 +23,8 @@ canonical Run lease 획득
 - event factory는 ID와 시각만 만든다. run ID, authority, epoch와 event body는 runtime이 durable state에서 조립한다.
 - raw arguments와 resolved credential은 journal에 넣지 않는다. Direct Executor가 exact Definition·Instance·adapter를 검증해 만든 core-owned one-shot session이 committed Run·Step·effect·material·journal head와 모두 일치할 때만 실행한다.
 - sink가 요청 전송 여부를 확정할 수 없는 transport 오류는 definite failure가 아니라 `Unknown`으로 분류해야 한다.
-- success·failure의 receipt digest는 adapter가 durable receipt를 만든 뒤 반환해야 한다. 이 실험은 receipt body 저장소까지 구현하지 않는다.
-- 빈 receipt/evidence/reason은 확정 event로 기록하지 않는다. 외부 호출 뒤 이런 adapter 오류가 발생하면 `executing` 또는 `reconciling`을 유지해 다음 recovery가 보수적으로 판정하게 한다.
+- success·failure outcome의 digest는 adapter evidence다. 성공 또는 applied reconciliation 뒤에는 별도 Core verification 경계가 protocol Receipt를 생성하며, adapter가 Receipt identity나 status를 만들지 않는다.
+- 빈 evidence/reason은 확정 event로 기록하지 않는다. 외부 호출 뒤 이런 adapter 오류가 발생하면 `executing` 또는 `reconciling`을 유지해 다음 recovery가 보수적으로 판정하게 한다.
 
 ## 재시작 판정표
 
@@ -51,14 +51,14 @@ Run lease를 가진 worker만 `drive_step`을 호출한다. journal CAS는 stale
 ## 실행 가능한 검증
 
 - 시작 event commit 실패 시 sink 호출 0회
-- event metadata 생성 실패·prepared digest 불일치 시 sink 호출 0회
+- event metadata 생성 실패·invalid RFC 3339 시각·prepared digest 불일치 시 sink 호출 0회
 - sink 호출 뒤 outcome commit 실패 시 `executing` 보존
 - 재시작한 `executing`에서 sink 재호출 없이 `effect_unknown` 전환
 - 실제 자식 process가 counter effect 직후 종료된 뒤 counter 1회 유지
 - process 종료 후 file lease 재획득과 SQLite journal 복구
 - query 지원·미지원·불명·applied·not-applied 분기
-- definite failure와 reconciliation failure의 receipt/evidence 보존
-- 빈 receipt/evidence를 확정 결과로 수용하지 않는 fail-closed 검증
+- definite failure와 reconciliation failure의 evidence 보존
+- 빈 evidence를 확정 결과로 수용하지 않는 fail-closed 검증
 - not-applied 재시도에서 authorization 비중복 소비와 attempt 상한
 - 잘못된 Run의 lease로 event·effect 변경 0회
 - Prepared session의 Run/Step/effect/material/head binding 불일치 시 sink 호출 0회
@@ -68,7 +68,7 @@ Run lease를 가진 worker만 `drive_step`을 호출한다. journal CAS는 stale
 - filesystem/process/MCP/Connector/XGEN 실제 adapter
 - sandbox, secret resolver와 OS별 권한 UI
 - async cancellation과 process tree 종료
-- receipt body·artifact content store와 verifier loop
+- adapter definite failure·effect unknown Receipt와 artifact content store
 - canonical Run directory factory와 network filesystem 진단
 - CLI init/run/resume UX와 설치 패키지 E2E
 - VM power-loss, disk corruption과 반복 fault matrix

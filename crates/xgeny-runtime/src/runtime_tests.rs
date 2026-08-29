@@ -15,11 +15,13 @@ use tempfile::{TempDir, tempdir};
 use xgeny_local_store::{
     Commit, ExpectedHead, MemoryRunStore, RunSnapshot, RunStore, SqliteRunStore, StoreError,
 };
+use xgeny_protocol::{CORE_RECEIPT_INPUT_SUMMARY_V1, CORE_RECEIPT_PROFILE_V1};
 use xgeny_workgraph::{
     AuthorizationBinding, AuthorizationUse, EffectClass, EffectIntent, InvocationBinding,
-    InvocationMaterialRecord, InvocationMaterialRetention, RunEvent, RunEventBody, RunState,
+    InvocationMaterialRecord, InvocationMaterialRetention, ReceiptPlacement, ReceiptProvenance,
+    ReceiptVerificationRule, ReceiptVerificationStrategy, RunEvent, RunEventBody, RunState,
     SinkGuarantee, StepStatus, authorization_digest, invocation_material_digest,
-    invocation_material_retention_digest, once_authorization_id,
+    invocation_material_retention_digest, once_authorization_id, receipt_provenance_digest,
 };
 
 const RUN_ID: &str = "run-1";
@@ -152,6 +154,18 @@ impl EventFactory for FailingEvents {
 }
 
 #[derive(Debug)]
+struct InvalidTimestampEvents;
+
+impl EventFactory for InvalidTimestampEvents {
+    fn create_metadata(&mut self, _state: &RunState) -> Result<EventMetadata, EventFactoryError> {
+        Ok(EventMetadata {
+            event_id: "invalid-start-metadata".to_owned(),
+            recorded_at: "RAW-START-TIMESTAMP-SENTINEL".to_owned(),
+        })
+    }
+}
+
+#[derive(Debug)]
 struct ScriptedSink {
     executions: VecDeque<ExecutionObservation>,
     reconciliations: VecDeque<ReconciliationObservation>,
@@ -262,7 +276,7 @@ fn effect_intent(state: &RunState, guarantee: SinkGuarantee) -> EffectIntent {
         instance_id: "test.instance".to_owned(),
         instance_binding_digest: "sha256:instance-1".to_owned(),
     };
-    let binding = AuthorizationBinding {
+    let mut binding = AuthorizationBinding {
         run_id: state.run_id.clone(),
         step_id: STEP_ID.to_owned(),
         authority: state.authority.clone(),
@@ -278,7 +292,25 @@ fn effect_intent(state: &RunState, guarantee: SinkGuarantee) -> EffectIntent {
         material_digest,
         material_retention_digest,
         policy_evidence_digest: "sha256:policy-1".to_owned(),
+        receipt_provenance_digest: None,
     };
+    let provenance = ReceiptProvenance {
+        profile_version: CORE_RECEIPT_PROFILE_V1.to_owned(),
+        invocation_id: "invocation-runtime-test".to_owned(),
+        plan_id: "plan-runtime-test".to_owned(),
+        policy_decision_id: "decision-runtime-test".to_owned(),
+        policy_decision_digest: format!("sha256:{}", "c".repeat(64)),
+        executor_id: "xgeny-local".to_owned(),
+        executor_placement: ReceiptPlacement::Local,
+        executor_platform: crate::local_executor_platform(),
+        input_summary: CORE_RECEIPT_INPUT_SUMMARY_V1.to_owned(),
+        verification_plan: vec![ReceiptVerificationRule {
+            strategy: ReceiptVerificationStrategy::Postcondition,
+            required: true,
+        }],
+    };
+    binding.receipt_provenance_digest =
+        Some(receipt_provenance_digest(&provenance).expect("provenance should canonicalize"));
     EffectIntent {
         effect_id: EFFECT_ID.to_owned(),
         action_digest: "sha256:action-1".to_owned(),
@@ -294,6 +326,7 @@ fn effect_intent(state: &RunState, guarantee: SinkGuarantee) -> EffectIntent {
             max_uses: 1,
             binding,
         },
+        receipt_provenance: Some(provenance),
     }
 }
 
@@ -401,7 +434,7 @@ fn effect_call_happens_only_after_start_marker_is_committed() {
     trace.borrow_mut().clear();
     let mut sink = ScriptedSink::new(Rc::clone(&trace));
     sink.executions.push_back(ExecutionObservation::Succeeded {
-        receipt_digest: "sha256:receipt-1".to_owned(),
+        evidence_digest: "sha256:receipt-1".to_owned(),
     });
     let mut events = DeterministicEvents::default();
     let (_directory, lease) = lease();
@@ -431,7 +464,7 @@ fn definite_effect_failure_commits_its_receipt() {
     trace.borrow_mut().clear();
     let mut sink = ScriptedSink::new(Rc::clone(&trace));
     sink.executions.push_back(ExecutionObservation::Failed {
-        receipt_digest: "sha256:failure-receipt-1".to_owned(),
+        evidence_digest: "sha256:failure-receipt-1".to_owned(),
     });
     let mut events = DeterministicEvents::default();
     let (_directory, lease) = lease();
@@ -444,7 +477,9 @@ fn definite_effect_failure_commits_its_receipt() {
     assert_eq!(report.action, DriveAction::EffectFailed);
     assert_eq!(report.state.steps[STEP_ID].status, StepStatus::Failed);
     assert_eq!(
-        report.state.steps[STEP_ID].receipt_digest.as_deref(),
+        report.state.steps[STEP_ID]
+            .effect_evidence_digest
+            .as_deref(),
         Some("sha256:failure-receipt-1")
     );
     assert_eq!(
@@ -465,7 +500,7 @@ fn empty_execution_receipt_fails_closed_and_recovers_as_unknown() {
     trace.borrow_mut().clear();
     let mut sink = ScriptedSink::new(Rc::clone(&trace));
     sink.executions.push_back(ExecutionObservation::Succeeded {
-        receipt_digest: "  ".to_owned(),
+        evidence_digest: "  ".to_owned(),
     });
     let mut events = DeterministicEvents::default();
     let (_directory, lease) = lease();
@@ -478,7 +513,7 @@ fn empty_execution_receipt_fails_closed_and_recovers_as_unknown() {
         first,
         Err(RuntimeError::InvalidSinkObservation {
             observation: "execution_succeeded",
-            field: "receipt_digest"
+            field: "evidence_digest"
         })
     ));
     assert_eq!(sink.execute_calls, 1);
@@ -551,6 +586,38 @@ fn failed_event_metadata_creation_prevents_start_and_physical_effect() {
 }
 
 #[test]
+fn invalid_start_timestamp_prevents_started_commit_and_physical_effect() {
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let mut store = RecordingStore::new(Rc::clone(&trace));
+    seed_intent(&mut store, SinkGuarantee::None);
+    trace.borrow_mut().clear();
+    let mut sink = ScriptedSink::new(Rc::clone(&trace));
+    let mut events = InvalidTimestampEvents;
+    let (_directory, lease) = lease();
+    let prepared = prepared_effect(&store);
+
+    let error = DurableEffectRuntime::new(&mut store, &mut sink, &mut events, &lease)
+        .drive_step(STEP_ID, Some(prepared))
+        .expect_err("invalid start timestamp must fail closed");
+
+    assert!(matches!(error, RuntimeError::EventMetadata(_)));
+    let rendered = format!("{error}\n{error:?}");
+    assert!(!rendered.contains("RAW-START-TIMESTAMP-SENTINEL"));
+    assert_eq!(sink.execute_calls, 0);
+    assert!(trace.borrow().is_empty());
+    assert_eq!(
+        store
+            .load()
+            .expect("store should load")
+            .expect("Run should exist")
+            .state
+            .steps[STEP_ID]
+            .status,
+        StepStatus::IntentCommitted
+    );
+}
+
+#[test]
 fn lost_outcome_commit_recovers_to_unknown_without_duplicate_execution() {
     let trace = Rc::new(RefCell::new(Vec::new()));
     let mut store = RecordingStore::new(Rc::clone(&trace));
@@ -558,7 +625,7 @@ fn lost_outcome_commit_recovers_to_unknown_without_duplicate_execution() {
     store.fail_once_on(EventKind::EffectSucceeded);
     let mut sink = ScriptedSink::new(Rc::clone(&trace));
     sink.executions.push_back(ExecutionObservation::Succeeded {
-        receipt_digest: "sha256:receipt-1".to_owned(),
+        evidence_digest: "sha256:receipt-1".to_owned(),
     });
     let mut events = DeterministicEvents::default();
     let (_directory, lease) = lease();
@@ -756,7 +823,7 @@ fn proved_not_applied_reuses_intent_without_reconsuming_authorization() {
             evidence_digest: "sha256:not-applied-1".to_owned(),
         });
     sink.executions.push_back(ExecutionObservation::Succeeded {
-        receipt_digest: "sha256:receipt-2".to_owned(),
+        evidence_digest: "sha256:receipt-2".to_owned(),
     });
     let mut events = DeterministicEvents::default();
     let (_directory, lease) = lease();

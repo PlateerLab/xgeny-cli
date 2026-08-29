@@ -6,6 +6,8 @@
 - 공개 protocol v0.1 변경: 없음
 - local store schema 변경: 없음(schema 3 유지)
 
+> 후속 상태: ADR-0012가 adapter outcome을 effect evidence로 명확히 분리하고, exact read-only verifier, Core-owned Execution Receipt와 schema 4 원자 저장을 구현했다. 아래 비목표는 ADR-0011 결정 당시의 범위를 기록한다.
+
 ## 문맥
 
 ADR-0010은 `EffectIntent`와 secret-free `InvocationMaterialRecord`를 원자적으로 commit하고, 재시작 뒤 exact material을 복구하는 계약을 만들었다. 그러나 기존 저수준 runtime은 호출자가 sink와 prepared value를 직접 넘겼고, adapter가 action·Definition·Instance digest를 자기보고했다. 이 구조에서는 다음을 core가 증명할 수 없다.

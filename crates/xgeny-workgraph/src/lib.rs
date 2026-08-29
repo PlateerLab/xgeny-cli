@@ -48,12 +48,14 @@ pub enum RunEventBody {
     EffectSucceeded {
         step_id: String,
         effect_id: String,
-        receipt_digest: String,
+        #[serde(rename = "receiptDigest")]
+        evidence_digest: String,
     },
     EffectFailed {
         step_id: String,
         effect_id: String,
-        receipt_digest: String,
+        #[serde(rename = "receiptDigest")]
+        evidence_digest: String,
     },
     EffectBecameUnknown {
         step_id: String,
@@ -82,6 +84,13 @@ pub enum RunEventBody {
         step_id: String,
         reason: String,
     },
+    VerificationRecorded {
+        step_id: String,
+        effect_id: String,
+        disposition: VerificationDisposition,
+        receipt_id: String,
+        receipt_digest: String,
+    },
 }
 
 impl RunEventBody {
@@ -100,6 +109,7 @@ impl RunEventBody {
             Self::ManualInterventionRequired { .. } => "manual_intervention_required",
             Self::VerificationPassed { .. } => "verification_passed",
             Self::VerificationFailed { .. } => "verification_failed",
+            Self::VerificationRecorded { .. } => "verification_recorded",
         }
     }
 }
@@ -114,6 +124,72 @@ pub struct EffectIntent {
     pub idempotency_key: Option<String>,
     pub sink_guarantee: SinkGuarantee,
     pub authorization: AuthorizationUse,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_provenance: Option<ReceiptProvenance>,
+}
+
+/// Core-issued, secret-free facts needed to construct a protocol `ExecutionReceipt` after a
+/// process restart. The adapter cannot create or modify this binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReceiptProvenance {
+    pub profile_version: String,
+    pub invocation_id: String,
+    pub plan_id: String,
+    pub policy_decision_id: String,
+    pub policy_decision_digest: String,
+    pub executor_id: String,
+    pub executor_placement: ReceiptPlacement,
+    pub executor_platform: String,
+    pub input_summary: String,
+    pub verification_plan: Vec<ReceiptVerificationRule>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptPlacement {
+    Local,
+    Device,
+    Remote,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptVerificationStrategy {
+    OutputSchema,
+    Postcondition,
+    ArtifactDigest,
+    Receipt,
+    Human,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReceiptVerificationRule {
+    pub strategy: ReceiptVerificationStrategy,
+    pub required: bool,
+}
+
+/// Final core verification result bound to one persisted `ExecutionReceipt`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationDisposition {
+    Passed,
+    Failed,
+    Inconclusive,
+}
+
+/// Calculate the canonical digest covered by a new authorization binding.
+///
+/// # Errors
+///
+/// Returns an error when RFC 8785 canonicalization fails.
+pub fn receipt_provenance_digest(
+    provenance: &ReceiptProvenance,
+) -> Result<String, AuthorizationDigestError> {
+    let canonical = serde_jcs::to_vec(provenance)
+        .map_err(|error| AuthorizationDigestError::Canonicalization(error.to_string()))?;
+    Ok(sha256_digest(&canonical))
 }
 
 /// Immutable executable binding retained with a durable effect intent.
@@ -631,6 +707,8 @@ pub struct AuthorizationBinding {
     pub material_digest: String,
     pub material_retention_digest: String,
     pub policy_evidence_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_provenance_digest: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -801,7 +879,12 @@ pub struct StepState {
     pub status: StepStatus,
     pub attempts: u32,
     pub intent: Option<EffectIntent>,
-    pub receipt_digest: Option<String>,
+    #[serde(rename = "receiptDigest")]
+    pub effect_evidence_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_receipt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_receipt_digest: Option<String>,
     pub uncertainty_reason: Option<String>,
     pub reconciliation_evidence_digest: Option<String>,
 }
@@ -921,7 +1004,9 @@ fn apply_body(state: &mut RunState, body: &RunEventBody) -> Result<(), Transitio
                     status: StepStatus::Planned,
                     attempts: 0,
                     intent: None,
-                    receipt_digest: None,
+                    effect_evidence_digest: None,
+                    execution_receipt_id: None,
+                    execution_receipt_digest: None,
                     uncertainty_reason: None,
                     reconciliation_evidence_digest: None,
                 },
@@ -951,46 +1036,37 @@ fn apply_effect_lifecycle(
             reason,
         } => mark_material_unavailable(state, step_id, effect_id, *reason, body)?,
         RunEventBody::EffectExecutionStarted { step_id, effect_id } => {
-            let step = matching_step_mut(state, step_id, effect_id)?;
-            require_status(step, StepStatus::IntentCommitted, body)?;
-            step.status = StepStatus::Executing;
-            step.attempts =
-                step.attempts
-                    .checked_add(1)
-                    .ok_or_else(|| TransitionError::AttemptOverflow {
-                        step_id: step_id.clone(),
-                    })?;
+            record_execution_started(state, step_id, effect_id, body)?;
         }
         RunEventBody::EffectSucceeded {
             step_id,
             effect_id,
-            receipt_digest,
-        } => {
-            let step = matching_step_mut(state, step_id, effect_id)?;
-            require_status(step, StepStatus::Executing, body)?;
-            step.status = StepStatus::Validating;
-            step.receipt_digest = Some(receipt_digest.clone());
-        }
+            evidence_digest,
+        } => record_effect_observation(
+            state,
+            step_id,
+            effect_id,
+            evidence_digest,
+            StepStatus::Validating,
+            body,
+        )?,
         RunEventBody::EffectFailed {
             step_id,
             effect_id,
-            receipt_digest,
-        } => {
-            let step = matching_step_mut(state, step_id, effect_id)?;
-            require_status(step, StepStatus::Executing, body)?;
-            step.status = StepStatus::Failed;
-            step.receipt_digest = Some(receipt_digest.clone());
-        }
+            evidence_digest,
+        } => record_effect_observation(
+            state,
+            step_id,
+            effect_id,
+            evidence_digest,
+            StepStatus::Failed,
+            body,
+        )?,
         RunEventBody::EffectBecameUnknown {
             step_id,
             effect_id,
             reason,
-        } => {
-            let step = matching_step_mut(state, step_id, effect_id)?;
-            require_status(step, StepStatus::Executing, body)?;
-            step.status = StepStatus::EffectUnknown;
-            step.uncertainty_reason = Some(reason.clone());
-        }
+        } => record_effect_unknown(state, step_id, effect_id, reason, body)?,
         RunEventBody::ReconciliationStarted { step_id, effect_id } => {
             let step = matching_step_mut(state, step_id, effect_id)?;
             require_status(step, StepStatus::EffectUnknown, body)?;
@@ -1001,31 +1077,19 @@ fn apply_effect_lifecycle(
             effect_id,
             resolution,
             evidence_digest,
-        } => {
-            let step = matching_step_mut(state, step_id, effect_id)?;
-            require_status(step, StepStatus::Reconciling, body)?;
-            step.reconciliation_evidence_digest = Some(evidence_digest.clone());
-            step.status = match resolution {
-                ReconciliationResolution::ProvedApplied => StepStatus::Validating,
-                ReconciliationResolution::ProvedNotApplied => StepStatus::IntentCommitted,
-                ReconciliationResolution::Failed => StepStatus::Failed,
-            };
-        }
+        } => record_reconciliation(
+            state,
+            step_id,
+            effect_id,
+            *resolution,
+            evidence_digest,
+            body,
+        )?,
         RunEventBody::ManualInterventionRequired {
             step_id,
             effect_id,
             reason,
-        } => {
-            let step = matching_step_mut(state, step_id, effect_id)?;
-            if !matches!(
-                step.status,
-                StepStatus::EffectUnknown | StepStatus::Reconciling
-            ) {
-                return invalid_transition(step, body);
-            }
-            step.status = StepStatus::ManualRequired;
-            step.uncertainty_reason = Some(reason.clone());
-        }
+        } => record_manual_required(state, step_id, effect_id, reason, body)?,
         RunEventBody::VerificationPassed { step_id } => {
             let step = step_mut(state, step_id)?;
             require_status(step, StepStatus::Validating, body)?;
@@ -1036,7 +1100,138 @@ fn apply_effect_lifecycle(
             require_status(step, StepStatus::Validating, body)?;
             step.status = StepStatus::Failed;
         }
+        RunEventBody::VerificationRecorded {
+            step_id,
+            effect_id,
+            disposition,
+            receipt_id,
+            receipt_digest,
+        } => record_verification(
+            state,
+            step_id,
+            effect_id,
+            *disposition,
+            receipt_id,
+            receipt_digest,
+            body,
+        )?,
     }
+    Ok(())
+}
+
+fn record_execution_started(
+    state: &mut RunState,
+    step_id: &str,
+    effect_id: &str,
+    body: &RunEventBody,
+) -> Result<(), TransitionError> {
+    let step = matching_step_mut(state, step_id, effect_id)?;
+    require_status(step, StepStatus::IntentCommitted, body)?;
+    step.status = StepStatus::Executing;
+    step.attempts =
+        step.attempts
+            .checked_add(1)
+            .ok_or_else(|| TransitionError::AttemptOverflow {
+                step_id: step_id.to_owned(),
+            })?;
+    Ok(())
+}
+
+fn record_effect_unknown(
+    state: &mut RunState,
+    step_id: &str,
+    effect_id: &str,
+    reason: &str,
+    body: &RunEventBody,
+) -> Result<(), TransitionError> {
+    let step = matching_step_mut(state, step_id, effect_id)?;
+    require_status(step, StepStatus::Executing, body)?;
+    step.status = StepStatus::EffectUnknown;
+    step.uncertainty_reason = Some(reason.to_owned());
+    Ok(())
+}
+
+fn record_reconciliation(
+    state: &mut RunState,
+    step_id: &str,
+    effect_id: &str,
+    resolution: ReconciliationResolution,
+    evidence_digest: &str,
+    body: &RunEventBody,
+) -> Result<(), TransitionError> {
+    let step = matching_step_mut(state, step_id, effect_id)?;
+    require_status(step, StepStatus::Reconciling, body)?;
+    step.reconciliation_evidence_digest = Some(evidence_digest.to_owned());
+    step.uncertainty_reason = None;
+    step.status = match resolution {
+        ReconciliationResolution::ProvedApplied => StepStatus::Validating,
+        ReconciliationResolution::ProvedNotApplied => StepStatus::IntentCommitted,
+        ReconciliationResolution::Failed => StepStatus::Failed,
+    };
+    Ok(())
+}
+
+fn record_manual_required(
+    state: &mut RunState,
+    step_id: &str,
+    effect_id: &str,
+    reason: &str,
+    body: &RunEventBody,
+) -> Result<(), TransitionError> {
+    let step = matching_step_mut(state, step_id, effect_id)?;
+    if !matches!(
+        step.status,
+        StepStatus::EffectUnknown | StepStatus::Reconciling
+    ) {
+        return invalid_transition(step, body);
+    }
+    step.status = StepStatus::ManualRequired;
+    step.uncertainty_reason = Some(reason.to_owned());
+    Ok(())
+}
+
+fn record_effect_observation(
+    state: &mut RunState,
+    step_id: &str,
+    effect_id: &str,
+    evidence_digest: &str,
+    next_status: StepStatus,
+    body: &RunEventBody,
+) -> Result<(), TransitionError> {
+    let step = matching_step_mut(state, step_id, effect_id)?;
+    require_status(step, StepStatus::Executing, body)?;
+    step.status = next_status;
+    step.effect_evidence_digest = Some(evidence_digest.to_owned());
+    Ok(())
+}
+
+fn record_verification(
+    state: &mut RunState,
+    step_id: &str,
+    effect_id: &str,
+    disposition: VerificationDisposition,
+    receipt_id: &str,
+    receipt_digest: &str,
+    body: &RunEventBody,
+) -> Result<(), TransitionError> {
+    let step = matching_step_mut(state, step_id, effect_id)?;
+    require_status(step, StepStatus::Validating, body)?;
+    step.execution_receipt_id = Some(receipt_id.to_owned());
+    step.execution_receipt_digest = Some(receipt_digest.to_owned());
+    step.status = match disposition {
+        VerificationDisposition::Passed => {
+            step.uncertainty_reason = None;
+            StepStatus::Completed
+        }
+        VerificationDisposition::Failed => {
+            step.uncertainty_reason = None;
+            StepStatus::Failed
+        }
+        VerificationDisposition::Inconclusive => {
+            step.uncertainty_reason = Some("verification_inconclusive".to_owned());
+            StepStatus::ManualRequired
+        }
+    };
     Ok(())
 }
 
@@ -1059,6 +1254,25 @@ fn commit_effect_intent(
     step_id: &str,
     intent: &EffectIntent,
 ) -> Result<(), TransitionError> {
+    match (
+        &intent.receipt_provenance,
+        &intent.authorization.binding.receipt_provenance_digest,
+    ) {
+        (Some(provenance), Some(expected)) => {
+            let actual = receipt_provenance_digest(provenance)?;
+            if &actual != expected {
+                return Err(TransitionError::ReceiptProvenanceDigestMismatch {
+                    effect_id: intent.effect_id.clone(),
+                });
+            }
+        }
+        (None, None) => {}
+        _ => {
+            return Err(TransitionError::ReceiptProvenanceBindingMismatch {
+                effect_id: intent.effect_id.clone(),
+            });
+        }
+    }
     if intent.authorization.max_uses != 1 {
         return Err(TransitionError::InvalidAuthorizationBudget {
             grant_id: intent.authorization.grant_id.clone(),
@@ -1362,6 +1576,10 @@ pub enum TransitionError {
     AuthorizationBudgetExceeded { grant_id: String, max_uses: u32 },
     #[error("effect `{effect_id}` claims a keyed sink guarantee without an idempotency key")]
     SinkGuaranteeRequiresIdempotencyKey { effect_id: String },
+    #[error("effect `{effect_id}` receipt provenance and authorization binding differ")]
+    ReceiptProvenanceBindingMismatch { effect_id: String },
+    #[error("effect `{effect_id}` receipt provenance digest is invalid")]
+    ReceiptProvenanceDigestMismatch { effect_id: String },
     #[error("step `{step_id}` attempt counter overflowed")]
     AttemptOverflow { step_id: String },
 }
@@ -1451,6 +1669,7 @@ mod tests {
             material_digest,
             material_retention_digest,
             policy_evidence_digest: "sha256:policy-1".to_owned(),
+            receipt_provenance_digest: None,
         };
         let grant_digest =
             authorization_digest(&binding, max_uses).expect("authorization should canonicalize");
@@ -1471,6 +1690,7 @@ mod tests {
                     max_uses,
                     binding,
                 },
+                receipt_provenance: None,
             }),
         }
     }
@@ -1675,7 +1895,7 @@ mod tests {
                 RunEventBody::EffectSucceeded {
                     step_id: "step-1".to_owned(),
                     effect_id: "effect-1".to_owned(),
-                    receipt_digest: "sha256:receipt-1".to_owned(),
+                    evidence_digest: "sha256:receipt-1".to_owned(),
                 },
             ),
         );
@@ -2099,6 +2319,25 @@ mod tests {
             ),
             Err(RecordError::SequenceOverflow)
         );
+    }
+
+    #[test]
+    fn legacy_receipt_digest_wire_spelling_is_preserved_for_effect_evidence() {
+        let body = RunEventBody::EffectSucceeded {
+            step_id: "step-1".to_owned(),
+            effect_id: "effect-1".to_owned(),
+            evidence_digest: format!("sha256:{}", "a".repeat(64)),
+        };
+        let value = serde_json::to_value(&body).expect("event body should serialize");
+        assert_eq!(
+            value.pointer("/receiptDigest"),
+            Some(&serde_json::json!(format!("sha256:{}", "a".repeat(64))))
+        );
+        assert!(value.pointer("/evidenceDigest").is_none());
+
+        let round_trip: RunEventBody =
+            serde_json::from_value(value).expect("legacy event should deserialize");
+        assert_eq!(round_trip, body);
     }
 
     fn planned_journal(step_count: u8) -> (Vec<EventRecord>, RunState) {

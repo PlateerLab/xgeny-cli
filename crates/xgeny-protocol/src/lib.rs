@@ -4,15 +4,97 @@ mod assets;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::sync::OnceLock;
 
 use jsonschema::{Draft, Registry};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use xgeny_domain::{API_VERSION_V1ALPHA1, ProtocolDocument};
+use xgeny_domain::{
+    API_VERSION_V1ALPHA1, ExecutionReceiptBody, PolicyDecisionBody, ProtocolDocument,
+    ReceiptStatus, VerificationEvidence, VerificationResult,
+};
 
 const SCHEMA_BASE_URI: &str = "https://schemas.xgeny.dev/v1alpha1/";
+
+struct BundledDocumentValidator {
+    registry: Registry<'static>,
+    validator: jsonschema::Validator,
+}
+
+static EXECUTION_RECEIPT_VALIDATOR: OnceLock<Result<BundledDocumentValidator, String>> =
+    OnceLock::new();
+static POLICY_DECISION_VALIDATOR: OnceLock<Result<BundledDocumentValidator, String>> =
+    OnceLock::new();
+
+/// Stable identifier for the first Core-owned Receipt construction and verification profile.
+pub const CORE_RECEIPT_PROFILE_V1: &str = "xgeny.core-receipt/v1";
+/// Secret-free input description required by the first Core Receipt profile.
+pub const CORE_RECEIPT_INPUT_SUMMARY_V1: &str = "Invocation input retained by digest only.";
+/// Exact redaction declarations required by the first Core Receipt profile.
+pub const CORE_RECEIPT_REDACTIONS_V1: [&str; 2] = [
+    "raw invocation arguments omitted",
+    "raw tool output omitted",
+];
+
+/// Core-owned terminal meaning derived from the complete verification evidence set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreVerificationOutcome {
+    Passed,
+    Failed,
+    Inconclusive,
+}
+
+/// Derive the deterministic Receipt identifier for the first Core Receipt profile.
+#[must_use]
+pub fn core_receipt_id_v1(effect_id: &str) -> String {
+    format!(
+        "receipt-{}",
+        effect_id.strip_prefix("effect-").unwrap_or(effect_id)
+    )
+}
+
+/// Return the only summary text allowed for one Core-owned verification observation.
+#[must_use]
+pub const fn core_verification_summary_v1(result: VerificationResult) -> &'static str {
+    match result {
+        VerificationResult::Passed => "Core-selected verification rule passed.",
+        VerificationResult::Failed => "Core-selected verification rule failed.",
+        VerificationResult::Inconclusive => "Core-selected verification rule was inconclusive.",
+    }
+}
+
+/// Evaluate the first Core Receipt profile over an exact verification evidence set.
+#[must_use]
+pub fn evaluate_core_verification_v1(evidence: &[VerificationEvidence]) -> CoreVerificationOutcome {
+    let required_failed = evidence
+        .iter()
+        .any(|item| item.required && item.result == VerificationResult::Failed);
+    let required_inconclusive = evidence
+        .iter()
+        .any(|item| item.required && item.result == VerificationResult::Inconclusive);
+    let any_passed = evidence
+        .iter()
+        .any(|item| item.result == VerificationResult::Passed);
+    if required_failed {
+        CoreVerificationOutcome::Failed
+    } else if required_inconclusive || !any_passed {
+        CoreVerificationOutcome::Inconclusive
+    } else {
+        CoreVerificationOutcome::Passed
+    }
+}
+
+/// Map a Core verification outcome to its protocol Receipt status.
+#[must_use]
+pub const fn core_receipt_status_v1(outcome: CoreVerificationOutcome) -> ReceiptStatus {
+    match outcome {
+        CoreVerificationOutcome::Passed => ReceiptStatus::Succeeded,
+        CoreVerificationOutcome::Failed => ReceiptStatus::Failed,
+        CoreVerificationOutcome::Inconclusive => ReceiptStatus::Unknown,
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ProtocolError {
@@ -212,6 +294,92 @@ pub fn canonical_digest_without_field(value: &Value, field: &str) -> Result<Stri
         )));
     }
     canonical_digest(&unsigned)
+}
+
+/// Validate one typed `ExecutionReceipt` against the bundled schema and derived digest rules.
+///
+/// This is the runtime/store boundary for generated or persisted Receipts. Validation is fully
+/// offline and includes the `kind` discriminator in the canonical digest input.
+///
+/// # Errors
+///
+/// Returns an error for schema, required-extension, serialization, or digest violations.
+pub fn validate_execution_receipt(receipt: &ExecutionReceiptBody) -> Result<(), ProtocolError> {
+    let context = cached_document_validator(
+        &EXECUTION_RECEIPT_VALIDATOR,
+        "execution-receipt.schema.json",
+    )?;
+    let document = ProtocolDocument::ExecutionReceipt(Box::new(receipt.clone()));
+    let value = serde_json::to_value(&document).map_err(|source| ProtocolError::Json {
+        asset: "runtime ExecutionReceipt".to_owned(),
+        source,
+    })?;
+    context.validator.validate(&value).map_err(|error| {
+        ProtocolError::Fixture(format!(
+            "runtime ExecutionReceipt violates the schema at {}: {}",
+            error.instance_path(),
+            error
+        ))
+    })?;
+    validate_required_extensions(&document, &BTreeSet::new())?;
+    validate_document_semantics(
+        "runtime ExecutionReceipt",
+        &value,
+        &document,
+        &context.registry,
+    )?;
+    Ok(())
+}
+
+/// Validate one typed `PolicyDecision` against the bundled offline contract.
+///
+/// # Errors
+///
+/// Returns an error for schema, required-extension, serialization, or semantic violations.
+pub fn validate_policy_decision(decision: &PolicyDecisionBody) -> Result<(), ProtocolError> {
+    let context =
+        cached_document_validator(&POLICY_DECISION_VALIDATOR, "policy-decision.schema.json")?;
+    let document = ProtocolDocument::PolicyDecision(Box::new(decision.clone()));
+    let value = serde_json::to_value(&document).map_err(|source| ProtocolError::Json {
+        asset: "runtime PolicyDecision".to_owned(),
+        source,
+    })?;
+    context.validator.validate(&value).map_err(|error| {
+        ProtocolError::Fixture(format!(
+            "runtime PolicyDecision violates the schema at {}: {}",
+            error.instance_path(),
+            error
+        ))
+    })?;
+    validate_required_extensions(&document, &BTreeSet::new())?;
+    validate_document_semantics(
+        "runtime PolicyDecision",
+        &value,
+        &document,
+        &context.registry,
+    )?;
+    Ok(())
+}
+
+fn cached_document_validator(
+    cell: &'static OnceLock<Result<BundledDocumentValidator, String>>,
+    schema_name: &'static str,
+) -> Result<&'static BundledDocumentValidator, ProtocolError> {
+    cell.get_or_init(|| {
+        let schemas = parse_schemas().map_err(|error| error.to_string())?;
+        let registry = build_registry(&schemas).map_err(|error| error.to_string())?;
+        let schema = schemas
+            .get(schema_name)
+            .ok_or_else(|| format!("schema `{schema_name}` is not bundled"))?;
+        let validator =
+            build_validator(schema, &registry, schema_name).map_err(|error| error.to_string())?;
+        Ok(BundledDocumentValidator {
+            registry,
+            validator,
+        })
+    })
+    .as_ref()
+    .map_err(|error| ProtocolError::Schema(error.clone()))
 }
 
 /// Fail closed when a document requires an extension unsupported by this reader.
@@ -501,6 +669,7 @@ fn require_equal_pointer(
 mod tests {
     use super::*;
     use serde_json::json;
+    use xgeny_domain::VerificationStrategy;
 
     #[test]
     fn bundled_protocol_is_conformant() {
@@ -539,6 +708,90 @@ mod tests {
         let expected = canonical_digest(&json!({"a": 1, "nested": {"digest": "kept"}}))
             .expect("digest should work");
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn arbitrary_execution_receipt_uses_the_bundled_schema_and_digest_rules() {
+        let value: Value = serde_json::from_str(
+            assets::FIXTURES
+                .iter()
+                .find(|asset| asset.name == "valid/execution-receipt.fs-read-success.json")
+                .expect("fixture should be bundled")
+                .contents,
+        )
+        .expect("fixture should parse");
+        let ProtocolDocument::ExecutionReceipt(receipt) =
+            serde_json::from_value(value).expect("fixture should deserialize")
+        else {
+            panic!("expected ExecutionReceipt")
+        };
+        validate_execution_receipt(&receipt).expect("fixture receipt should validate");
+
+        let mut tampered = (*receipt).clone();
+        tampered.output_digest = format!("sha256:{}", "e".repeat(64));
+        assert!(validate_execution_receipt(&tampered).is_err());
+    }
+
+    #[test]
+    fn runtime_policy_decision_validation_rejects_an_invalid_timestamp() {
+        let document: ProtocolDocument = serde_json::from_str(
+            assets::FIXTURES
+                .iter()
+                .find(|asset| asset.name == "valid/policy-decision.allow-once.json")
+                .expect("fixture should be bundled")
+                .contents,
+        )
+        .expect("fixture should deserialize");
+        let ProtocolDocument::PolicyDecision(mut decision) = document else {
+            panic!("expected PolicyDecision")
+        };
+        validate_policy_decision(&decision).expect("fixture decision should validate");
+        decision.decided_at = "RAW-POLICY-SENTINEL".to_owned();
+        assert!(validate_policy_decision(&decision).is_err());
+    }
+
+    #[test]
+    fn core_receipt_profile_handles_mixed_required_and_optional_rules() {
+        let evidence = |required, result| VerificationEvidence {
+            strategy: VerificationStrategy::Postcondition,
+            required,
+            result,
+            summary: core_verification_summary_v1(result).to_owned(),
+            evidence_digest: (result == VerificationResult::Passed)
+                .then(|| format!("sha256:{}", "a".repeat(64))),
+            artifact: None,
+        };
+
+        let optional_failure = vec![
+            evidence(true, VerificationResult::Passed),
+            evidence(false, VerificationResult::Failed),
+        ];
+        assert_eq!(
+            evaluate_core_verification_v1(&optional_failure),
+            CoreVerificationOutcome::Passed
+        );
+        assert_eq!(
+            core_receipt_status_v1(evaluate_core_verification_v1(&optional_failure)),
+            ReceiptStatus::Succeeded
+        );
+
+        let required_failure = vec![
+            evidence(false, VerificationResult::Passed),
+            evidence(true, VerificationResult::Failed),
+        ];
+        assert_eq!(
+            evaluate_core_verification_v1(&required_failure),
+            CoreVerificationOutcome::Failed
+        );
+
+        let required_inconclusive = vec![
+            evidence(false, VerificationResult::Passed),
+            evidence(true, VerificationResult::Inconclusive),
+        ];
+        assert_eq!(
+            evaluate_core_verification_v1(&required_inconclusive),
+            CoreVerificationOutcome::Inconclusive
+        );
     }
 
     #[test]
