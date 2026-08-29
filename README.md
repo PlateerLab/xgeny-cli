@@ -2,7 +2,7 @@
 
 Local-first general-purpose agent CLI and harness.
 
-> 현재 상태: 프로토콜 v0.1 검증, model-free WorkGraph·로컬 저장소 후보, effect 실행·복구 조정기, 결정론적 Capability Registry와 I/O 없는 Permission Broker 기본형을 실행할 수 있습니다. Router, 모델 루프, 실제 filesystem/process resolver·adapter, 승인 UI와 CLI 연결은 아직 구현하지 않았습니다.
+> 현재 상태: 프로토콜 v0.1 검증, model-free WorkGraph·로컬 저장소 후보, effect 실행·복구 조정기, 결정론적 Capability Registry·Router와 I/O 없는 Permission Broker 기본형을 실행할 수 있습니다. 모델 루프, 실제 filesystem/process resolver·adapter, 승인 UI와 CLI 연결은 아직 구현하지 않았습니다.
 
 ## 제품 원칙
 
@@ -39,7 +39,7 @@ cargo test --workspace --locked
 cargo run --locked --quiet -p xgeny-cli -- protocol check
 ```
 
-상세한 로컬·CI 검증 범위는 [Rust 워크스페이스 개발 환경](docs/development/rust-workspace.md)을 참고합니다. 기능 개발 순서, 테스트 계층과 완료 기준은 [XGENy 개발 방법론과 테스트 전략](docs/development/engineering-method.md)을 따릅니다.
+상세한 로컬·CI 검증 범위는 [Rust 워크스페이스 개발 환경](docs/development/rust-workspace.md)을 참고합니다. Router의 fail-closed filter, ranking과 권한 경계는 [결정론적 Capability Router 기본형](docs/development/deterministic-router.md), 기능 개발 순서와 테스트 계층·완료 기준은 [XGENy 개발 방법론과 테스트 전략](docs/development/engineering-method.md)을 따릅니다.
 
 ## Research
 

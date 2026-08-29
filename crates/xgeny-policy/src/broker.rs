@@ -224,6 +224,28 @@ pub enum BrokerOutcome {
     },
 }
 
+/// Broker-produced request/outcome pair that prevents wiring a detached outcome by mistake.
+///
+/// Fields are private and this value can only be created by `PermissionBroker::evaluate_bound`.
+/// It is still provisional policy evidence, not Executor authority or a reusable grant.
+#[must_use = "a bound policy evaluation must be handled and never treated as execution authority"]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundPolicyEvaluation {
+    request: ResolvedPermissionRequest,
+    outcome: BrokerOutcome,
+}
+
+impl BoundPolicyEvaluation {
+    #[must_use]
+    pub const fn request(&self) -> &ResolvedPermissionRequest {
+        &self.request
+    }
+
+    pub const fn outcome(&self) -> &BrokerOutcome {
+        &self.outcome
+    }
+}
+
 /// I/O-free permission policy composer.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PermissionBroker;
@@ -232,6 +254,28 @@ impl PermissionBroker {
     #[must_use]
     pub const fn new() -> Self {
         Self
+    }
+
+    /// Evaluate policy and retain the exact resolved request beside its outcome.
+    ///
+    /// Router and later integration boundaries should consume this opaque pair instead of a bare
+    /// `BrokerOutcome`, so the Router can compare the evaluated Capability and static effect
+    /// contract before placement. This is not full Run, action, or resource binding.
+    /// The result remains provisional and must not be accepted by an Executor.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same malformed-evidence errors as `evaluate`.
+    pub fn evaluate_bound(
+        &self,
+        request: &ResolvedPermissionRequest,
+        inputs: &PolicyInputs,
+    ) -> Result<BoundPolicyEvaluation, BrokerError> {
+        let outcome = self.evaluate(request, inputs)?;
+        Ok(BoundPolicyEvaluation {
+            request: request.clone(),
+            outcome,
+        })
     }
 
     /// Compose mandatory policy layers with deterministic deny-over-ask precedence.

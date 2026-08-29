@@ -1,6 +1,6 @@
 [package]
 name = "xgeny-runtime"
-description = "Capability registry and durable effect execution/recovery kernel for XGENy"
+description = "Deterministic Capability placement and durable effect execution/recovery kernel for XGENy"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,7 @@ repository.workspace = true
 thiserror.workspace = true
 xgeny-domain = { path = "../xgeny-domain" }
 xgeny-local-store = { path = "../xgeny-local-store" }
+xgeny-policy = { path = "../xgeny-policy" }
 xgeny-workgraph = { path = "../xgeny-workgraph" }
 
 [dev-dependencies]

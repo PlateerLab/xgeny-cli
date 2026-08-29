@@ -13,11 +13,11 @@ crates/
   xgeny-workgraph/    model-free RunEvent 상태 전이·재생 실험
   xgeny-local-store/  메모리 참조 구현과 embedded SQLite 후보
   xgeny-policy/       concrete resource 해석 경계와 순수 정책 교집합
-  xgeny-runtime/      durable effect 실행·복구와 Capability Registry 기본형
+  xgeny-runtime/      durable effect 실행·복구와 Capability Registry·Router 기본형
   xgeny-cli/          xgeny 실행 파일과 protocol check 명령
 ```
 
-`xgeny-workgraph`, `xgeny-local-store`, `xgeny-runtime`의 durable effect 부분은 ADR-0008 연구 gate를 위한 내부 실험이며 공개 프로토콜 v0.1을 변경하지 않는다. Registry 기본형도 기존 `CapabilityDefinition`과 `CapabilityInstance`를 그대로 사용한다. `xgeny-policy` 기본형은 기존 `PermissionRequest` 타입을 입력 경계로 사용하지만 Executor가 소비할 authority, reusable `Grant`나 `PolicyDecision` wire 문서를 발행하지 않는다. 이 단계는 모델 호출, Router, 실제 파일·process adapter, 승인 UI, MCP, Connector, XGEN 원격 연동 또는 사용자용 resume 명령을 구현하지 않는다.
+`xgeny-workgraph`, `xgeny-local-store`, `xgeny-runtime`의 durable effect 부분은 ADR-0008 연구 gate를 위한 내부 실험이며 공개 프로토콜 v0.1을 변경하지 않는다. Registry와 Router 기본형도 기존 `CapabilityDefinition`·`CapabilityInstance`를 그대로 사용하며 wire 문서를 추가하지 않는다. `xgeny-policy` 기본형은 기존 `PermissionRequest` 타입을 입력 경계로 사용하지만 Executor가 소비할 authority, reusable `Grant`나 `PolicyDecision` wire 문서를 발행하지 않는다. 이 단계는 모델 호출, 실제 파일·process adapter, 승인 UI, MCP, Connector, XGEN 원격 연동, `InvocationPlan` 투영 또는 사용자용 resume 명령을 구현하지 않는다.
 
 ## 준비물
 
@@ -56,6 +56,20 @@ crates/
 - platform, health, auth 상태를 실행 가능성으로 해석하지 않고 Router 입력으로 보존
 
 자세한 책임 경계와 제외 범위는 [Capability Registry 기본형](capability-registry.md)을 따른다.
+
+## 현재 Capability Router 검증 범위
+
+- Capability ID와 contract version exact lookup, 호환 version 추측 금지
+- concrete target platform과 Instance의 OS·architecture wildcard 비교
+- unavailable·unknown health, auth required·expired의 fail-closed 제거
+- 명시적 trust·data-boundary 허용 집합과 required feature filter, handler witness가 없는 required extension의 전면 fail-closed
+- invalid cost·reliability hint 제거와 signed zero 정규화
+- available/degraded, reliability, 명시적 trust·boundary 선호, latency, cost, 사용자 선호, Instance ID 순의 lexicographic ranking
+- pin의 hard filter·policy·critical action gate 우회 차단
+- Permission Broker의 allow·ask·deny와 누락을 구분한 `Selected`·`InteractionRequired`·`Blocked`
+- 후보 등록 순서와 무관한 결과·후보·reason 순서
+
+`Selected`는 실행 위치 결정일 뿐 실행 권한이 아니다. Router는 provisional policy allow를 `Grant`, `PolicyDecision` 또는 `InvocationPlan`으로 바꾸지 않으며 실제 effect를 호출하지 않는다. 자세한 계약과 후속 범위는 [결정론적 Capability Router 기본형](deterministic-router.md)을 따른다.
 
 ## 현재 Permission Broker 검증 범위
 
@@ -97,6 +111,6 @@ cargo build --locked --release -p xgeny-cli
 
 ## CI와 OS 경계
 
-GitHub Actions는 Linux에서 format과 clippy를 검사하고 Linux, macOS, Windows 각각에서 workspace test, `protocol check`, release build를 수행한다. 따라서 현재 보장하는 것은 세 OS의 **I/O 없는 Registry·Permission Broker·상태 기계와 내장 프로토콜 검증, CLI 빌드**다.
+GitHub Actions는 Linux에서 format과 clippy를 검사하고 Linux, macOS, Windows 각각에서 workspace test, `protocol check`, release build를 수행한다. 따라서 현재 보장하는 것은 세 OS의 **I/O 없는 Registry·Router·Permission Broker·상태 기계와 내장 프로토콜 검증, CLI 빌드**다.
 
 실제 OS 권한 broker, 파일시스템 sandbox, shell/process 실행, 설치 패키지 서명과 배포 E2E는 각각의 기능이 추가될 때 별도 테스트 계층으로 확장한다. CI 통과를 아직 구현하지 않은 통합 기능의 검증으로 해석하지 않는다.

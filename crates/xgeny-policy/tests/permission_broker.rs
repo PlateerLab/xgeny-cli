@@ -106,6 +106,19 @@ fn schema_flag_never_bypasses_the_trusted_resolver() {
 }
 
 #[test]
+fn bound_evaluation_retains_the_exact_resolved_request_and_outcome() {
+    let request = resolve(&request());
+    let inputs = PolicyInputs::local(host_allow(&request), user_allow(&request));
+
+    let evaluation = PermissionBroker::new()
+        .evaluate_bound(&request, &inputs)
+        .expect("policy inputs should be valid");
+
+    assert_eq!(evaluation.request(), &request);
+    assert!(matches!(evaluation.outcome(), BrokerOutcome::Allow { .. }));
+}
+
+#[test]
 fn unnormalized_wire_resource_fails_before_policy_evaluation() {
     let resolver = CanonicalResolver::default();
     let mut request = request();
