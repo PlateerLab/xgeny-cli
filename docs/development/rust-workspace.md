@@ -4,7 +4,7 @@
 
 ## 범위
 
-현재 워크스페이스는 다음 여섯 crate로 구성된다.
+현재 워크스페이스는 다음 일곱 crate로 구성된다.
 
 ```text
 crates/
@@ -12,11 +12,12 @@ crates/
   xgeny-protocol/     bundled/offline schema·fixture·digest 검증
   xgeny-workgraph/    model-free RunEvent 상태 전이·재생 실험
   xgeny-local-store/  메모리 참조 구현과 embedded SQLite 후보
+  xgeny-policy/       concrete resource 해석 경계와 순수 정책 교집합
   xgeny-runtime/      durable effect 실행·복구와 Capability Registry 기본형
   xgeny-cli/          xgeny 실행 파일과 protocol check 명령
 ```
 
-`xgeny-workgraph`, `xgeny-local-store`, `xgeny-runtime`의 durable effect 부분은 ADR-0008 연구 gate를 위한 내부 실험이며 공개 프로토콜 v0.1을 변경하지 않는다. Registry 기본형도 기존 `CapabilityDefinition`과 `CapabilityInstance`를 그대로 사용한다. 이 단계는 모델 호출, Router, 실제 파일·process adapter, Permission Broker, MCP, Connector, XGEN 원격 연동 또는 사용자용 resume 명령을 구현하지 않는다.
+`xgeny-workgraph`, `xgeny-local-store`, `xgeny-runtime`의 durable effect 부분은 ADR-0008 연구 gate를 위한 내부 실험이며 공개 프로토콜 v0.1을 변경하지 않는다. Registry 기본형도 기존 `CapabilityDefinition`과 `CapabilityInstance`를 그대로 사용한다. `xgeny-policy` 기본형은 기존 `PermissionRequest` 타입을 입력 경계로 사용하지만 Executor가 소비할 authority, reusable `Grant`나 `PolicyDecision` wire 문서를 발행하지 않는다. 이 단계는 모델 호출, Router, 실제 파일·process adapter, 승인 UI, MCP, Connector, XGEN 원격 연동 또는 사용자용 resume 명령을 구현하지 않는다.
 
 ## 준비물
 
@@ -56,6 +57,19 @@ crates/
 
 자세한 책임 경계와 제외 범위는 [Capability Registry 기본형](capability-registry.md)을 따른다.
 
+## 현재 Permission Broker 검증 범위
+
+- schema 검증 뒤에도 모든 resource를 trusted resolver에 통과시키는 불변 경계
+- scope별 exact canonical resource identity와 alias 중복 차단
+- 필수 host·user profile 및 managed mode의 필수 PolicyLease 계층
+- 전체 요청에 대한 정책 교집합과 `deny > ask > allow` 우선순위
+- source 순서, resource 순서와 무관한 결정적 결과
+- 모델이 만든 reason·metadata를 권한 근거에서 제외
+- critical action의 자동 허용 차단과 별도 승인 요구
+- lifetime을 크기 순서로 추측하지 않고 각 계층의 명시적 허용 집합으로 확인
+
+현재 CI의 resolver는 I/O 없는 fake다. 실제 path·symlink·process executable·network endpoint canonicalization, Run grant 발급·원자적 소비, PolicyLease 만료, 승인 UI와 wire `PolicyDecision` 투영은 구현하지 않았다. 자세한 경계는 [Permission Broker 기본형](permission-broker.md)을 따른다.
+
 ## 검증
 
 저장소 루트에서 실행한다.
@@ -83,6 +97,6 @@ cargo build --locked --release -p xgeny-cli
 
 ## CI와 OS 경계
 
-GitHub Actions는 Linux에서 format과 clippy를 검사하고 Linux, macOS, Windows 각각에서 workspace test, `protocol check`, release build를 수행한다. 따라서 현재 보장하는 것은 세 OS의 **I/O 없는 Registry·상태 기계와 내장 프로토콜 검증, CLI 빌드**다.
+GitHub Actions는 Linux에서 format과 clippy를 검사하고 Linux, macOS, Windows 각각에서 workspace test, `protocol check`, release build를 수행한다. 따라서 현재 보장하는 것은 세 OS의 **I/O 없는 Registry·Permission Broker·상태 기계와 내장 프로토콜 검증, CLI 빌드**다.
 
 실제 OS 권한 broker, 파일시스템 sandbox, shell/process 실행, 설치 패키지 서명과 배포 E2E는 각각의 기능이 추가될 때 별도 테스트 계층으로 확장한다. CI 통과를 아직 구현하지 않은 통합 기능의 검증으로 해석하지 않는다.

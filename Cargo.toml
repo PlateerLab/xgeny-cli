@@ -3,6 +3,7 @@ members = [
     "crates/xgeny-cli",
     "crates/xgeny-domain",
     "crates/xgeny-local-store",
+    "crates/xgeny-policy",
     "crates/xgeny-protocol",
     "crates/xgeny-runtime",
     "crates/xgeny-workgraph",
