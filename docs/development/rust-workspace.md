@@ -17,7 +17,7 @@ crates/
   xgeny-cli/          xgeny 실행 파일과 protocol check 명령
 ```
 
-`xgeny-workgraph`, `xgeny-local-store`, `xgeny-runtime`의 durable effect 부분은 ADR-0008 연구 gate를 위한 내부 실험이며 공개 프로토콜 v0.1을 변경하지 않는다. Registry와 Router 기본형도 기존 `CapabilityDefinition`·`CapabilityInstance`를 그대로 사용하며 wire 문서를 추가하지 않는다. `xgeny-policy` 기본형은 기존 `PermissionRequest` 타입을 입력 경계로 사용하지만 Executor가 소비할 authority, reusable `Grant`나 `PolicyDecision` wire 문서를 발행하지 않는다. 이 단계는 모델 호출, 실제 파일·process adapter, 승인 UI, MCP, Connector, XGEN 원격 연동, `InvocationPlan` 투영 또는 사용자용 resume 명령을 구현하지 않는다.
+`xgeny-workgraph`, `xgeny-local-store`, `xgeny-runtime`의 durable effect 부분은 ADR-0008 연구 gate를 위한 내부 실험이며 공개 프로토콜 v0.1을 변경하지 않는다. Registry와 Router 기본형도 기존 `CapabilityDefinition`·`CapabilityInstance`를 그대로 사용하며 wire 문서를 추가하지 않는다. `xgeny-policy`의 Allow는 provisional 결과로 유지되고, runtime의 Admission 기본형만 exact invocation에서 만든 local one-shot allow를 current Run/Step/action/Instance와 결합해 durable intent로 발행한다. reusable `Grant`나 `PolicyDecision` wire 문서는 발행하지 않는다. 이 단계는 모델 호출, 실제 파일·process adapter, 승인 UI, MCP, Connector, XGEN 원격 연동, `InvocationPlan` 투영 또는 사용자용 resume 명령을 구현하지 않는다.
 
 ## 준비물
 
@@ -31,17 +31,18 @@ crates/
 
 - RunEvent의 RFC 8785/SHA-256 hash chain과 I/O 없는 결정론적 replay
 - authority epoch와 journal head compare-and-swap을 통한 stale writer 거부
-- event, effect intent index, authorization consumption, projection의 단일 transaction
+- event, effect intent index, authorization consumption, projection의 단일 transaction과 각 사이 fault injection
 - transaction 중간 오류와 자식 process 즉시 종료 후 전량 rollback·재개
 - lost acknowledgement 뒤 `effect_unknown` 복원과 비멱등 effect의 blind retry 거부
 - Run별 OS file lease를 effect 호출 전체 구간에 유지해 동시 recovery worker 차단
-- 실행 직전 ephemeral prepared effect와 durable action digest 일치 검증
+- 실행 직전 ephemeral prepared effect와 durable action·Capability·Definition·Instance binding 일치 검증
 - 시작 event commit 이전에는 sink를 호출하지 않고, outcome commit 유실 시 재실행 없이 unknown 복구
 - query-capable sink만 read-only reconciliation하고 나머지는 manual 전환
 - process 종료 전 실제 counter effect가 발생한 시나리오의 단일 실행·lease 해제·unknown 복원
 - durable 실행 attempt 상한과 승인 예산 비중복 소비
 - 메모리 참조 저장소와 SQLite 후보의 동일한 canonical JSONL export
 - 임의 길이 journal 재생과 event 변조 탐지 property test
+- schema version 1의 불완전한 experimental authorization record를 자동 추측하지 않는 fail-closed 거부
 
 세부 실행 순서와 재시작 판정은 [Durable effect 실행·복구 수직 슬라이스](durable-effect-runtime.md)를 따른다. 이는 현재 개발 호스트의 process-crash 검증 결과다. power-loss, filesystem 손상, 실제 권한 경계가 있는 tool adapter, 설치 패키지, Linux/macOS/Windows 반복 fault matrix는 아직 통과했다고 주장하지 않는다. SQLite 채택 여부도 ADR-0008의 hardened JSONL 비교와 나머지 gate가 끝난 뒤 확정한다.
 
@@ -82,7 +83,21 @@ crates/
 - critical action의 자동 허용 차단과 별도 승인 요구
 - lifetime을 크기 순서로 추측하지 않고 각 계층의 명시적 허용 집합으로 확인
 
-현재 CI의 resolver는 I/O 없는 fake다. 실제 path·symlink·process executable·network endpoint canonicalization, Run grant 발급·원자적 소비, PolicyLease 만료, 승인 UI와 wire `PolicyDecision` 투영은 구현하지 않았다. 자세한 경계는 [Permission Broker 기본형](permission-broker.md)을 따른다.
+현재 CI의 resolver는 I/O 없는 fake다. 실제 path·symlink·process executable·network endpoint canonicalization, reusable/critical Run grant, PolicyLease 만료·취소, 승인 UI와 wire `PolicyDecision` 투영은 구현하지 않았다. 자세한 경계는 [Permission Broker 기본형](permission-broker.md)을 따른다.
+
+## 현재 Invocation Admission 검증 범위
+
+- exact argument와 Definition selector에서 permission request와 canonical 실행 argument를 함께 유도
+- raw 및 canonical argument의 JSON Schema offline 재검증과 canonical argument 1 MiB 상한
+- exact resolved request에 결합된 policy stack으로 invocation 간 pre-evaluated Allow 재사용 차단
+- 준비 뒤 Run head·authority·Definition 변경 차단과 Router 내부 재실행
+- local host+user, once, noncritical, sync, idempotency-key 조건의 명시적 허용
+- semantic action과 executable Instance binding을 분리한 domain-separated digest
+- Run·Step·authority·head·action·policy·Instance에 결합된 max-use 1 authorization
+- EffectIntent와 authorization consumption의 원자적 commit 및 lost-ack 수렴
+- raw argument의 journal·Debug 비노출과 SQLite 재시작 검증
+
+actual OS resolver, sandbox, secret/argument 복구, managed/critical/reusable grant와 external harness 연동은 아직 포함하지 않는다. 자세한 계약과 제한은 [Run-bound Invocation Admission 기본형](invocation-admission.md)을 따른다.
 
 ## 검증
 

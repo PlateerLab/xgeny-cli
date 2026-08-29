@@ -24,7 +24,7 @@ host boundary ∩ user profile [∩ managed lease]
        deny > ask > allow
 ```
 
-`xgeny-policy`는 `xgeny-domain`과 `thiserror`에만 의존하는 I/O 없는 crate다. XGEN, Connector, DB, MinIO, local store, WorkGraph, OS API와 filesystem/process 구현에 의존하지 않는다.
+`xgeny-policy`는 `xgeny-domain`, `serde_json`, `thiserror`에만 의존하는 I/O 없는 crate다. XGEN, Connector, DB, MinIO, local store, WorkGraph, OS API와 filesystem/process 구현에 의존하지 않는다.
 
 ## Resource 권위 경계
 
@@ -38,7 +38,7 @@ resolver 결과는 `(scope, canonical_resource)` exact identity로만 비교한�
 
 ## 정책 합성
 
-`PolicyInputs::local`은 정확히 하나의 host와 user profile 계층을 요구한다. `PolicyInputs::managed`는 여기에 managed lease 계층을 반드시 추가한다. 자유로운 contribution 목록을 받지 않으므로 host ceiling이나 managed mode의 lease를 실수로 누락할 수 없다.
+`PolicyInputs::local`은 정확히 하나의 host와 user profile 계층을 요구한다. `PolicyInputs::managed`는 여기에 managed lease 계층을 반드시 추가한다. 두 constructor는 평가 대상 `ResolvedPermissionRequest`를 private field로 함께 보존하고 Broker가 exact equality를 확인하므로, 한 invocation에서 사전 평가한 policy stack을 다른 request에 실수로 재사용할 수 없다. 자유로운 contribution 목록을 받지 않으므로 host ceiling이나 managed mode의 lease를 실수로 누락할 수도 없다.
 
 각 allow 계층은 현재 resolved request에 대해 허용하는 exact scope, concrete resource, critical action과 lifetime 집합을 `from_trusted_evaluation`으로 제공한다. 이 API는 모델·wire 입력용이 아니며 host가 선택한 policy evaluator만 호출해야 한다. policy source digest는 감사 evidence이지 서명이나 단독 권한 근거가 아니다. local/managed mode도 request나 모델이 아니라 trusted host config가 선택한다. 모든 요청 atom이 모든 allow 계층에 포함돼야 한다. 일부만 포함되면 요청을 축소 실행하지 않고 전체를 deny한다. source가 사용자 승격 가능성을 허용하려면 부분 allow가 아니라 명시적으로 ask를 반환해야 한다.
 
@@ -54,7 +54,7 @@ resolver 결과는 `(scope, canonical_resource)` exact identity로만 비교한�
 
 lifetime은 `once < run < session < project < persistent` 같은 크기 비교를 하지 않는다. 각 계층이 현재 요청 lifetime을 명시적으로 포함해야 한다. 특히 run과 session의 의미 범위가 항상 포함 관계라고 가정하지 않는다.
 
-ADR-0005의 완성형 교집합에는 current Run grant가 포함된다. 현재 crate는 Run/action binding과 소비 예산 계약이 없는 상태에서 이를 흉내 내지 않기 위해 Run grant 입력을 받지 않는다. 따라서 Allow는 host·profile·선택적 managed ceiling을 통과했다는 provisional 결과일 뿐이며, ADR-0005 전체 구현이나 Executor 권한으로 해석하면 안 된다.
+ADR-0005의 완성형 교집합에는 current Run grant가 포함된다. `xgeny-policy` 자체는 Run/action binding과 소비 예산을 발행하지 않으며 Allow는 여전히 provisional 결과다. 후단의 제한된 [Run-bound Invocation Admission 기본형](invocation-admission.md)이 exact invocation에서 request를 만들고 local one-shot allow만 current Run/Step/action/Instance와 결합해 `EffectIntent`와 원자적으로 소비한다. managed lease, critical approval와 reusable Run grant는 아직 지원하지 않는다.
 
 ## Critical action
 
@@ -81,14 +81,14 @@ ADR-0005의 완성형 교집합에는 current Run grant가 포함된다. 현재 
 - request reason·metadata의 approval 사칭 무시
 - critical action 자동 허용 차단
 - resource 입력 순서와 evidence 순서 결정성
+- 다른 resolved request에 대한 pre-evaluated policy stack 재사용 차단
 
 아직 보장하지 않는 범위는 다음과 같다.
 
 - 실제 filesystem/process/network resolver와 OS sandbox
-- Capability Definition에서 effect·scope·critical action을 host-derived request로 만드는 builder
 - profile 설정 parser와 permission prompt UI
-- Run grant 저장·재사용·소비와 PolicyLease expiry/clock-skew 판정
+- reusable Run grant와 PolicyLease expiry·revocation·clock-skew 판정
 - `PolicyDecisionBody`의 ID·timestamp·interaction projection
-- Run/action에 결합된 Router→Executor 권한 전달, CLI, MCP, Connector, XGEN 연결
+- critical approval를 Run/action에 결합하는 전달, CLI, MCP, Connector, XGEN 연결
 
-Router 기본형은 이 Broker의 bound request-wide outcome을 policy gate로 소비하지만 provisional allow를 실행 권한으로 승격하지 않는다. Permission Broker는 sandbox가 아니며 adapter는 결정된 exact resource를 실제 open/execute 시점에도 다시 강제해야 한다.
+Router 기본형은 이 Broker의 bound request-wide outcome을 policy gate로 소비하지만 그 자체로 provisional allow를 실행 권한으로 승격하지 않는다. Admission 기본형만 지원 범위 안에서 별도 durable 권한을 발행한다. Permission Broker는 sandbox가 아니며 adapter는 결정된 exact resource를 실제 open/execute 시점에도 다시 강제해야 한다.

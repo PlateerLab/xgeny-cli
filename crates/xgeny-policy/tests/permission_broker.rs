@@ -108,7 +108,7 @@ fn schema_flag_never_bypasses_the_trusted_resolver() {
 #[test]
 fn bound_evaluation_retains_the_exact_resolved_request_and_outcome() {
     let request = resolve(&request());
-    let inputs = PolicyInputs::local(host_allow(&request), user_allow(&request));
+    let inputs = PolicyInputs::local(&request, host_allow(&request), user_allow(&request));
 
     let evaluation = PermissionBroker::new()
         .evaluate_bound(&request, &inputs)
@@ -116,6 +116,20 @@ fn bound_evaluation_retains_the_exact_resolved_request_and_outcome() {
 
     assert_eq!(evaluation.request(), &request);
     assert!(matches!(evaluation.outcome(), BrokerOutcome::Allow { .. }));
+}
+
+#[test]
+fn pre_evaluated_policy_inputs_cannot_be_reused_for_another_request() {
+    let first = resolve(&request());
+    let inputs = PolicyInputs::local(&first, host_allow(&first), user_allow(&first));
+    let mut second_wire = request();
+    second_wire.request_id = "permission-request-other-invocation".to_owned();
+    let second = resolve(&second_wire);
+
+    assert!(matches!(
+        PermissionBroker::new().evaluate(&second, &inputs),
+        Err(BrokerError::PolicyRequestMismatch)
+    ));
 }
 
 #[test]
@@ -265,7 +279,10 @@ fn exact_local_intersection_allows_and_never_broadens_the_request() {
     );
 
     let outcome = PermissionBroker::new()
-        .evaluate(&request, &PolicyInputs::local(host, user_allow(&request)))
+        .evaluate(
+            &request,
+            &PolicyInputs::local(&request, host, user_allow(&request)),
+        )
         .expect("policy inputs should be valid");
 
     let BrokerOutcome::Allow {
@@ -298,7 +315,10 @@ fn any_explicit_deny_beats_ask_and_allow_in_local_or_managed_mode() {
         "host_confirmation",
     );
     let outcome = PermissionBroker::new()
-        .evaluate(&request, &PolicyInputs::local(host_ask, user_deny))
+        .evaluate(
+            &request,
+            &PolicyInputs::local(&request, host_ask, user_deny),
+        )
         .expect("policy inputs should be valid");
     assert!(matches!(
         outcome,
@@ -313,7 +333,12 @@ fn any_explicit_deny_beats_ask_and_allow_in_local_or_managed_mode() {
     let outcome = PermissionBroker::new()
         .evaluate(
             &request,
-            &PolicyInputs::managed(host_allow(&request), user_allow(&request), managed_deny),
+            &PolicyInputs::managed(
+                &request,
+                host_allow(&request),
+                user_allow(&request),
+                managed_deny,
+            ),
         )
         .expect("managed policy inputs should be valid");
     assert!(matches!(outcome, BrokerOutcome::Deny { .. }));
@@ -330,7 +355,7 @@ fn ask_is_returned_only_when_no_layer_denies() {
     let outcome = PermissionBroker::new()
         .evaluate(
             &request,
-            &PolicyInputs::local(host_allow(&request), user_ask),
+            &PolicyInputs::local(&request, host_allow(&request), user_ask),
         )
         .expect("policy inputs should be valid");
 
@@ -362,7 +387,7 @@ fn partial_or_prefix_only_resource_coverage_denies_the_whole_request() {
     let outcome = PermissionBroker::new()
         .evaluate(
             &resolved_request,
-            &PolicyInputs::local(host, user_allow(&resolved_request)),
+            &PolicyInputs::local(&resolved_request, host, user_allow(&resolved_request)),
         )
         .expect("policy inputs should be valid");
 
@@ -388,7 +413,7 @@ fn partial_or_prefix_only_resource_coverage_denies_the_whole_request() {
     let outcome = PermissionBroker::new()
         .evaluate(
             &resolved_request,
-            &PolicyInputs::local(host, user_allow(&resolved_request)),
+            &PolicyInputs::local(&resolved_request, host, user_allow(&resolved_request)),
         )
         .expect("policy inputs should be valid");
     assert!(matches!(outcome, BrokerOutcome::Deny { .. }));
@@ -413,7 +438,7 @@ fn implicit_coverage_deny_beats_another_layers_ask() {
     );
 
     let outcome = PermissionBroker::new()
-        .evaluate(&request, &PolicyInputs::local(host, user))
+        .evaluate(&request, &PolicyInputs::local(&request, host, user))
         .expect("policy inputs should be valid");
 
     assert!(matches!(outcome, BrokerOutcome::Deny { .. }));
@@ -430,7 +455,10 @@ fn missing_requested_lifetime_is_a_fail_closed_denial_not_an_ordering_guess() {
     );
 
     let outcome = PermissionBroker::new()
-        .evaluate(&request, &PolicyInputs::local(host, user_allow(&request)))
+        .evaluate(
+            &request,
+            &PolicyInputs::local(&request, host, user_allow(&request)),
+        )
         .expect("policy inputs should be valid");
 
     assert!(matches!(
@@ -455,7 +483,8 @@ fn critical_action_is_never_auto_allowed_and_explicit_deny_still_wins() {
         raw.critical_actions = vec![action];
         raw.requested_lifetime = GrantLifetime::Run;
         let request = resolve(&raw);
-        let full_local_equivalent = PolicyInputs::local(host_allow(&request), user_allow(&request));
+        let full_local_equivalent =
+            PolicyInputs::local(&request, host_allow(&request), user_allow(&request));
         let outcome = PermissionBroker::new()
             .evaluate(&request, &full_local_equivalent)
             .expect("policy inputs should be valid");
@@ -476,7 +505,10 @@ fn critical_action_is_never_auto_allowed_and_explicit_deny_still_wins() {
         "production_deploy_forbidden",
     );
     let outcome = PermissionBroker::new()
-        .evaluate(&request, &PolicyInputs::local(deny, user_allow(&request)))
+        .evaluate(
+            &request,
+            &PolicyInputs::local(&request, deny, user_allow(&request)),
+        )
         .expect("policy inputs should be valid");
     assert!(matches!(outcome, BrokerOutcome::Deny { .. }));
 }
@@ -496,7 +528,10 @@ fn request_reason_or_metadata_never_changes_an_ask_into_allow() {
     );
 
     let outcome = PermissionBroker::new()
-        .evaluate(&request, &PolicyInputs::local(host_allow(&request), ask))
+        .evaluate(
+            &request,
+            &PolicyInputs::local(&request, host_allow(&request), ask),
+        )
         .expect("policy inputs should be valid");
 
     assert!(matches!(outcome, BrokerOutcome::Ask { .. }));
@@ -506,6 +541,7 @@ fn request_reason_or_metadata_never_changes_an_ask_into_allow() {
 fn managed_mode_has_exact_mandatory_layers_and_deterministic_evidence_order() {
     let request = resolve(&request());
     let inputs = PolicyInputs::managed(
+        &request,
         host_allow(&request),
         user_allow(&request),
         managed_allow(&request),
@@ -536,7 +572,7 @@ fn wrong_or_malformed_policy_source_fails_closed() {
     );
     let result = PermissionBroker::new().evaluate(
         &request,
-        &PolicyInputs::local(wrong_kind, user_allow(&request)),
+        &PolicyInputs::local(&request, wrong_kind, user_allow(&request)),
     );
     assert!(matches!(
         result,
@@ -555,7 +591,7 @@ fn wrong_or_malformed_policy_source_fails_closed() {
     assert!(matches!(
         PermissionBroker::new().evaluate(
             &request,
-            &PolicyInputs::local(malformed, user_allow(&request)),
+            &PolicyInputs::local(&request, malformed, user_allow(&request)),
         ),
         Err(BrokerError::InvalidPolicySource { .. })
     ));
@@ -567,7 +603,7 @@ fn wrong_or_malformed_policy_source_fails_closed() {
     assert!(matches!(
         PermissionBroker::new().evaluate(
             &request,
-            &PolicyInputs::local(control_character, user_allow(&request)),
+            &PolicyInputs::local(&request, control_character, user_allow(&request)),
         ),
         Err(BrokerError::InvalidPolicySource { .. })
     ));
@@ -579,7 +615,7 @@ fn wrong_or_malformed_policy_source_fails_closed() {
     assert!(matches!(
         PermissionBroker::new().evaluate(
             &request,
-            &PolicyInputs::local(unsafe_reason, user_allow(&request)),
+            &PolicyInputs::local(&request, unsafe_reason, user_allow(&request)),
         ),
         Err(BrokerError::InvalidReasonCode { .. })
     ));
@@ -599,13 +635,13 @@ fn resource_and_input_order_do_not_change_the_provisional_authorization() {
     let first_outcome = PermissionBroker::new()
         .evaluate(
             &first,
-            &PolicyInputs::local(host_allow(&first), user_allow(&first)),
+            &PolicyInputs::local(&first, host_allow(&first), user_allow(&first)),
         )
         .expect("policy inputs should be valid");
     let second_outcome = PermissionBroker::new()
         .evaluate(
             &second,
-            &PolicyInputs::local(host_allow(&second), user_allow(&second)),
+            &PolicyInputs::local(&second, host_allow(&second), user_allow(&second)),
         )
         .expect("policy inputs should be valid");
 

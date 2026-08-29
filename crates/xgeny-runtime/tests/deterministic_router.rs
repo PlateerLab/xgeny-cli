@@ -179,7 +179,7 @@ fn policy_evaluation_for(
     };
 
     PermissionBroker::new()
-        .evaluate_bound(&resolved, &PolicyInputs::local(host, user))
+        .evaluate_bound(&resolved, &PolicyInputs::local(&resolved, host, user))
         .expect("policy inputs should be valid")
 }
 

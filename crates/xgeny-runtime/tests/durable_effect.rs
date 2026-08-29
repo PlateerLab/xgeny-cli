@@ -16,8 +16,8 @@ use xgeny_runtime::{
     RuntimeError, RuntimePolicy,
 };
 use xgeny_workgraph::{
-    AuthorizationUse, EffectClass, EffectIntent, RunEvent, RunEventBody, RunState, SinkGuarantee,
-    StepStatus,
+    AuthorizationBinding, AuthorizationUse, EffectClass, EffectIntent, InvocationBinding, RunEvent,
+    RunEventBody, RunState, SinkGuarantee, StepStatus, authorization_digest, once_authorization_id,
 };
 
 const RUN_ID: &str = "run-1";
@@ -138,17 +138,47 @@ struct ScriptedSink {
 #[derive(Debug)]
 struct TestPreparedEffect {
     action_digest: String,
+    capability_id: String,
+    contract_version: String,
+    definition_digest: String,
+    instance_id: String,
+    instance_binding_digest: String,
 }
 
 impl PreparedEffect for TestPreparedEffect {
     fn action_digest(&self) -> &str {
         &self.action_digest
     }
+
+    fn capability_id(&self) -> &str {
+        &self.capability_id
+    }
+
+    fn contract_version(&self) -> &str {
+        &self.contract_version
+    }
+
+    fn definition_digest(&self) -> &str {
+        &self.definition_digest
+    }
+
+    fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    fn instance_binding_digest(&self) -> &str {
+        &self.instance_binding_digest
+    }
 }
 
 fn prepared_effect() -> TestPreparedEffect {
     TestPreparedEffect {
         action_digest: "sha256:action-1".to_owned(),
+        capability_id: "test.effect".to_owned(),
+        contract_version: "1.0.0".to_owned(),
+        definition_digest: "sha256:definition-1".to_owned(),
+        instance_id: "test.instance".to_owned(),
+        instance_binding_digest: "sha256:instance-1".to_owned(),
     }
 }
 
@@ -211,17 +241,43 @@ fn append_body<S: RunStore>(
         .state
 }
 
-fn effect_intent(guarantee: SinkGuarantee) -> EffectIntent {
+fn effect_intent(state: &RunState, guarantee: SinkGuarantee) -> EffectIntent {
+    let invocation = InvocationBinding {
+        capability_id: "test.effect".to_owned(),
+        contract_version: "1.0.0".to_owned(),
+        definition_digest: "sha256:definition-1".to_owned(),
+        instance_id: "test.instance".to_owned(),
+        instance_binding_digest: "sha256:instance-1".to_owned(),
+    };
+    let binding = AuthorizationBinding {
+        run_id: state.run_id.clone(),
+        step_id: STEP_ID.to_owned(),
+        authority: state.authority.clone(),
+        authority_epoch: state.authority_epoch,
+        issued_at_sequence: state.journal_sequence,
+        issued_at_head_digest: state.journal_head_digest.clone(),
+        capability_id: invocation.capability_id.clone(),
+        contract_version: invocation.contract_version.clone(),
+        definition_digest: invocation.definition_digest.clone(),
+        instance_id: invocation.instance_id.clone(),
+        instance_binding_digest: invocation.instance_binding_digest.clone(),
+        action_digest: "sha256:action-1".to_owned(),
+        policy_evidence_digest: "sha256:policy-1".to_owned(),
+    };
     EffectIntent {
         effect_id: EFFECT_ID.to_owned(),
         action_digest: "sha256:action-1".to_owned(),
+        invocation,
         effect_class: EffectClass::NonIdempotent,
         idempotency_key: (guarantee != SinkGuarantee::None).then(|| "stable-key-1".to_owned()),
         sink_guarantee: guarantee,
         authorization: AuthorizationUse {
-            grant_id: "grant-1".to_owned(),
-            grant_digest: "sha256:grant-1".to_owned(),
+            grant_id: once_authorization_id(&binding.run_id, &binding.action_digest)
+                .expect("authorization ID should canonicalize"),
+            grant_digest: authorization_digest(&binding, 1)
+                .expect("authorization should canonicalize"),
             max_uses: 1,
+            binding,
         },
     }
 }
@@ -254,7 +310,7 @@ fn seed_intent<S: RunStore>(store: &mut S, guarantee: SinkGuarantee) -> RunState
         "seed-event-3",
         RunEventBody::EffectIntentCommitted {
             step_id: STEP_ID.to_owned(),
-            intent: effect_intent(guarantee),
+            intent: Box::new(effect_intent(&planned, guarantee)),
         },
     )
 }
@@ -689,7 +745,17 @@ fn proved_not_applied_reuses_intent_without_reconsuming_authorization() {
         .expect("same intent should execute after proof");
 
     assert_eq!(executed.action, DriveAction::EffectSucceeded);
-    assert_eq!(executed.state.authorization_consumption["grant-1"].uses, 1);
+    assert_eq!(executed.state.authorization_consumption.len(), 1);
+    assert_eq!(
+        executed
+            .state
+            .authorization_consumption
+            .values()
+            .next()
+            .expect("one authorization should exist")
+            .uses,
+        1
+    );
     assert_eq!(sink.execute_calls, 1);
     assert_eq!(sink.reconcile_calls, 1);
 }
@@ -808,9 +874,8 @@ fn mismatched_prepared_effect_digest_never_starts_execution() {
     let mut sink = ScriptedSink::new(Rc::clone(&trace));
     let mut events = DeterministicEvents::default();
     let (_directory, lease) = lease();
-    let mismatched = TestPreparedEffect {
-        action_digest: "sha256:different-action".to_owned(),
-    };
+    let mut mismatched = prepared_effect();
+    mismatched.action_digest = "sha256:different-action".to_owned();
 
     let result = DurableEffectRuntime::new(&mut store, &mut sink, &mut events, &lease)
         .drive_step(STEP_ID, Some(&mismatched));
@@ -818,6 +883,58 @@ fn mismatched_prepared_effect_digest_never_starts_execution() {
     assert!(matches!(
         result,
         Err(RuntimeError::PreparedEffectDigestMismatch { .. })
+    ));
+    assert_eq!(sink.execute_calls, 0);
+    assert!(trace.borrow().is_empty());
+}
+
+#[test]
+fn mismatched_prepared_instance_binding_never_starts_execution() {
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let mut store = RecordingStore::new(Rc::clone(&trace));
+    seed_intent(&mut store, SinkGuarantee::None);
+    trace.borrow_mut().clear();
+    let mut sink = ScriptedSink::new(Rc::clone(&trace));
+    let mut events = DeterministicEvents::default();
+    let (_directory, lease) = lease();
+    let mut mismatched = prepared_effect();
+    mismatched.instance_binding_digest = "sha256:redirected-instance".to_owned();
+
+    let result = DurableEffectRuntime::new(&mut store, &mut sink, &mut events, &lease)
+        .drive_step(STEP_ID, Some(&mismatched));
+
+    assert!(matches!(
+        result,
+        Err(RuntimeError::PreparedEffectBindingMismatch {
+            field: "instance_binding_digest",
+            ..
+        })
+    ));
+    assert_eq!(sink.execute_calls, 0);
+    assert!(trace.borrow().is_empty());
+}
+
+#[test]
+fn mismatched_prepared_definition_never_starts_execution() {
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let mut store = RecordingStore::new(Rc::clone(&trace));
+    seed_intent(&mut store, SinkGuarantee::None);
+    trace.borrow_mut().clear();
+    let mut sink = ScriptedSink::new(Rc::clone(&trace));
+    let mut events = DeterministicEvents::default();
+    let (_directory, lease) = lease();
+    let mut mismatched = prepared_effect();
+    mismatched.definition_digest = "sha256:different-definition".to_owned();
+
+    let result = DurableEffectRuntime::new(&mut store, &mut sink, &mut events, &lease)
+        .drive_step(STEP_ID, Some(&mismatched));
+
+    assert!(matches!(
+        result,
+        Err(RuntimeError::PreparedEffectBindingMismatch {
+            field: "definition_digest",
+            ..
+        })
     ));
     assert_eq!(sink.execute_calls, 0);
     assert!(trace.borrow().is_empty());

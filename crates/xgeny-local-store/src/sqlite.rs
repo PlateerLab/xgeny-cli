@@ -8,7 +8,7 @@ use crate::{
     Commit, ExpectedHead, RunSnapshot, RunStore, StoreError, prepare_commit, verified_snapshot,
 };
 
-const STORE_SCHEMA_VERSION: i64 = 1;
+const STORE_SCHEMA_VERSION: i64 = 2;
 
 const CREATE_SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS run_events (
@@ -100,8 +100,10 @@ impl SqliteRunStore {
 
         insert_event(&transaction, &commit.record)?;
         checkpoint(CommitStage::Event)?;
-        insert_intent_indexes(&transaction, &commit.record)?;
-        checkpoint(CommitStage::IntentIndexes)?;
+        insert_effect_intent_index(&transaction, &commit.record)?;
+        checkpoint(CommitStage::EffectIntentIndex)?;
+        insert_authorization_consumption(&transaction, &commit.record)?;
+        checkpoint(CommitStage::AuthorizationConsumption)?;
         write_projection(&transaction, &commit.state)?;
         checkpoint(CommitStage::Projection)?;
         transaction.commit()?;
@@ -226,7 +228,7 @@ impl SqliteRunStore {
             if stored_sequence != sequence
                 || stored_step_id != *step_id
                 || stored_action_digest != intent.action_digest
-                || stored_intent != *intent
+                || stored_intent != **intent
                 || stored_grant_id != intent.authorization.grant_id
                 || stored_authorization_action_digest != intent.action_digest
                 || stored_grant_digest != intent.authorization.grant_digest
@@ -260,7 +262,8 @@ impl RunStore for SqliteRunStore {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommitStage {
     Event,
-    IntentIndexes,
+    EffectIntentIndex,
+    AuthorizationConsumption,
     Projection,
 }
 
@@ -269,7 +272,8 @@ impl CommitStage {
     const fn label(self) -> &'static str {
         match self {
             Self::Event => "event insert",
-            Self::IntentIndexes => "intent indexes",
+            Self::EffectIntentIndex => "effect intent index",
+            Self::AuthorizationConsumption => "authorization consumption",
             Self::Projection => "projection write",
         }
     }
@@ -291,7 +295,7 @@ fn insert_event(transaction: &Transaction<'_>, record: &EventRecord) -> Result<(
     Ok(())
 }
 
-fn insert_intent_indexes(
+fn insert_effect_intent_index(
     transaction: &Transaction<'_>,
     record: &EventRecord,
 ) -> Result<(), StoreError> {
@@ -299,12 +303,22 @@ fn insert_intent_indexes(
         return Ok(());
     };
     let sequence = i64::try_from(record.sequence).map_err(|_| StoreError::SequenceOutOfRange)?;
-    let max_uses = i64::from(intent.authorization.max_uses);
     let intent_json = serde_json::to_vec(intent)?;
     transaction.execute(
         "INSERT INTO effect_intents (effect_id, event_sequence, step_id, action_digest, intent_json) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![intent.effect_id, sequence, step_id, intent.action_digest, intent_json],
     )?;
+    Ok(())
+}
+
+fn insert_authorization_consumption(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> Result<(), StoreError> {
+    let RunEventBody::EffectIntentCommitted { intent, .. } = &record.event.body else {
+        return Ok(());
+    };
+    let max_uses = i64::from(intent.authorization.max_uses);
     transaction.execute(
         "INSERT INTO authorization_consumption (grant_id, effect_id, action_digest, grant_digest, max_uses) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
