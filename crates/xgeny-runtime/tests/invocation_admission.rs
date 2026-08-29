@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
 use xgeny_domain::{
     Architecture, CapabilityDefinitionBody, CapabilityInstanceBody, CapabilityRef, CriticalAction,
-    DataBoundary, EffectClass, ExecutionStyle, GrantLifetime, OperatingSystem, Platform,
+    DataBoundary, EffectClass, ExecutionStyle, GrantLifetime, OperatingSystem, Placement, Platform,
     PolicySource, PolicySourceKind, ProtocolDocument, TrustLevel,
 };
 use xgeny_local_store::{
@@ -148,6 +148,17 @@ impl EventFactory for DeterministicEvents {
         Ok(EventMetadata {
             event_id: format!("admission-event-{next}"),
             recorded_at: "2026-08-29T12:00:00Z".to_owned(),
+        })
+    }
+}
+
+struct InvalidTimestampEvents;
+
+impl EventFactory for InvalidTimestampEvents {
+    fn create_metadata(&mut self, state: &RunState) -> Result<EventMetadata, EventFactoryError> {
+        Ok(EventMetadata {
+            event_id: format!("invalid-policy-event-{}", state.journal_sequence + 1),
+            recorded_at: "RAW-POLICY-SENTINEL".to_owned(),
         })
     }
 }
@@ -508,6 +519,123 @@ fn exact_arguments_are_resolved_authorized_and_atomically_committed() {
     );
     assert!(!format!("{material:?}").contains(SECRET_SENTINEL));
     assert!(!format!("{material:?}").contains(CANONICAL_PATH));
+}
+
+#[test]
+fn invalid_event_timestamp_is_rejected_without_echo_or_intent_commit() {
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, [instance]);
+    let resolver = CanonicalResolver::default();
+    let mut store = MemoryRunStore::new();
+    seed(&mut store, RUN_ID, STEP_ID);
+    let (_directory, lease) = acquire_lease(RUN_ID);
+    let pending = prepare(
+        &store,
+        &lease,
+        &registry,
+        &resolver,
+        &definition,
+        arguments(RAW_ALIAS, SECRET_SENTINEL),
+    )
+    .expect("invocation should prepare");
+    let inputs = allow_inputs(pending.permission_request());
+
+    let error = InvocationAdmission::new()
+        .authorize_and_commit(
+            pending,
+            &inputs,
+            &registry,
+            &mut store,
+            &mut InvalidTimestampEvents,
+            &lease,
+        )
+        .expect_err("invalid event timestamp must fail closed");
+
+    assert!(matches!(error, AdmissionError::EventMetadata(_)));
+    let rendered = format!("{error}\n{error:?}");
+    assert!(!rendered.contains("RAW-POLICY-SENTINEL"));
+    let snapshot = store.load().expect("store should load").expect("Run");
+    assert_eq!(snapshot.state.steps[STEP_ID].status, StepStatus::Planned);
+}
+
+#[test]
+fn protocol_invalid_policy_decision_is_rejected_without_echo_or_intent_commit() {
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, [instance]);
+    let resolver = CanonicalResolver::default();
+    let mut store = MemoryRunStore::new();
+    seed(&mut store, RUN_ID, STEP_ID);
+    let (_directory, lease) = acquire_lease(RUN_ID);
+    let oversized_resource = format!("RAW-POLICY-SENTINEL-{}", "x".repeat(4096));
+    let pending = prepare(
+        &store,
+        &lease,
+        &registry,
+        &resolver,
+        &definition,
+        arguments(&oversized_resource, SECRET_SENTINEL),
+    )
+    .expect("trusted resolver may return a value beyond the protocol document limit");
+    let inputs = allow_inputs(pending.permission_request());
+
+    let error = InvocationAdmission::new()
+        .authorize_and_commit(
+            pending,
+            &inputs,
+            &registry,
+            &mut store,
+            &mut DeterministicEvents,
+            &lease,
+        )
+        .expect_err("protocol-invalid PolicyDecision must fail closed");
+
+    assert!(matches!(error, AdmissionError::PolicyDecisionInvalid));
+    let rendered = format!("{error}\n{error:?}");
+    assert!(!rendered.contains("RAW-POLICY-SENTINEL"));
+    let snapshot = store.load().expect("store should load").expect("Run");
+    assert_eq!(snapshot.state.steps[STEP_ID].status, StepStatus::Planned);
+}
+
+#[test]
+fn non_local_instance_is_rejected_before_receipt_provenance_is_issued() {
+    let definition = definition_fixture();
+    let mut instance = instance_fixture(&definition);
+    instance.placement = Placement::Remote;
+    let registry = registry_with(&definition, [instance]);
+    let resolver = CanonicalResolver::default();
+    let mut store = MemoryRunStore::new();
+    seed(&mut store, RUN_ID, STEP_ID);
+    let (_directory, lease) = acquire_lease(RUN_ID);
+    let pending = prepare(
+        &store,
+        &lease,
+        &registry,
+        &resolver,
+        &definition,
+        arguments(RAW_ALIAS, SECRET_SENTINEL),
+    )
+    .expect("remote candidate may be routed before execution provenance is issued");
+    let inputs = allow_inputs(pending.permission_request());
+
+    let result = InvocationAdmission::new().authorize_and_commit(
+        pending,
+        &inputs,
+        &registry,
+        &mut store,
+        &mut DeterministicEvents,
+        &lease,
+    );
+
+    assert!(matches!(
+        result,
+        Err(AdmissionError::UnsupportedExecutorPlacement {
+            placement: Placement::Remote
+        })
+    ));
+    let snapshot = store.load().expect("store should load").expect("Run");
+    assert_eq!(snapshot.state.steps[STEP_ID].status, StepStatus::Planned);
 }
 
 #[test]

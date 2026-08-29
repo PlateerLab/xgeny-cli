@@ -1,6 +1,7 @@
 use std::num::NonZeroU32;
 
 use thiserror::Error;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use xgeny_local_store::{Commit, ExpectedHead, RunStore, StoreError};
 use xgeny_workgraph::{
     EffectIntent, InvocationMaterialRecord, ReconciliationResolution, RunEvent, RunEventBody,
@@ -23,6 +24,18 @@ pub struct EventMetadata {
     pub event_id: String,
     pub recorded_at: String,
 }
+
+impl EventMetadata {
+    pub(crate) fn validate(&self) -> Result<(), EventMetadataError> {
+        OffsetDateTime::parse(&self.recorded_at, &Rfc3339)
+            .map(|_| ())
+            .map_err(|_| EventMetadataError)
+    }
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[error("event metadata is invalid")]
+pub struct EventMetadataError;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[error("event metadata creation failed: {message}")]
@@ -118,8 +131,8 @@ pub(crate) trait PreparedEffect {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ExecutionObservation {
-    Succeeded { receipt_digest: String },
-    Failed { receipt_digest: String },
+    Succeeded { evidence_digest: String },
+    Failed { evidence_digest: String },
     Unknown { reason: String },
 }
 
@@ -141,6 +154,9 @@ pub enum DriveAction {
     ReconciliationNotApplied,
     ReconciliationFailed,
     ManualRequired,
+    VerificationPassed,
+    VerificationFailed,
+    VerificationInconclusive,
     NoAction,
 }
 
@@ -295,32 +311,32 @@ where
         )?;
         let observation = self.sink.execute(&intent, prepared);
         let (body, action) = match observation {
-            ExecutionObservation::Succeeded { receipt_digest } => {
-                let receipt_digest = require_observation_value(
+            ExecutionObservation::Succeeded { evidence_digest } => {
+                let evidence_digest = require_observation_value(
                     "execution_succeeded",
-                    "receipt_digest",
-                    receipt_digest,
+                    "evidence_digest",
+                    evidence_digest,
                 )?;
                 (
                     RunEventBody::EffectSucceeded {
                         step_id: step.step_id.clone(),
                         effect_id: intent.effect_id,
-                        receipt_digest,
+                        evidence_digest,
                     },
                     DriveAction::EffectSucceeded,
                 )
             }
-            ExecutionObservation::Failed { receipt_digest } => {
-                let receipt_digest = require_observation_value(
+            ExecutionObservation::Failed { evidence_digest } => {
+                let evidence_digest = require_observation_value(
                     "execution_failed",
-                    "receipt_digest",
-                    receipt_digest,
+                    "evidence_digest",
+                    evidence_digest,
                 )?;
                 (
                     RunEventBody::EffectFailed {
                         step_id: step.step_id.clone(),
                         effect_id: intent.effect_id,
-                        receipt_digest,
+                        evidence_digest,
                     },
                     DriveAction::EffectFailed,
                 )
@@ -481,6 +497,7 @@ where
         body: RunEventBody,
     ) -> Result<Commit, RuntimeError> {
         let metadata = self.events.create_metadata(state)?;
+        metadata.validate()?;
         let event = RunEvent {
             event_id: metadata.event_id,
             run_id: state.run_id.clone(),
@@ -580,6 +597,8 @@ pub enum RuntimeError {
     Store(#[from] StoreError),
     #[error(transparent)]
     EventFactory(#[from] EventFactoryError),
+    #[error(transparent)]
+    EventMetadata(#[from] EventMetadataError),
     #[error("durable Run is not initialized")]
     RunNotInitialized,
     #[error("step `{0}` does not exist")]

@@ -11,7 +11,8 @@ use tempfile::{TempDir, tempdir};
 use xgeny_domain::{
     Architecture, AuthState, CapabilityDefinitionBody, CapabilityInstanceBody, CapabilityRef,
     DataBoundary, EffectClass, ExecutionStyle, GrantLifetime, HealthStatus, OperatingSystem,
-    Platform, PolicySource, PolicySourceKind, ProtocolDocument, TrustLevel,
+    Platform, PolicySource, PolicySourceKind, ProtocolDocument, ReceiptStatus, TrustLevel,
+    VerificationResult,
 };
 use xgeny_local_store::{
     Commit, ExpectedHead, MemoryRunStore, RunSnapshot, RunStore, SqliteRunStore, StoreError,
@@ -25,14 +26,17 @@ use xgeny_runtime::{
     AdapterPrepareRequest, AdapterReconcileRequest, AdapterReconciliationInconclusiveReason,
     AdapterReconciliationObservation, AdapterRegistryError, AdmissionOutcome, AdmissionRequest,
     CapabilityRegistry, DirectExecutor, DirectExecutorError, DriveAction, EffectAdapter,
-    EffectAdapterRegistry, EventFactory, EventFactoryError, EventMetadata, InvocationAdmission,
-    InvocationMaterial, InvocationMaterialProvider, InvocationMaterialRecovery, LocalRunLease,
-    MaterialProviderFailure, MaterialProviderRegistry, MaterialProviderRegistryError,
-    PreparedAdapterInvocation, RequiredRouteFeatures, RouteRequest, RuntimePolicy,
+    EffectAdapterRegistry, EffectVerifier, EffectVerifierRegistry, EventFactory, EventFactoryError,
+    EventMetadata, InvocationAdmission, InvocationMaterial, InvocationMaterialProvider,
+    InvocationMaterialRecovery, LocalRunLease, MaterialProviderFailure, MaterialProviderRegistry,
+    MaterialProviderRegistryError, PreparedAdapterInvocation, RequiredRouteFeatures, RouteRequest,
+    RuleVerificationObservation, RuntimePolicy, VerificationPortFailure, VerificationRegistryError,
+    VerificationReport, VerificationRequest, VerificationRunner, VerifierOutputDigest,
 };
 use xgeny_workgraph::{
-    InvocationMaterialRecord, InvocationMaterialRetention, ReconstructableMaterialReference,
-    RunEvent, RunEventBody, RunState, SinkGuarantee, StepStatus,
+    EventRecord, InvocationMaterialRecord, InvocationMaterialRetention,
+    ReconstructableMaterialReference, RunEvent, RunEventBody, RunState, SinkGuarantee, StepStatus,
+    apply_record, authorization_digest, receipt_provenance_digest,
 };
 
 const RUN_ID: &str = "run-direct-1";
@@ -105,6 +109,7 @@ struct RecordingStore {
     trace: Rc<RefCell<Vec<&'static str>>>,
     fail_started_once: bool,
     fail_succeeded_once: bool,
+    lose_receipt_ack_once: bool,
     material_available: Rc<Cell<bool>>,
 }
 
@@ -115,6 +120,7 @@ impl RecordingStore {
             trace,
             fail_started_once: false,
             fail_succeeded_once: false,
+            lose_receipt_ack_once: false,
             material_available: Rc::new(Cell::new(true)),
         }
     }
@@ -174,6 +180,240 @@ impl RunStore for RecordingStore {
         }
         self.inner.load_invocation_material(effect_id)
     }
+
+    fn append_with_execution_receipt(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        receipt: xgeny_domain::ExecutionReceiptBody,
+    ) -> Result<Commit, StoreError> {
+        let commit = self
+            .inner
+            .append_with_execution_receipt(expected, event, receipt)?;
+        if self.lose_receipt_ack_once {
+            self.lose_receipt_ack_once = false;
+            return Err(StoreError::InjectedFault(
+                "lost Receipt commit acknowledgement",
+            ));
+        }
+        Ok(commit)
+    }
+
+    fn load_execution_receipts(
+        &self,
+    ) -> Result<Vec<xgeny_domain::ExecutionReceiptBody>, StoreError> {
+        self.inner.load_execution_receipts()
+    }
+}
+
+struct LostReceiptAckStore<S> {
+    inner: S,
+    lose_once: bool,
+}
+
+impl<S: RunStore> RunStore for LostReceiptAckStore<S> {
+    fn append(&mut self, expected: ExpectedHead, event: RunEvent) -> Result<Commit, StoreError> {
+        self.inner.append(expected, event)
+    }
+
+    fn load(&self) -> Result<Option<RunSnapshot>, StoreError> {
+        self.inner.load()
+    }
+
+    fn append_with_invocation_material(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        material: InvocationMaterialRecord,
+    ) -> Result<Commit, StoreError> {
+        self.inner
+            .append_with_invocation_material(expected, event, material)
+    }
+
+    fn load_invocation_material(
+        &self,
+        effect_id: &str,
+    ) -> Result<Option<InvocationMaterialRecord>, StoreError> {
+        self.inner.load_invocation_material(effect_id)
+    }
+
+    fn append_with_execution_receipt(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        receipt: xgeny_domain::ExecutionReceiptBody,
+    ) -> Result<Commit, StoreError> {
+        let commit = self
+            .inner
+            .append_with_execution_receipt(expected, event, receipt)?;
+        if self.lose_once {
+            self.lose_once = false;
+            return Err(StoreError::InjectedFault(
+                "lost SQLite Receipt commit acknowledgement",
+            ));
+        }
+        Ok(commit)
+    }
+
+    fn load_execution_receipts(
+        &self,
+    ) -> Result<Vec<xgeny_domain::ExecutionReceiptBody>, StoreError> {
+        self.inner.load_execution_receipts()
+    }
+}
+
+struct ReceiptProfileDriftStore {
+    inner: RecordingStore,
+    drift_profile: Cell<bool>,
+    drift_platform: Cell<bool>,
+    drift_binding: Cell<bool>,
+    drift_verification_plan: Cell<bool>,
+}
+
+struct LegacyReplayStore {
+    snapshot: RunSnapshot,
+    material: InvocationMaterialRecord,
+}
+
+impl RunStore for LegacyReplayStore {
+    fn append(&mut self, _expected: ExpectedHead, _event: RunEvent) -> Result<Commit, StoreError> {
+        Err(StoreError::InjectedFault(
+            "legacy replay store is read-only",
+        ))
+    }
+
+    fn load(&self) -> Result<Option<RunSnapshot>, StoreError> {
+        Ok(Some(self.snapshot.clone()))
+    }
+
+    fn append_with_invocation_material(
+        &mut self,
+        _expected: ExpectedHead,
+        _event: RunEvent,
+        _material: InvocationMaterialRecord,
+    ) -> Result<Commit, StoreError> {
+        Err(StoreError::InjectedFault(
+            "legacy replay store is read-only",
+        ))
+    }
+
+    fn load_invocation_material(
+        &self,
+        effect_id: &str,
+    ) -> Result<Option<InvocationMaterialRecord>, StoreError> {
+        Ok((self.material.effect_id() == effect_id).then(|| self.material.clone()))
+    }
+
+    fn append_with_execution_receipt(
+        &mut self,
+        _expected: ExpectedHead,
+        _event: RunEvent,
+        _receipt: xgeny_domain::ExecutionReceiptBody,
+    ) -> Result<Commit, StoreError> {
+        Err(StoreError::InjectedFault(
+            "legacy replay store is read-only",
+        ))
+    }
+
+    fn load_execution_receipts(
+        &self,
+    ) -> Result<Vec<xgeny_domain::ExecutionReceiptBody>, StoreError> {
+        Ok(Vec::new())
+    }
+}
+
+impl RunStore for ReceiptProfileDriftStore {
+    fn append(&mut self, expected: ExpectedHead, event: RunEvent) -> Result<Commit, StoreError> {
+        self.inner.append(expected, event)
+    }
+
+    fn load(&self) -> Result<Option<RunSnapshot>, StoreError> {
+        let mut snapshot = self.inner.load()?;
+        if (self.drift_profile.get()
+            || self.drift_platform.get()
+            || self.drift_binding.get()
+            || self.drift_verification_plan.get())
+            && let Some(snapshot) = &mut snapshot
+        {
+            for step in snapshot.state.steps.values_mut() {
+                if let Some(provenance) = step
+                    .intent
+                    .as_mut()
+                    .and_then(|intent| intent.receipt_provenance.as_mut())
+                {
+                    if self.drift_profile.get() {
+                        "unsupported-receipt-profile".clone_into(&mut provenance.profile_version);
+                    }
+                    if self.drift_platform.get() {
+                        "another-os-another-arch".clone_into(&mut provenance.executor_platform);
+                    }
+                    if self.drift_binding.get() {
+                        "drifted-policy-decision".clone_into(&mut provenance.policy_decision_id);
+                    }
+                    if self.drift_verification_plan.get() {
+                        let rule = provenance
+                            .verification_plan
+                            .first_mut()
+                            .expect("fixture should contain a verification rule");
+                        rule.required = !rule.required;
+                    }
+                }
+                if self.drift_verification_plan.get() {
+                    let intent = step
+                        .intent
+                        .as_mut()
+                        .expect("drifted step should retain its intent");
+                    let provenance = intent
+                        .receipt_provenance
+                        .as_ref()
+                        .expect("drifted step should retain Receipt provenance");
+                    intent.authorization.binding.receipt_provenance_digest = Some(
+                        receipt_provenance_digest(provenance)
+                            .expect("drifted Receipt provenance should canonicalize"),
+                    );
+                    intent.authorization.grant_digest = authorization_digest(
+                        &intent.authorization.binding,
+                        intent.authorization.max_uses,
+                    )
+                    .expect("drifted authorization should canonicalize");
+                }
+            }
+        }
+        Ok(snapshot)
+    }
+
+    fn append_with_invocation_material(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        material: InvocationMaterialRecord,
+    ) -> Result<Commit, StoreError> {
+        self.inner
+            .append_with_invocation_material(expected, event, material)
+    }
+
+    fn load_invocation_material(
+        &self,
+        effect_id: &str,
+    ) -> Result<Option<InvocationMaterialRecord>, StoreError> {
+        self.inner.load_invocation_material(effect_id)
+    }
+
+    fn append_with_execution_receipt(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        receipt: xgeny_domain::ExecutionReceiptBody,
+    ) -> Result<Commit, StoreError> {
+        self.inner
+            .append_with_execution_receipt(expected, event, receipt)
+    }
+
+    fn load_execution_receipts(
+        &self,
+    ) -> Result<Vec<xgeny_domain::ExecutionReceiptBody>, StoreError> {
+        self.inner.load_execution_receipts()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -214,10 +454,10 @@ impl FakeAdapter {
             trace,
             executions: VecDeque::from([
                 AdapterExecutionObservation::Succeeded {
-                    receipt_digest: digest('a'),
+                    evidence_digest: digest('a'),
                 },
                 AdapterExecutionObservation::Succeeded {
-                    receipt_digest: digest('b'),
+                    evidence_digest: digest('b'),
                 },
             ]),
             reconciliations: VecDeque::from([AdapterReconciliationObservation::Inconclusive {
@@ -561,6 +801,96 @@ fn append_body<S: RunStore>(
         )
         .expect("test event should append")
         .state
+}
+
+fn legacy_replay_store(
+    intent: &xgeny_workgraph::EffectIntent,
+    material_digest: &str,
+    validating: bool,
+) -> LegacyReplayStore {
+    let mut events = vec![
+        RunEvent {
+            event_id: "seed-direct-1".to_owned(),
+            run_id: RUN_ID.to_owned(),
+            authority: AUTHORITY.to_owned(),
+            authority_epoch: AUTHORITY_EPOCH,
+            recorded_at: "2026-08-29T15:00:00Z".to_owned(),
+            body: RunEventBody::RunCreated {
+                goal: "execute one exact fake effect".to_owned(),
+            },
+        },
+        RunEvent {
+            event_id: "seed-direct-2".to_owned(),
+            run_id: RUN_ID.to_owned(),
+            authority: AUTHORITY.to_owned(),
+            authority_epoch: AUTHORITY_EPOCH,
+            recorded_at: "2026-08-29T15:00:00Z".to_owned(),
+            body: RunEventBody::StepPlanned {
+                step_id: STEP_ID.to_owned(),
+                objective: "write one fake marker".to_owned(),
+            },
+        },
+        RunEvent {
+            event_id: "legacy-replay-intent".to_owned(),
+            run_id: RUN_ID.to_owned(),
+            authority: AUTHORITY.to_owned(),
+            authority_epoch: AUTHORITY_EPOCH,
+            recorded_at: "2026-08-29T15:00:00Z".to_owned(),
+            body: RunEventBody::EffectIntentCommitted {
+                step_id: STEP_ID.to_owned(),
+                intent: Box::new(intent.clone()),
+            },
+        },
+    ];
+    if validating {
+        events.extend([
+            RunEvent {
+                event_id: "legacy-replay-started".to_owned(),
+                run_id: RUN_ID.to_owned(),
+                authority: AUTHORITY.to_owned(),
+                authority_epoch: AUTHORITY_EPOCH,
+                recorded_at: "2026-08-29T15:00:00Z".to_owned(),
+                body: RunEventBody::EffectExecutionStarted {
+                    step_id: STEP_ID.to_owned(),
+                    effect_id: intent.effect_id.clone(),
+                },
+            },
+            RunEvent {
+                event_id: "legacy-replay-succeeded".to_owned(),
+                run_id: RUN_ID.to_owned(),
+                authority: AUTHORITY.to_owned(),
+                authority_epoch: AUTHORITY_EPOCH,
+                recorded_at: "2026-08-29T15:00:00Z".to_owned(),
+                body: RunEventBody::EffectSucceeded {
+                    step_id: STEP_ID.to_owned(),
+                    effect_id: intent.effect_id.clone(),
+                    evidence_digest: format!("sha256:{}", "a".repeat(64)),
+                },
+            },
+        ]);
+    }
+    let mut records = Vec::new();
+    let mut state = None;
+    for event in events {
+        let record = EventRecord::next(records.last(), event).expect("legacy event should record");
+        state = Some(apply_record(state.as_ref(), &record).expect("legacy event should replay"));
+        records.push(record);
+    }
+    let material = InvocationMaterialRecord::new(
+        RUN_ID,
+        STEP_ID,
+        intent,
+        material_digest,
+        InvocationMaterialRetention::Ephemeral,
+    )
+    .expect("legacy material should bind");
+    LegacyReplayStore {
+        snapshot: RunSnapshot {
+            records,
+            state: state.expect("legacy Run should have state"),
+        },
+        material,
+    }
 }
 
 fn seed_queryable_unknown(
@@ -1300,6 +1630,81 @@ fn exact_reconciliation_not_applied_reuses_the_same_material_without_new_authori
 }
 
 #[test]
+fn proved_applied_reconciliation_uses_its_evidence_for_a_core_receipt() {
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let counters = Rc::new(AdapterCounters::default());
+    let mut store = RecordingStore::new(Rc::clone(&trace));
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, instance.clone());
+    let (_lease_directory, lease) = acquire_lease();
+    drop(seed_queryable_unknown(
+        &mut store,
+        &lease,
+        &registry,
+        &definition,
+    ));
+    trace.borrow_mut().clear();
+    let mut adapter = FakeAdapter::succeeding(Rc::clone(&counters), Rc::clone(&trace));
+    adapter.reconciliations = VecDeque::from([AdapterReconciliationObservation::Applied {
+        evidence_digest: digest('c'),
+    }]);
+    let mut adapters = EffectAdapterRegistry::new();
+    register_fake(&mut adapters, &instance, adapter);
+
+    let reconciled = DirectExecutor::new()
+        .drive_step(
+            &mut store,
+            &mut DeterministicEvents,
+            &lease,
+            &registry,
+            &mut adapters,
+            STEP_ID,
+            None,
+        )
+        .expect("exact read-only reconciliation should prove the effect applied");
+    assert_eq!(reconciled.action, DriveAction::ReconciliationApplied);
+    assert_eq!(
+        reconciled.state.steps[STEP_ID].status,
+        StepStatus::Validating
+    );
+    assert_eq!(
+        reconciled.state.steps[STEP_ID].uncertainty_reason, None,
+        "proved-applied reconciliation must clear the prior unknown reason"
+    );
+    assert_eq!(counters.prepares.get(), 0);
+    assert_eq!(counters.executes.get(), 0);
+    assert_eq!(counters.reconciles.get(), 1);
+
+    let verifier_calls = Rc::new(Cell::new(0));
+    let mut verifiers = EffectVerifierRegistry::new();
+    verifiers
+        .register(
+            &instance.binding,
+            PassingVerifier {
+                calls: Rc::clone(&verifier_calls),
+            },
+        )
+        .expect("exact verifier should register");
+    let verified = VerificationRunner::new()
+        .drive_step(
+            &mut store,
+            &mut DeterministicEvents,
+            &lease,
+            &registry,
+            &mut verifiers,
+            STEP_ID,
+        )
+        .expect("reconciliation evidence should produce a Receipt");
+
+    assert_eq!(verified.action, DriveAction::VerificationPassed);
+    assert_eq!(verified.state.steps[STEP_ID].status, StepStatus::Completed);
+    assert_eq!(verified.state.steps[STEP_ID].uncertainty_reason, None);
+    assert_eq!(verifier_calls.get(), 1);
+    assert_eq!(store.load_execution_receipts().expect("Receipts").len(), 1);
+}
+
+#[test]
 fn attempt_limit_blocks_adapter_prepare_at_the_direct_executor_boundary() {
     let trace = Rc::new(RefCell::new(Vec::new()));
     let counters = Rc::new(AdapterCounters::default());
@@ -1547,4 +1952,993 @@ fn invalid_adapter_evidence_is_rejected_without_echoing_the_candidate() {
     let error = AdapterEvidenceDigest::new(candidate).expect_err("candidate must be rejected");
     let rendered = format!("{error} {error:?}");
     assert!(!rendered.contains(SECRET_SENTINEL));
+}
+
+struct PassingVerifier {
+    calls: Rc<Cell<usize>>,
+}
+
+struct ResultVerifier {
+    calls: Rc<Cell<usize>>,
+    result: VerificationResult,
+    omit_last_rule: bool,
+    omit_evidence: bool,
+}
+
+impl EffectVerifier for ResultVerifier {
+    fn verify(
+        &mut self,
+        request: VerificationRequest<'_>,
+    ) -> Result<VerificationReport, VerificationPortFailure> {
+        self.calls.set(self.calls.get() + 1);
+        let mut rules: Vec<_> = request
+            .definition()
+            .spec
+            .verification
+            .iter()
+            .map(|rule| {
+                let evidence_digest = (!self.omit_evidence).then(|| {
+                    AdapterEvidenceDigest::new(
+                        request.outcome_evidence_digest().as_str().to_owned(),
+                    )
+                    .expect("evidence digest should remain canonical")
+                });
+                RuleVerificationObservation::new(rule.strategy, self.result, evidence_digest)
+            })
+            .collect();
+        if self.omit_last_rule {
+            rules.pop();
+        }
+        Ok(VerificationReport::new(
+            VerifierOutputDigest::new(format!("sha256:{}", "d".repeat(64)))
+                .expect("output digest should be canonical"),
+            rules,
+        ))
+    }
+}
+
+fn execute_to_validating<S: RunStore>(
+    store: &mut S,
+    lease: &LocalRunLease,
+    registry: &CapabilityRegistry,
+    definition: &CapabilityDefinitionBody,
+    instance: &CapabilityInstanceBody,
+) -> Rc<AdapterCounters> {
+    seed(store);
+    let admitted = admit(store, lease, registry, definition, false);
+    let material = (*admitted)
+        .into_ephemeral_material()
+        .expect("admitted material should verify");
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let counters = Rc::new(AdapterCounters::default());
+    let mut adapters = EffectAdapterRegistry::new();
+    register_fake(
+        &mut adapters,
+        instance,
+        FakeAdapter::succeeding(Rc::clone(&counters), trace),
+    );
+    let mut events = DeterministicEvents;
+    let report = DirectExecutor::new()
+        .drive_step(
+            store,
+            &mut events,
+            lease,
+            registry,
+            &mut adapters,
+            STEP_ID,
+            Some(&material),
+        )
+        .expect("effect should execute");
+    assert_eq!(report.state.steps[STEP_ID].status, StepStatus::Validating);
+    counters
+}
+
+#[test]
+fn legacy_intent_without_receipt_provenance_cannot_start_after_upgrade() {
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, instance.clone());
+    let (_lease_directory, lease) = acquire_lease();
+
+    let mut source = MemoryRunStore::new();
+    seed(&mut source);
+    let admitted = admit(&mut source, &lease, &registry, &definition, false);
+    let mut legacy_intent = admitted.commit().state.steps[STEP_ID]
+        .intent
+        .as_ref()
+        .expect("admission should commit intent")
+        .clone();
+    let material = (*admitted)
+        .into_ephemeral_material()
+        .expect("source material should verify");
+    legacy_intent.receipt_provenance = None;
+    legacy_intent
+        .authorization
+        .binding
+        .receipt_provenance_digest = None;
+    legacy_intent.authorization.grant_digest = authorization_digest(
+        &legacy_intent.authorization.binding,
+        legacy_intent.authorization.max_uses,
+    )
+    .expect("legacy authorization should canonicalize");
+
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let counters = Rc::new(AdapterCounters::default());
+    let mut store = legacy_replay_store(&legacy_intent, material.record().material_digest(), false);
+    let mut adapters = EffectAdapterRegistry::new();
+    register_fake(
+        &mut adapters,
+        &instance,
+        FakeAdapter::succeeding(Rc::clone(&counters), Rc::clone(&trace)),
+    );
+
+    let result = DirectExecutor::new().drive_step(
+        &mut store,
+        &mut DeterministicEvents,
+        &lease,
+        &registry,
+        &mut adapters,
+        STEP_ID,
+        Some(&material),
+    );
+
+    assert!(matches!(
+        result,
+        Err(DirectExecutorError::ReceiptProvenanceUnavailable { .. })
+    ));
+    assert_eq!(counters.prepares.get(), 0);
+    assert_eq!(counters.executes.get(), 0);
+    let snapshot = store.load().expect("store should load").expect("Run");
+    assert_eq!(
+        snapshot.state.steps[STEP_ID].status,
+        StepStatus::IntentCommitted
+    );
+}
+
+#[test]
+fn mismatched_executor_platform_cannot_reach_adapter_prepare_or_execution() {
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, instance.clone());
+    let (_lease_directory, lease) = acquire_lease();
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let counters = Rc::new(AdapterCounters::default());
+    let inner = RecordingStore::new(Rc::clone(&trace));
+    let mut store = ReceiptProfileDriftStore {
+        inner,
+        drift_profile: Cell::new(false),
+        drift_platform: Cell::new(false),
+        drift_binding: Cell::new(false),
+        drift_verification_plan: Cell::new(false),
+    };
+    seed(&mut store);
+    let admitted = admit(&mut store, &lease, &registry, &definition, false);
+    let material = (*admitted)
+        .into_ephemeral_material()
+        .expect("admitted material should verify");
+    store.drift_platform.set(true);
+    let mut adapters = EffectAdapterRegistry::new();
+    register_fake(
+        &mut adapters,
+        &instance,
+        FakeAdapter::succeeding(Rc::clone(&counters), Rc::clone(&trace)),
+    );
+
+    let result = DirectExecutor::new().drive_step(
+        &mut store,
+        &mut DeterministicEvents,
+        &lease,
+        &registry,
+        &mut adapters,
+        STEP_ID,
+        Some(&material),
+    );
+
+    assert!(matches!(
+        result,
+        Err(DirectExecutorError::ReceiptExecutorProvenanceMismatch)
+    ));
+    assert_eq!(counters.prepares.get(), 0);
+    assert_eq!(counters.executes.get(), 0);
+    assert!(!trace.borrow().contains(&"store:started"));
+}
+
+#[test]
+fn unsupported_receipt_profile_cannot_reach_adapter_prepare_or_execution() {
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, instance.clone());
+    let (_lease_directory, lease) = acquire_lease();
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let counters = Rc::new(AdapterCounters::default());
+    let inner = RecordingStore::new(Rc::clone(&trace));
+    let mut store = ReceiptProfileDriftStore {
+        inner,
+        drift_profile: Cell::new(false),
+        drift_platform: Cell::new(false),
+        drift_binding: Cell::new(false),
+        drift_verification_plan: Cell::new(false),
+    };
+    seed(&mut store);
+    let admitted = admit(&mut store, &lease, &registry, &definition, false);
+    let material = (*admitted)
+        .into_ephemeral_material()
+        .expect("admitted material should verify");
+    store.drift_profile.set(true);
+    let mut adapters = EffectAdapterRegistry::new();
+    register_fake(
+        &mut adapters,
+        &instance,
+        FakeAdapter::succeeding(Rc::clone(&counters), Rc::clone(&trace)),
+    );
+
+    let result = DirectExecutor::new().drive_step(
+        &mut store,
+        &mut DeterministicEvents,
+        &lease,
+        &registry,
+        &mut adapters,
+        STEP_ID,
+        Some(&material),
+    );
+
+    assert!(matches!(
+        result,
+        Err(DirectExecutorError::UnsupportedReceiptProfile)
+    ));
+    assert_eq!(counters.prepares.get(), 0);
+    assert_eq!(counters.executes.get(), 0);
+    assert!(!trace.borrow().contains(&"store:started"));
+}
+
+#[test]
+fn drifted_receipt_provenance_binding_cannot_reach_adapter_prepare_or_execution() {
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, instance.clone());
+    let (_lease_directory, lease) = acquire_lease();
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let counters = Rc::new(AdapterCounters::default());
+    let inner = RecordingStore::new(Rc::clone(&trace));
+    let mut store = ReceiptProfileDriftStore {
+        inner,
+        drift_profile: Cell::new(false),
+        drift_platform: Cell::new(false),
+        drift_binding: Cell::new(false),
+        drift_verification_plan: Cell::new(false),
+    };
+    seed(&mut store);
+    let admitted = admit(&mut store, &lease, &registry, &definition, false);
+    let material = (*admitted)
+        .into_ephemeral_material()
+        .expect("admitted material should verify");
+    store.drift_binding.set(true);
+    let mut adapters = EffectAdapterRegistry::new();
+    register_fake(
+        &mut adapters,
+        &instance,
+        FakeAdapter::succeeding(Rc::clone(&counters), Rc::clone(&trace)),
+    );
+
+    let result = DirectExecutor::new().drive_step(
+        &mut store,
+        &mut DeterministicEvents,
+        &lease,
+        &registry,
+        &mut adapters,
+        STEP_ID,
+        Some(&material),
+    );
+
+    assert!(matches!(
+        result,
+        Err(DirectExecutorError::ReceiptProvenanceBindingMismatch)
+    ));
+    assert_eq!(counters.prepares.get(), 0);
+    assert_eq!(counters.executes.get(), 0);
+    assert!(!trace.borrow().contains(&"store:started"));
+}
+
+#[test]
+fn drifted_verification_plan_cannot_reach_adapter_prepare_or_execution() {
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, instance.clone());
+    let (_lease_directory, lease) = acquire_lease();
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let counters = Rc::new(AdapterCounters::default());
+    let inner = RecordingStore::new(Rc::clone(&trace));
+    let mut store = ReceiptProfileDriftStore {
+        inner,
+        drift_profile: Cell::new(false),
+        drift_platform: Cell::new(false),
+        drift_binding: Cell::new(false),
+        drift_verification_plan: Cell::new(false),
+    };
+    seed(&mut store);
+    let admitted = admit(&mut store, &lease, &registry, &definition, false);
+    let material = (*admitted)
+        .into_ephemeral_material()
+        .expect("admitted material should verify");
+    store.drift_verification_plan.set(true);
+
+    let drifted = store.load().expect("store should load").expect("Run");
+    let intent = drifted.state.steps[STEP_ID]
+        .intent
+        .as_ref()
+        .expect("intent should remain available");
+    let provenance = intent
+        .receipt_provenance
+        .as_ref()
+        .expect("Receipt provenance should remain available");
+    let expected_provenance_digest = receipt_provenance_digest(provenance)
+        .expect("drifted Receipt provenance should canonicalize");
+    assert_eq!(
+        intent
+            .authorization
+            .binding
+            .receipt_provenance_digest
+            .as_deref(),
+        Some(expected_provenance_digest.as_str())
+    );
+    assert_eq!(
+        intent.authorization.grant_digest,
+        authorization_digest(&intent.authorization.binding, intent.authorization.max_uses,)
+            .expect("drifted authorization should canonicalize")
+    );
+
+    let mut adapters = EffectAdapterRegistry::new();
+    register_fake(
+        &mut adapters,
+        &instance,
+        FakeAdapter::succeeding(Rc::clone(&counters), Rc::clone(&trace)),
+    );
+    let result = DirectExecutor::new().drive_step(
+        &mut store,
+        &mut DeterministicEvents,
+        &lease,
+        &registry,
+        &mut adapters,
+        STEP_ID,
+        Some(&material),
+    );
+
+    assert!(matches!(
+        result,
+        Err(DirectExecutorError::ReceiptVerificationPlanMismatch)
+    ));
+    assert_eq!(counters.prepares.get(), 0);
+    assert_eq!(counters.executes.get(), 0);
+    assert!(!trace.borrow().contains(&"store:started"));
+}
+
+impl EffectVerifier for PassingVerifier {
+    fn verify(
+        &mut self,
+        request: VerificationRequest<'_>,
+    ) -> Result<VerificationReport, VerificationPortFailure> {
+        self.calls.set(self.calls.get() + 1);
+        let rules = request
+            .definition()
+            .spec
+            .verification
+            .iter()
+            .map(|rule| {
+                RuleVerificationObservation::new(
+                    rule.strategy,
+                    VerificationResult::Passed,
+                    Some(
+                        AdapterEvidenceDigest::new(
+                            request.outcome_evidence_digest().as_str().to_owned(),
+                        )
+                        .expect("durable evidence should remain canonical"),
+                    ),
+                )
+            })
+            .collect();
+        Ok(VerificationReport::new(
+            VerifierOutputDigest::new(format!("sha256:{}", "c".repeat(64)))
+                .expect("output digest should be canonical"),
+            rules,
+        ))
+    }
+}
+
+#[test]
+fn unsupported_receipt_profile_cannot_reach_verifier_or_receipt_commit() {
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, instance.clone());
+    let (_lease_directory, lease) = acquire_lease();
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let inner = RecordingStore::new(trace);
+    let mut store = ReceiptProfileDriftStore {
+        inner,
+        drift_profile: Cell::new(false),
+        drift_platform: Cell::new(false),
+        drift_binding: Cell::new(false),
+        drift_verification_plan: Cell::new(false),
+    };
+    execute_to_validating(&mut store, &lease, &registry, &definition, &instance);
+    store.drift_profile.set(true);
+    let verifier_calls = Rc::new(Cell::new(0));
+    let mut verifiers = EffectVerifierRegistry::new();
+    verifiers
+        .register(
+            &instance.binding,
+            PassingVerifier {
+                calls: Rc::clone(&verifier_calls),
+            },
+        )
+        .expect("exact verifier should register");
+
+    let result = VerificationRunner::new().drive_step(
+        &mut store,
+        &mut DeterministicEvents,
+        &lease,
+        &registry,
+        &mut verifiers,
+        STEP_ID,
+    );
+
+    assert!(matches!(
+        result,
+        Err(xgeny_runtime::VerificationRunnerError::UnsupportedReceiptProfile)
+    ));
+    assert_eq!(verifier_calls.get(), 0);
+    assert!(
+        store
+            .inner
+            .load_execution_receipts()
+            .expect("Receipts should load")
+            .is_empty()
+    );
+}
+
+#[test]
+fn drifted_receipt_provenance_binding_cannot_reach_verifier_or_receipt_commit() {
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, instance.clone());
+    let (_lease_directory, lease) = acquire_lease();
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let inner = RecordingStore::new(trace);
+    let mut store = ReceiptProfileDriftStore {
+        inner,
+        drift_profile: Cell::new(false),
+        drift_platform: Cell::new(false),
+        drift_binding: Cell::new(false),
+        drift_verification_plan: Cell::new(false),
+    };
+    execute_to_validating(&mut store, &lease, &registry, &definition, &instance);
+    store.drift_binding.set(true);
+    let verifier_calls = Rc::new(Cell::new(0));
+    let mut verifiers = EffectVerifierRegistry::new();
+    verifiers
+        .register(
+            &instance.binding,
+            PassingVerifier {
+                calls: Rc::clone(&verifier_calls),
+            },
+        )
+        .expect("exact verifier should register");
+
+    let result = VerificationRunner::new().drive_step(
+        &mut store,
+        &mut DeterministicEvents,
+        &lease,
+        &registry,
+        &mut verifiers,
+        STEP_ID,
+    );
+
+    assert!(matches!(
+        result,
+        Err(xgeny_runtime::VerificationRunnerError::ReceiptProvenanceBindingMismatch)
+    ));
+    assert_eq!(verifier_calls.get(), 0);
+    assert!(
+        store
+            .inner
+            .load_execution_receipts()
+            .expect("Receipts should load")
+            .is_empty()
+    );
+}
+
+#[test]
+fn legacy_validating_step_stays_closed_without_invoking_a_verifier() {
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, instance.clone());
+    let (_lease_directory, lease) = acquire_lease();
+    let mut source = MemoryRunStore::new();
+    seed(&mut source);
+    let admitted = admit(&mut source, &lease, &registry, &definition, false);
+    let mut legacy_intent = admitted.commit().state.steps[STEP_ID]
+        .intent
+        .as_ref()
+        .expect("admission should commit intent")
+        .clone();
+    let material = (*admitted)
+        .into_ephemeral_material()
+        .expect("source material should verify");
+    legacy_intent.receipt_provenance = None;
+    legacy_intent
+        .authorization
+        .binding
+        .receipt_provenance_digest = None;
+    legacy_intent.authorization.grant_digest = authorization_digest(
+        &legacy_intent.authorization.binding,
+        legacy_intent.authorization.max_uses,
+    )
+    .expect("legacy authorization should canonicalize");
+
+    let mut store = legacy_replay_store(&legacy_intent, material.record().material_digest(), true);
+    assert_eq!(
+        store.snapshot.state.steps[STEP_ID].status,
+        StepStatus::Validating
+    );
+    let verifier_calls = Rc::new(Cell::new(0));
+    let mut verifiers = EffectVerifierRegistry::new();
+    verifiers
+        .register(
+            &instance.binding,
+            PassingVerifier {
+                calls: Rc::clone(&verifier_calls),
+            },
+        )
+        .expect("exact verifier should register");
+
+    let result = VerificationRunner::new().drive_step(
+        &mut store,
+        &mut DeterministicEvents,
+        &lease,
+        &registry,
+        &mut verifiers,
+        STEP_ID,
+    );
+
+    assert!(matches!(
+        result,
+        Err(xgeny_runtime::VerificationRunnerError::ReceiptProvenanceMissing { .. })
+    ));
+    assert_eq!(verifier_calls.get(), 0);
+    assert_eq!(
+        store
+            .load()
+            .expect("store should load")
+            .expect("Run")
+            .state
+            .steps[STEP_ID]
+            .status,
+        StepStatus::Validating
+    );
+}
+
+#[test]
+fn validating_step_commits_one_core_owned_receipt_and_is_idempotent_after_completion() {
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, instance.clone());
+    let (_lease_directory, lease) = acquire_lease();
+    let mut store = MemoryRunStore::new();
+    seed(&mut store);
+    let admitted = admit(&mut store, &lease, &registry, &definition, false);
+    let material = (*admitted)
+        .into_ephemeral_material()
+        .expect("admitted material should verify");
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let counters = Rc::new(AdapterCounters::default());
+    let mut adapters = EffectAdapterRegistry::new();
+    register_fake(
+        &mut adapters,
+        &instance,
+        FakeAdapter::succeeding(Rc::clone(&counters), trace),
+    );
+    let mut events = DeterministicEvents;
+    let executed = DirectExecutor::new()
+        .drive_step(
+            &mut store,
+            &mut events,
+            &lease,
+            &registry,
+            &mut adapters,
+            STEP_ID,
+            Some(&material),
+        )
+        .expect("effect should execute");
+    assert_eq!(executed.state.steps[STEP_ID].status, StepStatus::Validating);
+
+    let verifier_calls = Rc::new(Cell::new(0));
+    let mut verifiers = EffectVerifierRegistry::new();
+    verifiers
+        .register(
+            &instance.binding,
+            PassingVerifier {
+                calls: Rc::clone(&verifier_calls),
+            },
+        )
+        .expect("exact verifier should register");
+    let verified = VerificationRunner::new()
+        .drive_step(
+            &mut store,
+            &mut events,
+            &lease,
+            &registry,
+            &mut verifiers,
+            STEP_ID,
+        )
+        .expect("verification should commit a Receipt");
+
+    assert_eq!(verified.action, DriveAction::VerificationPassed);
+    assert_eq!(verified.state.steps[STEP_ID].status, StepStatus::Completed);
+    assert_eq!(counters.executes.get(), 1);
+    assert_eq!(verifier_calls.get(), 1);
+    let receipts = store
+        .load_execution_receipts()
+        .expect("Receipt should load");
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(
+        verified.state.steps[STEP_ID]
+            .execution_receipt_digest
+            .as_deref(),
+        Some(receipts[0].receipt_digest.as_str())
+    );
+    let receipt_json = serde_json::to_string(&receipts[0]).expect("Receipt should serialize");
+    assert!(!receipt_json.contains(SECRET_SENTINEL));
+    assert!(!receipt_json.contains(RAW_PATH));
+    assert!(!receipt_json.contains(CANONICAL_PATH));
+
+    let repeated = VerificationRunner::new()
+        .drive_step(
+            &mut store,
+            &mut events,
+            &lease,
+            &registry,
+            &mut verifiers,
+            STEP_ID,
+        )
+        .expect("completed verification should be a no-op");
+    assert_eq!(repeated.action, DriveAction::NoAction);
+    assert_eq!(verifier_calls.get(), 1);
+    assert_eq!(store.load_execution_receipts().expect("Receipts").len(), 1);
+}
+
+#[test]
+fn required_verification_failure_and_inconclusive_never_complete_the_step() {
+    for (result, expected_action, expected_step, expected_receipt) in [
+        (
+            VerificationResult::Failed,
+            DriveAction::VerificationFailed,
+            StepStatus::Failed,
+            ReceiptStatus::Failed,
+        ),
+        (
+            VerificationResult::Inconclusive,
+            DriveAction::VerificationInconclusive,
+            StepStatus::ManualRequired,
+            ReceiptStatus::Unknown,
+        ),
+    ] {
+        let definition = definition_fixture();
+        let instance = instance_fixture(&definition);
+        let registry = registry_with(&definition, instance.clone());
+        let (_lease_directory, lease) = acquire_lease();
+        let mut store = MemoryRunStore::new();
+        let counters = execute_to_validating(&mut store, &lease, &registry, &definition, &instance);
+        let calls = Rc::new(Cell::new(0));
+        let mut verifiers = EffectVerifierRegistry::new();
+        verifiers
+            .register(
+                &instance.binding,
+                ResultVerifier {
+                    calls: Rc::clone(&calls),
+                    result,
+                    omit_last_rule: false,
+                    omit_evidence: false,
+                },
+            )
+            .expect("verifier should register");
+        let mut events = DeterministicEvents;
+
+        let report = VerificationRunner::new()
+            .drive_step(
+                &mut store,
+                &mut events,
+                &lease,
+                &registry,
+                &mut verifiers,
+                STEP_ID,
+            )
+            .expect("closed verification result should commit");
+        assert_eq!(report.action, expected_action);
+        assert_eq!(report.state.steps[STEP_ID].status, expected_step);
+        assert_ne!(report.state.steps[STEP_ID].status, StepStatus::Completed);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(counters.executes.get(), 1);
+        let receipts = store
+            .load_execution_receipts()
+            .expect("Receipt should load");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].status, expected_receipt);
+    }
+}
+
+#[test]
+fn malformed_verifier_coverage_leaves_validating_without_a_receipt() {
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, instance.clone());
+    let (_lease_directory, lease) = acquire_lease();
+    let mut store = MemoryRunStore::new();
+    execute_to_validating(&mut store, &lease, &registry, &definition, &instance);
+    let calls = Rc::new(Cell::new(0));
+    let mut verifiers = EffectVerifierRegistry::new();
+    verifiers
+        .register(
+            &instance.binding,
+            ResultVerifier {
+                calls: Rc::clone(&calls),
+                result: VerificationResult::Passed,
+                omit_last_rule: true,
+                omit_evidence: false,
+            },
+        )
+        .expect("verifier should register");
+    let mut events = DeterministicEvents;
+
+    let error = VerificationRunner::new()
+        .drive_step(
+            &mut store,
+            &mut events,
+            &lease,
+            &registry,
+            &mut verifiers,
+            STEP_ID,
+        )
+        .expect_err("partial coverage must fail closed");
+    assert!(matches!(
+        error,
+        xgeny_runtime::VerificationRunnerError::VerificationReportMismatch
+    ));
+    assert_eq!(calls.get(), 1);
+    assert_eq!(
+        store
+            .load()
+            .expect("store should load")
+            .expect("Run")
+            .state
+            .steps[STEP_ID]
+            .status,
+        StepStatus::Validating
+    );
+    assert!(
+        store
+            .load_execution_receipts()
+            .expect("Receipts")
+            .is_empty()
+    );
+}
+
+#[test]
+fn passed_verification_without_evidence_leaves_validating_without_a_receipt() {
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, instance.clone());
+    let (_lease_directory, lease) = acquire_lease();
+    let mut store = MemoryRunStore::new();
+    execute_to_validating(&mut store, &lease, &registry, &definition, &instance);
+    let calls = Rc::new(Cell::new(0));
+    let mut verifiers = EffectVerifierRegistry::new();
+    verifiers
+        .register(
+            &instance.binding,
+            ResultVerifier {
+                calls: Rc::clone(&calls),
+                result: VerificationResult::Passed,
+                omit_last_rule: false,
+                omit_evidence: true,
+            },
+        )
+        .expect("verifier should register");
+
+    let error = VerificationRunner::new()
+        .drive_step(
+            &mut store,
+            &mut DeterministicEvents,
+            &lease,
+            &registry,
+            &mut verifiers,
+            STEP_ID,
+        )
+        .expect_err("evidence-free success must fail closed");
+
+    assert!(matches!(
+        error,
+        xgeny_runtime::VerificationRunnerError::VerificationReportMismatch
+    ));
+    assert_eq!(calls.get(), 1);
+    let snapshot = store.load().expect("store should load").expect("Run");
+    assert_eq!(snapshot.state.steps[STEP_ID].status, StepStatus::Validating);
+    assert!(
+        store
+            .load_execution_receipts()
+            .expect("Receipts")
+            .is_empty()
+    );
+}
+
+#[test]
+fn verifier_registry_rejects_duplicates_and_never_falls_back_to_a_nearby_binding() {
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let duplicate_calls = Rc::new(Cell::new(0));
+    let mut duplicate_registry = EffectVerifierRegistry::new();
+    duplicate_registry
+        .register(
+            &instance.binding,
+            PassingVerifier {
+                calls: Rc::clone(&duplicate_calls),
+            },
+        )
+        .expect("first verifier should register");
+    assert!(matches!(
+        duplicate_registry.register(
+            &instance.binding,
+            PassingVerifier {
+                calls: Rc::clone(&duplicate_calls),
+            },
+        ),
+        Err(VerificationRegistryError::DuplicateBinding)
+    ));
+
+    let registry = registry_with(&definition, instance.clone());
+    let (_lease_directory, lease) = acquire_lease();
+    let mut store = MemoryRunStore::new();
+    execute_to_validating(&mut store, &lease, &registry, &definition, &instance);
+    let nearby_calls = Rc::new(Cell::new(0));
+    let mut nearby_binding = instance.binding.clone();
+    nearby_binding.operation_ref = Some("nearby-operation".to_owned());
+    let mut nearby_registry = EffectVerifierRegistry::new();
+    nearby_registry
+        .register(
+            &nearby_binding,
+            PassingVerifier {
+                calls: Rc::clone(&nearby_calls),
+            },
+        )
+        .expect("nearby verifier should register under its own exact key");
+
+    let result = VerificationRunner::new().drive_step(
+        &mut store,
+        &mut DeterministicEvents,
+        &lease,
+        &registry,
+        &mut nearby_registry,
+        STEP_ID,
+    );
+    assert!(matches!(
+        result,
+        Err(xgeny_runtime::VerificationRunnerError::VerifierNotRegistered { .. })
+    ));
+    assert_eq!(nearby_calls.get(), 0);
+}
+
+#[test]
+fn lost_receipt_commit_acknowledgement_does_not_repeat_effect_or_verifier() {
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, instance.clone());
+    let (_lease_directory, lease) = acquire_lease();
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let mut store = RecordingStore::new(trace);
+    let counters = execute_to_validating(&mut store, &lease, &registry, &definition, &instance);
+    store.lose_receipt_ack_once = true;
+    let verifier_calls = Rc::new(Cell::new(0));
+    let mut verifiers = EffectVerifierRegistry::new();
+    verifiers
+        .register(
+            &instance.binding,
+            PassingVerifier {
+                calls: Rc::clone(&verifier_calls),
+            },
+        )
+        .expect("verifier should register");
+    let mut events = DeterministicEvents;
+
+    let first = VerificationRunner::new().drive_step(
+        &mut store,
+        &mut events,
+        &lease,
+        &registry,
+        &mut verifiers,
+        STEP_ID,
+    );
+    assert!(matches!(
+        first,
+        Err(xgeny_runtime::VerificationRunnerError::Store(
+            StoreError::InjectedFault(_)
+        ))
+    ));
+    assert_eq!(verifier_calls.get(), 1);
+
+    let resumed = VerificationRunner::new()
+        .drive_step(
+            &mut store,
+            &mut events,
+            &lease,
+            &registry,
+            &mut verifiers,
+            STEP_ID,
+        )
+        .expect("durably completed Step should not verify again");
+    assert_eq!(resumed.action, DriveAction::NoAction);
+    assert_eq!(resumed.state.steps[STEP_ID].status, StepStatus::Completed);
+    assert_eq!(verifier_calls.get(), 1);
+    assert_eq!(counters.executes.get(), 1);
+    assert_eq!(store.load_execution_receipts().expect("Receipts").len(), 1);
+}
+
+#[test]
+fn sqlite_reopen_after_lost_receipt_ack_does_not_repeat_effect_or_verifier() {
+    let directory = tempdir().expect("temporary Run directory should exist");
+    let database_path = directory.path().join("run.db");
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, instance.clone());
+    let (_lease_directory, lease) = acquire_lease();
+    let mut sqlite = SqliteRunStore::open(&database_path).expect("SQLite should open");
+    let counters = execute_to_validating(&mut sqlite, &lease, &registry, &definition, &instance);
+    let verifier_calls = Rc::new(Cell::new(0));
+    let mut verifiers = EffectVerifierRegistry::new();
+    verifiers
+        .register(
+            &instance.binding,
+            PassingVerifier {
+                calls: Rc::clone(&verifier_calls),
+            },
+        )
+        .expect("exact verifier should register");
+    let mut store = LostReceiptAckStore {
+        inner: sqlite,
+        lose_once: true,
+    };
+
+    let first = VerificationRunner::new().drive_step(
+        &mut store,
+        &mut DeterministicEvents,
+        &lease,
+        &registry,
+        &mut verifiers,
+        STEP_ID,
+    );
+    assert!(matches!(
+        first,
+        Err(xgeny_runtime::VerificationRunnerError::Store(
+            StoreError::InjectedFault(_)
+        ))
+    ));
+    assert_eq!(verifier_calls.get(), 1);
+    drop(store);
+
+    let mut reopened = SqliteRunStore::open(&database_path).expect("SQLite should reopen");
+    let resumed = VerificationRunner::new()
+        .drive_step(
+            &mut reopened,
+            &mut DeterministicEvents,
+            &lease,
+            &registry,
+            &mut EffectVerifierRegistry::new(),
+            STEP_ID,
+        )
+        .expect("durable terminal Receipt should make restart a no-op");
+    assert_eq!(resumed.action, DriveAction::NoAction);
+    assert_eq!(resumed.state.steps[STEP_ID].status, StepStatus::Completed);
+    assert_eq!(counters.executes.get(), 1);
+    assert_eq!(verifier_calls.get(), 1);
+    assert_eq!(
+        reopened.load_execution_receipts().expect("Receipts").len(),
+        1
+    );
 }

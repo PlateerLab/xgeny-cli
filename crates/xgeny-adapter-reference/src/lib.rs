@@ -10,12 +10,13 @@ use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use xgeny_domain::InstanceBinding;
+use xgeny_domain::{InstanceBinding, VerificationResult, VerificationStrategy};
 use xgeny_runtime::{
     AdapterEvidenceDigest, AdapterExecutionObservation, AdapterExecutionUnknownReason,
     AdapterPrepareFailure, AdapterPrepareRequest, AdapterReconcileRequest,
     AdapterReconciliationInconclusiveReason, AdapterReconciliationObservation, EffectAdapter,
-    PreparedAdapterInvocation,
+    EffectVerifier, PreparedAdapterInvocation, RuleVerificationObservation,
+    VerificationPortFailure, VerificationReport, VerificationRequest, VerifierOutputDigest,
 };
 use xgeny_workgraph::{EffectClass, EffectIntent};
 
@@ -101,6 +102,18 @@ impl PreopenedMarkerAdapter {
             limits,
         })
     }
+
+    /// Create a read-only verifier sharing the same preopened target.
+    ///
+    /// The verifier can be moved into an exact `EffectVerifierRegistry` before the adapter itself
+    /// is registered. Verification never truncates, writes, or syncs the target.
+    #[must_use]
+    pub fn verifier(&self) -> PreopenedMarkerVerifier {
+        PreopenedMarkerVerifier {
+            target: Arc::clone(&self.target),
+            expected_binding: self.expected_binding.clone(),
+        }
+    }
 }
 
 impl std::fmt::Debug for PreopenedMarkerAdapter {
@@ -126,11 +139,11 @@ impl EffectAdapter for PreopenedMarkerAdapter {
             &self.canonical_target_ref,
             self.limits,
         )?;
-        let (record, receipt_digest) = evidence_record(request.intent(), request.instance())?;
+        let (record, evidence_digest) = evidence_record(request.intent(), request.instance())?;
         Ok(Box::new(PreparedMarker {
             target: Arc::clone(&self.target),
             record,
-            receipt_digest,
+            evidence_digest,
         }))
     }
 
@@ -144,10 +157,83 @@ impl EffectAdapter for PreopenedMarkerAdapter {
     }
 }
 
+pub struct PreopenedMarkerVerifier {
+    target: Arc<Mutex<Box<dyn MarkerTarget>>>,
+    expected_binding: InstanceBinding,
+}
+
+impl std::fmt::Debug for PreopenedMarkerVerifier {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreopenedMarkerVerifier")
+            .field("target", &"<preopened/redacted>")
+            .field("expected_binding", &"<redacted>")
+            .finish()
+    }
+}
+
+impl EffectVerifier for PreopenedMarkerVerifier {
+    fn verify(
+        &mut self,
+        request: VerificationRequest<'_>,
+    ) -> Result<VerificationReport, VerificationPortFailure> {
+        if request.intent().invocation.capability_id != REFERENCE_CAPABILITY_ID
+            || request.intent().invocation.contract_version != REFERENCE_CONTRACT_VERSION
+            || request.instance().binding != self.expected_binding
+            || request.definition().spec.verification.is_empty()
+            || request
+                .definition()
+                .spec
+                .verification
+                .iter()
+                .any(|rule| rule.strategy != VerificationStrategy::Postcondition)
+        {
+            return Err(VerificationPortFailure::UnsupportedStrategy);
+        }
+        let observed = self
+            .target
+            .lock()
+            .map_err(|_| VerificationPortFailure::Unavailable)?
+            .read_record(MAX_EVIDENCE_RECORD_BYTES + 1)
+            .map_err(|_| VerificationPortFailure::EvidenceUnavailable)?;
+        if observed.is_empty() || observed.len() > MAX_EVIDENCE_RECORD_BYTES {
+            return Err(VerificationPortFailure::ResponseUnverifiable);
+        }
+        let observed_digest = AdapterEvidenceDigest::new(sha256_digest(&observed))
+            .map_err(|_| VerificationPortFailure::ResponseUnverifiable)?;
+        let result = if observed_digest.as_str() == request.outcome_evidence_digest().as_str() {
+            VerificationResult::Passed
+        } else {
+            VerificationResult::Failed
+        };
+        let rules = request
+            .definition()
+            .spec
+            .verification
+            .iter()
+            .map(|rule| {
+                RuleVerificationObservation::new(
+                    rule.strategy,
+                    result,
+                    Some(
+                        AdapterEvidenceDigest::new(observed_digest.as_str().to_owned())
+                            .expect("observed digest was already validated"),
+                    ),
+                )
+            })
+            .collect();
+        Ok(VerificationReport::new(
+            VerifierOutputDigest::new(sha256_digest(b"{}"))
+                .expect("empty object digest is canonical"),
+            rules,
+        ))
+    }
+}
+
 struct PreparedMarker {
     target: Arc<Mutex<Box<dyn MarkerTarget>>>,
     record: Vec<u8>,
-    receipt_digest: AdapterEvidenceDigest,
+    evidence_digest: AdapterEvidenceDigest,
 }
 
 impl std::fmt::Debug for PreparedMarker {
@@ -156,7 +242,7 @@ impl std::fmt::Debug for PreparedMarker {
             .debug_struct("PreparedMarker")
             .field("target", &"<preopened/redacted>")
             .field("record", &"<redacted>")
-            .field("receipt_digest", &self.receipt_digest)
+            .field("evidence_digest", &self.evidence_digest)
             .finish()
     }
 }
@@ -169,7 +255,7 @@ impl PreparedAdapterInvocation for PreparedMarker {
             };
         }
         AdapterExecutionObservation::Succeeded {
-            receipt_digest: self.receipt_digest,
+            evidence_digest: self.evidence_digest,
         }
     }
 }
@@ -268,9 +354,9 @@ fn evidence_record(
     if record.len() > MAX_EVIDENCE_RECORD_BYTES {
         return Err(AdapterPrepareFailure::InvalidMaterial);
     }
-    let receipt_digest = AdapterEvidenceDigest::new(sha256_digest(&record))
+    let evidence_digest = AdapterEvidenceDigest::new(sha256_digest(&record))
         .map_err(|_| AdapterPrepareFailure::InvalidMaterial)?;
-    Ok((record, receipt_digest))
+    Ok((record, evidence_digest))
 }
 
 fn sha256_digest(bytes: &[u8]) -> String {
@@ -386,7 +472,7 @@ mod tests {
                     failure,
                 }))),
                 record: record.clone(),
-                receipt_digest: AdapterEvidenceDigest::new(format!("sha256:{}", "0".repeat(64)))
+                evidence_digest: AdapterEvidenceDigest::new(format!("sha256:{}", "0".repeat(64)))
                     .expect("test digest"),
             };
 

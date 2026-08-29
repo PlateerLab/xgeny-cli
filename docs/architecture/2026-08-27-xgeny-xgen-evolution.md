@@ -209,6 +209,7 @@ domain                   -> 아무 제품/전송/저장 구현에도 의존하�
       artifacts/          # content-addressed immutable files
       export/
         journal.jsonl     # deterministic 교환·진단용 파생 export
+        receipts.jsonl    # complete ExecutionReceipt protocol documents
     memory/
       MEMORY.md
       topics/
@@ -217,7 +218,7 @@ domain                   -> 아무 제품/전송/저장 구현에도 의존하�
 
 Run별 committed `RunEvent` history가 논리적 source of truth다. 물리 저장은 hardened JSONL과 per-Run embedded SQLite를 Linux·macOS·Windows crash/power-loss 실험으로 비교한 뒤 ADR-0008에서 확정한다. embedded SQLite를 채택해도 사용자가 설치·운영하는 DB server나 daemon은 아니다.
 
-- WorkGraph snapshot, receipt index, JSONL export는 committed event에서 재구성 가능한 projection이다.
+- WorkGraph snapshot과 journal JSONL은 committed event에서 재구성 가능한 projection이다. Complete Receipt body는 terminal event와 원자 commit되는 검증된 sidecar이며 별도 Receipt JSONL로 export한다. 두 stream의 atomic archive/import manifest는 후속 계약이다.
 - 사용자·프로젝트가 검토하는 Markdown memory는 별도 정본이며 Run transactional state와 혼합하지 않는다.
 - 검색 DB는 파생 인덱스다.
 - XGEN의 `geny_memory_*` 테이블과 로컬 파일을 dual-write하지 않는다.

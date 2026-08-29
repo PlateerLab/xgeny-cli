@@ -14,9 +14,11 @@ serde_jcs.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+time.workspace = true
 xgeny-domain = { path = "../xgeny-domain" }
 xgeny-local-store = { path = "../xgeny-local-store" }
 xgeny-policy = { path = "../xgeny-policy" }
+xgeny-protocol = { path = "../xgeny-protocol" }
 xgeny-workgraph = { path = "../xgeny-workgraph" }
 
 [dev-dependencies]

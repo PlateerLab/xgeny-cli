@@ -63,7 +63,8 @@ Run/Step/authority/head/action/policy에 결합된 1회 권한
 | executable binding | Instance ID, Definition ref, source, placement, platform, trust, boundary, features, binding, stable `auth_ref` | 다른 adapter/placement/credential reference로 권한 재사용 방지 |
 | policy evidence | exact request identity/authority atoms와 allowance, ordered sources | 어떤 invocation·정책 교집합이 허용했는지 결합 |
 | material | canonical argument digest, host-selected retention digest | 실행 payload와 복구 recipe의 사후 교체 방지 |
-| authorization | Run, Step, authority/epoch, issued head, action, Definition/Instance, material, policy evidence, max uses | reducer가 검증하고 원자적으로 소비할 durable 1회 권한 |
+| Receipt provenance | invocation/plan ID, canonical PolicyDecision ID/digest, executor, redacted input summary, verification plan | 검증 뒤 Core Receipt의 사실을 admission 시점에 고정 |
+| authorization | Run, Step, authority/epoch, issued head, action, Definition/Instance, material, policy evidence, Receipt provenance digest, max uses | reducer가 검증하고 원자적으로 소비할 durable 1회 권한 |
 
 semantic action은 의도적으로 Run·Step·Instance와 독립적이다. 같은 의미 작업의 retry/replan을 식별하는 값과 실제 선택된 실행체에 대한 권한을 분리하기 위해서다. 반대로 authorization budget ID와 effect ID/idempotency key는 Run과 semantic action에 결합되어 같은 Run에서 Step이나 Instance만 바꾼 중복 효과를 허용하지 않는다.
 
@@ -74,6 +75,7 @@ semantic action은 의도적으로 Run·Step·Instance와 독립적이다. 같�
 기본형은 다음 조건을 모두 만족할 때만 intent를 발행한다.
 
 - local host + user-profile 정책 모드
+- selected Instance placement가 정확히 `Local`
 - `GrantLifetime::Once`, `max_uses = 1`
 - critical action 없음
 - synchronous execution
@@ -82,13 +84,13 @@ semantic action은 의도적으로 Run·Step·Instance와 독립적이다. 같�
 - sink guarantee는 증명되지 않은 `None`
 - Definition/Instance required extension 없음
 
-`ReadOnly`, `Compensatable`, `Unknown`, managed lease, critical approval은 의미를 축약 변환하지 않고 fail-closed한다. 특히 managed policy는 expiry·revocation witness가 없으므로 provisional 평가 결과가 있더라도 권한을 발행하지 않는다.
+`ReadOnly`, `Compensatable`, `Unknown`, Device/Remote placement, managed lease, critical approval은 의미를 축약 변환하지 않고 fail-closed한다. 특히 managed policy는 expiry·revocation witness가 없으므로 provisional 평가 결과가 있더라도 권한을 발행하지 않는다. 원격 실행은 실제 executor provenance 계약 없이 local host ID/platform과 섞어 기록하지 않는다.
 
 ## durable·runtime 방어
 
 WorkGraph reducer는 `EffectIntent`를 적용하기 전에 authorization binding의 Run, Step, authority, epoch, 발행 journal head, action digest, Capability contract와 Instance binding을 intent 및 현재 state와 교차 검증한다. Run+semantic action에서 one-shot budget ID를 다시 유도하고 `max_uses = 1`과 authorization digest도 재계산한다. 따라서 grant ID만 바꿔 같은 작업의 새 예산을 만드는 저수준 오배선도 거부한다. 검증 실패 시 state를 변경하지 않는다.
 
-SQLite schema version은 3이다. journal event, effect-intent index, authorization-consumption row, secret-free `InvocationMaterialRecord`와 projection은 한 transaction에 기록된다. 각 insert 뒤 fault injection을 포함해 어느 단계에서 process가 종료돼도 일부만 commit되지 않는지 검사한다. 내부 실험용 version 1·2 store는 material binding이 없으므로 명시적으로 거부하며 자동 migration하지 않는다.
+현재 SQLite schema version은 4다. Admission의 journal event, effect-intent index, authorization-consumption row, secret-free `InvocationMaterialRecord`와 projection은 한 transaction에 기록된다. Schema 4는 후속 Receipt table을 추가하며 schema 3 Run은 기존 journal bytes를 바꾸지 않고 원자 migration한다. 각 insert 뒤 fault injection을 포함해 어느 단계에서 process가 종료돼도 일부만 commit되지 않는지 검사한다. 내부 실험용 version 1·2 store는 material binding이 없으므로 명시적으로 거부한다.
 
 실행 직전 Direct Executor도 current Capability Definition과 Instance executable-binding digest를 durable intent와 다시 비교한다. 그 뒤 core-owned prepared session을 Run·Step·effect·material·full journal head에 결합한다. 하나라도 다르면 Started와 adapter execute는 0회다.
 
@@ -107,7 +109,7 @@ semantic action digest에는 canonical argument가 들어간다. 이 값은 암�
 - public WorkGraph/RunStore 저수준 API를 untrusted extension에서 격리하는 crate/API 경계
 - critical approval, reusable Run grant, expiry·revocation과 cross-run/global budget
 - read-only direct path, compensatable/unknown effect 의미와 async/task 실행
-- raw credential resolver, sealed argument store와 receipt body store
+- raw credential resolver, sealed argument store, adapter failure/unknown Receipt와 Artifact store
 - 동일 Run에서 의도적으로 같은 semantic action을 여러 번 수행할 trusted occurrence identity
 - CLI 명령, MCP/Claude/Codex harness, Connector 또는 XGEN wire 연동
 

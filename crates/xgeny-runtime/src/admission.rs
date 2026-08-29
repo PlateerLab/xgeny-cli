@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
 
 use jsonschema::Draft;
@@ -6,25 +7,32 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use xgeny_domain::{
-    CapabilityDefinitionBody, CapabilityInstanceBody, CapabilityRef,
-    EffectClass as DomainEffectClass, ExecutionStyle, GrantLifetime, PolicySource,
+    CapabilityDefinitionBody, CapabilityInstanceBody, CapabilityRef, Decision,
+    EffectClass as DomainEffectClass, ExecutionStyle, Grant, GrantLifetime, Placement,
+    PolicyDecisionBody, PolicySource, ProtocolDocument, ResolvedResource, VerificationStrategy,
 };
 use xgeny_local_store::{Commit, ExpectedHead, RunStore, StoreError};
 use xgeny_policy::{
     BoundPolicyEvaluation, BrokerError, BrokerOutcome, InvocationResolutionError, PermissionBroker,
     PermissionRequestResolver, PolicyInputs, ResolvedPermissionRequest, ResourceResolver,
 };
+use xgeny_protocol::{
+    CORE_RECEIPT_INPUT_SUMMARY_V1, CORE_RECEIPT_PROFILE_V1, ProtocolError, canonical_digest,
+    validate_policy_decision,
+};
 use xgeny_workgraph::{
     AuthorizationBinding, AuthorizationDigestError, AuthorizationUse,
     EffectClass as WorkGraphEffectClass, EffectIntent, InvocationBinding, InvocationMaterialError,
-    InvocationMaterialRecord, InvocationMaterialRetention, ReconstructableMaterialReference,
+    InvocationMaterialRecord, InvocationMaterialRetention, ReceiptPlacement, ReceiptProvenance,
+    ReceiptVerificationRule, ReceiptVerificationStrategy, ReconstructableMaterialReference,
     RunEvent, RunEventBody, RunState, SinkGuarantee, StepStatus, authorization_digest,
     invocation_material_digest, invocation_material_retention_digest, once_authorization_id,
+    receipt_provenance_digest,
 };
 
 use crate::{
-    CapabilityRegistry, CapabilityRouter, EventFactory, EventFactoryError, RouteInputError,
-    RouteOutcome, RouteRequest, RunLease,
+    CapabilityRegistry, CapabilityRouter, EventFactory, EventFactoryError, LOCAL_EXECUTOR_ID,
+    RouteInputError, RouteOutcome, RouteRequest, RunLease, local_executor_platform,
 };
 
 const MAX_ARGUMENTS_SIZE_BYTES: usize = 1024 * 1024;
@@ -374,7 +382,14 @@ impl InvocationAdmission {
                 instance_id: selected_instance_id.clone(),
             }
         })?;
+        if instance.placement != Placement::Local {
+            return Err(AdmissionError::UnsupportedExecutorPlacement {
+                placement: instance.placement,
+            });
+        }
 
+        let metadata = events.create_metadata(&snapshot.state)?;
+        metadata.validate()?;
         let issued = issue_once_effect(
             &pending,
             &snapshot.state,
@@ -382,8 +397,8 @@ impl InvocationAdmission {
             instance,
             &selected_instance_id,
             &evaluation,
+            &metadata.recorded_at,
         )?;
-        let metadata = events.create_metadata(&snapshot.state)?;
         let event = RunEvent {
             event_id: metadata.event_id,
             run_id: snapshot.state.run_id.clone(),
@@ -430,6 +445,7 @@ fn issue_once_effect(
     instance: &CapabilityInstanceBody,
     selected_instance_id: &str,
     evaluation: &BoundPolicyEvaluation,
+    decided_at: &str,
 ) -> Result<IssuedEffect, AdmissionError> {
     let BrokerOutcome::Allow {
         provisional_authorization,
@@ -447,6 +463,31 @@ fn issue_once_effect(
         return Err(AdmissionError::CriticalAuthorizationUnsupported);
     }
 
+    let effect_identity_digest = digest_serializable(&EffectIdentityDigestInput {
+        domain: "xgeny.effect.once/v1",
+        run_id: &state.run_id,
+        action_digest: &pending.action_digest,
+    })?;
+    let policy_evidence_digest = policy_evidence_digest(
+        &pending.permission_request,
+        provisional_authorization,
+        sources,
+    )?;
+    let (policy_decision_id, policy_decision_digest) = policy_decision_commitment(
+        &pending.permission_request,
+        provisional_authorization,
+        sources,
+        &policy_evidence_digest,
+        decided_at,
+    )?;
+    let receipt_provenance = build_receipt_provenance(
+        &effect_identity_digest,
+        policy_decision_id,
+        policy_decision_digest,
+        instance,
+        definition,
+    );
+    let receipt_provenance_digest = receipt_provenance_digest(&receipt_provenance)?;
     let instance_binding_digest = executable_binding_digest(instance)?;
     let invocation = InvocationBinding {
         capability_id: pending.route.capability.capability_id.clone(),
@@ -472,18 +513,10 @@ fn issue_once_effect(
         material_retention_digest: invocation_material_retention_digest(
             &pending.material_retention,
         )?,
-        policy_evidence_digest: policy_evidence_digest(
-            &pending.permission_request,
-            provisional_authorization,
-            sources,
-        )?,
+        policy_evidence_digest,
+        receipt_provenance_digest: Some(receipt_provenance_digest),
     };
     let grant_digest = authorization_digest(&binding, ONCE_MAX_USES)?;
-    let effect_identity_digest = digest_serializable(&EffectIdentityDigestInput {
-        domain: "xgeny.effect.once/v1",
-        run_id: &state.run_id,
-        action_digest: &pending.action_digest,
-    })?;
     let effect_id = content_id("effect", &effect_identity_digest);
     let intent = EffectIntent {
         effect_id: effect_id.clone(),
@@ -498,6 +531,7 @@ fn issue_once_effect(
             max_uses: ONCE_MAX_USES,
             binding,
         },
+        receipt_provenance: Some(receipt_provenance),
     };
     let material_record = InvocationMaterialRecord::new(
         &state.run_id,
@@ -513,6 +547,97 @@ fn issue_once_effect(
         effect_id,
         material_record,
     })
+}
+
+fn build_receipt_provenance(
+    effect_identity_digest: &str,
+    policy_decision_id: String,
+    policy_decision_digest: String,
+    instance: &CapabilityInstanceBody,
+    definition: &CapabilityDefinitionBody,
+) -> ReceiptProvenance {
+    ReceiptProvenance {
+        profile_version: CORE_RECEIPT_PROFILE_V1.to_owned(),
+        invocation_id: content_id("invocation", effect_identity_digest),
+        plan_id: content_id("plan", effect_identity_digest),
+        policy_decision_id,
+        policy_decision_digest,
+        executor_id: LOCAL_EXECUTOR_ID.to_owned(),
+        executor_placement: receipt_placement(instance.placement),
+        executor_platform: local_executor_platform(),
+        input_summary: CORE_RECEIPT_INPUT_SUMMARY_V1.to_owned(),
+        verification_plan: definition
+            .spec
+            .verification
+            .iter()
+            .map(|rule| ReceiptVerificationRule {
+                strategy: receipt_verification_strategy(rule.strategy),
+                required: rule.required,
+            })
+            .collect(),
+    }
+}
+
+fn policy_decision_commitment(
+    request: &ResolvedPermissionRequest,
+    authorization: &xgeny_policy::ProvisionalAuthorization,
+    sources: &[PolicySource],
+    evidence_digest: &str,
+    decided_at: &str,
+) -> Result<(String, String), AdmissionError> {
+    let decision_id = content_id("decision", evidence_digest);
+    let resources = authorization
+        .resources()
+        .iter()
+        .map(|resource| ResolvedResource {
+            scope: resource.scope().to_owned(),
+            resource: resource.canonical_resource().to_owned(),
+            normalized: true,
+            metadata: BTreeMap::new(),
+        })
+        .collect();
+    let decision = PolicyDecisionBody {
+        api_version: request.api_version().to_owned(),
+        extensions: BTreeMap::new(),
+        required_extensions: Vec::new(),
+        decision_id: decision_id.clone(),
+        request_id: request.request_id().to_owned(),
+        decision: Decision::Allow,
+        policy_sources: sources.to_vec(),
+        grant: Some(Grant {
+            lifetime: authorization.lifetime(),
+            expires_at: None,
+            scopes: authorization.scopes().to_vec(),
+            resources,
+            critical_actions: authorization.critical_actions().to_vec(),
+        }),
+        interaction_id: None,
+        deny_reasons: Vec::new(),
+        decided_at: decided_at.to_owned(),
+    };
+    validate_policy_decision(&decision).map_err(|_| AdmissionError::PolicyDecisionInvalid)?;
+    let value = serde_json::to_value(ProtocolDocument::PolicyDecision(Box::new(decision)))?;
+    Ok((decision_id, canonical_digest(&value)?))
+}
+
+const fn receipt_placement(placement: Placement) -> ReceiptPlacement {
+    match placement {
+        Placement::Local => ReceiptPlacement::Local,
+        Placement::Device => ReceiptPlacement::Device,
+        Placement::Remote => ReceiptPlacement::Remote,
+    }
+}
+
+const fn receipt_verification_strategy(
+    strategy: VerificationStrategy,
+) -> ReceiptVerificationStrategy {
+    match strategy {
+        VerificationStrategy::OutputSchema => ReceiptVerificationStrategy::OutputSchema,
+        VerificationStrategy::Postcondition => ReceiptVerificationStrategy::Postcondition,
+        VerificationStrategy::ArtifactDigest => ReceiptVerificationStrategy::ArtifactDigest,
+        VerificationStrategy::Receipt => ReceiptVerificationStrategy::Receipt,
+        VerificationStrategy::Human => ReceiptVerificationStrategy::Human,
+    }
 }
 
 fn verify_lease<L: RunLease>(lease: &L, state: &RunState) -> Result<(), AdmissionError> {
@@ -774,6 +899,8 @@ pub enum AdmissionError {
     #[error(transparent)]
     EventFactory(#[from] EventFactoryError),
     #[error(transparent)]
+    EventMetadata(#[from] crate::EventMetadataError),
+    #[error(transparent)]
     Resolution(#[from] InvocationResolutionError),
     #[error(transparent)]
     Broker(#[from] BrokerError),
@@ -783,6 +910,10 @@ pub enum AdmissionError {
     AuthorizationDigest(#[from] AuthorizationDigestError),
     #[error(transparent)]
     InvocationMaterial(#[from] InvocationMaterialError),
+    #[error(transparent)]
+    Protocol(#[from] ProtocolError),
+    #[error("JSON operation failed: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("durable Run is not initialized")]
     RunNotInitialized,
     #[error("lease is for Run `{lease_run_id}`, but durable state is `{state_run_id}`")]
@@ -825,6 +956,8 @@ pub enum AdmissionError {
     ManagedPolicyUnsupported,
     #[error("Router selected missing Instance `{instance_id}`")]
     SelectedInstanceMissing { instance_id: String },
+    #[error("Core Receipt execution currently supports only local placement, got {placement:?}")]
+    UnsupportedExecutorPlacement { placement: Placement },
     #[error("Router selected an Instance without a bound policy Allow")]
     SelectedRouteWithoutPolicyAllow,
     #[error("only once-lifetime authorization is supported")]
@@ -833,4 +966,6 @@ pub enum AdmissionError {
     CriticalAuthorizationUnsupported,
     #[error("policy Allow is detached from the exact resolved request")]
     PolicyAllowanceDetached,
+    #[error("the Core-generated PolicyDecision is invalid")]
+    PolicyDecisionInvalid,
 }

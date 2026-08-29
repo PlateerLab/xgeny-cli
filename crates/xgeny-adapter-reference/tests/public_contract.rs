@@ -1,7 +1,7 @@
 use std::cell::Cell;
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -10,13 +10,13 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::{TempDir, tempdir};
 use xgeny_adapter_reference::{
-    MarkerLimits, PreopenedMarkerAdapter, REFERENCE_CAPABILITY_ID, REFERENCE_CONTRACT_VERSION,
-    ReferenceAdapterConfigError,
+    MarkerLimits, PreopenedMarkerAdapter, PreopenedMarkerVerifier, REFERENCE_CAPABILITY_ID,
+    REFERENCE_CONTRACT_VERSION, ReferenceAdapterConfigError,
 };
 use xgeny_domain::{
     Architecture, CapabilityDefinitionBody, CapabilityInstanceBody, CapabilityRef, DataBoundary,
     EffectClass, ExecutionStyle, GrantLifetime, OperatingSystem, Platform, PolicySource,
-    PolicySourceKind, ProtocolDocument, TrustLevel, VerificationStrategy,
+    PolicySourceKind, ProtocolDocument, ReceiptStatus, TrustLevel, VerificationStrategy,
 };
 use xgeny_local_store::{
     Commit, ExpectedHead, MemoryRunStore, RunSnapshot, RunStore, SqliteRunStore, StoreError,
@@ -29,9 +29,10 @@ use xgeny_runtime::{
     AdapterExecutionObservation, AdapterPrepareFailure, AdapterPrepareRequest,
     AdapterReconcileRequest, AdapterReconciliationObservation, AdmissionOutcome, AdmissionRequest,
     CapabilityRegistry, DirectExecutor, DirectExecutorError, DriveAction, EffectAdapter,
-    EffectAdapterRegistry, EventFactory, EventFactoryError, EventMetadata, InvocationAdmission,
-    InvocationMaterialProvider, InvocationMaterialRecovery, LocalRunLease, MaterialProviderFailure,
-    MaterialProviderRegistry, PreparedAdapterInvocation, RequiredRouteFeatures, RouteRequest,
+    EffectAdapterRegistry, EffectVerifierRegistry, EventFactory, EventFactoryError, EventMetadata,
+    InvocationAdmission, InvocationMaterialProvider, InvocationMaterialRecovery, LocalRunLease,
+    MaterialProviderFailure, MaterialProviderRegistry, PreparedAdapterInvocation,
+    RequiredRouteFeatures, RouteRequest, VerificationRunner,
 };
 use xgeny_workgraph::{
     InvocationMaterialRecord, ReconstructableMaterialReference, RunEvent, RunEventBody, RunState,
@@ -160,6 +161,23 @@ impl RunStore for ObservingStore {
     ) -> Result<Option<InvocationMaterialRecord>, StoreError> {
         self.inner.load_invocation_material(effect_id)
     }
+
+    fn append_with_execution_receipt(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        receipt: xgeny_domain::ExecutionReceiptBody,
+    ) -> Result<Commit, StoreError> {
+        self.observe(&event)?;
+        self.inner
+            .append_with_execution_receipt(expected, event, receipt)
+    }
+
+    fn load_execution_receipts(
+        &self,
+    ) -> Result<Vec<xgeny_domain::ExecutionReceiptBody>, StoreError> {
+        self.inner.load_execution_receipts()
+    }
 }
 
 struct Fixture {
@@ -204,6 +222,16 @@ fn target_bytes(file: &mut File) -> Vec<u8> {
     file.read_to_end(&mut bytes)
         .expect("target should be readable for inspection");
     bytes
+}
+
+fn assert_bytes_exclude(bytes: &[u8], sentinels: &[&[u8]]) {
+    for sentinel in sentinels {
+        assert!(
+            !bytes
+                .windows(sentinel.len())
+                .any(|window| window == *sentinel)
+        );
+    }
 }
 
 fn sha256_digest(bytes: &[u8]) -> String {
@@ -628,7 +656,7 @@ fn register_reference(
     instance: &CapabilityInstanceBody,
     target: File,
     max_marker_bytes: usize,
-) {
+) -> PreopenedMarkerVerifier {
     let adapter = PreopenedMarkerAdapter::new(
         target,
         instance.binding.clone(),
@@ -639,9 +667,11 @@ fn register_reference(
     let rendered = format!("{adapter:?}");
     assert!(!rendered.contains(CANONICAL_TARGET));
     assert!(!rendered.contains(&instance.binding.binding_ref));
+    let verifier = adapter.verifier();
     adapters
         .register(&instance.binding, adapter)
         .expect("reference adapter should register");
+    verifier
 }
 
 #[test]
@@ -717,7 +747,7 @@ fn public_contract_executes_real_io_only_between_started_and_success() {
     .into_ephemeral_material()
     .expect("material should verify");
     let mut adapters = EffectAdapterRegistry::new();
-    register_reference(&mut adapters, &instance, fixture.target, 128);
+    let verifier = register_reference(&mut adapters, &instance, fixture.target, 128);
     let mut events = DeterministicEvents;
 
     let report = DirectExecutor::new()
@@ -753,23 +783,18 @@ fn public_contract_executes_real_io_only_between_started_and_success() {
     }))
     .expect("expected evidence should canonicalize");
     assert_eq!(evidence, expected_evidence);
-    assert!(
-        !evidence
-            .windows(MARKER_SENTINEL.len())
-            .any(|window| window == MARKER_SENTINEL.as_bytes())
-    );
-    assert!(
-        !evidence
-            .windows(CANONICAL_TARGET.len())
-            .any(|window| window == CANONICAL_TARGET.as_bytes())
-    );
-    assert!(
-        !evidence
-            .windows(RAW_TARGET.len())
-            .any(|window| window == RAW_TARGET.as_bytes())
+    assert_bytes_exclude(
+        &evidence,
+        &[
+            MARKER_SENTINEL.as_bytes(),
+            CANONICAL_TARGET.as_bytes(),
+            RAW_TARGET.as_bytes(),
+        ],
     );
     assert_eq!(
-        report.state.steps[STEP_ID].receipt_digest.as_deref(),
+        report.state.steps[STEP_ID]
+            .effect_evidence_digest
+            .as_deref(),
         Some(sha256_digest(&evidence).as_str())
     );
     let journal = String::from_utf8(store.inner.export_jsonl().expect("journal export"))
@@ -779,6 +804,195 @@ fn public_contract_executes_real_io_only_between_started_and_success() {
     assert!(!journal.contains(RAW_TARGET));
     assert!(!format!("{adapters:?}").contains(CANONICAL_TARGET));
     assert!(!format!("{adapters:?}").contains(RAW_TARGET));
+
+    let mut verifiers = EffectVerifierRegistry::new();
+    verifiers
+        .register(&instance.binding, verifier)
+        .expect("reference verifier should register");
+    let terminal_report = VerificationRunner::new()
+        .drive_step(
+            &mut store,
+            &mut events,
+            &lease,
+            &registry,
+            &mut verifiers,
+            STEP_ID,
+        )
+        .expect("reference evidence should verify");
+    assert_eq!(terminal_report.action, DriveAction::VerificationPassed);
+    assert_eq!(
+        terminal_report.state.steps[STEP_ID].status,
+        StepStatus::Completed
+    );
+    let receipts = store
+        .load_execution_receipts()
+        .expect("reference Receipt should load");
+    assert_eq!(receipts.len(), 1);
+    let receipt_json = serde_json::to_string(&receipts[0]).expect("Receipt should serialize");
+    assert!(!receipt_json.contains(MARKER_SENTINEL));
+    assert!(!receipt_json.contains(CANONICAL_TARGET));
+    assert!(!receipt_json.contains(RAW_TARGET));
+}
+
+#[test]
+fn sqlite_validating_restart_runs_only_the_read_only_reference_verifier() {
+    let run_directory = tempdir().expect("temporary Run directory should exist");
+    let database_path = run_directory.path().join("run.db");
+    let fixture = Fixture::new();
+    let mut probe = fixture.probe;
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, instance.clone());
+    let (_lease_directory, lease) = acquire_lease();
+    let verifier = {
+        let mut store = SqliteRunStore::open(&database_path).expect("SQLite should open");
+        seed(&mut store);
+        let material = (*admit(
+            &mut store,
+            &lease,
+            &registry,
+            &definition,
+            MARKER_SENTINEL,
+            false,
+        ))
+        .into_ephemeral_material()
+        .expect("material should verify");
+        let mut adapters = EffectAdapterRegistry::new();
+        let verifier = register_reference(&mut adapters, &instance, fixture.target, 128);
+        let mut events = DeterministicEvents;
+        let report = DirectExecutor::new()
+            .drive_step(
+                &mut store,
+                &mut events,
+                &lease,
+                &registry,
+                &mut adapters,
+                STEP_ID,
+                Some(&material),
+            )
+            .expect("reference effect should execute");
+        assert_eq!(report.state.steps[STEP_ID].status, StepStatus::Validating);
+        drop(adapters);
+        verifier
+    };
+    let evidence_before_restart = target_bytes(&mut probe);
+
+    let mut reopened = SqliteRunStore::open(&database_path).expect("SQLite should reopen");
+    let mut verifiers = EffectVerifierRegistry::new();
+    verifiers
+        .register(&instance.binding, verifier)
+        .expect("reference verifier should register");
+    let mut events = DeterministicEvents;
+    let report = VerificationRunner::new()
+        .drive_step(
+            &mut reopened,
+            &mut events,
+            &lease,
+            &registry,
+            &mut verifiers,
+            STEP_ID,
+        )
+        .expect("restart should resume verification");
+
+    assert_eq!(report.action, DriveAction::VerificationPassed);
+    assert_eq!(report.state.steps[STEP_ID].status, StepStatus::Completed);
+    assert_eq!(target_bytes(&mut probe), evidence_before_restart);
+    assert_eq!(
+        reopened
+            .load_execution_receipts()
+            .expect("Receipt should load")
+            .len(),
+        1
+    );
+    drop(reopened);
+    assert_directory_excludes(
+        run_directory.path(),
+        &[
+            MARKER_SENTINEL.as_bytes(),
+            CANONICAL_TARGET.as_bytes(),
+            RAW_TARGET.as_bytes(),
+        ],
+    );
+}
+
+#[test]
+fn target_tampering_before_verification_fails_without_reexecuting_the_effect() {
+    let fixture = Fixture::new();
+    let mut store = ObservingStore::new(fixture.probe);
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, instance.clone());
+    seed(&mut store);
+    let (_lease_directory, lease) = acquire_lease();
+    let material = (*admit(
+        &mut store,
+        &lease,
+        &registry,
+        &definition,
+        MARKER_SENTINEL,
+        false,
+    ))
+    .into_ephemeral_material()
+    .expect("material should verify");
+    let mut adapters = EffectAdapterRegistry::new();
+    let verifier = register_reference(&mut adapters, &instance, fixture.target, 128);
+    let mut events = DeterministicEvents;
+    let executed = DirectExecutor::new()
+        .drive_step(
+            &mut store,
+            &mut events,
+            &lease,
+            &registry,
+            &mut adapters,
+            STEP_ID,
+            Some(&material),
+        )
+        .expect("reference effect should execute");
+    assert_eq!(executed.state.steps[STEP_ID].status, StepStatus::Validating);
+
+    store
+        .target_probe
+        .seek(SeekFrom::Start(0))
+        .expect("probe should seek");
+    store
+        .target_probe
+        .set_len(0)
+        .expect("probe should truncate");
+    store
+        .target_probe
+        .write_all(b"tampered-after-effect")
+        .expect("test tampering should write");
+    store
+        .target_probe
+        .sync_all()
+        .expect("tampering should sync");
+    let tampered = target_bytes(&mut store.target_probe);
+
+    let mut verifiers = EffectVerifierRegistry::new();
+    verifiers
+        .register(&instance.binding, verifier)
+        .expect("reference verifier should register");
+    let terminal_report = VerificationRunner::new()
+        .drive_step(
+            &mut store,
+            &mut events,
+            &lease,
+            &registry,
+            &mut verifiers,
+            STEP_ID,
+        )
+        .expect("tampering should produce a failed Receipt");
+    assert_eq!(terminal_report.action, DriveAction::VerificationFailed);
+    assert_eq!(
+        terminal_report.state.steps[STEP_ID].status,
+        StepStatus::Failed
+    );
+    assert_eq!(target_bytes(&mut store.target_probe), tampered);
+    let receipts = store
+        .load_execution_receipts()
+        .expect("Receipt should load");
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].status, ReceiptStatus::Failed);
 }
 
 #[test]

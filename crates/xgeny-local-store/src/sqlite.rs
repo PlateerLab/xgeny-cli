@@ -3,16 +3,33 @@ use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use xgeny_domain::{ExecutionReceiptBody, ProtocolDocument};
 use xgeny_workgraph::{
     EffectIntent, EventRecord, InvocationMaterialRecord, RunEvent, RunEventBody, RunState,
 };
 
 use crate::{
-    Commit, ExpectedHead, RunSnapshot, RunStore, StoreError, prepare_commit, verified_snapshot,
-    verify_material_bundle, verify_material_records,
+    Commit, ExpectedHead, RunSnapshot, RunStore, StoreError, StoredExecutionReceipt,
+    prepare_commit, verified_snapshot, verify_material_bundle, verify_material_records,
+    verify_receipt_bundle, verify_receipt_records,
 };
 
-const STORE_SCHEMA_VERSION: i64 = 3;
+const STORE_SCHEMA_VERSION: i64 = 4;
+
+const CREATE_RECEIPT_SCHEMA: &str = r"
+CREATE TABLE execution_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    event_sequence INTEGER NOT NULL UNIQUE CHECK (event_sequence >= 1),
+    effect_id TEXT NOT NULL UNIQUE,
+    step_id TEXT NOT NULL,
+    previous_receipt_digest TEXT,
+    receipt_digest TEXT NOT NULL UNIQUE,
+    receipt_json BLOB NOT NULL,
+    FOREIGN KEY (event_sequence) REFERENCES run_events(sequence),
+    FOREIGN KEY (effect_id) REFERENCES effect_intents(effect_id),
+    FOREIGN KEY (previous_receipt_digest) REFERENCES execution_receipts(receipt_digest)
+) STRICT;
+";
 
 const CREATE_SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS run_events (
@@ -55,6 +72,19 @@ CREATE TABLE IF NOT EXISTS invocation_materials (
     record_json BLOB NOT NULL,
     FOREIGN KEY (effect_id) REFERENCES effect_intents(effect_id)
 ) STRICT;
+
+CREATE TABLE IF NOT EXISTS execution_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    event_sequence INTEGER NOT NULL UNIQUE CHECK (event_sequence >= 1),
+    effect_id TEXT NOT NULL UNIQUE,
+    step_id TEXT NOT NULL,
+    previous_receipt_digest TEXT,
+    receipt_digest TEXT NOT NULL UNIQUE,
+    receipt_json BLOB NOT NULL,
+    FOREIGN KEY (event_sequence) REFERENCES run_events(sequence),
+    FOREIGN KEY (effect_id) REFERENCES effect_intents(effect_id),
+    FOREIGN KEY (previous_receipt_digest) REFERENCES execution_receipts(receipt_digest)
+) STRICT;
 ";
 
 #[derive(Debug)]
@@ -72,7 +102,7 @@ impl SqliteRunStore {
     ///
     /// Returns an error when the file cannot be opened, configured, migrated, or verified.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let connection = Connection::open(path)?;
+        let mut connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
 
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -81,6 +111,10 @@ impl SqliteRunStore {
                 configure_connection(&connection)?;
                 connection.execute_batch(CREATE_SCHEMA)?;
                 connection.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
+            }
+            3 => {
+                configure_connection(&connection)?;
+                migrate_schema_three(&mut connection)?;
             }
             STORE_SCHEMA_VERSION => configure_connection(&connection)?,
             unsupported => return Err(StoreError::UnsupportedSchemaVersion(unsupported)),
@@ -96,9 +130,11 @@ impl SqliteRunStore {
         expected: ExpectedHead,
         event: RunEvent,
         material: Option<&InvocationMaterialRecord>,
+        receipt: Option<&ExecutionReceiptBody>,
         mut checkpoint: impl FnMut(CommitStage) -> Result<(), StoreError>,
     ) -> Result<Commit, StoreError> {
         verify_material_bundle(&event, material)?;
+        verify_receipt_bundle(&event, receipt)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -111,6 +147,21 @@ impl SqliteRunStore {
         validate_derived_state(&transaction, &current_records)?;
         let current_state = snapshot.as_ref().map(|snapshot| &snapshot.state);
         let commit = prepare_commit(&current_records, current_state, expected, event)?;
+        if let Some(receipt) = receipt {
+            let effect_id = match &commit.record.event.body {
+                RunEventBody::VerificationRecorded { effect_id, .. } => effect_id.clone(),
+                _ => unreachable!("receipt bundle validation requires a finalization event"),
+            };
+            let mut candidate_receipts = load_execution_receipts(&transaction)?;
+            candidate_receipts.push(StoredExecutionReceipt {
+                event_sequence: commit.record.sequence,
+                effect_id,
+                receipt: receipt.clone(),
+            });
+            let mut candidate_records = current_records.clone();
+            candidate_records.push(commit.record.clone());
+            verify_receipt_records(&candidate_records, &candidate_receipts)?;
+        }
 
         insert_event(&transaction, &commit.record)?;
         checkpoint(CommitStage::Event)?;
@@ -120,6 +171,8 @@ impl SqliteRunStore {
         checkpoint(CommitStage::AuthorizationConsumption)?;
         insert_invocation_material(&transaction, material)?;
         checkpoint(CommitStage::InvocationMaterial)?;
+        insert_execution_receipt(&transaction, &commit.record, receipt)?;
+        checkpoint(CommitStage::ExecutionReceipt)?;
         write_projection(&transaction, &commit.state)?;
         checkpoint(CommitStage::Projection)?;
         transaction.commit()?;
@@ -134,12 +187,45 @@ impl SqliteRunStore {
         material: &InvocationMaterialRecord,
         fault: CommitStage,
     ) -> Result<Commit, StoreError> {
-        self.append_internal(expected, event, Some(material), |stage| {
+        self.append_internal(expected, event, Some(material), None, |stage| {
             if stage == fault {
                 Err(StoreError::InjectedFault(stage.label()))
             } else {
                 Ok(())
             }
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn append_receipt_with_fault(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        receipt: &ExecutionReceiptBody,
+        fault: CommitStage,
+    ) -> Result<Commit, StoreError> {
+        self.append_internal(expected, event, None, Some(receipt), |stage| {
+            if stage == fault {
+                Err(StoreError::InjectedFault(stage.label()))
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn append_receipt_and_exit_at(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        receipt: &ExecutionReceiptBody,
+        fault: CommitStage,
+    ) -> Result<Commit, StoreError> {
+        self.append_internal(expected, event, None, Some(receipt), |stage| {
+            if stage == fault {
+                std::process::exit(86);
+            }
+            Ok(())
         })
     }
 
@@ -151,7 +237,7 @@ impl SqliteRunStore {
         material: &InvocationMaterialRecord,
         fault: CommitStage,
     ) -> Result<Commit, StoreError> {
-        self.append_internal(expected, event, Some(material), |stage| {
+        self.append_internal(expected, event, Some(material), None, |stage| {
             if stage == fault {
                 std::process::exit(86);
             }
@@ -177,6 +263,34 @@ impl SqliteRunStore {
     #[cfg(test)]
     pub(crate) fn invocation_material_count(&self) -> Result<u64, StoreError> {
         table_count(&self.connection, "invocation_materials")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execution_receipt_count(&self) -> Result<u64, StoreError> {
+        table_count(&self.connection, "execution_receipts")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delete_execution_receipts(&self) -> Result<(), StoreError> {
+        self.connection
+            .execute("DELETE FROM execution_receipts", [])?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn corrupt_execution_receipt_document(&self) -> Result<(), StoreError> {
+        let bytes: Vec<u8> = self.connection.query_row(
+            "SELECT receipt_json FROM execution_receipts LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        value["outputDigest"] = serde_json::Value::String(format!("sha256:{}", "9".repeat(64)));
+        self.connection.execute(
+            "UPDATE execution_receipts SET receipt_json = ?1",
+            [serde_json::to_vec(&value)?],
+        )?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -229,6 +343,32 @@ impl SqliteRunStore {
             .pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
         Ok((journal_mode, synchronous, foreign_keys))
     }
+}
+
+#[cfg(test)]
+pub(crate) fn write_schema_three_fixture(
+    path: &Path,
+    records: &[EventRecord],
+    state: &RunState,
+    materials: &[InvocationMaterialRecord],
+) -> Result<(), StoreError> {
+    let mut connection = Connection::open(path)?;
+    configure_connection(&connection)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(CREATE_SCHEMA)?;
+    transaction.execute("DROP TABLE execution_receipts", [])?;
+    for record in records {
+        insert_event(&transaction, record)?;
+        insert_effect_intent_index(&transaction, record)?;
+        insert_authorization_consumption(&transaction, record)?;
+    }
+    for material in materials {
+        insert_invocation_material(&transaction, Some(material))?;
+    }
+    write_projection(&transaction, state)?;
+    transaction.pragma_update(None, "user_version", 3_i64)?;
+    transaction.commit()?;
+    Ok(())
 }
 
 fn expected_intents(records: &[EventRecord]) -> Vec<(u64, &str, &EffectIntent)> {
@@ -347,7 +487,7 @@ fn validate_foreign_keys(connection: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn validate_derived_state(
+fn validate_derived_state_without_receipts(
     connection: &Connection,
     records: &[EventRecord],
 ) -> Result<(), StoreError> {
@@ -356,6 +496,55 @@ fn validate_derived_state(
     validate_authorization_index(connection, records)?;
     let materials = load_invocation_materials(connection)?;
     verify_material_records(records, &materials)
+}
+
+fn validate_derived_state(
+    connection: &Connection,
+    records: &[EventRecord],
+) -> Result<(), StoreError> {
+    validate_derived_state_without_receipts(connection, records)?;
+    let receipts = load_execution_receipts(connection)?;
+    verify_receipt_records(records, &receipts)
+}
+
+fn load_verified_store_data(
+    connection: &Connection,
+) -> Result<(Option<RunSnapshot>, Vec<StoredExecutionReceipt>), StoreError> {
+    let records = load_records(connection)?;
+    let projection = load_projection(connection)?;
+    let snapshot = verified_snapshot(records, projection)?;
+    let records = snapshot
+        .as_ref()
+        .map_or(&[][..], |snapshot| snapshot.records.as_slice());
+    validate_derived_state_without_receipts(connection, records)?;
+    let receipts = load_execution_receipts(connection)?;
+    verify_receipt_records(records, &receipts)?;
+    Ok((snapshot, receipts))
+}
+
+fn migrate_schema_three(connection: &mut Connection) -> Result<(), StoreError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let version: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    match version {
+        3 => {
+            let records = load_records(&transaction)?;
+            let projection = load_projection(&transaction)?;
+            let snapshot = verified_snapshot(records, projection)?;
+            let records = snapshot
+                .as_ref()
+                .map_or(&[][..], |snapshot| snapshot.records.as_slice());
+            validate_derived_state_without_receipts(&transaction, records)?;
+            transaction.execute_batch(CREATE_RECEIPT_SCHEMA)?;
+            transaction.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
+            transaction.commit()?;
+            Ok(())
+        }
+        STORE_SCHEMA_VERSION => {
+            transaction.commit()?;
+            Ok(())
+        }
+        unsupported => Err(StoreError::UnsupportedSchemaVersion(unsupported)),
+    }
 }
 
 fn configure_connection(connection: &Connection) -> Result<(), StoreError> {
@@ -367,7 +556,7 @@ fn configure_connection(connection: &Connection) -> Result<(), StoreError> {
 
 impl RunStore for SqliteRunStore {
     fn append(&mut self, expected: ExpectedHead, event: RunEvent) -> Result<Commit, StoreError> {
-        self.append_internal(expected, event, None, |_| Ok(()))
+        self.append_internal(expected, event, None, None, |_| Ok(()))
     }
 
     fn append_with_invocation_material(
@@ -376,17 +565,22 @@ impl RunStore for SqliteRunStore {
         event: RunEvent,
         material: InvocationMaterialRecord,
     ) -> Result<Commit, StoreError> {
-        self.append_internal(expected, event, Some(&material), |_| Ok(()))
+        self.append_internal(expected, event, Some(&material), None, |_| Ok(()))
+    }
+
+    fn append_with_execution_receipt(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        receipt: ExecutionReceiptBody,
+    ) -> Result<Commit, StoreError> {
+        self.append_internal(expected, event, None, Some(&receipt), |_| Ok(()))
     }
 
     fn load(&self) -> Result<Option<RunSnapshot>, StoreError> {
-        let records = load_records(&self.connection)?;
-        let projection = load_projection(&self.connection)?;
-        let snapshot = verified_snapshot(records, projection)?;
-        let records = snapshot
-            .as_ref()
-            .map_or(&[][..], |snapshot| snapshot.records.as_slice());
-        validate_derived_state(&self.connection, records)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let (snapshot, _) = load_verified_store_data(&transaction)?;
+        transaction.commit()?;
         Ok(snapshot)
     }
 
@@ -397,6 +591,25 @@ impl RunStore for SqliteRunStore {
         self.load()?;
         Ok(load_invocation_materials(&self.connection)?.remove(effect_id))
     }
+
+    fn load_execution_receipts(&self) -> Result<Vec<ExecutionReceiptBody>, StoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let (_, receipts) = load_verified_store_data(&transaction)?;
+        transaction.commit()?;
+        Ok(receipts.into_iter().map(|stored| stored.receipt).collect())
+    }
+
+    fn load_with_execution_receipts(
+        &self,
+    ) -> Result<(Option<RunSnapshot>, Vec<ExecutionReceiptBody>), StoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let (snapshot, receipts) = load_verified_store_data(&transaction)?;
+        transaction.commit()?;
+        Ok((
+            snapshot,
+            receipts.into_iter().map(|stored| stored.receipt).collect(),
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -405,6 +618,7 @@ pub(crate) enum CommitStage {
     EffectIntentIndex,
     AuthorizationConsumption,
     InvocationMaterial,
+    ExecutionReceipt,
     Projection,
 }
 
@@ -416,6 +630,7 @@ impl CommitStage {
             Self::EffectIntentIndex => "effect intent index",
             Self::AuthorizationConsumption => "authorization consumption",
             Self::InvocationMaterial => "invocation material",
+            Self::ExecutionReceipt => "execution receipt",
             Self::Projection => "projection write",
         }
     }
@@ -490,6 +705,38 @@ fn insert_invocation_material(
             material.material_digest(),
             material.record_digest(),
             record_json
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_execution_receipt(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+    receipt: Option<&ExecutionReceiptBody>,
+) -> Result<(), StoreError> {
+    let Some(receipt) = receipt else {
+        return Ok(());
+    };
+    let RunEventBody::VerificationRecorded {
+        step_id, effect_id, ..
+    } = &record.event.body
+    else {
+        unreachable!("receipt bundle validation requires a finalization event")
+    };
+    let sequence = i64::try_from(record.sequence).map_err(|_| StoreError::SequenceOutOfRange)?;
+    let document = ProtocolDocument::ExecutionReceipt(Box::new(receipt.clone()));
+    let receipt_json = serde_json::to_vec(&document)?;
+    transaction.execute(
+        "INSERT INTO execution_receipts (receipt_id, event_sequence, effect_id, step_id, previous_receipt_digest, receipt_digest, receipt_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            receipt.receipt_id,
+            sequence,
+            effect_id,
+            step_id,
+            receipt.previous_receipt_digest,
+            receipt.receipt_digest,
+            receipt_json
         ],
     )?;
     Ok(())
@@ -581,6 +828,60 @@ fn load_invocation_materials(
     Ok(materials)
 }
 
+fn load_execution_receipts(
+    connection: &Connection,
+) -> Result<Vec<StoredExecutionReceipt>, StoreError> {
+    let mut statement = connection.prepare(
+        "SELECT receipt_id, event_sequence, effect_id, step_id, previous_receipt_digest, receipt_digest, receipt_json FROM execution_receipts ORDER BY event_sequence",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, Vec<u8>>(6)?,
+        ))
+    })?;
+    let mut receipts = Vec::new();
+    for row in rows {
+        let (
+            receipt_id,
+            event_sequence,
+            effect_id,
+            step_id,
+            previous_receipt_digest,
+            receipt_digest,
+            receipt_json,
+        ) = row?;
+        let event_sequence =
+            u64::try_from(event_sequence).map_err(|_| StoreError::SequenceOutOfRange)?;
+        let document: ProtocolDocument = serde_json::from_slice(&receipt_json)?;
+        let ProtocolDocument::ExecutionReceipt(receipt) = document else {
+            return Err(StoreError::Corrupt(
+                "receipt row does not contain an ExecutionReceipt document".to_owned(),
+            ));
+        };
+        if receipt.receipt_id != receipt_id
+            || receipt.step_id != step_id
+            || receipt.previous_receipt_digest != previous_receipt_digest
+            || receipt.receipt_digest != receipt_digest
+        {
+            return Err(StoreError::Corrupt(
+                "execution receipt index differs from its document".to_owned(),
+            ));
+        }
+        receipts.push(StoredExecutionReceipt {
+            event_sequence,
+            effect_id,
+            receipt: *receipt,
+        });
+    }
+    Ok(receipts)
+}
+
 #[cfg(test)]
 fn table_count(connection: &Connection, table: &str) -> Result<u64, StoreError> {
     let query = match table {
@@ -588,6 +889,7 @@ fn table_count(connection: &Connection, table: &str) -> Result<u64, StoreError> 
         "effect_intents" => "SELECT COUNT(*) FROM effect_intents",
         "authorization_consumption" => "SELECT COUNT(*) FROM authorization_consumption",
         "invocation_materials" => "SELECT COUNT(*) FROM invocation_materials",
+        "execution_receipts" => "SELECT COUNT(*) FROM execution_receipts",
         _ => {
             return Err(StoreError::Corrupt(format!(
                 "unsupported internal count table `{table}`"

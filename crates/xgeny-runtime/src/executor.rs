@@ -4,12 +4,13 @@ use std::fmt;
 use serde_json::Value;
 use thiserror::Error;
 use xgeny_domain::{
-    AuthState, CapabilityInstanceBody, CapabilityRef, HealthStatus, InstanceBinding,
+    AuthState, CapabilityInstanceBody, CapabilityRef, HealthStatus, InstanceBinding, Placement,
 };
 use xgeny_local_store::{RunStore, StoreError};
+use xgeny_protocol::{CORE_RECEIPT_INPUT_SUMMARY_V1, CORE_RECEIPT_PROFILE_V1};
 use xgeny_workgraph::{
-    EffectIntent, InvocationMaterialError, InvocationMaterialRecord, RunState, SinkGuarantee,
-    StepStatus, invocation_material_digest,
+    EffectIntent, InvocationMaterialError, InvocationMaterialRecord, ReceiptPlacement, RunState,
+    SinkGuarantee, StepStatus, invocation_material_digest, receipt_provenance_digest,
 };
 
 use crate::admission::{AdmissionError, definition_contract_digest, executable_binding_digest};
@@ -18,7 +19,11 @@ use crate::runtime::{
     DurableEffectRuntime, EffectSink, ExecutionObservation, PreparedEffect, PreparedEffectBinding,
     ReconciliationObservation, RuntimeError,
 };
-use crate::{CapabilityRegistry, DriveReport, EventFactory, RunLease, RuntimePolicy};
+use crate::verification::receipt_verification_plan_matches;
+use crate::{
+    CapabilityRegistry, DriveReport, EventFactory, LOCAL_EXECUTOR_ID, RunLease, RuntimePolicy,
+    local_executor_platform,
+};
 
 const MAX_BINDING_COMPONENT_BYTES: usize = 2_048;
 
@@ -164,10 +169,10 @@ impl AdapterExecutionUnknownReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdapterExecutionObservation {
     Succeeded {
-        receipt_digest: AdapterEvidenceDigest,
+        evidence_digest: AdapterEvidenceDigest,
     },
     Failed {
-        receipt_digest: AdapterEvidenceDigest,
+        evidence_digest: AdapterEvidenceDigest,
     },
     Unknown {
         reason: AdapterExecutionUnknownReason,
@@ -404,14 +409,14 @@ impl EffectSink for DirectSink<'_> {
         prepared: Self::Prepared,
     ) -> ExecutionObservation {
         match prepared.invocation.execute() {
-            AdapterExecutionObservation::Succeeded { receipt_digest } => {
+            AdapterExecutionObservation::Succeeded { evidence_digest } => {
                 ExecutionObservation::Succeeded {
-                    receipt_digest: receipt_digest.into_string(),
+                    evidence_digest: evidence_digest.into_string(),
                 }
             }
-            AdapterExecutionObservation::Failed { receipt_digest } => {
+            AdapterExecutionObservation::Failed { evidence_digest } => {
                 ExecutionObservation::Failed {
-                    receipt_digest: receipt_digest.into_string(),
+                    evidence_digest: evidence_digest.into_string(),
                 }
             }
             AdapterExecutionObservation::Unknown { reason } => ExecutionObservation::Unknown {
@@ -513,6 +518,11 @@ impl DirectExecutor {
 
         match step.status {
             StepStatus::IntentCommitted => {
+                let intent = step
+                    .intent
+                    .as_ref()
+                    .ok_or_else(|| DirectExecutorError::IntentMissing(step_id.to_owned()))?;
+                verify_receipt_provenance(intent)?;
                 if step.attempts >= self.policy.max_execution_attempts() {
                     return Err(DirectExecutorError::Runtime(
                         RuntimeError::ExecutionAttemptLimitReached {
@@ -525,10 +535,6 @@ impl DirectExecutor {
                 let material = material.ok_or_else(|| DirectExecutorError::MaterialRequired {
                     step_id: step_id.to_owned(),
                 })?;
-                let intent = step
-                    .intent
-                    .as_ref()
-                    .ok_or_else(|| DirectExecutorError::IntentMissing(step_id.to_owned()))?;
                 let (record, arguments) = material.parts();
                 verify_material(store, &snapshot.state, step_id, intent, record, arguments)?;
                 let instance = verify_current_instance(capabilities, intent)?;
@@ -570,6 +576,7 @@ impl DirectExecutor {
                     .intent
                     .as_ref()
                     .ok_or_else(|| DirectExecutorError::IntentMissing(step_id.to_owned()))?;
+                verify_receipt_provenance(intent)?;
                 if !supports_query(intent.sink_guarantee) {
                     return drive_without_adapter(self.policy, store, events, lease, step_id);
                 }
@@ -670,6 +677,14 @@ fn verify_current_instance<'a>(
     if definition_contract_digest(definition)? != intent.invocation.definition_digest {
         return Err(DirectExecutorError::DefinitionChanged);
     }
+    let provenance = intent.receipt_provenance.as_ref().ok_or_else(|| {
+        DirectExecutorError::ReceiptProvenanceUnavailable {
+            effect_id: intent.effect_id.clone(),
+        }
+    })?;
+    if !receipt_verification_plan_matches(definition, provenance) {
+        return Err(DirectExecutorError::ReceiptVerificationPlanMismatch);
+    }
     let instance = registry
         .instance(&intent.invocation.instance_id)
         .ok_or_else(|| DirectExecutorError::InstanceNotFound {
@@ -686,6 +701,11 @@ fn verify_current_instance<'a>(
 fn verify_dynamic_execution_gate(
     instance: &CapabilityInstanceBody,
 ) -> Result<(), DirectExecutorError> {
+    if instance.placement != Placement::Local {
+        return Err(DirectExecutorError::UnsupportedExecutorPlacement {
+            placement: instance.placement,
+        });
+    }
     if instance.health.status != HealthStatus::Available {
         return Err(DirectExecutorError::InstanceNotAvailable {
             status: instance.health.status,
@@ -693,6 +713,38 @@ fn verify_dynamic_execution_gate(
     }
     if instance.auth.state != AuthState::NotRequired || instance.auth.auth_ref.is_some() {
         return Err(DirectExecutorError::CredentialWitnessUnavailable);
+    }
+    Ok(())
+}
+
+fn verify_receipt_provenance(intent: &EffectIntent) -> Result<(), DirectExecutorError> {
+    let provenance = intent.receipt_provenance.as_ref().ok_or_else(|| {
+        DirectExecutorError::ReceiptProvenanceUnavailable {
+            effect_id: intent.effect_id.clone(),
+        }
+    })?;
+    if provenance.profile_version != CORE_RECEIPT_PROFILE_V1 {
+        return Err(DirectExecutorError::UnsupportedReceiptProfile);
+    }
+    if provenance.input_summary != CORE_RECEIPT_INPUT_SUMMARY_V1 {
+        return Err(DirectExecutorError::ReceiptProvenanceBindingMismatch);
+    }
+    if provenance.executor_id != LOCAL_EXECUTOR_ID
+        || provenance.executor_placement != ReceiptPlacement::Local
+        || provenance.executor_platform != local_executor_platform()
+    {
+        return Err(DirectExecutorError::ReceiptExecutorProvenanceMismatch);
+    }
+    let expected = intent
+        .authorization
+        .binding
+        .receipt_provenance_digest
+        .as_ref()
+        .ok_or(DirectExecutorError::ReceiptProvenanceBindingMismatch)?;
+    let actual = receipt_provenance_digest(provenance)
+        .map_err(|_| DirectExecutorError::ReceiptProvenanceBindingMismatch)?;
+    if &actual != expected {
+        return Err(DirectExecutorError::ReceiptProvenanceBindingMismatch);
     }
     Ok(())
 }
@@ -740,6 +792,16 @@ pub enum DirectExecutorError {
     MaterialRecordChanged,
     #[error("invocation material does not match its committed digest")]
     MaterialDigestMismatch,
+    #[error("effect `{effect_id}` predates the Core Receipt provenance contract")]
+    ReceiptProvenanceUnavailable { effect_id: String },
+    #[error("the durable Receipt profile is unsupported")]
+    UnsupportedReceiptProfile,
+    #[error("durable Receipt provenance does not match its authorization binding")]
+    ReceiptProvenanceBindingMismatch,
+    #[error("the durable Receipt verification plan differs from the current Definition")]
+    ReceiptVerificationPlanMismatch,
+    #[error("durable Receipt provenance does not match this local executor")]
+    ReceiptExecutorProvenanceMismatch,
     #[error("Capability Definition `{capability_id}` version `{contract_version}` is missing")]
     DefinitionNotFound {
         capability_id: String,
@@ -755,6 +817,8 @@ pub enum DirectExecutorError {
     InstanceNotAvailable { status: HealthStatus },
     #[error("credential-bearing Capability Instances require a committed credential witness")]
     CredentialWitnessUnavailable,
+    #[error("Direct Executor currently supports only local placement, got {placement:?}")]
+    UnsupportedExecutorPlacement { placement: Placement },
     #[error("the exact Capability Instance adapter is not registered")]
     AdapterNotRegistered { instance_id: String },
     #[error("adapter preparation failed with {0:?}")]

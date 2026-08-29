@@ -3,7 +3,7 @@
 - 기준일: 2026-08-29
 - 상태: 비제품·비배포 public-port 참조 구현
 - 공개 protocol v0.1 변경: 없음
-- local store schema 변경: 없음
+- local store schema: 4
 
 ## 목적
 
@@ -28,7 +28,9 @@ opaque targetRef + marker
   -> PreparedAdapterInvocation.execute
        seek -> truncate -> write -> sync -> bounded read-back
   -> evidence digest
-  -> durable outcome
+  -> durable outcome -> Validating
+  -> PreopenedMarkerVerifier bounded read-only 확인
+  -> Core ExecutionReceipt + terminal event atomic commit
 ```
 
 호출 material에는 OS path가 없고 allow-listed opaque `targetRef`만 있다. Adapter 생성자는 신뢰된 host가 넘긴 `std::fs::File`이 일반 파일인지 metadata로 확인하지만 파일 내용은 읽거나 쓰지 않는다. `prepare`는 exact capability·contract·Instance·binding·effect·idempotency key와 argument shape/size를 확인하고 one-shot session을 만든다. 실제 파일 변경은 core가 Started event를 commit한 뒤 `execute`에서만 일어난다.
@@ -47,7 +49,9 @@ opaque targetRef + marker
 - executable binding digest
 - idempotency key
 
-기록 byte의 SHA-256을 현재 adapter outcome의 `receipt_digest` 자리에 전달한다. 이는 digest가 실제 파일 byte와 연결되는지를 시험하기 위한 adapter evidence다. Protocol `ExecutionReceipt` body를 생성하거나 저장했다는 의미가 아니며, Artifact 또는 tool output도 제공하지 않는다.
+기록 byte의 SHA-256을 adapter outcome의 `evidence_digest`로 전달한다. 이는 실제 파일 byte와 연결되는 실행 evidence이며 protocol Receipt가 아니다. 이후 별도 verifier가 같은 preopened handle을 read-only로 다시 읽고 digest를 비교한다. Core는 그 결과와 admission provenance로 protocol `ExecutionReceipt`를 만들고 SQLite schema 4에 terminal event와 함께 저장한다.
+
+Reference adapter에는 typed tool output이 없으므로 Receipt `outputDigest`는 canonical empty object의 고정 digest다. Artifact 또는 실제 output body를 제공한다는 뜻이 아니다.
 
 Marker, raw/canonical target reference와 OS 오류 문자열은 adapter `Debug`, journal, SQLite 및 닫힌 WAL/SHM artifact에 기록하지 않는다. 다만 action/material digest는 공개 SHA-256 commitment이므로 저엔트로피 입력에 대한 추측을 막는 암호화나 keyed commitment가 아니다. 실제 secret 또는 credential을 marker로 전달하면 안 된다.
 
@@ -58,7 +62,8 @@ Marker, raw/canonical target reference와 OS 오류 문자열은 adapter `Debug`
 | prepare 또는 Started commit 전 실패 | `IntentCommitted` | 변경 없음 | 같은 material로 새 session 준비 가능 |
 | Started 뒤 I/O 실패·부분 쓰기·검증 실패 | `EffectUnknown` | 없거나 부분 기록 가능 | 확정 실패로 축소하지 않음 |
 | 파일 반영 뒤 outcome commit 유실 | `Executing` | evidence 존재 | adapter/provider 없이 `EffectUnknown`, adapter execute 0회 |
-| 성공 outcome commit | `Validating` | evidence 존재 | receipt digest로 파일 byte 연결 확인 |
+| 성공 outcome commit | `Validating` | evidence 존재 | verifier만 재개, adapter execute 0회 |
+| 검증·Receipt commit | `Completed` 또는 `Failed` | 변경 없음 | terminal no-op, verifier/execute 0회 |
 
 파일은 host가 미리 생성하므로 `sync_all`은 파일 내용 flush만 시험한다. 디렉터리 entry durability, 전원 차단, 디스크·filesystem 손상 또는 hardware write cache까지 보장하지 않는다.
 
@@ -72,6 +77,9 @@ Public-port integration test와 adapter 내부 fault-injection unit test는 다�
 - marker size 실패 시 Started와 I/O 0회
 - Started commit 전 파일 변경 0회, 성공 commit 전 실제 I/O 완료
 - 성공 evidence byte와 reported digest 일치
+- 성공 outcome 뒤 read-only verifier와 Core-owned succeeded Receipt
+- effect 이후 파일 tamper 시 failed Receipt와 파일 재작성 0회
+- `Validating` SQLite close/reopen 뒤 verifier-only 재개
 - read-only handle의 OS 오류를 고정 `ResponseUnverifiable` unknown으로 축소
 - 내부 fault target으로 주입한 truncate 뒤 partial write와 write 뒤 sync 실패를 고정 unknown으로 축소
 - Started commit 실패 뒤 파일 무변경 및 안전한 재시도
@@ -94,11 +102,12 @@ Workspace CI가 Linux, macOS, Windows에서 이 integration test를 함께 실�
 - `xgeny.fs/read-text` 또는 사용자 workspace의 임의 파일 접근
 - path normalization, directory confinement, symlink/junction/reparse-point, TOCTOU 방어
 - ReadOnly effect 의미와 idempotency 없는 호출
-- typed tool output, Artifact와 core-owned `ExecutionReceipt` body
+- typed tool output, Artifact와 제품용 output digest 계약
+- adapter definite failure·effect unknown·cancelled/not-started Receipt
 - process, network, MCP, Connector 또는 XGEN adapter
 - credential resolution, approval UI, CLI 명령과 model loop
 - in-process hostile plugin 격리
 
-실제 filesystem adapter는 이 참조 구현을 이름만 바꿔 확장하지 않는다. WorkGraph의 ReadOnly 의미, bounded typed output, core-owned Receipt/Artifact, root directory capability와 OS별 path race 규칙을 별도 ADR과 실패 테스트로 먼저 정해야 한다. 전체 구현 순서상 다음 큰 slice는 Tracked/Persistent WorkGraph와 crash recovery다.
+실제 filesystem adapter는 이 참조 구현을 이름만 바꿔 확장하지 않는다. WorkGraph의 ReadOnly 의미, bounded typed output와 Artifact, failure/unknown Receipt, root directory capability와 OS별 path race 규칙을 별도 ADR과 실패 테스트로 먼저 정해야 한다. 전체 구현 순서상 다음 큰 slice는 Tracked/Persistent WorkGraph와 crash recovery다.
 
 공통 adapter contract testkit은 두 번째 실제 adapter가 생길 때 이 suite에서 구현별 fixture를 분리해 추출한다. 지금은 재사용 추상화를 미리 고정하지 않고 public-port conformance의 첫 실행 가능한 기준으로 유지한다.
