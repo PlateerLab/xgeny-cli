@@ -45,7 +45,7 @@ Registry는 다음 상태를 보존할 뿐 해석하지 않는다.
 - source가 builtin, local CLI, MCP, Connector, XGEN인지 여부
 - optional extension payload와 required extension URI
 
-현재 host OS 감지, availability/auth/required-extension filter, policy deny, ranking과 fallback은 Router·Permission Broker 단계에서 명시적 입력을 받아 수행한다. 따라서 다른 OS용, 현재 unavailable인 Instance 또는 아직 지원 여부를 판정하지 않은 required extension이 있는 문서도 catalog 등록 자체는 가능하다. Router는 지원하지 않는 required extension을 가진 후보를 실행 가능 상태로 승격하면 안 된다.
+host OS 감지 자체는 Router 밖의 trusted host가 담당한다. Router 기본형은 caller가 준 concrete target platform, trust/data boundary, required feature와 bound Permission Broker 결과를 명시적으로 받아 filter와 ranking을 수행한다. availability/auth는 Instance 상태를 사용하고, handler witness가 아직 없는 required extension은 모두 fail-closed한다. 따라서 다른 OS용, 현재 unavailable인 Instance 또는 required extension이 있는 문서도 catalog 등록 자체는 가능하다. 자세한 규칙은 [결정론적 Capability Router 기본형](deterministic-router.md)을 따른다.
 
 Definition의 `idempotencyKeySupported`와 Instance의 `idempotencyQuery` 사이에는 protocol v0.1이 강제하는 cross-field 규칙이 아직 없다. Registry는 둘의 관계를 추측하지 않으며, durable sink guarantee와 Router feature 요구 계약을 확정할 때 별도 테스트로 고정한다.
 
@@ -67,8 +67,8 @@ Definition의 `idempotencyKeySupported`와 Instance의 `idempotencyQuery` 사이
 - schema-conformant document를 만드는 ingress loader/newtype
 - prerequisite closure와 cycle 검증
 - keyword·semantic search와 catalog context paging
-- platform, health, auth, trust, policy hard filter
-- 후보 ranking, pin, fallback과 InvocationPlan 생성
+- effect 시작 전·후 실행 실패를 처리하는 fallback과 resume
+- InvocationPlan 생성과 실행 직전 재검증
 - persistence, hot reload, background health polling과 upsert
 - adapter discovery trait와 실제 adapter
 - Permission Broker, filesystem/process 실행, CLI와 모델 loop

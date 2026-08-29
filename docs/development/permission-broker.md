@@ -50,6 +50,8 @@ resolver 결과는 `(scope, canonical_resource)` exact identity로만 비교한�
 
 출력 source evidence는 host, user profile, managed lease 순으로 고정된다. 요청과 policy 입력 순서가 결과를 바꾸지 않는다. Allow 결과의 `ProvisionalAuthorization`은 요청 범위로 잘라서 추가 scope가 새어 나오지 않는다. 이 타입에는 canonical action digest와 atomic use budget이 없으므로 Executor 입력이나 reusable grant로 사용할 수 없다.
 
+`evaluate_bound`는 exact `ResolvedPermissionRequest` clone과 outcome을 private-field `BoundPolicyEvaluation`으로 함께 반환한다. Router는 bare outcome 대신 이 타입만 받아 Capability·effect·critical action·Definition scope의 잘못된 교차 배선을 차단한다. 이는 같은 Capability의 다른 concrete resource, Run, Step 또는 action에 재사용 가능한 authority를 만든다는 뜻이 아니다.
+
 lifetime은 `once < run < session < project < persistent` 같은 크기 비교를 하지 않는다. 각 계층이 현재 요청 lifetime을 명시적으로 포함해야 한다. 특히 run과 session의 의미 범위가 항상 포함 관계라고 가정하지 않는다.
 
 ADR-0005의 완성형 교집합에는 current Run grant가 포함된다. 현재 crate는 Run/action binding과 소비 예산 계약이 없는 상태에서 이를 흉내 내지 않기 위해 Run grant 입력을 받지 않는다. 따라서 Allow는 host·profile·선택적 managed ceiling을 통과했다는 provisional 결과일 뿐이며, ADR-0005 전체 구현이나 Executor 권한으로 해석하면 안 된다.
@@ -87,6 +89,6 @@ ADR-0005의 완성형 교집합에는 current Run grant가 포함된다. 현재 
 - profile 설정 parser와 permission prompt UI
 - Run grant 저장·재사용·소비와 PolicyLease expiry/clock-skew 판정
 - `PolicyDecisionBody`의 ID·timestamp·interaction projection
-- Router, Executor, CLI, MCP, Connector, XGEN 연결
+- Run/action에 결합된 Router→Executor 권한 전달, CLI, MCP, Connector, XGEN 연결
 
-Permission Broker는 sandbox가 아니며 adapter는 결정된 exact resource를 실제 open/execute 시점에도 다시 강제해야 한다.
+Router 기본형은 이 Broker의 bound request-wide outcome을 policy gate로 소비하지만 provisional allow를 실행 권한으로 승격하지 않는다. Permission Broker는 sandbox가 아니며 adapter는 결정된 exact resource를 실제 open/execute 시점에도 다시 강제해야 한다.

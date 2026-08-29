@@ -1211,6 +1211,7 @@ dependencies = [
  "thiserror",
  "xgeny-domain",
  "xgeny-local-store",
+ "xgeny-policy",
  "xgeny-workgraph",
 ]
 
