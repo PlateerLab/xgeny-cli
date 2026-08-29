@@ -28,6 +28,7 @@ Local-first general-purpose agent CLI and harness.
 - [ADR-0006: 결정론적 router와 실행 mode](docs/adr/0006-deterministic-router-and-execution-modes.md)
 - [ADR-0007: Run Journal과 Execution Receipt](docs/adr/0007-run-journal-and-execution-receipt.md)
 - [ADR-0008: Durable Run Store와 외부 effect 복구](docs/adr/0008-durable-run-store-and-effect-recovery.md)
+- [ADR-0009: Single Orchestrator와 외부 Harness 통합](docs/adr/0009-single-orchestrator-and-external-harness-integration.md)
 
 ## 개발 및 검증
 

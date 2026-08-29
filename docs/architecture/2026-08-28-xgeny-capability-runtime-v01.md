@@ -59,6 +59,8 @@ flowchart TB
 
 모델은 후보를 제안할 수 있지만 권한을 부여하거나 실행 사실을 확정하지 않는다. 런타임이 구체적 resource를 해석하고, 정책을 검사하고, 실행 결과를 검증한다.
 
+이 구조는 XGENy가 `orchestration_authority`인 runtime mode에 적용된다. Claude Code, Codex 등 외부 harness가 authority인 observer mode에서는 XGENy가 Goal interpreter, Router, Executor와 WorkGraph mutation을 실행하지 않으며 v0.1 canonical WorkGraph도 만들지 않는다. 외부 harness의 local tool은 host가 직접 실행하고 XGEN capability만 MCP/A2A remote invocation으로 추가한다. 세부 계약은 ADR-0009를 따른다.
+
 ## 3. 의미 경계
 
 | 개념 | 책임 | 금지 사항 |
@@ -329,6 +331,14 @@ InvocationPlan의 raw argument는 실행 중에만 존재하며 canonical JSON �
 - WorkGraph 내부 Step과 정책 상세는 기본 A2A 표면에 노출하지 않는다.
 - WorkGraph delta, PolicyLease, Receipt는 필요한 경우 명시적 XGEN extension URI로 제공한다.
 
+### 외부 harness host adapter
+
+- 외부 harness Parent Run과 XGEN child Run은 별도 authority와 Run ID를 가진다.
+- provider adapter, lifecycle observer, XGEN capability client를 하나의 agent loop로 결합하지 않는다.
+- Model Gateway 연결만으로 local tool execution을 관측했다고 주장하지 않는다.
+- adapter는 model override, structured event, permission, evidence, MCP, durable task, resume 지원 여부를 선언한다.
+- hook이나 structured event에서 누락된 의미는 추정하지 않고 `unknown`으로 보존한다.
+
 ## 12. MVP Capability pack
 
 ### Core OS pack
@@ -374,8 +384,10 @@ Coding은 기본 acceptance scenario이지만 core domain identity가 아니다.
 10. model provider와 ContextAssembler
 11. core OS Capability pack
 12. MCP adapter
-13. read-only·Artifact 생성형 XGEN capability live E2E
-14. OS별 package/install E2E
+13. Codex observer/provider reference adapter conformance
+14. Claude Code observer/provider adapter conformance
+15. read-only·Artifact 생성형 XGEN capability live E2E
+16. OS별 package/install E2E
 
 서버에 effect를 만드는 XGEN workflow는 idempotency, reconcile, Receipt 검증 뒤에 연결한다. 첫 vertical slice의 상세 실험 순서와 통계 기준은 `docs/research/2026-08-28-runtime-evaluation-protocol.md`를 따른다.
 
