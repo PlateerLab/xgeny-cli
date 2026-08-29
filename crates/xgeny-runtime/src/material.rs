@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde_json::Value;
@@ -34,8 +35,6 @@ pub enum MaterialProviderFailure {
 /// core validation. Raw credentials remain behind their typed references and are resolved later by
 /// the selected adapter.
 pub trait InvocationMaterialProvider {
-    fn provider_id(&self) -> &str;
-
     /// Rebuild candidate invocation arguments for one exact recipe revision.
     ///
     /// # Errors
@@ -49,12 +48,103 @@ pub trait InvocationMaterialProvider {
     ) -> Result<Value, MaterialProviderFailure>;
 }
 
+/// Trusted process-local catalog for restart reconstruction providers.
+///
+/// Provider identity belongs to the composition root, not to provider implementations. Recovery
+/// performs one byte-exact lookup using the identifier committed in the material record and never
+/// falls back to another provider.
+#[derive(Default)]
+pub struct MaterialProviderRegistry {
+    providers: BTreeMap<String, Box<dyn InvocationMaterialProvider>>,
+}
+
+impl MaterialProviderRegistry {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            providers: BTreeMap::new(),
+        }
+    }
+
+    /// Register a trusted provider under one stable identifier.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an invalid or duplicate identifier without replacing the existing provider.
+    pub fn register<P>(
+        &mut self,
+        provider_id: impl Into<String>,
+        provider: P,
+    ) -> Result<(), MaterialProviderRegistryError>
+    where
+        P: InvocationMaterialProvider + 'static,
+    {
+        let provider_id = provider_id.into();
+        validate_provider_id(&provider_id)?;
+        if self.providers.contains_key(&provider_id) {
+            return Err(MaterialProviderRegistryError::DuplicateProvider);
+        }
+        self.providers.insert(provider_id, Box::new(provider));
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.providers.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.providers.is_empty()
+    }
+
+    fn provider_mut(
+        &mut self,
+        provider_id: &str,
+    ) -> Result<&mut (dyn InvocationMaterialProvider + '_), MaterialRecoveryError> {
+        match self.providers.get_mut(provider_id) {
+            Some(provider) => Ok(provider.as_mut()),
+            None => Err(MaterialRecoveryError::ProviderNotRegistered),
+        }
+    }
+}
+
+impl fmt::Debug for MaterialProviderRegistry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MaterialProviderRegistry")
+            .field("provider_count", &self.providers.len())
+            .finish()
+    }
+}
+
+fn validate_provider_id(provider_id: &str) -> Result<(), MaterialProviderRegistryError> {
+    const MAX_PROVIDER_ID_BYTES: usize = 128;
+    if provider_id.is_empty()
+        || matches!(provider_id, "." | "..")
+        || provider_id.len() > MAX_PROVIDER_ID_BYTES
+        || !provider_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(MaterialProviderRegistryError::InvalidProviderId);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum MaterialProviderRegistryError {
+    #[error("material provider identifier is invalid")]
+    InvalidProviderId,
+    #[error("material provider identifier is already registered")]
+    DuplicateProvider,
+}
+
 /// Typed core-verified invocation arguments bound to one committed effect intent.
 ///
-/// This value cannot be deserialized or cloned as a whole. Its argument accessor exists for the
-/// current trusted in-process boundary, while Debug output redacts arguments and the opaque
-/// reference. The next Direct Executor slice will narrow this to a consume-only core-owned
-/// prepared adapter token.
+/// This value cannot be deserialized or cloned as a whole. Direct Executor borrows its arguments
+/// only inside the crate, while Debug output redacts arguments and the opaque reference. External
+/// adapters receive only a borrowed, redacted prepare request.
 #[must_use = "verified invocation material must be prepared by the selected adapter or discarded"]
 pub struct InvocationMaterial {
     record: InvocationMaterialRecord,
@@ -67,9 +157,8 @@ impl InvocationMaterial {
         &self.record
     }
 
-    #[must_use]
-    pub const fn normalized_arguments(&self) -> &Value {
-        &self.normalized_arguments
+    pub(crate) const fn parts(&self) -> (&InvocationMaterialRecord, &Value) {
+        (&self.record, &self.normalized_arguments)
     }
 }
 
@@ -127,20 +216,19 @@ impl InvocationMaterialRecovery {
     ///
     /// Fails closed for a missing/stale Run, wrong lease, non-reconstructable material, wrong
     /// provider, provider failure, Definition/Instance drift, invalid arguments, or digest drift.
-    pub fn recover<S, R, L, P>(
+    pub fn recover<S, R, L>(
         &self,
         store: &S,
         lease: &L,
         registry: &CapabilityRegistry,
         resolver: &R,
-        provider: &mut P,
+        providers: &mut MaterialProviderRegistry,
         step_id: &str,
     ) -> Result<InvocationMaterial, MaterialRecoveryError>
     where
         S: RunStore,
         R: ResourceResolver,
         L: RunLease,
-        P: InvocationMaterialProvider,
     {
         let snapshot = store
             .load()?
@@ -172,10 +260,6 @@ impl InvocationMaterialRecovery {
         else {
             return Err(MaterialRecoveryError::EphemeralMaterialUnavailable);
         };
-        if provider.provider_id() != reference.provider_id() {
-            return Err(MaterialRecoveryError::ProviderMismatch);
-        }
-
         let capability = CapabilityRef {
             capability_id: intent.invocation.capability_id.clone(),
             contract_version: intent.invocation.contract_version.clone(),
@@ -200,7 +284,8 @@ impl InvocationMaterialRecovery {
             return Err(MaterialRecoveryError::InstanceBindingChanged);
         }
 
-        let reconstructed = provider
+        let reconstructed = providers
+            .provider_mut(reference.provider_id())?
             .reconstruct(reference.reference_id(), reference.revision())
             .map_err(MaterialRecoveryError::Provider)?;
         validate_arguments(definition, &reconstructed)?;
@@ -329,8 +414,8 @@ pub enum MaterialRecoveryError {
     EphemeralMaterialUnavailable,
     #[error("admitted invocation material is not ephemeral")]
     NotEphemeral,
-    #[error("the selected invocation material provider does not match the committed reference")]
-    ProviderMismatch,
+    #[error("the committed invocation material provider is not registered")]
+    ProviderNotRegistered,
     #[error("invocation material provider failed with {0:?}")]
     Provider(MaterialProviderFailure),
     #[error("Capability Definition `{capability_id}` version `{contract_version}` is missing")]

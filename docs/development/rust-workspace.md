@@ -17,7 +17,7 @@ crates/
   xgeny-cli/          xgeny 실행 파일과 protocol check 명령
 ```
 
-`xgeny-workgraph`, `xgeny-local-store`, `xgeny-runtime`의 durable effect와 invocation material 부분은 ADR-0008·0010 연구 gate를 위한 내부 실험이며 공개 프로토콜 v0.1을 변경하지 않는다. Registry와 Router 기본형도 기존 `CapabilityDefinition`·`CapabilityInstance`를 그대로 사용하며 wire 문서를 추가하지 않는다. `xgeny-policy`의 Allow는 provisional 결과로 유지되고, runtime의 Admission 기본형만 exact invocation에서 만든 local one-shot allow를 current Run/Step/action/Instance/material과 결합해 durable intent로 발행한다. reusable `Grant`나 `PolicyDecision` wire 문서는 발행하지 않는다. 이 단계는 모델 호출, Direct Executor, 실제 파일·process adapter, 승인 UI, MCP, Connector, XGEN 원격 연동, `InvocationPlan` 투영 또는 사용자용 resume 명령을 구현하지 않는다.
+`xgeny-workgraph`, `xgeny-local-store`, `xgeny-runtime`의 durable effect, invocation material과 Direct Executor 부분은 ADR-0008·0010·0011 연구 gate를 위한 내부 실험이며 공개 프로토콜 v0.1을 변경하지 않는다. Registry와 Router 기본형도 기존 `CapabilityDefinition`·`CapabilityInstance`를 그대로 사용하며 wire 문서를 추가하지 않는다. `xgeny-policy`의 Allow는 provisional 결과로 유지되고, runtime의 Admission 기본형만 exact invocation에서 만든 local one-shot allow를 current Run/Step/action/Instance/material과 결합해 durable intent로 발행한다. reusable `Grant`나 `PolicyDecision` wire 문서는 발행하지 않는다. 이 단계는 fake adapter Direct Executor까지 구현하며 모델 호출, 실제 파일·process adapter, 승인 UI, MCP, Connector, XGEN 원격 연동, `InvocationPlan` 투영 또는 사용자용 resume 명령은 구현하지 않는다.
 
 ## 준비물
 
@@ -98,7 +98,7 @@ crates/
 - EffectIntent·authorization·material sidecar의 원자적 commit과 reconstructable lost-ack 복구
 - raw argument의 journal·SQLite/WAL·Debug 비노출과 SQLite 재시작 검증
 
-actual OS resolver, sandbox, sealed secret/argument 저장, managed/critical/reusable grant와 external harness 연동은 아직 포함하지 않는다. 자세한 admission 계약은 [Run-bound Invocation Admission 기본형](invocation-admission.md), 재시작 material 경계는 [Recoverable Invocation Material 기본형](recoverable-invocation-material.md)을 따른다.
+actual OS resolver/adapter, sandbox, sealed secret/argument 저장, managed/critical/reusable grant와 external harness 연동은 아직 포함하지 않는다. 자세한 admission 계약은 [Run-bound Invocation Admission 기본형](invocation-admission.md), 재시작 material 경계는 [Recoverable Invocation Material 기본형](recoverable-invocation-material.md), exact fake-adapter 실행 경계는 [Direct Executor 기본형](direct-executor.md)을 따른다.
 
 ## 검증
 

@@ -5,6 +5,8 @@
 - 적용 범위: local Run admission, embedded SQLite store, effect 실행 전 복구
 - 공개 protocol v0.1 변경: 없음
 
+> 후속 상태: ADR-0011이 trusted provider registry, exact adapter dispatch와 core-owned consume-once prepared 경계를 구현한다. 이 ADR의 material 저장·복구 결정은 그대로 유지된다.
+
 ## 문맥
 
 현재 admission은 exact invocation argument를 schema로 검증하고, trusted resource resolver로 정규화한 뒤 permission, Router 선택, semantic action, 1회 authorization을 하나의 `EffectIntent`로 commit한다. 그러나 canonical argument 자체는 process 안의 `AdmittedEffect`에만 남는다.
@@ -133,11 +135,11 @@ MVP reason code는 최소 다음 범주를 구분한다.
 
 Manual 전이는 기존 authorization consumption을 되돌리지 않는다. 현재 effect/grant identity는 같은 Run의 semantic action에 고정되므로 새 Step만 만들어 동일 작업을 재승인할 수도 없다. 다시 실행하려면 사용자가 상태를 확인한 뒤 새 Run에서 admission을 거치거나, 후속 occurrence/replacement protocol이 명시적으로 도입되어야 한다.
 
-### 7. Adapter execution boundary는 다음 PR로 분리한다
+### 7. Adapter execution boundary는 후속 ADR로 분리한다
 
 이번 결정은 durable sidecar, 복구, revalidation과 fail-closed 상태까지만 다룬다. Actual filesystem/process/MCP/XGEN adapter 호출은 포함하지 않는다.
 
-현재 adapter-owned `PreparedEffect`가 action·Definition·Instance digest를 자기 보고하는 경계도 이번 PR에서 교체하지 않는다. 다음 Direct Executor PR에서 core가 exact `binding_ref + operation_ref`로 adapter를 선택하고, core-owned opaque prepared wrapper를 발행하도록 변경한다.
+이 slice 당시 adapter-owned `PreparedEffect`가 action·Definition·Instance digest를 자기 보고하는 경계는 교체하지 않았다. 후속 ADR-0011은 core가 exact full Instance binding으로 adapter를 선택하고 core-owned opaque prepared wrapper를 발행하도록 변경한다.
 
 따라서 이번 slice의 성공은 “재시작 뒤 exact material을 복구했거나, effect 시작 전에 명시적으로 안전하게 중단했다”는 뜻이다. 실제 tool effect 실행이 가능해졌다는 뜻은 아니다.
 
@@ -166,7 +168,7 @@ Manual 전이는 기존 authorization consumption을 되돌리지 않는다. 현
 
 ## 명시적 비목표
 
-- Actual adapter와 core-owned `PreparedEffect` 구현
+- Actual filesystem/process/MCP/XGEN adapter 구현
 - OS credential store와 raw credential resolver
 - Sealed material encryption과 key lifecycle
 - Mutable endpoint/config 또는 credential principal의 일반적인 pinning protocol

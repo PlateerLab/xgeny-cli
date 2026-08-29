@@ -154,7 +154,7 @@ pub struct AdmittedEffect {
 
 impl AdmittedEffect {
     #[must_use]
-    pub const fn normalized_arguments(&self) -> &Value {
+    pub(crate) const fn normalized_arguments(&self) -> &Value {
         &self.normalized_arguments
     }
 

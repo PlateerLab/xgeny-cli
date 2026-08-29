@@ -90,7 +90,7 @@ WorkGraph reducer는 `EffectIntent`를 적용하기 전에 authorization binding
 
 SQLite schema version은 3이다. journal event, effect-intent index, authorization-consumption row, secret-free `InvocationMaterialRecord`와 projection은 한 transaction에 기록된다. 각 insert 뒤 fault injection을 포함해 어느 단계에서 process가 종료돼도 일부만 commit되지 않는지 검사한다. 내부 실험용 version 1·2 store는 material binding이 없으므로 명시적으로 거부하며 자동 migration하지 않는다.
 
-실행 직전 runtime도 ephemeral `PreparedEffect`의 action digest뿐 아니라 Capability ID/version, Definition digest, Instance ID와 executable-binding digest를 durable intent와 다시 비교한다. 하나라도 다르면 sink 호출은 0회다.
+실행 직전 Direct Executor도 current Capability Definition과 Instance executable-binding digest를 durable intent와 다시 비교한다. 그 뒤 core-owned prepared session을 Run·Step·effect·material·full journal head에 결합한다. 하나라도 다르면 Started와 adapter execute는 0회다.
 
 ## 검증과 알려진 한계
 
