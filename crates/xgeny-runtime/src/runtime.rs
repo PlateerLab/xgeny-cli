@@ -58,6 +58,11 @@ pub trait EffectSink {
 /// the same canonical semantic action committed in [`EffectIntent::action_digest`].
 pub trait PreparedEffect {
     fn action_digest(&self) -> &str;
+    fn capability_id(&self) -> &str;
+    fn contract_version(&self) -> &str;
+    fn definition_digest(&self) -> &str;
+    fn instance_id(&self) -> &str;
+    fn instance_binding_digest(&self) -> &str;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +225,7 @@ where
                 actual: prepared.action_digest().to_owned(),
             });
         }
+        verify_prepared_invocation(&step.step_id, &intent, prepared)?;
         let started = self.append_event(
             state,
             RunEventBody::EffectExecutionStarted {
@@ -442,6 +448,50 @@ where
     }
 }
 
+fn verify_prepared_invocation<P: PreparedEffect>(
+    step_id: &str,
+    intent: &EffectIntent,
+    prepared: &P,
+) -> Result<(), RuntimeError> {
+    for (field, expected, actual) in [
+        (
+            "capability_id",
+            intent.invocation.capability_id.as_str(),
+            prepared.capability_id(),
+        ),
+        (
+            "contract_version",
+            intent.invocation.contract_version.as_str(),
+            prepared.contract_version(),
+        ),
+        (
+            "definition_digest",
+            intent.invocation.definition_digest.as_str(),
+            prepared.definition_digest(),
+        ),
+        (
+            "instance_id",
+            intent.invocation.instance_id.as_str(),
+            prepared.instance_id(),
+        ),
+        (
+            "instance_binding_digest",
+            intent.invocation.instance_binding_digest.as_str(),
+            prepared.instance_binding_digest(),
+        ),
+    ] {
+        if expected != actual {
+            return Err(RuntimeError::PreparedEffectBindingMismatch {
+                step_id: step_id.to_owned(),
+                field,
+                expected: expected.to_owned(),
+                actual: actual.to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn require_intent(step: &StepState) -> Result<EffectIntent, RuntimeError> {
     step.intent
         .clone()
@@ -499,6 +549,15 @@ pub enum RuntimeError {
     )]
     PreparedEffectDigestMismatch {
         step_id: String,
+        expected: String,
+        actual: String,
+    },
+    #[error(
+        "step `{step_id}` prepared effect {field} mismatch: expected `{expected}`, got `{actual}`"
+    )]
+    PreparedEffectBindingMismatch {
+        step_id: String,
+        field: &'static str,
         expected: String,
         actual: String,
     },

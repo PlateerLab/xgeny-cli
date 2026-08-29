@@ -34,7 +34,7 @@ pub enum RunEventBody {
     },
     EffectIntentCommitted {
         step_id: String,
-        intent: EffectIntent,
+        intent: Box<EffectIntent>,
     },
     EffectExecutionStarted {
         step_id: String,
@@ -103,10 +103,25 @@ impl RunEventBody {
 pub struct EffectIntent {
     pub effect_id: String,
     pub action_digest: String,
+    pub invocation: InvocationBinding,
     pub effect_class: EffectClass,
     pub idempotency_key: Option<String>,
     pub sink_guarantee: SinkGuarantee,
     pub authorization: AuthorizationUse,
+}
+
+/// Immutable executable binding retained with a durable effect intent.
+///
+/// Dynamic health, authentication state, and cost hints are deliberately excluded. The binding
+/// digest identifies the adapter endpoint/operation selected by the trusted admission path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InvocationBinding {
+    pub capability_id: String,
+    pub contract_version: String,
+    pub definition_digest: String,
+    pub instance_id: String,
+    pub instance_binding_digest: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,6 +147,87 @@ pub struct AuthorizationUse {
     pub grant_id: String,
     pub grant_digest: String,
     pub max_uses: u32,
+    pub binding: AuthorizationBinding,
+}
+
+/// Run-local facts covered by one issued authorization digest.
+///
+/// The journal head is the state against which policy and routing were evaluated. Persisting the
+/// binding lets replay reject copying an intent to another Run, Step, authority epoch, action, or
+/// executable Instance even though the low-level journal types remain serializable primitives.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthorizationBinding {
+    pub run_id: String,
+    pub step_id: String,
+    pub authority: String,
+    pub authority_epoch: u64,
+    pub issued_at_sequence: u64,
+    pub issued_at_head_digest: String,
+    pub capability_id: String,
+    pub contract_version: String,
+    pub definition_digest: String,
+    pub instance_id: String,
+    pub instance_binding_digest: String,
+    pub action_digest: String,
+    pub policy_evidence_digest: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthorizationDigestInput<'a> {
+    domain: &'static str,
+    binding: &'a AuthorizationBinding,
+    max_uses: u32,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OnceAuthorizationIdInput<'a> {
+    domain: &'static str,
+    run_id: &'a str,
+    action_digest: &'a str,
+}
+
+/// Derive the stable budget identity for one semantic action within a Run.
+///
+/// Keeping this derivation in the reducer's crate prevents a caller from changing only the grant
+/// ID to mint a fresh one-shot budget for the same Run/action pair.
+///
+/// # Errors
+///
+/// Returns an error if RFC 8785 canonical JSON encoding fails.
+pub fn once_authorization_id(
+    run_id: &str,
+    action_digest: &str,
+) -> Result<String, AuthorizationDigestError> {
+    let canonical = serde_jcs::to_vec(&OnceAuthorizationIdInput {
+        domain: "xgeny.authorization-budget.once/v1",
+        run_id,
+        action_digest,
+    })
+    .map_err(|error| AuthorizationDigestError::Canonicalization(error.to_string()))?;
+    let digest = sha256_digest(&canonical);
+    let encoded = digest.strip_prefix("sha256:").unwrap_or(&digest);
+    Ok(format!("authorization-{encoded}"))
+}
+
+/// Calculate the content digest the reducer expects for a durable authorization binding.
+///
+/// # Errors
+///
+/// Returns an error if RFC 8785 canonical JSON encoding fails.
+pub fn authorization_digest(
+    binding: &AuthorizationBinding,
+    max_uses: u32,
+) -> Result<String, AuthorizationDigestError> {
+    let canonical = serde_jcs::to_vec(&AuthorizationDigestInput {
+        domain: "xgeny.authorization.once/v1",
+        binding,
+        max_uses,
+    })
+    .map_err(|error| AuthorizationDigestError::Canonicalization(error.to_string()))?;
+    Ok(sha256_digest(&canonical))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,12 +307,16 @@ fn record_digest(
         event,
     })
     .map_err(|error| RecordError::Canonicalization(error.to_string()))?;
-    let digest = Sha256::digest(canonical);
+    Ok(sha256_digest(&canonical))
+}
+
+fn sha256_digest(value: &[u8]) -> String {
+    let digest = Sha256::digest(value);
     let mut encoded = String::with_capacity(64);
     for byte in digest {
         write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
     }
-    Ok(format!("sha256:{encoded}"))
+    format!("sha256:{encoded}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -480,7 +580,7 @@ fn commit_effect_intent(
     step_id: &str,
     intent: &EffectIntent,
 ) -> Result<(), TransitionError> {
-    if intent.authorization.max_uses == 0 {
+    if intent.authorization.max_uses != 1 {
         return Err(TransitionError::InvalidAuthorizationBudget {
             grant_id: intent.authorization.grant_id.clone(),
         });
@@ -500,6 +600,8 @@ fn commit_effect_intent(
         return Err(TransitionError::DuplicateEffect(intent.effect_id.clone()));
     }
 
+    validate_authorization_binding(state, step_id, intent)?;
+
     let step = state
         .steps
         .get(step_id)
@@ -509,7 +611,7 @@ fn commit_effect_intent(
         StepStatus::Planned,
         &RunEventBody::EffectIntentCommitted {
             step_id: step_id.to_owned(),
-            intent: intent.clone(),
+            intent: Box::new(intent.clone()),
         },
     )?;
 
@@ -544,6 +646,72 @@ fn commit_effect_intent(
         .expect("step was checked before authorization mutation");
     step.intent = Some(intent.clone());
     step.status = StepStatus::IntentCommitted;
+    Ok(())
+}
+
+fn validate_authorization_binding(
+    state: &RunState,
+    step_id: &str,
+    intent: &EffectIntent,
+) -> Result<(), TransitionError> {
+    let authorization = &intent.authorization;
+    let binding = &authorization.binding;
+    let invocation = &intent.invocation;
+
+    if binding.run_id != state.run_id {
+        return Err(TransitionError::AuthorizationRunMismatch {
+            grant_id: authorization.grant_id.clone(),
+        });
+    }
+    if binding.step_id != step_id {
+        return Err(TransitionError::AuthorizationStepMismatch {
+            grant_id: authorization.grant_id.clone(),
+        });
+    }
+    if binding.authority != state.authority {
+        return Err(TransitionError::AuthorizationAuthorityMismatch {
+            grant_id: authorization.grant_id.clone(),
+        });
+    }
+    if binding.authority_epoch != state.authority_epoch {
+        return Err(TransitionError::AuthorizationEpochMismatch {
+            grant_id: authorization.grant_id.clone(),
+        });
+    }
+    if binding.issued_at_sequence != state.journal_sequence
+        || binding.issued_at_head_digest != state.journal_head_digest
+    {
+        return Err(TransitionError::AuthorizationHeadMismatch {
+            grant_id: authorization.grant_id.clone(),
+        });
+    }
+    if binding.action_digest != intent.action_digest {
+        return Err(TransitionError::AuthorizationActionMismatch {
+            grant_id: authorization.grant_id.clone(),
+        });
+    }
+    if binding.capability_id != invocation.capability_id
+        || binding.contract_version != invocation.contract_version
+        || binding.definition_digest != invocation.definition_digest
+        || binding.instance_id != invocation.instance_id
+        || binding.instance_binding_digest != invocation.instance_binding_digest
+    {
+        return Err(TransitionError::AuthorizationInvocationMismatch {
+            grant_id: authorization.grant_id.clone(),
+        });
+    }
+    let expected_id = once_authorization_id(&binding.run_id, &binding.action_digest)?;
+    if authorization.grant_id != expected_id {
+        return Err(TransitionError::AuthorizationIdMismatch {
+            grant_id: authorization.grant_id.clone(),
+        });
+    }
+    let expected = authorization_digest(binding, authorization.max_uses)?;
+    if authorization.grant_digest != expected {
+        return Err(TransitionError::AuthorizationDigestMismatch {
+            grant_id: authorization.grant_id.clone(),
+        });
+    }
     Ok(())
 }
 
@@ -642,6 +810,12 @@ pub enum RecordError {
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum AuthorizationDigestError {
+    #[error("authorization canonicalization failed: {0}")]
+    Canonicalization(String),
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum TransitionError {
     #[error(transparent)]
     Record(#[from] RecordError),
@@ -681,8 +855,28 @@ pub enum TransitionError {
         from: StepStatus,
         event: &'static str,
     },
-    #[error("authorization `{grant_id}` must allow at least one use")]
+    #[error("authorization `{grant_id}` must allow exactly one use")]
     InvalidAuthorizationBudget { grant_id: String },
+    #[error("authorization `{grant_id}` is bound to another Run")]
+    AuthorizationRunMismatch { grant_id: String },
+    #[error("authorization `{grant_id}` is bound to another Step")]
+    AuthorizationStepMismatch { grant_id: String },
+    #[error("authorization `{grant_id}` is bound to another authority")]
+    AuthorizationAuthorityMismatch { grant_id: String },
+    #[error("authorization `{grant_id}` is bound to another authority epoch")]
+    AuthorizationEpochMismatch { grant_id: String },
+    #[error("authorization `{grant_id}` was issued against another journal head")]
+    AuthorizationHeadMismatch { grant_id: String },
+    #[error("authorization `{grant_id}` is bound to another semantic action")]
+    AuthorizationActionMismatch { grant_id: String },
+    #[error("authorization `{grant_id}` is bound to another executable invocation")]
+    AuthorizationInvocationMismatch { grant_id: String },
+    #[error("authorization `{grant_id}` is not the stable ID for its Run/action budget")]
+    AuthorizationIdMismatch { grant_id: String },
+    #[error("authorization `{grant_id}` digest does not cover its durable binding")]
+    AuthorizationDigestMismatch { grant_id: String },
+    #[error(transparent)]
+    AuthorizationDigest(#[from] AuthorizationDigestError),
     #[error("authorization `{grant_id}` changed after first consumption")]
     AuthorizationGrantChanged { grant_id: String },
     #[error("authorization `{grant_id}` exceeded its {max_uses}-use budget")]
@@ -721,6 +915,8 @@ mod tests {
     const AUTHORITY: &str = "local:test";
     const AUTHORITY_EPOCH: u64 = 7;
 
+    type IntentMutation = Box<dyn Fn(&mut EffectIntent)>;
+
     fn event(event_id: &str, body: RunEventBody) -> RunEvent {
         RunEvent {
             event_id: event_id.to_owned(),
@@ -744,21 +940,50 @@ mod tests {
         state
     }
 
-    fn intent(step_id: &str, effect_id: &str, max_uses: u32) -> RunEventBody {
+    fn intent(state: &RunState, step_id: &str, effect_id: &str, max_uses: u32) -> RunEventBody {
+        let action_digest = format!("sha256:action-{effect_id}");
+        let invocation = InvocationBinding {
+            capability_id: "test.effect".to_owned(),
+            contract_version: "1.0.0".to_owned(),
+            definition_digest: "sha256:definition-1".to_owned(),
+            instance_id: "test.instance".to_owned(),
+            instance_binding_digest: "sha256:instance-1".to_owned(),
+        };
+        let binding = AuthorizationBinding {
+            run_id: state.run_id.clone(),
+            step_id: step_id.to_owned(),
+            authority: state.authority.clone(),
+            authority_epoch: state.authority_epoch,
+            issued_at_sequence: state.journal_sequence,
+            issued_at_head_digest: state.journal_head_digest.clone(),
+            capability_id: invocation.capability_id.clone(),
+            contract_version: invocation.contract_version.clone(),
+            definition_digest: invocation.definition_digest.clone(),
+            instance_id: invocation.instance_id.clone(),
+            instance_binding_digest: invocation.instance_binding_digest.clone(),
+            action_digest: action_digest.clone(),
+            policy_evidence_digest: "sha256:policy-1".to_owned(),
+        };
+        let grant_digest =
+            authorization_digest(&binding, max_uses).expect("authorization should canonicalize");
+        let grant_id = once_authorization_id(&binding.run_id, &binding.action_digest)
+            .expect("authorization ID should canonicalize");
         RunEventBody::EffectIntentCommitted {
             step_id: step_id.to_owned(),
-            intent: EffectIntent {
+            intent: Box::new(EffectIntent {
                 effect_id: effect_id.to_owned(),
-                action_digest: format!("sha256:action-{effect_id}"),
+                action_digest,
+                invocation,
                 effect_class: EffectClass::NonIdempotent,
                 idempotency_key: None,
                 sink_guarantee: SinkGuarantee::None,
                 authorization: AuthorizationUse {
-                    grant_id: "grant-1".to_owned(),
-                    grant_digest: "sha256:grant-1".to_owned(),
+                    grant_id,
+                    grant_digest,
                     max_uses,
+                    binding,
                 },
-            },
+            }),
         }
     }
 
@@ -789,7 +1014,7 @@ mod tests {
         state = append(
             &mut records,
             Some(&state),
-            event("event-3", intent("step-1", "effect-1", 1)),
+            event("event-3", intent(&state, "step-1", "effect-1", 1)),
         );
         state = append(
             &mut records,
@@ -826,7 +1051,16 @@ mod tests {
         );
 
         assert_eq!(state.steps["step-1"].status, StepStatus::Completed);
-        assert_eq!(state.authorization_consumption["grant-1"].uses, 1);
+        assert_eq!(state.authorization_consumption.len(), 1);
+        assert_eq!(
+            state
+                .authorization_consumption
+                .values()
+                .next()
+                .expect("one authorization should exist")
+                .uses,
+            1
+        );
         assert_eq!(replay(&records).expect("replay should pass"), state);
         assert_eq!(replay(&records).expect("second replay should pass"), state);
     }
@@ -839,15 +1073,23 @@ mod tests {
             None,
             event("event-1", RunEventBody::RunCreated { goal: "g".into() }),
         );
-        for (event_id, body) in [
-            (
+        state = append(
+            &mut records,
+            Some(&state),
+            event(
                 "event-2",
                 RunEventBody::StepPlanned {
                     step_id: "step-1".into(),
                     objective: "o".into(),
                 },
             ),
-            ("event-3", intent("step-1", "effect-1", 1)),
+        );
+        state = append(
+            &mut records,
+            Some(&state),
+            event("event-3", intent(&state, "step-1", "effect-1", 1)),
+        );
+        for (event_id, body) in [
             (
                 "event-4",
                 RunEventBody::EffectExecutionStarted {
@@ -893,12 +1135,23 @@ mod tests {
             None,
             event("event-1", RunEventBody::RunCreated { goal: "g".into() }),
         );
+        state = append(
+            &mut records,
+            Some(&state),
+            event(
+                "event-2",
+                RunEventBody::StepPlanned {
+                    step_id: "step-1".into(),
+                    objective: "o".into(),
+                },
+            ),
+        );
+        state = append(
+            &mut records,
+            Some(&state),
+            event("event-3", intent(&state, "step-1", "effect-1", 1)),
+        );
         let bodies = [
-            RunEventBody::StepPlanned {
-                step_id: "step-1".into(),
-                objective: "o".into(),
-            },
-            intent("step-1", "effect-1", 1),
             RunEventBody::EffectExecutionStarted {
                 step_id: "step-1".into(),
                 effect_id: "effect-1".into(),
@@ -927,52 +1180,160 @@ mod tests {
             state = append(
                 &mut records,
                 Some(&state),
-                event(&format!("event-{}", index + 2), body),
+                event(&format!("event-{}", index + 4), body),
             );
         }
 
         assert_eq!(state.steps["step-1"].status, StepStatus::Executing);
         assert_eq!(state.steps["step-1"].attempts, 2);
-        assert_eq!(state.authorization_consumption["grant-1"].uses, 1);
+        assert_eq!(state.authorization_consumption.len(), 1);
+        assert_eq!(
+            state
+                .authorization_consumption
+                .values()
+                .next()
+                .expect("one authorization should exist")
+                .uses,
+            1
+        );
     }
 
     #[test]
-    fn authorization_budget_is_consumed_by_distinct_effect_intents() {
+    fn one_shot_authorization_cannot_be_rebound_to_another_step() {
         let mut records = Vec::new();
         let mut state = append(
             &mut records,
             None,
             event("event-1", RunEventBody::RunCreated { goal: "g".into() }),
         );
-        for (event_id, body) in [
-            (
-                "event-2",
-                RunEventBody::StepPlanned {
-                    step_id: "step-1".into(),
-                    objective: "o1".into(),
-                },
-            ),
-            (
-                "event-3",
-                RunEventBody::StepPlanned {
-                    step_id: "step-2".into(),
-                    objective: "o2".into(),
-                },
-            ),
-            ("event-4", intent("step-1", "effect-1", 1)),
-        ] {
-            state = append(&mut records, Some(&state), event(event_id, body));
+        for (event_id, step_id) in [("event-2", "step-1"), ("event-3", "step-2")] {
+            state = append(
+                &mut records,
+                Some(&state),
+                event(
+                    event_id,
+                    RunEventBody::StepPlanned {
+                        step_id: step_id.into(),
+                        objective: step_id.into(),
+                    },
+                ),
+            );
         }
-        let over_budget = EventRecord::next(
+        state = append(
+            &mut records,
+            Some(&state),
+            event("event-4", intent(&state, "step-1", "effect-1", 1)),
+        );
+        let RunEventBody::EffectIntentCommitted {
+            step_id,
+            mut intent,
+        } = intent(&state, "step-2", "effect-2", 1)
+        else {
+            unreachable!("intent helper always creates an effect intent")
+        };
+        intent.action_digest = "sha256:action-effect-1".to_owned();
+        intent.authorization.binding.action_digest = intent.action_digest.clone();
+        intent.authorization.grant_id = once_authorization_id(
+            &intent.authorization.binding.run_id,
+            &intent.authorization.binding.action_digest,
+        )
+        .expect("authorization ID should canonicalize");
+        intent.authorization.grant_digest =
+            authorization_digest(&intent.authorization.binding, intent.authorization.max_uses)
+                .expect("authorization should canonicalize");
+        let rebound = EventRecord::next(
             records.last(),
-            event("event-5", intent("step-2", "effect-2", 1)),
+            event(
+                "event-5",
+                RunEventBody::EffectIntentCommitted { step_id, intent },
+            ),
         )
         .expect("record should build");
 
         assert!(matches!(
-            apply_record(Some(&state), &over_budget),
-            Err(TransitionError::AuthorizationBudgetExceeded { .. })
+            apply_record(Some(&state), &rebound),
+            Err(TransitionError::AuthorizationGrantChanged { .. })
         ));
+    }
+
+    #[test]
+    fn durable_authorization_binding_mismatches_fail_without_mutating_state() {
+        let mut records = Vec::new();
+        let created = append(
+            &mut records,
+            None,
+            event("event-1", RunEventBody::RunCreated { goal: "g".into() }),
+        );
+        let state = append(
+            &mut records,
+            Some(&created),
+            event(
+                "event-2",
+                RunEventBody::StepPlanned {
+                    step_id: "step-1".into(),
+                    objective: "o".into(),
+                },
+            ),
+        );
+        let original = state.clone();
+
+        let mutations: Vec<IntentMutation> = vec![
+            Box::new(|intent| intent.authorization.binding.run_id = "other-run".into()),
+            Box::new(|intent| intent.authorization.binding.step_id = "other-step".into()),
+            Box::new(|intent| intent.authorization.binding.authority = "other:authority".into()),
+            Box::new(|intent| intent.authorization.binding.authority_epoch += 1),
+            Box::new(|intent| intent.authorization.binding.issued_at_sequence += 1),
+            Box::new(|intent| {
+                intent.authorization.binding.issued_at_head_digest = "sha256:other-head".into();
+            }),
+            Box::new(|intent| {
+                intent.authorization.binding.action_digest = "sha256:other-action".into();
+            }),
+            Box::new(|intent| intent.invocation.capability_id = "other.capability".into()),
+            Box::new(|intent| intent.invocation.contract_version = "2.0.0".into()),
+            Box::new(|intent| {
+                intent.invocation.definition_digest = "sha256:other-definition".into();
+            }),
+            Box::new(|intent| intent.invocation.instance_id = "other.instance".into()),
+            Box::new(|intent| {
+                intent.invocation.instance_binding_digest = "sha256:other-binding".into();
+            }),
+            Box::new(|intent| {
+                intent.authorization.binding.policy_evidence_digest = "sha256:other-policy".into();
+            }),
+            Box::new(|intent| intent.authorization.grant_id = "authorization-forged".into()),
+            Box::new(|intent| {
+                intent.authorization.max_uses = 2;
+                intent.authorization.grant_digest = authorization_digest(
+                    &intent.authorization.binding,
+                    intent.authorization.max_uses,
+                )
+                .expect("authorization should canonicalize");
+            }),
+            Box::new(|intent| intent.authorization.grant_digest = "sha256:forged".into()),
+        ];
+
+        for (index, mutate) in mutations.into_iter().enumerate() {
+            let RunEventBody::EffectIntentCommitted {
+                step_id,
+                mut intent,
+            } = intent(&state, "step-1", "effect-1", 1)
+            else {
+                unreachable!("intent helper always creates an effect intent")
+            };
+            mutate(&mut intent);
+            let record = EventRecord::next(
+                records.last(),
+                event(
+                    &format!("invalid-event-{index}"),
+                    RunEventBody::EffectIntentCommitted { step_id, intent },
+                ),
+            )
+            .expect("record should build");
+
+            assert!(apply_record(Some(&state), &record).is_err());
+            assert_eq!(state, original);
+        }
     }
 
     #[test]
@@ -1024,7 +1385,7 @@ mod tests {
         let RunEventBody::EffectIntentCommitted {
             step_id,
             mut intent,
-        } = intent("step-1", "effect-1", 1)
+        } = intent(&state, "step-1", "effect-1", 1)
         else {
             unreachable!("intent helper always returns an intent event");
         };

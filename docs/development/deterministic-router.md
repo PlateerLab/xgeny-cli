@@ -95,7 +95,7 @@ ADR-0006의 의미 적합성·검증 강도·추가 permission·reversibility/ef
 
 후보별 placement filter와 ranking 뒤에 request-wide 정책 gate를 적용한다. 따라서 audit의 `PlacementEligible`은 platform·상태·기능 조건을 통과했다는 뜻이며 policy allow나 실행 권한을 뜻하지 않는다. ADR-0006의 policy hard filter는 이 후단 gate가 `Selected`를 차단하는 방식으로 보존한다.
 
-Router는 bare `BrokerOutcome`을 받지 않고 Broker만 생성할 수 있는 `BoundPolicyEvaluation`을 받는다. 그 안의 exact Capability, effect class, critical action과 Definition selector scope가 현재 route와 일치하지 않으면 입력 오류로 닫힌다. 이 결합은 다른 Capability/effect의 결과를 실수로 배선하는 것을 막지만 concrete resource, Run, Step, canonical action까지 실행 권한으로 결합한 것은 아니다. 그 검증과 use budget 소비는 후속 issuer·Executor 경계의 책임이다.
+Router는 bare `BrokerOutcome`을 받지 않고 Broker만 생성할 수 있는 `BoundPolicyEvaluation`을 받는다. 그 안의 exact Capability, effect class, critical action과 Definition selector scope가 현재 route와 일치하지 않으면 입력 오류로 닫힌다. Router 단독 결과는 concrete resource, Run, Step, canonical action까지 결합한 실행 권한이 아니다. 제한된 [Run-bound Invocation Admission 기본형](invocation-admission.md)이 Router를 내부에서 다시 실행하고 local one-shot 결과만 durable binding과 use budget으로 발행한다.
 
 - placement-eligible 후보가 없으면 policy가 ask여도 `Blocked`다.
 - policy 누락은 `Blocked(policy_missing)`이다.
@@ -117,7 +117,7 @@ pin은 일반 ranking보다 먼저 선택 의사를 표현하지만 어떤 안�
 - candidate-specific PermissionRequest와 추가 권한량 비교
 - health TTL, background probing과 remote platform attestation
 - `InvocationPlanBody` ID·timestamp·policyDecisionId 투영
-- Run/action-bound grant 발급과 원자적 소비
+- critical·managed·reusable Run/action-bound grant 발급과 소비
 - 실제 adapter 실행과 실행 직전 재검증
 - effect 시작 전 실패의 다음 후보 fallback
 - effect 시작 후 idempotency query, resume와 보상 Step

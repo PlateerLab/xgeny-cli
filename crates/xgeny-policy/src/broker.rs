@@ -85,10 +85,19 @@ impl PolicyContribution {
     }
 }
 
-/// Complete mandatory policy stack. A local stack always contains host and user policy, while a
-/// managed stack additionally requires exactly one managed lease contribution.
+/// Complete mandatory policy stack bound to one exact resolved request.
+///
+/// A local stack always contains host and user policy, while a managed stack additionally
+/// requires exactly one managed lease contribution. Private fields prevent a pre-evaluated stack
+/// for one invocation from being accidentally paired with another request.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PolicyInputs {
+pub struct PolicyInputs {
+    request: ResolvedPermissionRequest,
+    layers: PolicyLayers,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PolicyLayers {
     Local {
         host: PolicyContribution,
         user_profile: PolicyContribution,
@@ -102,30 +111,46 @@ pub enum PolicyInputs {
 
 impl PolicyInputs {
     #[must_use]
-    pub const fn local(host: PolicyContribution, user_profile: PolicyContribution) -> Self {
-        Self::Local { host, user_profile }
+    pub fn local(
+        request: &ResolvedPermissionRequest,
+        host: PolicyContribution,
+        user_profile: PolicyContribution,
+    ) -> Self {
+        Self {
+            request: request.clone(),
+            layers: PolicyLayers::Local { host, user_profile },
+        }
     }
 
     #[must_use]
-    pub const fn managed(
+    pub fn managed(
+        request: &ResolvedPermissionRequest,
         host: PolicyContribution,
         user_profile: PolicyContribution,
         managed_lease: PolicyContribution,
     ) -> Self {
-        Self::Managed {
-            host,
-            user_profile,
-            managed_lease,
+        Self {
+            request: request.clone(),
+            layers: PolicyLayers::Managed {
+                host,
+                user_profile,
+                managed_lease,
+            },
         }
     }
 
+    #[must_use]
+    pub const fn is_managed(&self) -> bool {
+        matches!(self.layers, PolicyLayers::Managed { .. })
+    }
+
     fn ordered(&self) -> Vec<(PolicySourceKind, &PolicyContribution)> {
-        match self {
-            Self::Local { host, user_profile } => vec![
+        match &self.layers {
+            PolicyLayers::Local { host, user_profile } => vec![
                 (PolicySourceKind::Host, host),
                 (PolicySourceKind::UserProfile, user_profile),
             ],
-            Self::Managed {
+            PolicyLayers::Managed {
                 host,
                 user_profile,
                 managed_lease,
@@ -260,8 +285,9 @@ impl PermissionBroker {
     ///
     /// Router and later integration boundaries should consume this opaque pair instead of a bare
     /// `BrokerOutcome`, so the Router can compare the evaluated Capability and static effect
-    /// contract before placement. This is not full Run, action, or resource binding.
-    /// The result remains provisional and must not be accepted by an Executor.
+    /// contract before placement. It retains exact resolved resources but is not durable
+    /// Run/action authority. The result remains provisional and must not be accepted by an
+    /// Executor.
     ///
     /// # Errors
     ///
@@ -292,6 +318,9 @@ impl PermissionBroker {
         request: &ResolvedPermissionRequest,
         inputs: &PolicyInputs,
     ) -> Result<BrokerOutcome, BrokerError> {
+        if &inputs.request != request {
+            return Err(BrokerError::PolicyRequestMismatch);
+        }
         let layers = inputs.ordered();
         for (expected, contribution) in &layers {
             validate_contribution(*expected, contribution)?;
@@ -449,6 +478,8 @@ const fn lifetime_rank(lifetime: GrantLifetime) -> u8 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum BrokerError {
+    #[error("policy inputs were pre-evaluated for another resolved permission request")]
+    PolicyRequestMismatch,
     #[error("policy layer expects source kind {expected:?}, but received {actual:?}")]
     SourceKindMismatch {
         expected: PolicySourceKind,

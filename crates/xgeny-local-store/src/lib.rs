@@ -178,8 +178,9 @@ mod tests {
 
     use tempfile::tempdir;
     use xgeny_workgraph::{
-        AuthorizationUse, EffectClass, EffectIntent, ReconciliationResolution, RunEvent,
-        RunEventBody, SinkGuarantee, StepStatus,
+        AuthorizationBinding, AuthorizationUse, EffectClass, EffectIntent, InvocationBinding,
+        ReconciliationResolution, RunEvent, RunEventBody, RunState, SinkGuarantee, StepStatus,
+        authorization_digest, once_authorization_id,
     };
 
     use super::*;
@@ -195,17 +196,43 @@ mod tests {
         }
     }
 
-    fn intent() -> EffectIntent {
+    fn intent(state: &RunState) -> EffectIntent {
+        let invocation = InvocationBinding {
+            capability_id: "test.effect".to_owned(),
+            contract_version: "1.0.0".to_owned(),
+            definition_digest: "sha256:definition-1".to_owned(),
+            instance_id: "test.instance".to_owned(),
+            instance_binding_digest: "sha256:instance-1".to_owned(),
+        };
+        let binding = AuthorizationBinding {
+            run_id: state.run_id.clone(),
+            step_id: "step-1".to_owned(),
+            authority: state.authority.clone(),
+            authority_epoch: state.authority_epoch,
+            issued_at_sequence: state.journal_sequence,
+            issued_at_head_digest: state.journal_head_digest.clone(),
+            capability_id: invocation.capability_id.clone(),
+            contract_version: invocation.contract_version.clone(),
+            definition_digest: invocation.definition_digest.clone(),
+            instance_id: invocation.instance_id.clone(),
+            instance_binding_digest: invocation.instance_binding_digest.clone(),
+            action_digest: "sha256:action-1".to_owned(),
+            policy_evidence_digest: "sha256:policy-1".to_owned(),
+        };
         EffectIntent {
             effect_id: "effect-1".to_owned(),
             action_digest: "sha256:action-1".to_owned(),
+            invocation,
             effect_class: EffectClass::NonIdempotent,
             idempotency_key: None,
             sink_guarantee: SinkGuarantee::None,
             authorization: AuthorizationUse {
-                grant_id: "grant-1".to_owned(),
-                grant_digest: "sha256:grant-1".to_owned(),
+                grant_id: once_authorization_id(&binding.run_id, &binding.action_digest)
+                    .expect("authorization ID should canonicalize"),
+                grant_digest: authorization_digest(&binding, 1)
+                    .expect("authorization should canonicalize"),
                 max_uses: 1,
+                binding,
             },
         }
     }
@@ -244,7 +271,7 @@ mod tests {
                     "event-3",
                     RunEventBody::EffectIntentCommitted {
                         step_id: "step-1".to_owned(),
-                        intent: intent(),
+                        intent: Box::new(intent(&previous.state)),
                     },
                 ),
             )
@@ -309,6 +336,22 @@ mod tests {
     }
 
     #[test]
+    fn prior_experimental_store_version_is_rejected_instead_of_silently_misread() {
+        let directory = tempdir().expect("temp directory should exist");
+        let path = directory.path().join("run.db");
+        let connection = rusqlite::Connection::open(&path).expect("SQLite file should open");
+        connection
+            .pragma_update(None, "user_version", 1_i64)
+            .expect("old experimental version should be written");
+        drop(connection);
+
+        assert!(matches!(
+            SqliteRunStore::open(&path),
+            Err(StoreError::UnsupportedSchemaVersion(1))
+        ));
+    }
+
+    #[test]
     fn sqlite_detects_a_corrupted_derived_effect_index() {
         let directory = tempdir().expect("temp directory should exist");
         let mut store =
@@ -337,7 +380,7 @@ mod tests {
                 "event-stale",
                 RunEventBody::EffectIntentCommitted {
                     step_id: "step-1".to_owned(),
-                    intent: intent(),
+                    intent: Box::new(intent(&seed.state)),
                 },
             ),
         );
@@ -369,7 +412,7 @@ mod tests {
                 "event-3",
                 RunEventBody::EffectIntentCommitted {
                     step_id: "step-1".to_owned(),
-                    intent: intent(),
+                    intent: Box::new(intent(&seed.state)),
                 },
             ),
         );
@@ -396,7 +439,7 @@ mod tests {
                 "event-1",
                 RunEventBody::EffectIntentCommitted {
                     step_id: "step-1".to_owned(),
-                    intent: intent(),
+                    intent: Box::new(intent(&seed.state)),
                 },
             ),
         );
@@ -408,7 +451,8 @@ mod tests {
     fn sqlite_rolls_back_every_partial_commit_stage() {
         for fault in [
             AppendFault::Event,
-            AppendFault::IntentIndexes,
+            AppendFault::EffectIntentIndex,
+            AppendFault::AuthorizationConsumption,
             AppendFault::Projection,
         ] {
             let directory = tempdir().expect("temp directory should exist");
@@ -419,7 +463,7 @@ mod tests {
                 "event-3",
                 RunEventBody::EffectIntentCommitted {
                     step_id: "step-1".to_owned(),
-                    intent: intent(),
+                    intent: Box::new(intent(&seed.state)),
                 },
             );
 
@@ -463,7 +507,8 @@ mod tests {
                 .as_str()
             {
                 "event" => AppendFault::Event,
-                "intent" => AppendFault::IntentIndexes,
+                "intent" => AppendFault::EffectIntentIndex,
+                "authorization" => AppendFault::AuthorizationConsumption,
                 "projection" => AppendFault::Projection,
                 stage => panic!("unknown child fault stage: {stage}"),
             };
@@ -476,7 +521,7 @@ mod tests {
                 "event-3",
                 RunEventBody::EffectIntentCommitted {
                     step_id: "step-1".to_owned(),
-                    intent: intent(),
+                    intent: Box::new(intent(&snapshot.state)),
                 },
             );
             let _never_returns = store.append_and_exit_at(
@@ -489,7 +534,8 @@ mod tests {
 
         for (label, fault) in [
             ("event", AppendFault::Event),
-            ("intent", AppendFault::IntentIndexes),
+            ("intent", AppendFault::EffectIntentIndex),
+            ("authorization", AppendFault::AuthorizationConsumption),
             ("projection", AppendFault::Projection),
         ] {
             let directory = tempdir().expect("temp directory should exist");
