@@ -1194,6 +1194,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "xgeny-runtime"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror",
+ "xgeny-local-store",
+ "xgeny-workgraph",
+]
+
+[[package]]
 name = "xgeny-workgraph"
 version = "0.1.0"
 dependencies = [

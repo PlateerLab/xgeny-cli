@@ -2,7 +2,7 @@
 
 Local-first general-purpose agent CLI and harness.
 
-> 현재 상태: 프로토콜 v0.1 검증과 model-free WorkGraph 상태 기계·로컬 저장소 후보를 실행할 수 있습니다. 모델·도구 실행 루프와 CLI 연결은 아직 구현하지 않았습니다.
+> 현재 상태: 프로토콜 v0.1 검증, model-free WorkGraph·로컬 저장소 후보, effect 실행·복구 조정기를 실행할 수 있습니다. 모델 루프, 실제 filesystem/process adapter와 CLI 연결은 아직 구현하지 않았습니다.
 
 ## 제품 원칙
 
