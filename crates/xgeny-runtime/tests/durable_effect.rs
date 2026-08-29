@@ -16,8 +16,10 @@ use xgeny_runtime::{
     RuntimeError, RuntimePolicy,
 };
 use xgeny_workgraph::{
-    AuthorizationBinding, AuthorizationUse, EffectClass, EffectIntent, InvocationBinding, RunEvent,
-    RunEventBody, RunState, SinkGuarantee, StepStatus, authorization_digest, once_authorization_id,
+    AuthorizationBinding, AuthorizationUse, EffectClass, EffectIntent, InvocationBinding,
+    InvocationMaterialRecord, InvocationMaterialRetention, RunEvent, RunEventBody, RunState,
+    SinkGuarantee, StepStatus, authorization_digest, invocation_material_digest,
+    invocation_material_retention_digest, once_authorization_id,
 };
 
 const RUN_ID: &str = "run-1";
@@ -96,6 +98,29 @@ impl RunStore for RecordingStore {
 
     fn load(&self) -> Result<Option<RunSnapshot>, StoreError> {
         self.inner.load()
+    }
+
+    fn append_with_invocation_material(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        material: InvocationMaterialRecord,
+    ) -> Result<Commit, StoreError> {
+        let kind = event_kind(&event.body);
+        self.trace.borrow_mut().push(trace_label(kind));
+        if self.fail_once == Some(kind) {
+            self.fail_once = None;
+            return Err(StoreError::InjectedFault("runtime contract test"));
+        }
+        self.inner
+            .append_with_invocation_material(expected, event, material)
+    }
+
+    fn load_invocation_material(
+        &self,
+        effect_id: &str,
+    ) -> Result<Option<InvocationMaterialRecord>, StoreError> {
+        self.inner.load_invocation_material(effect_id)
     }
 }
 
@@ -242,6 +267,11 @@ fn append_body<S: RunStore>(
 }
 
 fn effect_intent(state: &RunState, guarantee: SinkGuarantee) -> EffectIntent {
+    let material_digest = invocation_material_digest(&serde_json::json!({"operation": "test"}))
+        .expect("material should canonicalize");
+    let material_retention_digest =
+        invocation_material_retention_digest(&InvocationMaterialRetention::Ephemeral)
+            .expect("retention should canonicalize");
     let invocation = InvocationBinding {
         capability_id: "test.effect".to_owned(),
         contract_version: "1.0.0".to_owned(),
@@ -262,6 +292,8 @@ fn effect_intent(state: &RunState, guarantee: SinkGuarantee) -> EffectIntent {
         instance_id: invocation.instance_id.clone(),
         instance_binding_digest: invocation.instance_binding_digest.clone(),
         action_digest: "sha256:action-1".to_owned(),
+        material_digest,
+        material_retention_digest,
         policy_evidence_digest: "sha256:policy-1".to_owned(),
     };
     EffectIntent {
@@ -304,15 +336,31 @@ fn seed_intent<S: RunStore>(store: &mut S, guarantee: SinkGuarantee) -> RunState
             objective: "perform effect".to_owned(),
         },
     );
-    append_body(
-        store,
-        &planned,
-        "seed-event-3",
-        RunEventBody::EffectIntentCommitted {
-            step_id: STEP_ID.to_owned(),
-            intent: Box::new(effect_intent(&planned, guarantee)),
-        },
+    let effect = effect_intent(&planned, guarantee);
+    let material_digest = invocation_material_digest(&serde_json::json!({"operation": "test"}))
+        .expect("material should canonicalize");
+    let material = InvocationMaterialRecord::new(
+        RUN_ID,
+        STEP_ID,
+        &effect,
+        material_digest,
+        InvocationMaterialRetention::Ephemeral,
     )
+    .expect("material should bind");
+    store
+        .append_with_invocation_material(
+            ExpectedHead::from_state(&planned),
+            seed_event(
+                "seed-event-3",
+                RunEventBody::EffectIntentCommitted {
+                    step_id: STEP_ID.to_owned(),
+                    intent: Box::new(effect),
+                },
+            ),
+            material,
+        )
+        .expect("intent and material should commit")
+        .state
 }
 
 fn seed_executing<S: RunStore>(store: &mut S, guarantee: SinkGuarantee) -> RunState {

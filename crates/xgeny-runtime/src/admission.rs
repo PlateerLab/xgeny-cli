@@ -16,8 +16,10 @@ use xgeny_policy::{
 };
 use xgeny_workgraph::{
     AuthorizationBinding, AuthorizationDigestError, AuthorizationUse,
-    EffectClass as WorkGraphEffectClass, EffectIntent, InvocationBinding, RunEvent, RunEventBody,
-    RunState, SinkGuarantee, StepStatus, authorization_digest, once_authorization_id,
+    EffectClass as WorkGraphEffectClass, EffectIntent, InvocationBinding, InvocationMaterialError,
+    InvocationMaterialRecord, InvocationMaterialRetention, ReconstructableMaterialReference,
+    RunEvent, RunEventBody, RunState, SinkGuarantee, StepStatus, authorization_digest,
+    invocation_material_digest, invocation_material_retention_digest, once_authorization_id,
 };
 
 use crate::{
@@ -88,6 +90,8 @@ pub struct PendingInvocation {
     permission_request: ResolvedPermissionRequest,
     definition_digest: String,
     action_digest: String,
+    material_digest: String,
+    material_retention: InvocationMaterialRetention,
 }
 
 impl PendingInvocation {
@@ -102,6 +106,18 @@ impl PendingInvocation {
     pub fn action_digest(&self) -> &str {
         &self.action_digest
     }
+
+    /// Select a secret-free, immutable recipe reference for restart reconstruction.
+    ///
+    /// The host creates the typed reference. Models and adapters cannot supply raw paths, URLs,
+    /// credentials, or bearer tokens through this API.
+    pub fn with_reconstructable_material(
+        mut self,
+        reference: ReconstructableMaterialReference,
+    ) -> Self {
+        self.material_retention = InvocationMaterialRetention::ReconstructableReference(reference);
+        self
+    }
 }
 
 impl fmt::Debug for PendingInvocation {
@@ -114,6 +130,8 @@ impl fmt::Debug for PendingInvocation {
             .field("permission_request", &"<resolved/redacted>")
             .field("definition_digest", &self.definition_digest)
             .field("action_digest", &self.action_digest)
+            .field("material_digest", &self.material_digest)
+            .field("material_retention", &self.material_retention)
             .finish()
     }
 }
@@ -130,6 +148,7 @@ pub struct AdmittedEffect {
     instance_binding_digest: String,
     action_digest: String,
     effect_id: String,
+    material_record: InvocationMaterialRecord,
     commit: Commit,
 }
 
@@ -170,6 +189,11 @@ impl AdmittedEffect {
     }
 
     #[must_use]
+    pub const fn material_record(&self) -> &InvocationMaterialRecord {
+        &self.material_record
+    }
+
+    #[must_use]
     pub const fn commit(&self) -> &Commit {
         &self.commit
     }
@@ -186,6 +210,7 @@ impl fmt::Debug for AdmittedEffect {
             .field("instance_binding_digest", &self.instance_binding_digest)
             .field("action_digest", &self.action_digest)
             .field("effect_id", &self.effect_id)
+            .field("material_record", &self.material_record)
             .field("journal_sequence", &self.commit.state.journal_sequence)
             .finish()
     }
@@ -276,6 +301,7 @@ impl InvocationAdmission {
             derived_request.normalized_arguments(),
             derived_request.permission_request(),
         )?;
+        let material_digest = invocation_material_digest(derived_request.normalized_arguments())?;
 
         Ok(PendingInvocation {
             run_binding: PendingRunBinding::from_state(&snapshot.state),
@@ -284,6 +310,8 @@ impl InvocationAdmission {
             permission_request: derived_request.permission_request().clone(),
             definition_digest,
             action_digest,
+            material_digest,
+            material_retention: InvocationMaterialRetention::Ephemeral,
         })
     }
 
@@ -367,7 +395,12 @@ impl InvocationAdmission {
                 intent: Box::new(issued.intent),
             },
         };
-        let commit = store.append(ExpectedHead::from_state(&snapshot.state), event)?;
+        let material_record = issued.material_record.clone();
+        let commit = store.append_with_invocation_material(
+            ExpectedHead::from_state(&snapshot.state),
+            event,
+            issued.material_record,
+        )?;
 
         Ok(AdmissionOutcome::Authorized(Box::new(AdmittedEffect {
             normalized_arguments: pending.normalized_arguments,
@@ -377,6 +410,7 @@ impl InvocationAdmission {
             instance_binding_digest: issued.instance_binding_digest,
             action_digest: pending.action_digest,
             effect_id: issued.effect_id,
+            material_record,
             commit,
         })))
     }
@@ -386,6 +420,7 @@ struct IssuedEffect {
     intent: EffectIntent,
     instance_binding_digest: String,
     effect_id: String,
+    material_record: InvocationMaterialRecord,
 }
 
 fn issue_once_effect(
@@ -433,6 +468,10 @@ fn issue_once_effect(
         instance_id: invocation.instance_id.clone(),
         instance_binding_digest: invocation.instance_binding_digest.clone(),
         action_digest: pending.action_digest.clone(),
+        material_digest: pending.material_digest.clone(),
+        material_retention_digest: invocation_material_retention_digest(
+            &pending.material_retention,
+        )?,
         policy_evidence_digest: policy_evidence_digest(
             &pending.permission_request,
             provisional_authorization,
@@ -460,11 +499,19 @@ fn issue_once_effect(
             binding,
         },
     };
+    let material_record = InvocationMaterialRecord::new(
+        &state.run_id,
+        pending.permission_request.step_id(),
+        &intent,
+        &pending.material_digest,
+        pending.material_retention.clone(),
+    )?;
 
     Ok(IssuedEffect {
         intent,
         instance_binding_digest,
         effect_id,
+        material_record,
     })
 }
 
@@ -492,7 +539,7 @@ fn require_planned_step(state: &RunState, step_id: &str) -> Result<(), Admission
     Ok(())
 }
 
-fn validate_arguments(
+pub(crate) fn validate_arguments(
     definition: &CapabilityDefinitionBody,
     arguments: &Value,
 ) -> Result<(), AdmissionError> {
@@ -556,7 +603,7 @@ struct DefinitionContractDigestInput<'a> {
     required_extensions: &'a [String],
 }
 
-fn definition_contract_digest(
+pub(crate) fn definition_contract_digest(
     definition: &CapabilityDefinitionBody,
 ) -> Result<String, AdmissionError> {
     digest_serializable(&DefinitionContractDigestInput {
@@ -599,7 +646,7 @@ struct SemanticActionDigestInput<'a> {
     resources: Vec<CanonicalResourceDigestInput<'a>>,
 }
 
-fn semantic_action_digest(
+pub(crate) fn semantic_action_digest(
     capability: &CapabilityRef,
     definition_digest: &str,
     effect_class: DomainEffectClass,
@@ -629,12 +676,15 @@ struct ExecutableBindingDigestInput<'a> {
     data_boundary: xgeny_domain::DataBoundary,
     features: &'a xgeny_domain::InstanceFeatures,
     binding: &'a xgeny_domain::InstanceBinding,
+    auth_ref: Option<&'a str>,
     required_extensions: &'a [String],
 }
 
-fn executable_binding_digest(instance: &CapabilityInstanceBody) -> Result<String, AdmissionError> {
+pub(crate) fn executable_binding_digest(
+    instance: &CapabilityInstanceBody,
+) -> Result<String, AdmissionError> {
     digest_serializable(&ExecutableBindingDigestInput {
-        domain: "xgeny.executable-binding/v1",
+        domain: "xgeny.executable-binding/v2",
         instance_id: &instance.instance_id,
         definition: &instance.definition,
         source: instance.source,
@@ -644,6 +694,7 @@ fn executable_binding_digest(instance: &CapabilityInstanceBody) -> Result<String
         data_boundary: instance.data_boundary,
         features: &instance.features,
         binding: &instance.binding,
+        auth_ref: instance.auth.auth_ref.as_deref(),
         required_extensions: &instance.required_extensions,
     })
 }
@@ -730,6 +781,8 @@ pub enum AdmissionError {
     Route(#[from] RouteInputError),
     #[error(transparent)]
     AuthorizationDigest(#[from] AuthorizationDigestError),
+    #[error(transparent)]
+    InvocationMaterial(#[from] InvocationMaterialError),
     #[error("durable Run is not initialized")]
     RunNotInitialized,
     #[error("lease is for Run `{lease_run_id}`, but durable state is `{state_run_id}`")]

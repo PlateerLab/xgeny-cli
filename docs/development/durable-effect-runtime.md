@@ -75,4 +75,4 @@ Run lease를 가진 worker만 `drive_step`을 호출한다. journal CAS는 stale
 
 따라서 이 slice는 실제 사용자 도구 실행 기능의 완료가 아니라, 다음 adapter가 반드시 통과해야 할 durable execution contract다.
 
-effect intent 앞단의 exact argument→permission→Router→one-shot authorization 계약은 [Run-bound Invocation Admission 기본형](invocation-admission.md)을 따른다. 이 연결 이후에도 public 저수준 store/reducer API와 trusted adapter가 보안 sandbox가 되는 것은 아니며, durable argument 복구도 아직 포함하지 않는다.
+effect intent 앞단의 exact argument→permission→Router→one-shot authorization 계약은 [Run-bound Invocation Admission 기본형](invocation-admission.md)을 따른다. 재시작 전 material 확보와 fail-closed 전이는 [Recoverable Invocation Material 기본형](recoverable-invocation-material.md)을 따른다. 이 연결 이후에도 public 저수준 store/reducer API와 trusted adapter가 보안 sandbox가 되는 것은 아니며, recovered material을 exact adapter에 전달하는 Direct Executor는 아직 포함하지 않는다.

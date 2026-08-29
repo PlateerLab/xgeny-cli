@@ -379,15 +379,16 @@ Coding은 기본 acceptance scenario이지만 core domain identity가 아니다.
 5. Registry와 fake Instance
 6. Permission Broker와 concrete resource resolver
 7. Router와 deterministic golden test
-8. Direct executor, Journal, Receipt
-9. Tracked/Persistent WorkGraph와 crash recovery
-10. model provider와 ContextAssembler
-11. core OS Capability pack
-12. MCP adapter
-13. Codex observer/provider reference adapter conformance
-14. Claude Code observer/provider adapter conformance
-15. read-only·Artifact 생성형 XGEN capability live E2E
-16. OS별 package/install E2E
+8. Recoverable Invocation Material과 atomic sidecar
+9. Direct executor, Journal, Receipt
+10. Tracked/Persistent WorkGraph와 crash recovery
+11. model provider와 ContextAssembler
+12. core OS Capability pack
+13. MCP adapter
+14. Codex observer/provider reference adapter conformance
+15. Claude Code observer/provider adapter conformance
+16. read-only·Artifact 생성형 XGEN capability live E2E
+17. OS별 package/install E2E
 
 서버에 effect를 만드는 XGEN workflow는 idempotency, reconcile, Receipt 검증 뒤에 연결한다. 첫 vertical slice의 상세 실험 순서와 통계 기준은 `docs/research/2026-08-28-runtime-evaluation-protocol.md`를 따른다.
 
@@ -399,6 +400,7 @@ Coding은 기본 acceptance scenario이지만 core domain identity가 아니다.
 | permission | path traversal, symlink escape, credential redaction, critical action 차단 |
 | router | unavailable/auth/policy 후보 제거, 동일 입력 deterministic 선택 |
 | effect | 시작 전 fallback, lost ack는 effect_unknown, sink 증거 없는 blind retry 금지 |
+| material | intent·권한·sidecar 원자 commit, restart revalidation, plaintext argument 금지 |
 | journal | 모든 transaction·effect 경계 강제 종료 후 replay 결과 동일 |
 | receipt | digest tamper 검출, success의 모든 필수 verification evidence PASS |
 | context | 모델 length를 넘는 Run에서 active frontier로 재개 |

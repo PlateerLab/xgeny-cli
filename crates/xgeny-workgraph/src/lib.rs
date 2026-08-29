@@ -36,6 +36,11 @@ pub enum RunEventBody {
         step_id: String,
         intent: Box<EffectIntent>,
     },
+    InvocationMaterialUnavailable {
+        step_id: String,
+        effect_id: String,
+        reason: InvocationMaterialUnavailableReason,
+    },
     EffectExecutionStarted {
         step_id: String,
         effect_id: String,
@@ -85,6 +90,7 @@ impl RunEventBody {
             Self::RunCreated { .. } => "run_created",
             Self::StepPlanned { .. } => "step_planned",
             Self::EffectIntentCommitted { .. } => "effect_intent_committed",
+            Self::InvocationMaterialUnavailable { .. } => "invocation_material_unavailable",
             Self::EffectExecutionStarted { .. } => "effect_execution_started",
             Self::EffectSucceeded { .. } => "effect_succeeded",
             Self::EffectFailed { .. } => "effect_failed",
@@ -122,6 +128,458 @@ pub struct InvocationBinding {
     pub definition_digest: String,
     pub instance_id: String,
     pub instance_binding_digest: String,
+}
+
+pub const INVOCATION_MATERIAL_FORMAT_VERSION: u32 = 1;
+const MAX_MATERIAL_REFERENCE_COMPONENT_BYTES: usize = 128;
+
+/// Secret-free, version-pinned recipe reference used to reconstruct invocation arguments.
+///
+/// A reference is an identifier, never a path, URL, bearer token, raw argument, or credential.
+/// Its provider owns the durable recipe and must return canonical invocation arguments when asked
+/// for this exact `(reference_id, revision)` pair.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReconstructableMaterialReference {
+    provider_id: String,
+    reference_id: String,
+    revision: String,
+}
+
+impl ReconstructableMaterialReference {
+    /// Build a bounded opaque reference. Components intentionally reject path and URI syntax.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a component is empty, oversized, or contains characters outside the
+    /// identifier alphabet `[A-Za-z0-9._-]`.
+    pub fn new(
+        provider_id: impl Into<String>,
+        reference_id: impl Into<String>,
+        revision: impl Into<String>,
+    ) -> Result<Self, InvocationMaterialError> {
+        let reference = Self {
+            provider_id: provider_id.into(),
+            reference_id: reference_id.into(),
+            revision: revision.into(),
+        };
+        validate_reference_component("provider_id", &reference.provider_id)?;
+        validate_reference_component("reference_id", &reference.reference_id)?;
+        validate_reference_component("revision", &reference.revision)?;
+        Ok(reference)
+    }
+
+    #[must_use]
+    pub fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    #[must_use]
+    pub fn reference_id(&self) -> &str {
+        &self.reference_id
+    }
+
+    #[must_use]
+    pub fn revision(&self) -> &str {
+        &self.revision
+    }
+
+    fn validate(&self) -> Result<(), InvocationMaterialError> {
+        validate_reference_component("provider_id", &self.provider_id)?;
+        validate_reference_component("reference_id", &self.reference_id)?;
+        validate_reference_component("revision", &self.revision)
+    }
+}
+
+impl std::fmt::Debug for ReconstructableMaterialReference {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReconstructableMaterialReference")
+            .field("provider_id", &self.provider_id)
+            .field("reference_id", &"<redacted>")
+            .field("revision", &self.revision)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "mode",
+    content = "reference",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum InvocationMaterialRetention {
+    Ephemeral,
+    ReconstructableReference(ReconstructableMaterialReference),
+}
+
+impl std::fmt::Debug for InvocationMaterialRetention {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ephemeral => formatter.write_str("Ephemeral"),
+            Self::ReconstructableReference(reference) => formatter
+                .debug_tuple("ReconstructableReference")
+                .field(reference)
+                .finish(),
+        }
+    }
+}
+
+/// Durable, secret-free sidecar binding for one exact effect intent.
+///
+/// The record deliberately excludes invocation arguments and credentials. It binds a recovery
+/// mode and canonical material digest to the Run, Step, effect, semantic action, and selected
+/// executable Instance. It is committed atomically with the intent by a supporting `RunStore`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InvocationMaterialRecord {
+    format_version: u32,
+    material_id: String,
+    run_id: String,
+    step_id: String,
+    effect_id: String,
+    action_digest: String,
+    invocation: InvocationBinding,
+    material_digest: String,
+    retention: InvocationMaterialRetention,
+    record_digest: String,
+}
+
+impl InvocationMaterialRecord {
+    /// Create a self-verifying material binding for a committed effect intent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing identity fields, invalid references, or canonicalization
+    /// failures.
+    pub fn new(
+        run_id: impl Into<String>,
+        step_id: impl Into<String>,
+        intent: &EffectIntent,
+        material_digest: impl Into<String>,
+        retention: InvocationMaterialRetention,
+    ) -> Result<Self, InvocationMaterialError> {
+        let mut record = Self {
+            format_version: INVOCATION_MATERIAL_FORMAT_VERSION,
+            material_id: String::new(),
+            run_id: run_id.into(),
+            step_id: step_id.into(),
+            effect_id: intent.effect_id.clone(),
+            action_digest: intent.action_digest.clone(),
+            invocation: intent.invocation.clone(),
+            material_digest: material_digest.into(),
+            retention,
+            record_digest: String::new(),
+        };
+        record.validate_shape()?;
+        record.material_id =
+            invocation_material_id(&record.run_id, &record.effect_id, &record.material_digest)?;
+        record.record_digest = invocation_material_record_digest(&record)?;
+        record.verify_for(&record.run_id, &record.step_id, intent)?;
+        Ok(record)
+    }
+
+    /// Verify content integrity and exact binding to a durable intent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported versions, malformed fields, tampering, or cross-intent
+    /// record reuse.
+    pub fn verify_for(
+        &self,
+        run_id: &str,
+        step_id: &str,
+        intent: &EffectIntent,
+    ) -> Result<(), InvocationMaterialError> {
+        if self.format_version != INVOCATION_MATERIAL_FORMAT_VERSION {
+            return Err(InvocationMaterialError::UnsupportedFormatVersion(
+                self.format_version,
+            ));
+        }
+        self.validate_shape()?;
+        if self.run_id != run_id {
+            return Err(InvocationMaterialError::BindingMismatch("run_id"));
+        }
+        if self.step_id != step_id {
+            return Err(InvocationMaterialError::BindingMismatch("step_id"));
+        }
+        if self.effect_id != intent.effect_id {
+            return Err(InvocationMaterialError::BindingMismatch("effect_id"));
+        }
+        if self.action_digest != intent.action_digest {
+            return Err(InvocationMaterialError::BindingMismatch("action_digest"));
+        }
+        if self.invocation != intent.invocation {
+            return Err(InvocationMaterialError::BindingMismatch("invocation"));
+        }
+        if intent.authorization.binding.material_digest != self.material_digest {
+            return Err(InvocationMaterialError::BindingMismatch("material_digest"));
+        }
+        if intent.authorization.binding.material_retention_digest
+            != invocation_material_retention_digest(&self.retention)?
+        {
+            return Err(InvocationMaterialError::BindingMismatch(
+                "material_retention_digest",
+            ));
+        }
+        let expected_id =
+            invocation_material_id(&self.run_id, &self.effect_id, &self.material_digest)?;
+        if self.material_id != expected_id {
+            return Err(InvocationMaterialError::MaterialIdMismatch);
+        }
+        let expected_digest = invocation_material_record_digest(self)?;
+        if self.record_digest != expected_digest {
+            return Err(InvocationMaterialError::RecordDigestMismatch);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    #[must_use]
+    pub fn material_id(&self) -> &str {
+        &self.material_id
+    }
+
+    #[must_use]
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    #[must_use]
+    pub fn step_id(&self) -> &str {
+        &self.step_id
+    }
+
+    #[must_use]
+    pub fn effect_id(&self) -> &str {
+        &self.effect_id
+    }
+
+    #[must_use]
+    pub fn action_digest(&self) -> &str {
+        &self.action_digest
+    }
+
+    #[must_use]
+    pub const fn invocation(&self) -> &InvocationBinding {
+        &self.invocation
+    }
+
+    #[must_use]
+    pub fn material_digest(&self) -> &str {
+        &self.material_digest
+    }
+
+    #[must_use]
+    pub const fn retention(&self) -> &InvocationMaterialRetention {
+        &self.retention
+    }
+
+    #[must_use]
+    pub fn record_digest(&self) -> &str {
+        &self.record_digest
+    }
+
+    fn validate_shape(&self) -> Result<(), InvocationMaterialError> {
+        for (field, value) in [
+            ("run_id", self.run_id.as_str()),
+            ("step_id", self.step_id.as_str()),
+            ("effect_id", self.effect_id.as_str()),
+            ("action_digest", self.action_digest.as_str()),
+            ("material_digest", self.material_digest.as_str()),
+        ] {
+            if value.is_empty() {
+                return Err(InvocationMaterialError::EmptyField(field));
+            }
+        }
+        if let InvocationMaterialRetention::ReconstructableReference(reference) = &self.retention {
+            reference.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for InvocationMaterialRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InvocationMaterialRecord")
+            .field("format_version", &self.format_version)
+            .field("material_id", &self.material_id)
+            .field("run_id", &self.run_id)
+            .field("step_id", &self.step_id)
+            .field("effect_id", &self.effect_id)
+            .field("action_digest", &self.action_digest)
+            .field("invocation", &self.invocation)
+            .field("material_digest", &self.material_digest)
+            .field("retention", &self.retention)
+            .field("record_digest", &self.record_digest)
+            .finish()
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InvocationMaterialDigestInput<'a, T: Serialize + ?Sized> {
+    domain: &'static str,
+    material: &'a T,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InvocationMaterialIdInput<'a> {
+    domain: &'static str,
+    run_id: &'a str,
+    effect_id: &'a str,
+    material_digest: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InvocationMaterialRecordDigestInput<'a> {
+    domain: &'static str,
+    format_version: u32,
+    material_id: &'a str,
+    run_id: &'a str,
+    step_id: &'a str,
+    effect_id: &'a str,
+    action_digest: &'a str,
+    invocation: &'a InvocationBinding,
+    material_digest: &'a str,
+    retention: &'a InvocationMaterialRetention,
+}
+
+/// Commit to canonical invocation material without storing it.
+///
+/// # Errors
+///
+/// Returns an error when RFC 8785 canonicalization fails.
+pub fn invocation_material_digest<T: Serialize + ?Sized>(
+    material: &T,
+) -> Result<String, InvocationMaterialError> {
+    let canonical = serde_jcs::to_vec(&InvocationMaterialDigestInput {
+        domain: "xgeny.invocation-material.payload/v1",
+        material,
+    })
+    .map_err(|error| InvocationMaterialError::Canonicalization(error.to_string()))?;
+    Ok(sha256_digest(&canonical))
+}
+
+/// Commit an authorization to the host-selected material retention recipe.
+///
+/// # Errors
+///
+/// Returns an error when RFC 8785 canonicalization fails.
+pub fn invocation_material_retention_digest(
+    retention: &InvocationMaterialRetention,
+) -> Result<String, InvocationMaterialError> {
+    let canonical = serde_jcs::to_vec(&InvocationMaterialDigestInput {
+        domain: "xgeny.invocation-material.retention/v1",
+        material: retention,
+    })
+    .map_err(|error| InvocationMaterialError::Canonicalization(error.to_string()))?;
+    Ok(sha256_digest(&canonical))
+}
+
+fn invocation_material_id(
+    run_id: &str,
+    effect_id: &str,
+    material_digest: &str,
+) -> Result<String, InvocationMaterialError> {
+    let canonical = serde_jcs::to_vec(&InvocationMaterialIdInput {
+        domain: "xgeny.invocation-material.id/v1",
+        run_id,
+        effect_id,
+        material_digest,
+    })
+    .map_err(|error| InvocationMaterialError::Canonicalization(error.to_string()))?;
+    let digest = sha256_digest(&canonical);
+    let encoded = digest.strip_prefix("sha256:").unwrap_or(&digest);
+    Ok(format!("material-{encoded}"))
+}
+
+fn invocation_material_record_digest(
+    record: &InvocationMaterialRecord,
+) -> Result<String, InvocationMaterialError> {
+    let canonical = serde_jcs::to_vec(&InvocationMaterialRecordDigestInput {
+        domain: "xgeny.invocation-material.record/v1",
+        format_version: record.format_version,
+        material_id: &record.material_id,
+        run_id: &record.run_id,
+        step_id: &record.step_id,
+        effect_id: &record.effect_id,
+        action_digest: &record.action_digest,
+        invocation: &record.invocation,
+        material_digest: &record.material_digest,
+        retention: &record.retention,
+    })
+    .map_err(|error| InvocationMaterialError::Canonicalization(error.to_string()))?;
+    Ok(sha256_digest(&canonical))
+}
+
+fn validate_reference_component(
+    field: &'static str,
+    value: &str,
+) -> Result<(), InvocationMaterialError> {
+    if value.is_empty() {
+        return Err(InvocationMaterialError::InvalidReferenceComponent(field));
+    }
+    if matches!(value, "." | "..")
+        || value.len() > MAX_MATERIAL_REFERENCE_COMPONENT_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(InvocationMaterialError::InvalidReferenceComponent(field));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum InvocationMaterialError {
+    #[error("unsupported invocation material format version {0}")]
+    UnsupportedFormatVersion(u32),
+    #[error("invocation material field `{0}` must not be empty")]
+    EmptyField(&'static str),
+    #[error("invocation material reference component `{0}` is invalid")]
+    InvalidReferenceComponent(&'static str),
+    #[error("invocation material binding differs at `{0}`")]
+    BindingMismatch(&'static str),
+    #[error("invocation material identifier does not match its binding")]
+    MaterialIdMismatch,
+    #[error("invocation material record digest does not match its content")]
+    RecordDigestMismatch,
+    #[error("invocation material canonicalization failed: {0}")]
+    Canonicalization(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvocationMaterialUnavailableReason {
+    EphemeralMaterialLost,
+    ReferenceUnavailable,
+    ReferenceChanged,
+    AdapterBindingUnavailable,
+    CredentialBindingChanged,
+    UnsupportedMaterialVersion,
+}
+
+impl InvocationMaterialUnavailableReason {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::EphemeralMaterialLost => "ephemeral_material_lost",
+            Self::ReferenceUnavailable => "reference_unavailable",
+            Self::ReferenceChanged => "reference_changed",
+            Self::AdapterBindingUnavailable => "adapter_binding_unavailable",
+            Self::CredentialBindingChanged => "credential_binding_changed",
+            Self::UnsupportedMaterialVersion => "unsupported_material_version",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,6 +628,8 @@ pub struct AuthorizationBinding {
     pub instance_id: String,
     pub instance_binding_digest: String,
     pub action_digest: String,
+    pub material_digest: String,
+    pub material_retention_digest: String,
     pub policy_evidence_digest: String,
 }
 
@@ -222,7 +682,7 @@ pub fn authorization_digest(
     max_uses: u32,
 ) -> Result<String, AuthorizationDigestError> {
     let canonical = serde_jcs::to_vec(&AuthorizationDigestInput {
-        domain: "xgeny.authorization.once/v1",
+        domain: "xgeny.authorization.once/v2",
         binding,
         max_uses,
     })
@@ -485,6 +945,11 @@ fn apply_effect_lifecycle(
         | RunEventBody::EffectIntentCommitted { .. } => {
             unreachable!("handled by apply_body")
         }
+        RunEventBody::InvocationMaterialUnavailable {
+            step_id,
+            effect_id,
+            reason,
+        } => mark_material_unavailable(state, step_id, effect_id, *reason, body)?,
         RunEventBody::EffectExecutionStarted { step_id, effect_id } => {
             let step = matching_step_mut(state, step_id, effect_id)?;
             require_status(step, StepStatus::IntentCommitted, body)?;
@@ -572,6 +1037,20 @@ fn apply_effect_lifecycle(
             step.status = StepStatus::Failed;
         }
     }
+    Ok(())
+}
+
+fn mark_material_unavailable(
+    state: &mut RunState,
+    step_id: &str,
+    effect_id: &str,
+    reason: InvocationMaterialUnavailableReason,
+    body: &RunEventBody,
+) -> Result<(), TransitionError> {
+    let step = matching_step_mut(state, step_id, effect_id)?;
+    require_status(step, StepStatus::IntentCommitted, body)?;
+    step.status = StepStatus::ManualRequired;
+    step.uncertainty_reason = Some(reason.code().to_owned());
     Ok(())
 }
 
@@ -942,6 +1421,13 @@ mod tests {
 
     fn intent(state: &RunState, step_id: &str, effect_id: &str, max_uses: u32) -> RunEventBody {
         let action_digest = format!("sha256:action-{effect_id}");
+        let material_digest = invocation_material_digest(&serde_json::json!({
+            "effectId": effect_id
+        }))
+        .expect("material should canonicalize");
+        let material_retention_digest =
+            invocation_material_retention_digest(&InvocationMaterialRetention::Ephemeral)
+                .expect("retention should canonicalize");
         let invocation = InvocationBinding {
             capability_id: "test.effect".to_owned(),
             contract_version: "1.0.0".to_owned(),
@@ -962,6 +1448,8 @@ mod tests {
             instance_id: invocation.instance_id.clone(),
             instance_binding_digest: invocation.instance_binding_digest.clone(),
             action_digest: action_digest.clone(),
+            material_digest,
+            material_retention_digest,
             policy_evidence_digest: "sha256:policy-1".to_owned(),
         };
         let grant_digest =
@@ -985,6 +1473,158 @@ mod tests {
                 },
             }),
         }
+    }
+
+    fn planned_state(records: &mut Vec<EventRecord>) -> RunState {
+        let created = append(
+            records,
+            None,
+            event(
+                "material-event-1",
+                RunEventBody::RunCreated {
+                    goal: "recover one invocation".to_owned(),
+                },
+            ),
+        );
+        append(
+            records,
+            Some(&created),
+            event(
+                "material-event-2",
+                RunEventBody::StepPlanned {
+                    step_id: "step-material".to_owned(),
+                    objective: "prepare effect".to_owned(),
+                },
+            ),
+        )
+    }
+
+    #[test]
+    fn invocation_material_record_detects_cross_effect_and_content_tampering() {
+        let mut records = Vec::new();
+        let state = planned_state(&mut records);
+        let RunEventBody::EffectIntentCommitted { mut intent, .. } =
+            intent(&state, "step-material", "effect-material", 1)
+        else {
+            panic!("helper must create an intent")
+        };
+        let reference = ReconstructableMaterialReference::new("run-recipe", "recipe-1", "rev-1")
+            .expect("reference should validate");
+        let retention = InvocationMaterialRetention::ReconstructableReference(reference);
+        intent.authorization.binding.material_retention_digest =
+            invocation_material_retention_digest(&retention)
+                .expect("retention should canonicalize");
+        intent.authorization.grant_digest =
+            authorization_digest(&intent.authorization.binding, intent.authorization.max_uses)
+                .expect("authorization should canonicalize");
+        let digest = intent.authorization.binding.material_digest.clone();
+        let record =
+            InvocationMaterialRecord::new(RUN_ID, "step-material", &intent, digest, retention)
+                .expect("record should bind");
+        record
+            .verify_for(RUN_ID, "step-material", &intent)
+            .expect("original record should verify");
+        assert!(matches!(
+            record.verify_for("run-other", "step-material", &intent),
+            Err(InvocationMaterialError::BindingMismatch("run_id"))
+        ));
+        assert!(matches!(
+            record.verify_for(RUN_ID, "step-other", &intent),
+            Err(InvocationMaterialError::BindingMismatch("step_id"))
+        ));
+
+        let mut swapped_intent = (*intent).clone();
+        swapped_intent.effect_id = "effect-other".to_owned();
+        assert!(matches!(
+            record.verify_for(RUN_ID, "step-material", &swapped_intent),
+            Err(InvocationMaterialError::BindingMismatch("effect_id"))
+        ));
+
+        let mut tampered_json = serde_json::to_value(&record).expect("record should serialize");
+        tampered_json["materialDigest"] = serde_json::json!("sha256:changed");
+        let tampered: InvocationMaterialRecord =
+            serde_json::from_value(tampered_json).expect("shape should deserialize");
+        assert!(matches!(
+            tampered.verify_for(RUN_ID, "step-material", &intent),
+            Err(InvocationMaterialError::BindingMismatch("material_digest")
+                | InvocationMaterialError::MaterialIdMismatch
+                | InvocationMaterialError::RecordDigestMismatch)
+        ));
+        assert!(!format!("{record:?}").contains("recipe-1"));
+    }
+
+    #[test]
+    fn material_reference_rejects_paths_uris_and_oversized_components() {
+        for invalid in ["", ".", "..", "../recipe", "https://recipe", "recipe/value"] {
+            assert!(matches!(
+                ReconstructableMaterialReference::new("provider", invalid, "rev-1"),
+                Err(InvocationMaterialError::InvalidReferenceComponent(
+                    "reference_id"
+                ))
+            ));
+        }
+        assert!(
+            ReconstructableMaterialReference::new(
+                "provider",
+                "x".repeat(MAX_MATERIAL_REFERENCE_COMPONENT_BYTES + 1),
+                "rev-1"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn material_unavailable_moves_only_an_unstarted_intent_to_manual() {
+        let mut records = Vec::new();
+        let planned = planned_state(&mut records);
+        let committed = append(
+            &mut records,
+            Some(&planned),
+            event(
+                "material-event-3",
+                intent(&planned, "step-material", "effect-material", 1),
+            ),
+        );
+        let manual = append(
+            &mut records,
+            Some(&committed),
+            event(
+                "material-event-4",
+                RunEventBody::InvocationMaterialUnavailable {
+                    step_id: "step-material".to_owned(),
+                    effect_id: "effect-material".to_owned(),
+                    reason: InvocationMaterialUnavailableReason::EphemeralMaterialLost,
+                },
+            ),
+        );
+        assert_eq!(
+            manual.steps["step-material"].status,
+            StepStatus::ManualRequired
+        );
+        assert_eq!(
+            manual.steps["step-material"].uncertainty_reason.as_deref(),
+            Some("ephemeral_material_lost")
+        );
+
+        let record = EventRecord::next(
+            records.last(),
+            event(
+                "material-event-5",
+                RunEventBody::InvocationMaterialUnavailable {
+                    step_id: "step-material".to_owned(),
+                    effect_id: "effect-material".to_owned(),
+                    reason: InvocationMaterialUnavailableReason::ReferenceUnavailable,
+                },
+            ),
+        )
+        .expect("record should build");
+        assert!(matches!(
+            apply_record(Some(&manual), &record),
+            Err(TransitionError::InvalidStepTransition {
+                from: StepStatus::ManualRequired,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1300,6 +1940,13 @@ mod tests {
             }),
             Box::new(|intent| {
                 intent.authorization.binding.policy_evidence_digest = "sha256:other-policy".into();
+            }),
+            Box::new(|intent| {
+                intent.authorization.binding.material_digest = "sha256:other-material".into();
+            }),
+            Box::new(|intent| {
+                intent.authorization.binding.material_retention_digest =
+                    "sha256:other-retention".into();
             }),
             Box::new(|intent| intent.authorization.grant_id = "authorization-forged".into()),
             Box::new(|intent| {

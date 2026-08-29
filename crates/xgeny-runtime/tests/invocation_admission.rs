@@ -1,6 +1,7 @@
 use std::cell::Cell;
+use std::fs;
 
-use serde_json::json;
+use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
 use xgeny_domain::{
     Architecture, CapabilityDefinitionBody, CapabilityInstanceBody, CapabilityRef, CriticalAction,
@@ -16,10 +17,14 @@ use xgeny_policy::{
 };
 use xgeny_runtime::{
     AdmissionError, AdmissionOutcome, AdmissionRequest, CapabilityRegistry, EventFactory,
-    EventFactoryError, EventMetadata, InvocationAdmission, LocalRunLease, RequiredRouteFeatures,
-    RouteOutcome, RouteRequest,
+    EventFactoryError, EventMetadata, InvocationAdmission, InvocationMaterialProvider,
+    InvocationMaterialRecovery, LocalRunLease, MaterialProviderFailure, MaterialRecoveryError,
+    RequiredRouteFeatures, RouteOutcome, RouteRequest,
 };
-use xgeny_workgraph::{RunEvent, RunEventBody, RunState, StepStatus};
+use xgeny_workgraph::{
+    InvocationMaterialRecord, InvocationMaterialUnavailableReason,
+    ReconstructableMaterialReference, RunEvent, RunEventBody, RunState, StepStatus,
+};
 
 const RUN_ID: &str = "run-admission-1";
 const STEP_ID: &str = "step-admission-1";
@@ -42,6 +47,60 @@ impl ResourceResolver for CanonicalResolver {
             RAW_ALIAS | "/workspace/./output.txt" | CANONICAL_PATH => Ok(CANONICAL_PATH.to_owned()),
             "reject://outside" => Err(ResourceResolutionFailure::OutsideHostBoundary),
             other => Ok(other.to_owned()),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FixedMaterialProvider {
+    provider_id: String,
+    material: Value,
+    result: Result<(), MaterialProviderFailure>,
+    calls: usize,
+}
+
+impl FixedMaterialProvider {
+    fn available(provider_id: &str, material: Value) -> Self {
+        Self {
+            provider_id: provider_id.to_owned(),
+            material,
+            result: Ok(()),
+            calls: 0,
+        }
+    }
+}
+
+impl InvocationMaterialProvider for FixedMaterialProvider {
+    fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    fn reconstruct(
+        &mut self,
+        _reference_id: &str,
+        _revision: &str,
+    ) -> Result<Value, MaterialProviderFailure> {
+        self.calls += 1;
+        self.result?;
+        Ok(self.material.clone())
+    }
+}
+
+fn assert_sqlite_artifacts_exclude(directory: &std::path::Path, sentinels: &[&[u8]]) {
+    for entry in fs::read_dir(directory).expect("run directory should be readable") {
+        let path = entry.expect("directory entry should be readable").path();
+        if !path.is_file() {
+            continue;
+        }
+        let bytes = fs::read(&path).expect("SQLite artifacts should be readable");
+        for sentinel in sentinels {
+            assert!(
+                !bytes
+                    .windows(sentinel.len())
+                    .any(|window| window == *sentinel),
+                "plaintext invocation material leaked into {}",
+                path.display()
+            );
         }
     }
 }
@@ -302,6 +361,38 @@ fn acquire_lease(run_id: &str) -> (TempDir, LocalRunLease) {
     (directory, lease)
 }
 
+fn commit_reconstructable<S: RunStore>(
+    store: &mut S,
+    lease: &LocalRunLease,
+    registry: &CapabilityRegistry,
+    resolver: &CanonicalResolver,
+    definition: &CapabilityDefinitionBody,
+    marker: &str,
+) -> Box<xgeny_runtime::AdmittedEffect> {
+    let pending = prepare(
+        store,
+        lease,
+        registry,
+        resolver,
+        definition,
+        arguments(CANONICAL_PATH, marker),
+    )
+    .expect("invocation should prepare")
+    .with_reconstructable_material(
+        ReconstructableMaterialReference::new("run-recipe", "recipe-1", "rev-1")
+            .expect("reference should validate"),
+    );
+    let inputs = allow_inputs(pending.permission_request());
+    let mut events = DeterministicEvents;
+    let outcome = InvocationAdmission::new()
+        .authorize_and_commit(pending, &inputs, registry, store, &mut events, lease)
+        .expect("reconstructable intent should commit");
+    let AdmissionOutcome::Authorized(admitted) = outcome else {
+        panic!("invocation should authorize")
+    };
+    admitted
+}
+
 #[test]
 fn exact_arguments_are_resolved_authorized_and_atomically_committed() {
     let definition = definition_fixture();
@@ -379,6 +470,15 @@ fn exact_arguments_are_resolved_authorized_and_atomically_committed() {
     assert!(!journal.contains(CANONICAL_PATH));
     assert!(!format!("{admitted:?}").contains(SECRET_SENTINEL));
     assert!(!format!("{admitted:?}").contains(CANONICAL_PATH));
+    let material = (*admitted)
+        .into_ephemeral_material()
+        .expect("same-process admitted arguments should become opaque material");
+    assert_eq!(
+        material.normalized_arguments()["marker"],
+        json!(SECRET_SENTINEL)
+    );
+    assert!(!format!("{material:?}").contains(SECRET_SENTINEL));
+    assert!(!format!("{material:?}").contains(CANONICAL_PATH));
 }
 
 #[test]
@@ -884,12 +984,12 @@ fn sqlite_restart_preserves_exactly_one_intent_and_no_raw_arguments() {
 }
 
 #[derive(Debug)]
-struct LostAcknowledgementStore {
-    inner: MemoryRunStore,
+struct LostAcknowledgementStore<S> {
+    inner: S,
     lose_effect_commit_once: bool,
 }
 
-impl RunStore for LostAcknowledgementStore {
+impl<S: RunStore> RunStore for LostAcknowledgementStore<S> {
     fn append(&mut self, expected: ExpectedHead, event: RunEvent) -> Result<Commit, StoreError> {
         let lose_ack = self.lose_effect_commit_once
             && matches!(&event.body, RunEventBody::EffectIntentCommitted { .. });
@@ -904,6 +1004,32 @@ impl RunStore for LostAcknowledgementStore {
 
     fn load(&self) -> Result<Option<RunSnapshot>, StoreError> {
         self.inner.load()
+    }
+
+    fn append_with_invocation_material(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        material: InvocationMaterialRecord,
+    ) -> Result<Commit, StoreError> {
+        let lose_ack = self.lose_effect_commit_once
+            && matches!(&event.body, RunEventBody::EffectIntentCommitted { .. });
+        let commit = self
+            .inner
+            .append_with_invocation_material(expected, event, material)?;
+        if lose_ack {
+            self.lose_effect_commit_once = false;
+            Err(StoreError::InjectedFault("lost admission acknowledgement"))
+        } else {
+            Ok(commit)
+        }
+    }
+
+    fn load_invocation_material(
+        &self,
+        effect_id: &str,
+    ) -> Result<Option<InvocationMaterialRecord>, StoreError> {
+        self.inner.load_invocation_material(effect_id)
     }
 }
 
@@ -926,7 +1052,11 @@ fn lost_commit_acknowledgement_does_not_mint_a_second_budget() {
         &definition,
         arguments(CANONICAL_PATH, "lost-ack"),
     )
-    .expect("invocation should prepare");
+    .expect("invocation should prepare")
+    .with_reconstructable_material(
+        ReconstructableMaterialReference::new("run-recipe", "recipe-lost-ack", "rev-1")
+            .expect("reference should be a bounded opaque identifier"),
+    );
     let inputs = allow_inputs(pending.permission_request());
     let mut events = DeterministicEvents;
     assert!(matches!(
@@ -968,6 +1098,517 @@ fn lost_commit_acknowledgement_does_not_mint_a_second_budget() {
         ),
         Err(AdmissionError::StepNotPlanned { .. })
     ));
+
+    let mut provider =
+        FixedMaterialProvider::available("run-recipe", arguments(CANONICAL_PATH, "lost-ack"));
+    let material = InvocationMaterialRecovery::new()
+        .recover(&store, &lease, &registry, &resolver, &mut provider, STEP_ID)
+        .expect("lost acknowledgement should retain a recoverable material descriptor");
+    assert_eq!(material.normalized_arguments()["marker"], json!("lost-ack"));
+    assert_eq!(provider.calls, 1);
+    assert_eq!(
+        store
+            .load()
+            .expect("store should load")
+            .expect("Run should exist")
+            .state
+            .authorization_consumption
+            .values()
+            .next()
+            .expect("one authorization")
+            .uses,
+        1
+    );
+}
+
+#[test]
+fn sqlite_lost_ack_reopens_with_one_recoverable_material_and_no_plaintext_arguments() {
+    let directory = tempdir().expect("temporary directory should exist");
+    let database = directory.path().join("복구 테스트 run.db");
+    let definition = definition_fixture();
+    let registry = registry_with(&definition, [instance_fixture(&definition)]);
+    let resolver = CanonicalResolver::default();
+    let (_lease_directory, lease) = acquire_lease(RUN_ID);
+
+    {
+        let inner = SqliteRunStore::open(&database).expect("SQLite should open");
+        let mut store = LostAcknowledgementStore {
+            inner,
+            lose_effect_commit_once: true,
+        };
+        seed(&mut store, RUN_ID, STEP_ID);
+        let pending = prepare(
+            &store,
+            &lease,
+            &registry,
+            &resolver,
+            &definition,
+            arguments(CANONICAL_PATH, SECRET_SENTINEL),
+        )
+        .expect("invocation should prepare")
+        .with_reconstructable_material(
+            ReconstructableMaterialReference::new("run-recipe", "recipe-sqlite", "rev-1")
+                .expect("reference should validate"),
+        );
+        let inputs = allow_inputs(pending.permission_request());
+        let mut events = DeterministicEvents;
+        assert!(matches!(
+            InvocationAdmission::new().authorize_and_commit(
+                pending,
+                &inputs,
+                &registry,
+                &mut store,
+                &mut events,
+                &lease,
+            ),
+            Err(AdmissionError::Store(StoreError::InjectedFault(_)))
+        ));
+    }
+
+    let reopened = SqliteRunStore::open(&database).expect("SQLite should reopen");
+    let snapshot = reopened
+        .load()
+        .expect("replay should verify")
+        .expect("Run should exist");
+    let intent = snapshot.state.steps[STEP_ID]
+        .intent
+        .as_ref()
+        .expect("intent should be committed");
+    assert_eq!(snapshot.records.len(), 3);
+    assert_eq!(snapshot.state.authorization_consumption.len(), 1);
+    assert_eq!(
+        snapshot
+            .state
+            .authorization_consumption
+            .values()
+            .next()
+            .expect("one authorization")
+            .uses,
+        1
+    );
+    let record = reopened
+        .load_invocation_material(&intent.effect_id)
+        .expect("material lookup should work")
+        .expect("one material record should exist");
+    record
+        .verify_for(RUN_ID, STEP_ID, intent)
+        .expect("material should remain bound after reopen");
+
+    let mut provider =
+        FixedMaterialProvider::available("run-recipe", arguments(CANONICAL_PATH, SECRET_SENTINEL));
+    let material = InvocationMaterialRecovery::new()
+        .recover(
+            &reopened,
+            &lease,
+            &registry,
+            &resolver,
+            &mut provider,
+            STEP_ID,
+        )
+        .expect("reopened material should reconstruct");
+    assert_eq!(
+        material.normalized_arguments()["marker"],
+        json!(SECRET_SENTINEL)
+    );
+    assert!(!format!("{material:?}").contains(SECRET_SENTINEL));
+    assert!(!format!("{material:?}").contains(CANONICAL_PATH));
+    assert_eq!(provider.calls, 1);
+
+    assert_sqlite_artifacts_exclude(
+        directory.path(),
+        &[SECRET_SENTINEL.as_bytes(), CANONICAL_PATH.as_bytes()],
+    );
+}
+
+#[test]
+fn ephemeral_material_loss_is_explicitly_closed_to_manual_without_an_effect_start() {
+    let definition = definition_fixture();
+    let registry = registry_with(&definition, [instance_fixture(&definition)]);
+    let resolver = CanonicalResolver::default();
+    let mut store = MemoryRunStore::new();
+    seed(&mut store, RUN_ID, STEP_ID);
+    let (_directory, lease) = acquire_lease(RUN_ID);
+    let pending = prepare(
+        &store,
+        &lease,
+        &registry,
+        &resolver,
+        &definition,
+        arguments(CANONICAL_PATH, SECRET_SENTINEL),
+    )
+    .expect("ephemeral invocation should prepare");
+    let inputs = allow_inputs(pending.permission_request());
+    let mut events = DeterministicEvents;
+    let outcome = InvocationAdmission::new()
+        .authorize_and_commit(pending, &inputs, &registry, &mut store, &mut events, &lease)
+        .expect("ephemeral intent should commit");
+    let AdmissionOutcome::Authorized(admitted) = outcome else {
+        panic!("ephemeral invocation should authorize")
+    };
+    let effect_id = admitted.effect_id().to_owned();
+    drop(admitted);
+
+    let mut provider = FixedMaterialProvider::available(
+        "unused-provider",
+        arguments(CANONICAL_PATH, SECRET_SENTINEL),
+    );
+    assert!(matches!(
+        InvocationMaterialRecovery::new().recover(
+            &store,
+            &lease,
+            &registry,
+            &resolver,
+            &mut provider,
+            STEP_ID,
+        ),
+        Err(MaterialRecoveryError::EphemeralMaterialUnavailable)
+    ));
+    assert_eq!(provider.calls, 0);
+
+    let commit = InvocationMaterialRecovery::new()
+        .mark_unavailable(
+            &mut store,
+            &mut events,
+            &lease,
+            STEP_ID,
+            InvocationMaterialUnavailableReason::EphemeralMaterialLost,
+        )
+        .expect("permanent ephemeral loss should be durable");
+    let step = &commit.state.steps[STEP_ID];
+    assert_eq!(step.status, StepStatus::ManualRequired);
+    assert_eq!(
+        step.uncertainty_reason.as_deref(),
+        Some("ephemeral_material_lost")
+    );
+    assert_eq!(
+        commit
+            .state
+            .authorization_consumption
+            .values()
+            .next()
+            .expect("one authorization")
+            .uses,
+        1
+    );
+    assert_eq!(
+        step.intent
+            .as_ref()
+            .expect("intent remains auditable")
+            .effect_id,
+        effect_id
+    );
+    assert_eq!(
+        commit
+            .state
+            .steps
+            .values()
+            .filter(|step| step.status == StepStatus::Executing)
+            .count(),
+        0
+    );
+    let journal = String::from_utf8(store.export_jsonl().expect("journal should export"))
+        .expect("journal should be UTF-8");
+    assert!(journal.contains("ephemeral_material_lost"));
+    assert!(!journal.contains(SECRET_SENTINEL));
+    assert!(!journal.contains(CANONICAL_PATH));
+}
+
+#[test]
+fn reconstructable_material_revalidates_provider_payload_and_binding_before_returning() {
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, [instance]);
+    let resolver = CanonicalResolver::default();
+    let mut store = MemoryRunStore::new();
+    seed(&mut store, RUN_ID, STEP_ID);
+    let (_directory, lease) = acquire_lease(RUN_ID);
+    let pending = prepare(
+        &store,
+        &lease,
+        &registry,
+        &resolver,
+        &definition,
+        arguments(CANONICAL_PATH, "original-marker"),
+    )
+    .expect("invocation should prepare")
+    .with_reconstructable_material(
+        ReconstructableMaterialReference::new("run-recipe", "recipe-1", "rev-1")
+            .expect("reference should validate"),
+    );
+    let inputs = allow_inputs(pending.permission_request());
+    let mut events = DeterministicEvents;
+    let outcome = InvocationAdmission::new()
+        .authorize_and_commit(pending, &inputs, &registry, &mut store, &mut events, &lease)
+        .expect("reconstructable intent should commit");
+    let AdmissionOutcome::Authorized(admitted) = outcome else {
+        panic!("invocation should authorize")
+    };
+    let record_debug = format!("{:?}", admitted.material_record());
+    assert!(!record_debug.contains("recipe-1"));
+    drop(admitted);
+
+    let (_wrong_lease_directory, wrong_lease) = acquire_lease("another-run");
+    let mut lease_blocked_provider = FixedMaterialProvider::available(
+        "run-recipe",
+        arguments(CANONICAL_PATH, "original-marker"),
+    );
+    assert!(matches!(
+        InvocationMaterialRecovery::new().recover(
+            &store,
+            &wrong_lease,
+            &registry,
+            &resolver,
+            &mut lease_blocked_provider,
+            STEP_ID,
+        ),
+        Err(MaterialRecoveryError::LeaseRunMismatch { .. })
+    ));
+    assert_eq!(lease_blocked_provider.calls, 0);
+
+    let mut wrong_provider = FixedMaterialProvider::available(
+        "different-provider",
+        arguments(CANONICAL_PATH, "original-marker"),
+    );
+    assert!(matches!(
+        InvocationMaterialRecovery::new().recover(
+            &store,
+            &lease,
+            &registry,
+            &resolver,
+            &mut wrong_provider,
+            STEP_ID,
+        ),
+        Err(MaterialRecoveryError::ProviderMismatch)
+    ));
+    assert_eq!(wrong_provider.calls, 0);
+
+    let mut changed_payload =
+        FixedMaterialProvider::available("run-recipe", arguments(CANONICAL_PATH, "changed-marker"));
+    assert!(matches!(
+        InvocationMaterialRecovery::new().recover(
+            &store,
+            &lease,
+            &registry,
+            &resolver,
+            &mut changed_payload,
+            STEP_ID,
+        ),
+        Err(MaterialRecoveryError::MaterialDigestMismatch)
+    ));
+    assert_eq!(changed_payload.calls, 1);
+    let snapshot = store
+        .load()
+        .expect("store should load")
+        .expect("Run should exist");
+    assert_eq!(snapshot.records.len(), 3);
+    assert_eq!(
+        snapshot.state.steps[STEP_ID].status,
+        StepStatus::IntentCommitted
+    );
+}
+
+#[test]
+fn material_provider_failures_are_fixed_and_do_not_expose_invocation_data() {
+    let definition = definition_fixture();
+    let registry = registry_with(&definition, [instance_fixture(&definition)]);
+    let resolver = CanonicalResolver::default();
+    let mut store = MemoryRunStore::new();
+    seed(&mut store, RUN_ID, STEP_ID);
+    let (_directory, lease) = acquire_lease(RUN_ID);
+    drop(commit_reconstructable(
+        &mut store,
+        &lease,
+        &registry,
+        &resolver,
+        &definition,
+        SECRET_SENTINEL,
+    ));
+    let mut provider =
+        FixedMaterialProvider::available("run-recipe", arguments(CANONICAL_PATH, SECRET_SENTINEL));
+    provider.result = Err(MaterialProviderFailure::Unavailable);
+
+    let error = InvocationMaterialRecovery::new()
+        .recover(&store, &lease, &registry, &resolver, &mut provider, STEP_ID)
+        .expect_err("provider failure must close recovery");
+    let rendered = format!("{error} {error:?}");
+    assert!(matches!(
+        error,
+        MaterialRecoveryError::Provider(MaterialProviderFailure::Unavailable)
+    ));
+    assert!(!rendered.contains(SECRET_SENTINEL));
+    assert!(!rendered.contains(CANONICAL_PATH));
+    assert!(!rendered.contains("recipe-1"));
+}
+
+#[test]
+fn recovery_rejects_definition_and_instance_drift_before_provider_access() {
+    let definition = definition_fixture();
+    let registry = registry_with(&definition, [instance_fixture(&definition)]);
+    let resolver = CanonicalResolver::default();
+    let mut store = MemoryRunStore::new();
+    seed(&mut store, RUN_ID, STEP_ID);
+    let (_directory, lease) = acquire_lease(RUN_ID);
+    drop(commit_reconstructable(
+        &mut store,
+        &lease,
+        &registry,
+        &resolver,
+        &definition,
+        "binding-drift",
+    ));
+
+    let mut changed_definition = definition.clone();
+    changed_definition.spec.input_schema["properties"]["marker"]["minLength"] = json!(2);
+    let changed_definition_registry =
+        registry_with(&changed_definition, [instance_fixture(&changed_definition)]);
+    let mut provider =
+        FixedMaterialProvider::available("run-recipe", arguments(CANONICAL_PATH, "binding-drift"));
+    assert!(matches!(
+        InvocationMaterialRecovery::new().recover(
+            &store,
+            &lease,
+            &changed_definition_registry,
+            &resolver,
+            &mut provider,
+            STEP_ID,
+        ),
+        Err(MaterialRecoveryError::DefinitionChanged)
+    ));
+    assert_eq!(provider.calls, 0);
+
+    let mut changed_instance = instance_fixture(&definition);
+    "builtin://test/retargeted-writer".clone_into(&mut changed_instance.binding.binding_ref);
+    let changed_instance_registry = registry_with(&definition, [changed_instance]);
+    assert!(matches!(
+        InvocationMaterialRecovery::new().recover(
+            &store,
+            &lease,
+            &changed_instance_registry,
+            &resolver,
+            &mut provider,
+            STEP_ID,
+        ),
+        Err(MaterialRecoveryError::InstanceBindingChanged)
+    ));
+    assert_eq!(provider.calls, 0);
+}
+
+#[test]
+fn recovery_revalidates_schema_size_and_resource_resolution() {
+    let definition = definition_fixture();
+    let registry = registry_with(&definition, [instance_fixture(&definition)]);
+    let resolver = CanonicalResolver::default();
+    let mut store = MemoryRunStore::new();
+    seed(&mut store, RUN_ID, STEP_ID);
+    let (_directory, lease) = acquire_lease(RUN_ID);
+    drop(commit_reconstructable(
+        &mut store,
+        &lease,
+        &registry,
+        &resolver,
+        &definition,
+        "revalidate",
+    ));
+
+    let mut invalid_schema =
+        FixedMaterialProvider::available("run-recipe", json!({"path": CANONICAL_PATH}));
+    assert!(matches!(
+        InvocationMaterialRecovery::new().recover(
+            &store,
+            &lease,
+            &registry,
+            &resolver,
+            &mut invalid_schema,
+            STEP_ID,
+        ),
+        Err(MaterialRecoveryError::Admission(
+            AdmissionError::ArgumentsDoNotConform
+        ))
+    ));
+
+    let mut oversized = FixedMaterialProvider::available(
+        "run-recipe",
+        arguments(CANONICAL_PATH, &"x".repeat(1_048_576)),
+    );
+    assert!(matches!(
+        InvocationMaterialRecovery::new().recover(
+            &store,
+            &lease,
+            &registry,
+            &resolver,
+            &mut oversized,
+            STEP_ID,
+        ),
+        Err(MaterialRecoveryError::Admission(
+            AdmissionError::ArgumentsTooLarge { .. }
+        ))
+    ));
+
+    let mut rejected_resource =
+        FixedMaterialProvider::available("run-recipe", arguments("reject://outside", "revalidate"));
+    assert!(matches!(
+        InvocationMaterialRecovery::new().recover(
+            &store,
+            &lease,
+            &registry,
+            &resolver,
+            &mut rejected_resource,
+            STEP_ID,
+        ),
+        Err(MaterialRecoveryError::InvocationResolution(
+            InvocationResolutionError::ResolverRejected { .. }
+        ))
+    ));
+}
+
+#[test]
+fn credential_identity_retarget_is_detected_before_material_provider_access() {
+    let definition = definition_fixture();
+    let mut admitted_instance = instance_fixture(&definition);
+    admitted_instance.auth.auth_ref = Some("principal-a".to_owned());
+    let registry = registry_with(&definition, [admitted_instance.clone()]);
+    let resolver = CanonicalResolver::default();
+    let mut store = MemoryRunStore::new();
+    seed(&mut store, RUN_ID, STEP_ID);
+    let (_directory, lease) = acquire_lease(RUN_ID);
+    let pending = prepare(
+        &store,
+        &lease,
+        &registry,
+        &resolver,
+        &definition,
+        arguments(CANONICAL_PATH, "credential-binding"),
+    )
+    .expect("invocation should prepare")
+    .with_reconstructable_material(
+        ReconstructableMaterialReference::new("run-recipe", "recipe-credential", "rev-1")
+            .expect("reference should validate"),
+    );
+    let inputs = allow_inputs(pending.permission_request());
+    let mut events = DeterministicEvents;
+    let outcome = InvocationAdmission::new()
+        .authorize_and_commit(pending, &inputs, &registry, &mut store, &mut events, &lease)
+        .expect("intent should commit");
+    assert!(matches!(outcome, AdmissionOutcome::Authorized(_)));
+
+    admitted_instance.auth.auth_ref = Some("principal-b".to_owned());
+    let changed_registry = registry_with(&definition, [admitted_instance]);
+    let mut provider = FixedMaterialProvider::available(
+        "run-recipe",
+        arguments(CANONICAL_PATH, "credential-binding"),
+    );
+    assert!(matches!(
+        InvocationMaterialRecovery::new().recover(
+            &store,
+            &lease,
+            &changed_registry,
+            &resolver,
+            &mut provider,
+            STEP_ID,
+        ),
+        Err(MaterialRecoveryError::InstanceBindingChanged)
+    ));
+    assert_eq!(provider.calls, 0);
 }
 
 #[test]
