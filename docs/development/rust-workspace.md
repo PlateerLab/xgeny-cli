@@ -12,11 +12,11 @@ crates/
   xgeny-protocol/     bundled/offline schema·fixture·digest 검증
   xgeny-workgraph/    model-free RunEvent 상태 전이·재생 실험
   xgeny-local-store/  메모리 참조 구현과 embedded SQLite 후보
-  xgeny-runtime/      durable effect 실행 순서·복구·Run lease
+  xgeny-runtime/      durable effect 실행·복구와 Capability Registry 기본형
   xgeny-cli/          xgeny 실행 파일과 protocol check 명령
 ```
 
-`xgeny-workgraph`, `xgeny-local-store`, `xgeny-runtime`은 ADR-0008 연구 gate를 위한 내부 실험이며 공개 프로토콜 v0.1을 변경하지 않는다. 이 단계는 모델 호출, 실제 파일·process adapter, permission broker, MCP, Connector, XGEN 원격 연동 또는 사용자용 resume 명령을 구현하지 않는다.
+`xgeny-workgraph`, `xgeny-local-store`, `xgeny-runtime`의 durable effect 부분은 ADR-0008 연구 gate를 위한 내부 실험이며 공개 프로토콜 v0.1을 변경하지 않는다. Registry 기본형도 기존 `CapabilityDefinition`과 `CapabilityInstance`를 그대로 사용한다. 이 단계는 모델 호출, Router, 실제 파일·process adapter, Permission Broker, MCP, Connector, XGEN 원격 연동 또는 사용자용 resume 명령을 구현하지 않는다.
 
 ## 준비물
 
@@ -43,6 +43,18 @@ crates/
 - 임의 길이 journal 재생과 event 변조 탐지 property test
 
 세부 실행 순서와 재시작 판정은 [Durable effect 실행·복구 수직 슬라이스](durable-effect-runtime.md)를 따른다. 이는 현재 개발 호스트의 process-crash 검증 결과다. power-loss, filesystem 손상, 실제 권한 경계가 있는 tool adapter, 설치 패키지, Linux/macOS/Windows 반복 fault matrix는 아직 통과했다고 주장하지 않는다. SQLite 채택 여부도 ADR-0008의 hardened JSONL 비교와 나머지 gate가 끝난 뒤 확정한다.
+
+## 현재 Capability Registry 검증 범위
+
+- Capability ID와 contract version의 exact identity
+- 같은 Capability의 여러 contract version 공존
+- 전역 Instance ID 중복과 기존 항목 덮어쓰기 차단
+- 등록되지 않은 exact Definition version을 가리키는 Instance 차단
+- Definition보다 강한 sync/task/cancellation 기능 주장 차단
+- 등록 순서와 무관한 Definition·Instance 조회 순서
+- platform, health, auth 상태를 실행 가능성으로 해석하지 않고 Router 입력으로 보존
+
+자세한 책임 경계와 제외 범위는 [Capability Registry 기본형](capability-registry.md)을 따른다.
 
 ## 검증
 
@@ -71,6 +83,6 @@ cargo build --locked --release -p xgeny-cli
 
 ## CI와 OS 경계
 
-GitHub Actions는 Linux에서 format과 clippy를 검사하고 Linux, macOS, Windows 각각에서 test, `protocol check`, release build를 수행한다. 따라서 현재 보장하는 것은 세 OS의 **CLI 빌드와 내장 프로토콜 검증**이다.
+GitHub Actions는 Linux에서 format과 clippy를 검사하고 Linux, macOS, Windows 각각에서 workspace test, `protocol check`, release build를 수행한다. 따라서 현재 보장하는 것은 세 OS의 **I/O 없는 Registry·상태 기계와 내장 프로토콜 검증, CLI 빌드**다.
 
 실제 OS 권한 broker, 파일시스템 sandbox, shell/process 실행, 설치 패키지 서명과 배포 E2E는 각각의 기능이 추가될 때 별도 테스트 계층으로 확장한다. CI 통과를 아직 구현하지 않은 통합 기능의 검증으로 해석하지 않는다.

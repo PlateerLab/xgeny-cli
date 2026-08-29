@@ -1,6 +1,6 @@
 [package]
 name = "xgeny-runtime"
-description = "Durable effect execution and recovery loop for XGENy"
+description = "Capability registry and durable effect execution/recovery kernel for XGENy"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,10 +9,12 @@ repository.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+xgeny-domain = { path = "../xgeny-domain" }
 xgeny-local-store = { path = "../xgeny-local-store" }
 xgeny-workgraph = { path = "../xgeny-workgraph" }
 
 [dev-dependencies]
+serde_json.workspace = true
 tempfile.workspace = true
 
 [lints]
