@@ -2,7 +2,7 @@
 
 Local-first general-purpose agent CLI and harness.
 
-> 현재 상태: 프로토콜 v0.1 검증, model-free WorkGraph·embedded SQLite store, effect 실행·복구 조정기, 결정론적 Capability Registry·Router, I/O 없는 Permission Broker, secret-free invocation material 복구와 fake-adapter Direct Executor 수직 슬라이스를 실행할 수 있습니다. 모델 루프, 실제 filesystem/process resolver·adapter, 승인 UI와 CLI 연결은 아직 구현하지 않았습니다.
+> 현재 상태: 프로토콜 v0.1 검증, model-free WorkGraph·embedded SQLite store, effect 실행·복구 조정기, 결정론적 Capability Registry·Router, I/O 없는 Permission Broker, secret-free invocation material 복구와 Direct Executor를 실행할 수 있습니다. 별도 public-port 참조 adapter가 preopened 임시 파일로 Started 이후 I/O와 crash recovery 계약을 검증하지만 제품용 filesystem 도구는 아닙니다. 모델 루프, 실제 filesystem/process resolver·adapter, 승인 UI와 CLI 연결은 아직 구현하지 않았습니다.
 
 ## 제품 원칙
 
@@ -41,7 +41,7 @@ cargo test --workspace --locked
 cargo run --locked --quiet -p xgeny-cli -- protocol check
 ```
 
-상세한 로컬·CI 검증 범위는 [Rust 워크스페이스 개발 환경](docs/development/rust-workspace.md)을 참고합니다. Router의 fail-closed filter, ranking과 권한 경계는 [결정론적 Capability Router 기본형](docs/development/deterministic-router.md), 재시작 전 실행 인자 경계는 [Recoverable Invocation Material 기본형](docs/development/recoverable-invocation-material.md), exact adapter 실행 경계는 [Direct Executor 기본형](docs/development/direct-executor.md), 기능 개발 순서와 테스트 계층·완료 기준은 [XGENy 개발 방법론과 테스트 전략](docs/development/engineering-method.md)을 따릅니다.
+상세한 로컬·CI 검증 범위는 [Rust 워크스페이스 개발 환경](docs/development/rust-workspace.md)을 참고합니다. Router의 fail-closed filter, ranking과 권한 경계는 [결정론적 Capability Router 기본형](docs/development/deterministic-router.md), 재시작 전 실행 인자 경계는 [Recoverable Invocation Material 기본형](docs/development/recoverable-invocation-material.md), exact adapter 실행 경계는 [Direct Executor 기본형](docs/development/direct-executor.md), 실제 OS I/O를 쓰는 비제품 기준은 [Preopened Reference Adapter Conformance](docs/development/reference-adapter-conformance.md), 기능 개발 순서와 테스트 계층·완료 기준은 [XGENy 개발 방법론과 테스트 전략](docs/development/engineering-method.md)을 따릅니다.
 
 ## Research
 

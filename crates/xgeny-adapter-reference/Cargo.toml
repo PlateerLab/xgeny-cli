@@ -1,0 +1,28 @@
+[package]
+name = "xgeny-adapter-reference"
+description = "Non-production preopened-handle reference adapter for XGENy conformance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_jcs.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+xgeny-domain = { path = "../xgeny-domain" }
+xgeny-runtime = { path = "../xgeny-runtime" }
+xgeny-workgraph = { path = "../xgeny-workgraph" }
+
+[dev-dependencies]
+jsonschema.workspace = true
+tempfile.workspace = true
+xgeny-local-store = { path = "../xgeny-local-store" }
+xgeny-policy = { path = "../xgeny-policy" }
+
+[lints]
+workspace = true

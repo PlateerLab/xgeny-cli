@@ -1,7 +1,7 @@
 # Direct Executor 기본형
 
 - 기준일: 2026-08-29
-- 상태: ADR-0011 연구 gate용 fake-adapter 수직 슬라이스
+- 상태: ADR-0011 연구 gate용 fake + public-port reference-adapter 수직 슬라이스
 - 공개 protocol v0.1 변경: 없음
 - local store schema: 3
 
@@ -25,7 +25,7 @@ restart -> MaterialProviderRegistry exact ----+-> DirectExecutor
                                                   +-> durable outcome
 ```
 
-이 단계는 fake adapter로 실행 순서와 복구 계약을 검증한다. Filesystem이나 process에 실제 변경을 만드는 제품 adapter는 아직 없다.
+이 단계는 runtime fake와 별도 workspace crate의 preopened reference adapter로 실행 순서와 복구 계약을 검증한다. 참조 adapter는 임시 일반 파일에 실제 I/O를 수행하지만 제품용 filesystem/process adapter는 아니다.
 
 ## Composition root
 
@@ -93,6 +93,14 @@ Credential-bearing adapter를 임시로 허용하거나 raw credential을 argume
 
 Started commit 실패 시 prepared session을 폐기하고 execute하지 않는다. Outcome commit이 실패하면 `Executing`을 유지하고 재개 시 blind retry하지 않는다.
 
+## Public-port reference adapter
+
+`xgeny-adapter-reference`는 `publish = false`인 비제품 crate다. Runtime private API 없이 `EffectAdapter`와 `PreparedAdapterInvocation`을 구현하고, trusted composition root가 미리 연 격리 파일 handle만 받는다. Invocation에는 OS path 대신 exact opaque target reference가 들어간다.
+
+`prepare`는 target을 변경하지 않는다. Started commit 뒤 `execute`가 canonical evidence marker를 seek·truncate·write·sync하고 bounded read-back으로 확인한다. Raw marker와 target reference는 기록하지 않으며 partial write·sync를 포함한 I/O 오류는 OS 문자열을 내보내지 않고 `ResponseUnverifiable` unknown으로 처리한다. 별도 process를 write·sync·read-back 뒤 outcome commit 전에 종료하는 SQLite test는 재시작 때 adapter/provider 없이 `EffectUnknown`으로 수렴하고 adapter execute가 0회인지 확인한다.
+
+현재 outcome의 `receipt_digest`는 물리 evidence byte의 digest일 뿐 protocol `ExecutionReceipt` body나 Artifact가 아니다. 상세 범위와 비보장은 [Preopened Reference Adapter Conformance](reference-adapter-conformance.md)를 따른다.
+
 ## 검증 명령
 
 ```bash
@@ -113,8 +121,10 @@ cargo build --workspace --release --locked
 - Started commit 뒤 execute 순서
 - lost outcome commit과 child-process exit 뒤 duplicate execute 0회
 - SQLite restart reconstruct → execute E2E
+- 외부 crate의 preopened 일반 파일 actual I/O와 exact binding conformance
+- post-write/pre-outcome process exit + SQLite restart의 adapter execute 0회
 - Debug, JSONL과 SQLite artifact plaintext sentinel scan. POSIX에서는 열린 DB에서 현재 존재하는 WAL/SHM까지 검사하고, Windows에서는 store를 clean close해 SQLite byte-range lock을 해제한 뒤 남아 있는 DB/WAL/SHM artifact를 검사한다.
 
 ## 다음 수직 슬라이스
 
-다음 구현은 Direct Executor contract를 바꾸지 않고 fake session 하나를 실제 최소 adapter로 교체한다. 첫 후보는 sandbox가 필요 없는 bounded read-only 또는 fixture-only adapter여야 한다. Receipt body와 Artifact 저장, credential resolver, process adapter는 각각 별도 gate로 진행한다.
+구현 순서상 다음 큰 slice는 같은 Run 엔진 위의 Tracked/Persistent WorkGraph와 crash recovery다. 제품용 read-only filesystem adapter는 참조 adapter의 단순 확장이 아니다. WorkGraph `ReadOnly`, bounded typed output, core-owned Receipt/Artifact, root directory capability와 symlink/junction/TOCTOU 규칙을 별도 ADR·gate에서 먼저 확정한다. Credential resolver와 process adapter도 각각 분리한다.

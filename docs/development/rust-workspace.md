@@ -4,10 +4,11 @@
 
 ## 범위
 
-현재 워크스페이스는 다음 일곱 crate로 구성된다.
+현재 워크스페이스는 다음 여덟 crate로 구성된다.
 
 ```text
 crates/
+  xgeny-adapter-reference/ publish하지 않는 preopened-handle conformance 기준
   xgeny-domain/       I/O 없는 정본 Rust 프로토콜 타입
   xgeny-protocol/     bundled/offline schema·fixture·digest 검증
   xgeny-workgraph/    model-free RunEvent 상태 전이·재생 실험
@@ -17,7 +18,7 @@ crates/
   xgeny-cli/          xgeny 실행 파일과 protocol check 명령
 ```
 
-`xgeny-workgraph`, `xgeny-local-store`, `xgeny-runtime`의 durable effect, invocation material과 Direct Executor 부분은 ADR-0008·0010·0011 연구 gate를 위한 내부 실험이며 공개 프로토콜 v0.1을 변경하지 않는다. Registry와 Router 기본형도 기존 `CapabilityDefinition`·`CapabilityInstance`를 그대로 사용하며 wire 문서를 추가하지 않는다. `xgeny-policy`의 Allow는 provisional 결과로 유지되고, runtime의 Admission 기본형만 exact invocation에서 만든 local one-shot allow를 current Run/Step/action/Instance/material과 결합해 durable intent로 발행한다. reusable `Grant`나 `PolicyDecision` wire 문서는 발행하지 않는다. 이 단계는 fake adapter Direct Executor까지 구현하며 모델 호출, 실제 파일·process adapter, 승인 UI, MCP, Connector, XGEN 원격 연동, `InvocationPlan` 투영 또는 사용자용 resume 명령은 구현하지 않는다.
+`xgeny-workgraph`, `xgeny-local-store`, `xgeny-runtime`의 durable effect, invocation material과 Direct Executor 부분은 ADR-0008·0010·0011 연구 gate를 위한 내부 실험이며 공개 프로토콜 v0.1을 변경하지 않는다. Registry와 Router 기본형도 기존 `CapabilityDefinition`·`CapabilityInstance`를 그대로 사용하며 wire 문서를 추가하지 않는다. `xgeny-policy`의 Allow는 provisional 결과로 유지되고, runtime의 Admission 기본형만 exact invocation에서 만든 local one-shot allow를 current Run/Step/action/Instance/material과 결합해 durable intent로 발행한다. reusable `Grant`나 `PolicyDecision` wire 문서는 발행하지 않는다. `xgeny-adapter-reference`는 public runtime port를 실제 preopened 임시 파일 I/O로 검증하지만 `publish = false`인 비제품 기준이다. 모델 호출, 사용자 workspace용 파일·process adapter, 승인 UI, MCP, Connector, XGEN 원격 연동, `InvocationPlan` 투영 또는 사용자용 resume 명령은 구현하지 않는다.
 
 ## 준비물
 
@@ -43,8 +44,10 @@ crates/
 - 메모리 참조 저장소와 SQLite 후보의 동일한 canonical JSONL export
 - 임의 길이 journal 재생과 event 변조 탐지 property test
 - schema version 1·2와 future version을 변경하거나 자동 추측하지 않는 schema 3 fail-closed 거부
+- 외부 reference crate의 Started 이후 preopened-file I/O, fixed-error redaction과 exact binding
+- write·sync·read-back 뒤 outcome 전 child process 종료 + SQLite 재시작에서 adapter execute 0회와 unknown 복원
 
-세부 실행 순서와 재시작 판정은 [Durable effect 실행·복구 수직 슬라이스](durable-effect-runtime.md)를 따른다. 이는 현재 개발 호스트의 process-crash 검증 결과다. power-loss, filesystem 손상, 실제 권한 경계가 있는 tool adapter, 설치 패키지, Linux/macOS/Windows 반복 fault matrix는 아직 통과했다고 주장하지 않는다. SQLite 채택 여부도 ADR-0008의 hardened JSONL 비교와 나머지 gate가 끝난 뒤 확정한다.
+세부 실행 순서와 재시작 판정은 [Durable effect 실행·복구 수직 슬라이스](durable-effect-runtime.md), 외부 adapter 범위는 [Preopened Reference Adapter Conformance](reference-adapter-conformance.md)를 따른다. Reference test는 임시 디렉터리의 전용 일반 파일만 사용하며 path sandbox가 아니다. power-loss, filesystem 손상, 사용자 workspace의 실제 권한 경계, 설치 패키지와 반복 fault matrix는 아직 통과했다고 주장하지 않는다. SQLite 채택 여부도 ADR-0008의 hardened JSONL 비교와 나머지 gate가 끝난 뒤 확정한다.
 
 ## 현재 Capability Registry 검증 범위
 
@@ -98,7 +101,7 @@ crates/
 - EffectIntent·authorization·material sidecar의 원자적 commit과 reconstructable lost-ack 복구
 - raw argument의 journal·SQLite/WAL·Debug 비노출과 SQLite 재시작 검증
 
-actual OS resolver/adapter, sandbox, sealed secret/argument 저장, managed/critical/reusable grant와 external harness 연동은 아직 포함하지 않는다. 자세한 admission 계약은 [Run-bound Invocation Admission 기본형](invocation-admission.md), 재시작 material 경계는 [Recoverable Invocation Material 기본형](recoverable-invocation-material.md), exact fake-adapter 실행 경계는 [Direct Executor 기본형](direct-executor.md)을 따른다.
+actual OS resource resolver, 사용자용 adapter, sandbox, sealed secret/argument 저장, managed/critical/reusable grant와 external harness 연동은 아직 포함하지 않는다. 자세한 admission 계약은 [Run-bound Invocation Admission 기본형](invocation-admission.md), 재시작 material 경계는 [Recoverable Invocation Material 기본형](recoverable-invocation-material.md), exact 실행 경계는 [Direct Executor 기본형](direct-executor.md), 비제품 actual-I/O 기준은 [Preopened Reference Adapter Conformance](reference-adapter-conformance.md)를 따른다.
 
 ## 검증
 
@@ -127,6 +130,6 @@ cargo build --locked --release -p xgeny-cli
 
 ## CI와 OS 경계
 
-GitHub Actions는 Linux에서 format과 clippy를 검사하고 Linux, macOS, Windows 각각에서 workspace test, `protocol check`, release build를 수행한다. 따라서 현재 보장하는 것은 세 OS의 **I/O 없는 Registry·Router·Permission Broker·상태 기계와 내장 프로토콜 검증, CLI 빌드**다.
+GitHub Actions는 Linux에서 format과 clippy를 검사하고 Linux, macOS, Windows 각각에서 workspace test, `protocol check`, release build를 수행한다. 따라서 현재 보장하는 것은 세 OS의 **I/O 없는 Registry·Router·Permission Broker·상태 기계, 내장 프로토콜 검증, 격리된 preopened 임시 파일 reference conformance와 CLI 빌드**다.
 
 실제 OS 권한 broker, 파일시스템 sandbox, shell/process 실행, 설치 패키지 서명과 배포 E2E는 각각의 기능이 추가될 때 별도 테스트 계층으로 확장한다. CI 통과를 아직 구현하지 않은 통합 기능의 검증으로 해석하지 않는다.
