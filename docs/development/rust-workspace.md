@@ -4,7 +4,7 @@
 
 ## 범위
 
-현재 워크스페이스는 다음 다섯 crate로 구성된다.
+현재 워크스페이스는 다음 여섯 crate로 구성된다.
 
 ```text
 crates/
@@ -12,10 +12,11 @@ crates/
   xgeny-protocol/     bundled/offline schema·fixture·digest 검증
   xgeny-workgraph/    model-free RunEvent 상태 전이·재생 실험
   xgeny-local-store/  메모리 참조 구현과 embedded SQLite 후보
+  xgeny-runtime/      durable effect 실행 순서·복구·Run lease
   xgeny-cli/          xgeny 실행 파일과 protocol check 명령
 ```
 
-`xgeny-workgraph`와 `xgeny-local-store`는 ADR-0008 연구 gate를 위한 내부 실험이며 공개 프로토콜 v0.1을 변경하지 않는다. 이 단계는 모델 호출, 실제 파일·process effect 실행, MCP, Connector, XGEN 원격 연동 또는 사용자용 resume 명령을 구현하지 않는다.
+`xgeny-workgraph`, `xgeny-local-store`, `xgeny-runtime`은 ADR-0008 연구 gate를 위한 내부 실험이며 공개 프로토콜 v0.1을 변경하지 않는다. 이 단계는 모델 호출, 실제 파일·process adapter, permission broker, MCP, Connector, XGEN 원격 연동 또는 사용자용 resume 명령을 구현하지 않는다.
 
 ## 준비물
 
@@ -32,10 +33,16 @@ crates/
 - event, effect intent index, authorization consumption, projection의 단일 transaction
 - transaction 중간 오류와 자식 process 즉시 종료 후 전량 rollback·재개
 - lost acknowledgement 뒤 `effect_unknown` 복원과 비멱등 effect의 blind retry 거부
+- Run별 OS file lease를 effect 호출 전체 구간에 유지해 동시 recovery worker 차단
+- 실행 직전 ephemeral prepared effect와 durable action digest 일치 검증
+- 시작 event commit 이전에는 sink를 호출하지 않고, outcome commit 유실 시 재실행 없이 unknown 복구
+- query-capable sink만 read-only reconciliation하고 나머지는 manual 전환
+- process 종료 전 실제 counter effect가 발생한 시나리오의 단일 실행·lease 해제·unknown 복원
+- durable 실행 attempt 상한과 승인 예산 비중복 소비
 - 메모리 참조 저장소와 SQLite 후보의 동일한 canonical JSONL export
 - 임의 길이 journal 재생과 event 변조 탐지 property test
 
-이는 현재 개발 호스트의 process-crash 검증 결과다. power-loss, filesystem 손상, 실제 tool effect, 설치 패키지, Linux/macOS/Windows 전체 반복 매트릭스는 아직 통과했다고 주장하지 않는다. SQLite 채택 여부도 ADR-0008의 hardened JSONL 비교와 나머지 gate가 끝난 뒤 확정한다.
+세부 실행 순서와 재시작 판정은 [Durable effect 실행·복구 수직 슬라이스](durable-effect-runtime.md)를 따른다. 이는 현재 개발 호스트의 process-crash 검증 결과다. power-loss, filesystem 손상, 실제 권한 경계가 있는 tool adapter, 설치 패키지, Linux/macOS/Windows 반복 fault matrix는 아직 통과했다고 주장하지 않는다. SQLite 채택 여부도 ADR-0008의 hardened JSONL 비교와 나머지 gate가 끝난 뒤 확정한다.
 
 ## 검증
 

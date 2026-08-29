@@ -1,0 +1,19 @@
+[package]
+name = "xgeny-runtime"
+description = "Durable effect execution and recovery loop for XGENy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+xgeny-local-store = { path = "../xgeny-local-store" }
+xgeny-workgraph = { path = "../xgeny-workgraph" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
