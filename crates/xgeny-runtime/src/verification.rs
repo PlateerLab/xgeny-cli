@@ -15,8 +15,8 @@ use xgeny_protocol::{
     validate_execution_receipt,
 };
 use xgeny_workgraph::{
-    EffectIntent, EventRecord, ReceiptPlacement, ReceiptProvenance, ReceiptVerificationStrategy,
-    RunEvent, RunEventBody, RunState, StepState, StepStatus, VerificationDisposition,
+    EffectIntent, ReceiptPlacement, ReceiptProvenance, ReceiptVerificationStrategy, RunEvent,
+    RunEventBody, RunState, StepState, StepStatus, VerificationDisposition,
     receipt_provenance_digest,
 };
 
@@ -303,7 +303,7 @@ impl VerificationRunner {
         F: EventFactory,
         L: RunLease,
     {
-        let (snapshot, receipts) = store.load_with_execution_receipts()?;
+        let snapshot = store.load_verification_snapshot(step_id)?;
         let snapshot = snapshot.ok_or(VerificationRunnerError::RunNotInitialized)?;
         verify_lease(lease, &snapshot.state)?;
         let step = snapshot
@@ -329,15 +329,17 @@ impl VerificationRunner {
         let verified = verify_step(step, capabilities, verifiers)?;
         let metadata = events.create_metadata(&snapshot.state)?;
         metadata.validate()?;
-        let previous_receipt_digest = receipts
-            .last()
-            .map(|receipt| receipt.receipt_digest.clone());
+        let started_at = snapshot.effect_started_at.ok_or_else(|| {
+            VerificationRunnerError::EffectStartMissing {
+                effect_id: verified.intent.effect_id.clone(),
+            }
+        })?;
         let receipt = build_execution_receipt(
             &snapshot.state,
-            &snapshot.records,
             step_id,
+            started_at,
             &metadata.recorded_at,
-            previous_receipt_digest,
+            snapshot.previous_receipt_digest,
             &verified,
         )?;
         let event = RunEvent {
@@ -452,15 +454,14 @@ fn verify_step(
 
 fn build_execution_receipt(
     state: &RunState,
-    records: &[EventRecord],
     step_id: &str,
+    started_at: String,
     ended_at: &str,
     previous_receipt_digest: Option<String>,
     verified: &VerifiedStep,
 ) -> Result<ExecutionReceiptBody, VerificationRunnerError> {
     let intent = &verified.intent;
     let provenance = &verified.provenance;
-    let started_at = effect_started_at(records, step_id, &intent.effect_id)?;
     let mut receipt = ExecutionReceiptBody {
         api_version: API_VERSION_V1ALPHA1.to_owned(),
         extensions: BTreeMap::new(),
@@ -605,28 +606,6 @@ fn verify_report(
         });
     }
     Ok((evaluate_core_verification_v1(&evidence), evidence))
-}
-
-fn effect_started_at(
-    records: &[xgeny_workgraph::EventRecord],
-    step_id: &str,
-    effect_id: &str,
-) -> Result<String, VerificationRunnerError> {
-    records
-        .iter()
-        .rev()
-        .find_map(|record| match &record.event.body {
-            RunEventBody::EffectExecutionStarted {
-                step_id: candidate_step,
-                effect_id: candidate_effect,
-            } if candidate_step == step_id && candidate_effect == effect_id => {
-                Some(record.event.recorded_at.clone())
-            }
-            _ => None,
-        })
-        .ok_or_else(|| VerificationRunnerError::EffectStartMissing {
-            effect_id: effect_id.to_owned(),
-        })
 }
 
 fn execution_receipt_digest(

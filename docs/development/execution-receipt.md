@@ -118,7 +118,7 @@ Memory와 SQLite store는 같은 bundle 검사를 수행한다.
 2. 새 `EffectIntentCommitted`는 supported Receipt provenance가 필수며 legacy absence는 migration load/replay에서만 허용한다.
 3. Legacy `VerificationPassed/Failed`는 replay만 가능하고 새 append는 거부한다.
 4. Receipt가 다른 event, Run, Step, effect 또는 intent에 붙을 수 없다.
-5. Receipt protocol schema와 canonical digest를 매 load마다 다시 검증한다.
+5. Receipt protocol schema와 canonical digest를 cold open, 명시적 full audit 또는 외부 SQLite generation 변경 때 다시 검증한다. 같은 generation의 runtime hot path는 ADR-0013의 verified index를 사용한다.
 6. Capability, Instance, input, policy, executor, effect와 verification plan이 admission provenance와 같아야 한다.
 7. Receipt ID, extensions, Artifact, summary, redaction은 현재 Core builder의 deterministic shape와 같아야 한다.
 8. Receipt started/ended 시각이 journal의 start/final event 시각과 같고 RFC 3339 시간 순서가 역전되지 않아야 한다.
@@ -127,7 +127,7 @@ Memory와 SQLite store는 같은 bundle 검사를 수행한다.
 
 Admission은 Receipt가 참조하는 transient `PolicyDecisionBody`를 bundled schema와 semantic rule로 검증한 뒤에만 digest를 commit한다. Candidate schema 오류는 fixed `PolicyDecisionInvalid`로 축소해 resource나 timestamp를 error에 echo하지 않는다. EventFactory timestamp도 append 전에 RFC 3339로 검증하며 invalid Started metadata에서는 effect를 호출하지 않는다.
 
-`RunStore::export_jsonl`은 기존 journal-only canonical stream이다. Complete Receipt는 `export_execution_receipts_jsonl`에서 `kind: ExecutionReceipt`를 포함한 protocol document로 chain 순서에 export한다. 현재 두 export는 하나의 atomic archive/import format이 아니며, SQLite built-in의 `load_with_execution_receipts`만 한 read transaction에서 Run과 Receipt chain을 읽는다.
+`RunStore::export_jsonl`은 기존 journal-only canonical stream이다. Complete Receipt는 `export_execution_receipts_jsonl`에서 `kind: ExecutionReceipt`를 포함한 protocol document로 chain 순서에 export한다. 현재 두 export는 하나의 atomic archive/import format이 아니며, SQLite built-in의 `load_with_execution_receipts`만 한 read transaction에서 Run과 Receipt chain을 읽는다. Runtime의 Receipt finalization은 전체 vector 대신 같은 verified generation에서 state, start 시각과 이전 Receipt digest만 반환하는 `load_verification_snapshot`을 사용한다.
 
 SQLite schema 4 transaction은 다음 순서로 수행한다.
 

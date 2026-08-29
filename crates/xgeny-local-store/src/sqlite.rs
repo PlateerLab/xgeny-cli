@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
@@ -9,9 +10,10 @@ use xgeny_workgraph::{
 };
 
 use crate::{
-    Commit, ExpectedHead, RunSnapshot, RunStore, StoreError, StoredExecutionReceipt,
-    prepare_commit, verified_snapshot, verify_material_bundle, verify_material_records,
-    verify_receipt_bundle, verify_receipt_records,
+    AuditMetrics, Commit, ExpectedHead, RunSnapshot, RunStore, RunVerificationSnapshot, StoreError,
+    StoredExecutionReceipt, VerifiedRunIndex, audit_snapshot, prepare_commit,
+    verify_material_bundle, verify_material_point, verify_material_records, verify_receipt_bundle,
+    verify_receipt_candidate, verify_receipt_records,
 };
 
 const STORE_SCHEMA_VERSION: i64 = 4;
@@ -90,6 +92,14 @@ CREATE TABLE IF NOT EXISTS execution_receipts (
 #[derive(Debug)]
 pub struct SqliteRunStore {
     connection: Connection,
+    cache: RefCell<Option<VerifiedSqliteCache>>,
+    metrics: RefCell<AuditMetrics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerifiedSqliteCache {
+    data_version: i64,
+    index: VerifiedRunIndex,
 }
 
 impl SqliteRunStore {
@@ -120,9 +130,13 @@ impl SqliteRunStore {
             unsupported => return Err(StoreError::UnsupportedSchemaVersion(unsupported)),
         }
 
-        let store = Self { connection };
-        store.load()?;
-        Ok(store)
+        let metrics = RefCell::new(AuditMetrics::default());
+        let cache = build_verified_cache(&connection, &metrics)?;
+        Ok(Self {
+            connection,
+            cache: RefCell::new(Some(cache)),
+            metrics,
+        })
     }
 
     fn append_internal(
@@ -135,47 +149,66 @@ impl SqliteRunStore {
     ) -> Result<Commit, StoreError> {
         verify_material_bundle(&event, material)?;
         verify_receipt_bundle(&event, receipt)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let records = load_records(&transaction)?;
-        let persisted = load_projection(&transaction)?;
-        let snapshot = verified_snapshot(records, persisted)?;
-        let current_records = snapshot
-            .as_ref()
-            .map_or_else(Vec::new, |snapshot| snapshot.records.clone());
-        validate_derived_state(&transaction, &current_records)?;
-        let current_state = snapshot.as_ref().map(|snapshot| &snapshot.state);
-        let commit = prepare_commit(&current_records, current_state, expected, event)?;
-        if let Some(receipt) = receipt {
-            let effect_id = match &commit.record.event.body {
-                RunEventBody::VerificationRecorded { effect_id, .. } => effect_id.clone(),
-                _ => unreachable!("receipt bundle validation requires a finalization event"),
-            };
-            let mut candidate_receipts = load_execution_receipts(&transaction)?;
-            candidate_receipts.push(StoredExecutionReceipt {
-                event_sequence: commit.record.sequence,
-                effect_id,
-                receipt: receipt.clone(),
-            });
-            let mut candidate_records = current_records.clone();
-            candidate_records.push(commit.record.clone());
-            verify_receipt_records(&candidate_records, &candidate_receipts)?;
+        let Self {
+            connection,
+            cache,
+            metrics,
+        } = self;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Err(error) = ensure_verified_cache(cache, metrics, &transaction) {
+            cache.replace(None);
+            return Err(error);
+        }
+        let (commit, receipt_anchor) = {
+            let cached = cache.borrow();
+            let index = &cached
+                .as_ref()
+                .expect("cache refresh must install a verified index")
+                .index;
+            let commit = prepare_commit(index, expected, event)?;
+            if let Some(material) = material
+                && index.material_effect_ids.contains(material.effect_id())
+            {
+                return Err(StoreError::Corrupt(
+                    "duplicate invocation material effect ID".to_owned(),
+                ));
+            }
+            let receipt_anchor = receipt
+                .map(|receipt| verify_receipt_candidate(index, &commit.record, receipt))
+                .transpose()?;
+            (commit, receipt_anchor)
+        };
+        {
+            let mut metrics = metrics.borrow_mut();
+            metrics.record_candidate(material.is_some(), receipt.is_some());
         }
 
-        insert_event(&transaction, &commit.record)?;
-        checkpoint(CommitStage::Event)?;
-        insert_effect_intent_index(&transaction, &commit.record)?;
-        checkpoint(CommitStage::EffectIntentIndex)?;
-        insert_authorization_consumption(&transaction, &commit.record)?;
-        checkpoint(CommitStage::AuthorizationConsumption)?;
-        insert_invocation_material(&transaction, material)?;
-        checkpoint(CommitStage::InvocationMaterial)?;
-        insert_execution_receipt(&transaction, &commit.record, receipt)?;
-        checkpoint(CommitStage::ExecutionReceipt)?;
-        write_projection(&transaction, &commit.state)?;
-        checkpoint(CommitStage::Projection)?;
-        transaction.commit()?;
+        let write_result = (|| -> Result<(), StoreError> {
+            insert_event(&transaction, &commit.record)?;
+            checkpoint(CommitStage::Event)?;
+            insert_effect_intent_index(&transaction, &commit.record)?;
+            checkpoint(CommitStage::EffectIntentIndex)?;
+            insert_authorization_consumption(&transaction, &commit.record)?;
+            checkpoint(CommitStage::AuthorizationConsumption)?;
+            insert_invocation_material(&transaction, material)?;
+            checkpoint(CommitStage::InvocationMaterial)?;
+            insert_execution_receipt(&transaction, &commit.record, receipt)?;
+            checkpoint(CommitStage::ExecutionReceipt)?;
+            write_projection(&transaction, &commit.state)?;
+            checkpoint(CommitStage::Projection)?;
+            transaction.commit()?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            cache.replace(None);
+            return Err(error);
+        }
+        cache
+            .borrow_mut()
+            .as_mut()
+            .expect("successful commit must retain its verified prefix")
+            .index
+            .apply_committed(&commit, material, receipt, receipt_anchor);
         Ok(commit)
     }
 
@@ -246,6 +279,21 @@ impl SqliteRunStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn invalidate_cache(&self) {
+        self.cache.replace(None);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_test_metrics(&mut self) {
+        *self.metrics.get_mut() = AuditMetrics::default();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_metrics(&self) -> AuditMetrics {
+        *self.metrics.borrow()
+    }
+
+    #[cfg(test)]
     pub(crate) fn effect_intent_count(&self) -> Result<u64, StoreError> {
         table_count(&self.connection, "effect_intents")
     }
@@ -274,6 +322,7 @@ impl SqliteRunStore {
     pub(crate) fn delete_execution_receipts(&self) -> Result<(), StoreError> {
         self.connection
             .execute("DELETE FROM execution_receipts", [])?;
+        self.invalidate_cache();
         Ok(())
     }
 
@@ -290,6 +339,7 @@ impl SqliteRunStore {
             "UPDATE execution_receipts SET receipt_json = ?1",
             [serde_json::to_vec(&value)?],
         )?;
+        self.invalidate_cache();
         Ok(())
     }
 
@@ -299,6 +349,7 @@ impl SqliteRunStore {
             "UPDATE effect_intents SET action_digest = 'sha256:corrupted'",
             [],
         )?;
+        self.invalidate_cache();
         Ok(())
     }
 
@@ -308,6 +359,7 @@ impl SqliteRunStore {
             "UPDATE invocation_materials SET material_digest = 'sha256:corrupted'",
             [],
         )?;
+        self.invalidate_cache();
         Ok(())
     }
 
@@ -315,6 +367,7 @@ impl SqliteRunStore {
     pub(crate) fn delete_invocation_material(&self) -> Result<(), StoreError> {
         self.connection
             .execute("DELETE FROM invocation_materials", [])?;
+        self.invalidate_cache();
         Ok(())
     }
 
@@ -327,6 +380,7 @@ impl SqliteRunStore {
         );
         self.connection.pragma_update(None, "foreign_keys", true)?;
         result?;
+        self.invalidate_cache();
         Ok(())
     }
 
@@ -371,23 +425,20 @@ pub(crate) fn write_schema_three_fixture(
     Ok(())
 }
 
-fn expected_intents(records: &[EventRecord]) -> Vec<(u64, &str, &EffectIntent)> {
-    records
-        .iter()
-        .filter_map(|record| {
-            let RunEventBody::EffectIntentCommitted { step_id, intent } = &record.event.body else {
-                return None;
-            };
-            Some((record.sequence, step_id.as_str(), intent.as_ref()))
-        })
-        .collect()
+fn expected_intents(index: &VerifiedRunIndex) -> Vec<&crate::EffectIntentAnchor> {
+    let mut expected: Vec<_> = index.intents.values().collect();
+    expected.sort_by(|left, right| {
+        (left.event_sequence, &left.intent.effect_id)
+            .cmp(&(right.event_sequence, &right.intent.effect_id))
+    });
+    expected
 }
 
 fn validate_effect_intent_index(
     connection: &Connection,
-    records: &[EventRecord],
+    index: &VerifiedRunIndex,
 ) -> Result<(), StoreError> {
-    let expected = expected_intents(records);
+    let expected = expected_intents(index);
     let mut statement = connection.prepare(
         "SELECT effect_id, event_sequence, step_id, action_digest, intent_json FROM effect_intents ORDER BY event_sequence, effect_id",
     )?;
@@ -408,19 +459,20 @@ fn validate_effect_intent_index(
             actual.len()
         )));
     }
-    for ((sequence, step_id, intent), actual) in expected.into_iter().zip(actual) {
+    for (anchor, actual) in expected.into_iter().zip(actual) {
         let (effect_id, stored_sequence, stored_step_id, action_digest, intent_json) = actual;
         let stored_sequence =
             u64::try_from(stored_sequence).map_err(|_| StoreError::SequenceOutOfRange)?;
         let stored_intent: EffectIntent = serde_json::from_slice(&intent_json)?;
-        if effect_id != intent.effect_id
-            || stored_sequence != sequence
-            || stored_step_id != step_id
-            || action_digest != intent.action_digest
-            || stored_intent != *intent
+        if effect_id != anchor.intent.effect_id
+            || stored_sequence != anchor.event_sequence
+            || stored_step_id != anchor.step_id
+            || action_digest != anchor.intent.action_digest
+            || stored_intent != anchor.intent
         {
             return Err(StoreError::Corrupt(format!(
-                "effect index at event {sequence} differs from committed intent"
+                "effect index at event {} differs from committed intent",
+                anchor.event_sequence
             )));
         }
     }
@@ -429,11 +481,11 @@ fn validate_effect_intent_index(
 
 fn validate_authorization_index(
     connection: &Connection,
-    records: &[EventRecord],
+    index: &VerifiedRunIndex,
 ) -> Result<(), StoreError> {
-    let mut expected: Vec<_> = expected_intents(records)
+    let mut expected: Vec<_> = expected_intents(index)
         .into_iter()
-        .map(|(_, _, intent)| intent)
+        .map(|anchor| &anchor.intent)
         .collect();
     expected.sort_by(|left, right| {
         (&left.effect_id, &left.authorization.grant_id)
@@ -489,37 +541,35 @@ fn validate_foreign_keys(connection: &Connection) -> Result<(), StoreError> {
 
 fn validate_derived_state_without_receipts(
     connection: &Connection,
-    records: &[EventRecord],
+    index: &mut VerifiedRunIndex,
+    metrics: &mut AuditMetrics,
 ) -> Result<(), StoreError> {
     validate_foreign_keys(connection)?;
-    validate_effect_intent_index(connection, records)?;
-    validate_authorization_index(connection, records)?;
+    validate_effect_intent_index(connection, index)?;
+    validate_authorization_index(connection, index)?;
     let materials = load_invocation_materials(connection)?;
-    verify_material_records(records, &materials)
-}
-
-fn validate_derived_state(
-    connection: &Connection,
-    records: &[EventRecord],
-) -> Result<(), StoreError> {
-    validate_derived_state_without_receipts(connection, records)?;
-    let receipts = load_execution_receipts(connection)?;
-    verify_receipt_records(records, &receipts)
+    verify_material_records(index, &materials, metrics)
 }
 
 fn load_verified_store_data(
     connection: &Connection,
-) -> Result<(Option<RunSnapshot>, Vec<StoredExecutionReceipt>), StoreError> {
+    metrics: &mut AuditMetrics,
+) -> Result<
+    (
+        Option<RunSnapshot>,
+        Vec<StoredExecutionReceipt>,
+        VerifiedRunIndex,
+    ),
+    StoreError,
+> {
+    metrics.record_full_audit();
     let records = load_records(connection)?;
     let projection = load_projection(connection)?;
-    let snapshot = verified_snapshot(records, projection)?;
-    let records = snapshot
-        .as_ref()
-        .map_or(&[][..], |snapshot| snapshot.records.as_slice());
-    validate_derived_state_without_receipts(connection, records)?;
+    let (snapshot, mut index) = audit_snapshot(records, projection, metrics)?;
+    validate_derived_state_without_receipts(connection, &mut index, metrics)?;
     let receipts = load_execution_receipts(connection)?;
-    verify_receipt_records(records, &receipts)?;
-    Ok((snapshot, receipts))
+    verify_receipt_records(&mut index, &receipts, metrics)?;
+    Ok((snapshot, receipts, index))
 }
 
 fn migrate_schema_three(connection: &mut Connection) -> Result<(), StoreError> {
@@ -529,11 +579,9 @@ fn migrate_schema_three(connection: &mut Connection) -> Result<(), StoreError> {
         3 => {
             let records = load_records(&transaction)?;
             let projection = load_projection(&transaction)?;
-            let snapshot = verified_snapshot(records, projection)?;
-            let records = snapshot
-                .as_ref()
-                .map_or(&[][..], |snapshot| snapshot.records.as_slice());
-            validate_derived_state_without_receipts(&transaction, records)?;
+            let mut metrics = AuditMetrics::default();
+            let (_, mut index) = audit_snapshot(records, projection, &mut metrics)?;
+            validate_derived_state_without_receipts(&transaction, &mut index, &mut metrics)?;
             transaction.execute_batch(CREATE_RECEIPT_SCHEMA)?;
             transaction.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
             transaction.commit()?;
@@ -551,6 +599,73 @@ fn configure_connection(connection: &Connection) -> Result<(), StoreError> {
     connection.pragma_update(None, "foreign_keys", true)?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "synchronous", "FULL")?;
+    Ok(())
+}
+
+fn load_data_version(connection: &Connection) -> Result<i64, StoreError> {
+    Ok(connection.pragma_query_value(None, "data_version", |row| row.get(0))?)
+}
+
+fn load_durable_head(connection: &Connection) -> Result<ExpectedHead, StoreError> {
+    let row: Option<(i64, String)> = connection
+        .query_row(
+            "SELECT sequence, digest FROM run_events ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    row.map_or(Ok(ExpectedHead::Empty), |(sequence, digest)| {
+        Ok(ExpectedHead::Exact {
+            sequence: u64::try_from(sequence).map_err(|_| StoreError::SequenceOutOfRange)?,
+            digest,
+        })
+    })
+}
+
+fn build_verified_cache(
+    connection: &Connection,
+    metrics: &RefCell<AuditMetrics>,
+) -> Result<VerifiedSqliteCache, StoreError> {
+    let transaction = connection.unchecked_transaction()?;
+    let data_version = load_data_version(&transaction)?;
+    let durable_head = load_durable_head(&transaction)?;
+    let (_, _, index) = load_verified_store_data(&transaction, &mut metrics.borrow_mut())?;
+    if index.head() != durable_head {
+        return Err(StoreError::Corrupt(
+            "verified journal head differs from the durable head".to_owned(),
+        ));
+    }
+    transaction.commit()?;
+    Ok(VerifiedSqliteCache {
+        data_version,
+        index,
+    })
+}
+
+fn ensure_verified_cache(
+    cache: &RefCell<Option<VerifiedSqliteCache>>,
+    metrics: &RefCell<AuditMetrics>,
+    connection: &Connection,
+) -> Result<(), StoreError> {
+    let data_version = load_data_version(connection)?;
+    let durable_head = load_durable_head(connection)?;
+    if cache.borrow().as_ref().is_some_and(|cached| {
+        cached.data_version == data_version && cached.index.head() == durable_head
+    }) {
+        return Ok(());
+    }
+
+    cache.replace(None);
+    let (_, _, index) = load_verified_store_data(connection, &mut metrics.borrow_mut())?;
+    if index.head() != durable_head {
+        return Err(StoreError::Corrupt(
+            "verified journal head differs from the durable head".to_owned(),
+        ));
+    }
+    cache.replace(Some(VerifiedSqliteCache {
+        data_version,
+        index,
+    }));
     Ok(())
 }
 
@@ -579,22 +694,63 @@ impl RunStore for SqliteRunStore {
 
     fn load(&self) -> Result<Option<RunSnapshot>, StoreError> {
         let transaction = self.connection.unchecked_transaction()?;
-        let (snapshot, _) = load_verified_store_data(&transaction)?;
+        let data_version = load_data_version(&transaction)?;
+        let durable_head = load_durable_head(&transaction)?;
+        let (snapshot, _, index) =
+            load_verified_store_data(&transaction, &mut self.metrics.borrow_mut())?;
+        if index.head() != durable_head {
+            return Err(StoreError::Corrupt(
+                "verified journal head differs from the durable head".to_owned(),
+            ));
+        }
         transaction.commit()?;
+        self.cache.replace(Some(VerifiedSqliteCache {
+            data_version,
+            index,
+        }));
         Ok(snapshot)
+    }
+
+    fn load_current(&self) -> Result<Option<RunState>, StoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        ensure_verified_cache(&self.cache, &self.metrics, &transaction)?;
+        let state = self
+            .cache
+            .borrow()
+            .as_ref()
+            .expect("cache refresh must install a verified index")
+            .index
+            .state
+            .clone();
+        transaction.commit()?;
+        Ok(state)
     }
 
     fn load_invocation_material(
         &self,
         effect_id: &str,
     ) -> Result<Option<InvocationMaterialRecord>, StoreError> {
-        self.load()?;
-        Ok(load_invocation_materials(&self.connection)?.remove(effect_id))
+        let transaction = self.connection.unchecked_transaction()?;
+        ensure_verified_cache(&self.cache, &self.metrics, &transaction)?;
+        let material = load_invocation_material(&transaction, effect_id)?;
+        verify_material_point(
+            &self
+                .cache
+                .borrow()
+                .as_ref()
+                .expect("cache refresh must install a verified index")
+                .index,
+            effect_id,
+            material.as_ref(),
+        )?;
+        transaction.commit()?;
+        Ok(material)
     }
 
     fn load_execution_receipts(&self) -> Result<Vec<ExecutionReceiptBody>, StoreError> {
         let transaction = self.connection.unchecked_transaction()?;
-        let (_, receipts) = load_verified_store_data(&transaction)?;
+        ensure_verified_cache(&self.cache, &self.metrics, &transaction)?;
+        let receipts = load_execution_receipts(&transaction)?;
         transaction.commit()?;
         Ok(receipts.into_iter().map(|stored| stored.receipt).collect())
     }
@@ -603,12 +759,41 @@ impl RunStore for SqliteRunStore {
         &self,
     ) -> Result<(Option<RunSnapshot>, Vec<ExecutionReceiptBody>), StoreError> {
         let transaction = self.connection.unchecked_transaction()?;
-        let (snapshot, receipts) = load_verified_store_data(&transaction)?;
+        let data_version = load_data_version(&transaction)?;
+        let durable_head = load_durable_head(&transaction)?;
+        let (snapshot, receipts, index) =
+            load_verified_store_data(&transaction, &mut self.metrics.borrow_mut())?;
+        if index.head() != durable_head {
+            return Err(StoreError::Corrupt(
+                "verified journal head differs from the durable head".to_owned(),
+            ));
+        }
         transaction.commit()?;
+        self.cache.replace(Some(VerifiedSqliteCache {
+            data_version,
+            index,
+        }));
         Ok((
             snapshot,
             receipts.into_iter().map(|stored| stored.receipt).collect(),
         ))
+    }
+
+    fn load_verification_snapshot(
+        &self,
+        step_id: &str,
+    ) -> Result<Option<RunVerificationSnapshot>, StoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        ensure_verified_cache(&self.cache, &self.metrics, &transaction)?;
+        let snapshot = self
+            .cache
+            .borrow()
+            .as_ref()
+            .expect("cache refresh must install a verified index")
+            .index
+            .verification_snapshot(step_id);
+        transaction.commit()?;
+        Ok(snapshot)
     }
 }
 
@@ -826,6 +1011,35 @@ fn load_invocation_materials(
         }
     }
     Ok(materials)
+}
+
+fn load_invocation_material(
+    connection: &Connection,
+    effect_id: &str,
+) -> Result<Option<InvocationMaterialRecord>, StoreError> {
+    let row: Option<(String, String, String, Vec<u8>)> = connection
+        .query_row(
+            "SELECT material_id, material_digest, record_digest, record_json FROM invocation_materials WHERE effect_id = ?1",
+            [effect_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    row.map(
+        |(material_id, material_digest, record_digest, record_json)| {
+            let material: InvocationMaterialRecord = serde_json::from_slice(&record_json)?;
+            if effect_id != material.effect_id()
+                || material_id != material.material_id()
+                || material_digest != material.material_digest()
+                || record_digest != material.record_digest()
+            {
+                return Err(StoreError::Corrupt(format!(
+                    "invocation material index for effect `{effect_id}` differs from its record"
+                )));
+            }
+            Ok(material)
+        },
+    )
+    .transpose()
 }
 
 fn load_execution_receipts(

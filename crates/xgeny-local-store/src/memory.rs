@@ -4,9 +4,10 @@ use xgeny_domain::ExecutionReceiptBody;
 use xgeny_workgraph::{EventRecord, InvocationMaterialRecord, RunEvent, RunState};
 
 use crate::{
-    Commit, ExpectedHead, RunSnapshot, RunStore, StoreError, StoredExecutionReceipt,
-    prepare_commit, verified_snapshot, verify_material_bundle, verify_material_records,
-    verify_receipt_bundle, verify_receipt_records,
+    AuditMetrics, Commit, ExpectedHead, RunSnapshot, RunStore, RunVerificationSnapshot, StoreError,
+    StoredExecutionReceipt, VerifiedRunIndex, audit_snapshot, prepare_commit,
+    verify_material_bundle, verify_material_point, verify_material_records, verify_receipt_bundle,
+    verify_receipt_candidate, verify_receipt_records,
 };
 
 #[derive(Debug, Default)]
@@ -15,6 +16,7 @@ pub struct MemoryRunStore {
     projection: Option<RunState>,
     materials: BTreeMap<String, InvocationMaterialRecord>,
     receipts: Vec<StoredExecutionReceipt>,
+    index: VerifiedRunIndex,
 }
 
 impl MemoryRunStore {
@@ -28,9 +30,10 @@ impl RunStore for MemoryRunStore {
     fn append(&mut self, expected: ExpectedHead, event: RunEvent) -> Result<Commit, StoreError> {
         verify_material_bundle(&event, None)?;
         verify_receipt_bundle(&event, None)?;
-        let commit = prepare_commit(&self.records, self.projection.as_ref(), expected, event)?;
+        let commit = prepare_commit(&self.index, expected, event)?;
         self.records.push(commit.record.clone());
         self.projection = Some(commit.state.clone());
+        self.index.apply_committed(&commit, None, None, None);
         Ok(commit)
     }
 
@@ -42,8 +45,12 @@ impl RunStore for MemoryRunStore {
     ) -> Result<Commit, StoreError> {
         verify_material_bundle(&event, Some(&material))?;
         verify_receipt_bundle(&event, None)?;
-        let commit = prepare_commit(&self.records, self.projection.as_ref(), expected, event)?;
-        if self.materials.contains_key(material.effect_id()) {
+        let commit = prepare_commit(&self.index, expected, event)?;
+        if self
+            .index
+            .material_effect_ids
+            .contains(material.effect_id())
+        {
             return Err(StoreError::Corrupt(
                 "duplicate invocation material effect ID".to_owned(),
             ));
@@ -52,6 +59,17 @@ impl RunStore for MemoryRunStore {
         self.projection = Some(commit.state.clone());
         self.materials
             .insert(material.effect_id().to_owned(), material);
+        let material = self
+            .materials
+            .get(match &commit.record.event.body {
+                xgeny_workgraph::RunEventBody::EffectIntentCommitted { intent, .. } => {
+                    &intent.effect_id
+                }
+                _ => unreachable!("material bundle requires an effect intent"),
+            })
+            .expect("committed material must be indexed");
+        self.index
+            .apply_committed(&commit, Some(material), None, None);
         Ok(commit)
     }
 
@@ -63,65 +81,60 @@ impl RunStore for MemoryRunStore {
     ) -> Result<Commit, StoreError> {
         verify_material_bundle(&event, None)?;
         verify_receipt_bundle(&event, Some(&receipt))?;
-        let commit = prepare_commit(&self.records, self.projection.as_ref(), expected, event)?;
+        let commit = prepare_commit(&self.index, expected, event)?;
+        let receipt_anchor = verify_receipt_candidate(&self.index, &commit.record, &receipt)?;
         let effect_id = match &commit.record.event.body {
             xgeny_workgraph::RunEventBody::VerificationRecorded { effect_id, .. } => {
                 effect_id.clone()
             }
             _ => unreachable!("receipt bundle validation requires a finalization event"),
         };
-        if self.receipts.iter().any(|stored| {
-            stored.receipt.receipt_id == receipt.receipt_id
-                || stored.receipt.receipt_digest == receipt.receipt_digest
-                || stored.effect_id == effect_id
-        }) {
-            return Err(StoreError::Corrupt(
-                "duplicate execution receipt identity".to_owned(),
-            ));
-        }
         let stored = StoredExecutionReceipt {
             event_sequence: commit.record.sequence,
             effect_id,
             receipt,
         };
-        let mut candidate_receipts = self.receipts.clone();
-        candidate_receipts.push(stored.clone());
-        let mut candidate_records = self.records.clone();
-        candidate_records.push(commit.record.clone());
-        verify_receipt_records(&candidate_records, &candidate_receipts)?;
         self.records.push(commit.record.clone());
         self.projection = Some(commit.state.clone());
         self.receipts.push(stored);
+        let receipt = &self
+            .receipts
+            .last()
+            .expect("committed receipt must be retained")
+            .receipt;
+        self.index
+            .apply_committed(&commit, None, Some(receipt), Some(receipt_anchor));
         Ok(commit)
     }
 
     fn load(&self) -> Result<Option<RunSnapshot>, StoreError> {
-        let snapshot = verified_snapshot(self.records.clone(), self.projection.clone())?;
-        if let Some(snapshot) = &snapshot {
-            verify_material_records(&snapshot.records, &self.materials)?;
-            verify_receipt_records(&snapshot.records, &self.receipts)?;
-        } else if !self.materials.is_empty() {
+        let mut metrics = AuditMetrics::default();
+        let (snapshot, mut audited_index) =
+            audit_snapshot(self.records.clone(), self.projection.clone(), &mut metrics)?;
+        verify_material_records(&mut audited_index, &self.materials, &mut metrics)?;
+        verify_receipt_records(&mut audited_index, &self.receipts, &mut metrics)?;
+        if audited_index != self.index {
             return Err(StoreError::Corrupt(
-                "invocation material exists without a Run".to_owned(),
-            ));
-        } else if !self.receipts.is_empty() {
-            return Err(StoreError::Corrupt(
-                "execution receipt exists without a Run".to_owned(),
+                "in-memory verified index differs from committed data".to_owned(),
             ));
         }
         Ok(snapshot)
+    }
+
+    fn load_current(&self) -> Result<Option<RunState>, StoreError> {
+        Ok(self.projection.clone())
     }
 
     fn load_invocation_material(
         &self,
         effect_id: &str,
     ) -> Result<Option<InvocationMaterialRecord>, StoreError> {
-        self.load()?;
-        Ok(self.materials.get(effect_id).cloned())
+        let material = self.materials.get(effect_id);
+        verify_material_point(&self.index, effect_id, material)?;
+        Ok(material.cloned())
     }
 
     fn load_execution_receipts(&self) -> Result<Vec<ExecutionReceiptBody>, StoreError> {
-        self.load()?;
         Ok(self
             .receipts
             .iter()
@@ -139,5 +152,12 @@ impl RunStore for MemoryRunStore {
             .map(|stored| stored.receipt.clone())
             .collect();
         Ok((snapshot, receipts))
+    }
+
+    fn load_verification_snapshot(
+        &self,
+        step_id: &str,
+    ) -> Result<Option<RunVerificationSnapshot>, StoreError> {
+        Ok(self.index.verification_snapshot(step_id))
     }
 }

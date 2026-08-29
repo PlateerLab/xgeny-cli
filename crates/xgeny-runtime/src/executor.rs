@@ -506,12 +506,11 @@ impl DirectExecutor {
         F: EventFactory,
         L: RunLease,
     {
-        let snapshot = store
-            .load()?
+        let state = store
+            .load_current()?
             .ok_or(DirectExecutorError::RunNotInitialized)?;
-        verify_lease(lease, &snapshot.state)?;
-        let step = snapshot
-            .state
+        verify_lease(lease, &state)?;
+        let step = state
             .steps
             .get(step_id)
             .ok_or_else(|| DirectExecutorError::StepNotFound(step_id.to_owned()))?;
@@ -536,7 +535,7 @@ impl DirectExecutor {
                     step_id: step_id.to_owned(),
                 })?;
                 let (record, arguments) = material.parts();
-                verify_material(store, &snapshot.state, step_id, intent, record, arguments)?;
+                verify_material(store, &state, step_id, intent, record, arguments)?;
                 let instance = verify_current_instance(capabilities, intent)?;
                 verify_dynamic_execution_gate(instance)?;
                 let adapter_key = AdapterBindingKey::from_binding(&instance.binding)?;
@@ -554,7 +553,7 @@ impl DirectExecutor {
                     .map_err(DirectExecutorError::AdapterPrepare)?;
                 let prepared = CorePreparedEffect {
                     binding: PreparedEffectBinding::from_verified(
-                        &snapshot.state,
+                        &state,
                         step_id,
                         intent,
                         record.clone(),

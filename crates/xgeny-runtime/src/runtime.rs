@@ -238,27 +238,29 @@ where
         step_id: &str,
         prepared: Option<E::Prepared>,
     ) -> Result<DriveReport, RuntimeError> {
-        let snapshot = self.store.load()?.ok_or(RuntimeError::RunNotInitialized)?;
-        self.verify_lease(&snapshot.state)?;
-        let step = snapshot
-            .state
+        let state = self
+            .store
+            .load_current()?
+            .ok_or(RuntimeError::RunNotInitialized)?;
+        self.verify_lease(&state)?;
+        let step = state
             .steps
             .get(step_id)
             .cloned()
             .ok_or_else(|| RuntimeError::StepNotFound(step_id.to_owned()))?;
 
         match step.status {
-            StepStatus::IntentCommitted => self.execute_intent(&snapshot.state, &step, prepared),
-            StepStatus::Executing => self.mark_recovered_execution_unknown(&snapshot.state, &step),
-            StepStatus::EffectUnknown => self.begin_reconciliation(&snapshot.state, &step),
-            StepStatus::Reconciling => self.finish_reconciliation(&snapshot.state, &step),
+            StepStatus::IntentCommitted => self.execute_intent(&state, &step, prepared),
+            StepStatus::Executing => self.mark_recovered_execution_unknown(&state, &step),
+            StepStatus::EffectUnknown => self.begin_reconciliation(&state, &step),
+            StepStatus::Reconciling => self.finish_reconciliation(&state, &step),
             StepStatus::Planned
             | StepStatus::Validating
             | StepStatus::Completed
             | StepStatus::Failed
             | StepStatus::ManualRequired => Ok(DriveReport {
                 action: DriveAction::NoAction,
-                state: snapshot.state,
+                state,
             }),
         }
     }
