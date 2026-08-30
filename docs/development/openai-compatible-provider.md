@@ -14,7 +14,7 @@
 - credential, endpoint와 raw content Debug redaction
 - Core model-call reservation 및 Plan settlement 통합 테스트
 
-Core, public protocol v0.1과 SQLite schema 7은 OpenAI/vLLM/Qwen에 의존하지 않는다.
+Core, public protocol v0.1과 SQLite schema 8은 OpenAI/vLLM/Qwen에 의존하지 않는다.
 Configured model은 provider response의 `model`과 exact match해야 한다. Alias가 다른 문자열을 반환하는 provider는 현재 별도 response identity 설정이 없으므로 fail-closed한다.
 
 ## 기본 검증
@@ -30,9 +30,11 @@ cargo test --workspace --locked
 - model, messages, deterministic options와 strict response schema
 - durable reservation 뒤 outbound 한 번
 - accepted Plan의 atomic settlement
+- exact completion summary의 atomic settlement와 durable in-memory replay
 - deterministic 4xx rejection의 closed settlement
 - raw provider response sentinel 비영속화
 - request 전달 뒤 connection loss에서 transport retry 0회
+- loopback server 종료 뒤 completion replay의 HTTP 재호출 0회
 
 Ignored live test도 모든 OS에서 compile되지만 일반 CI에서는 실행하지 않는다.
 
@@ -84,6 +86,6 @@ Test는 health/model-list preflight를 하지 않는다. 한 durable reservation
 
 ## 아직 연결하지 않은 것
 
-사용자용 `xgeny run`, 실제 filesystem/process Capability와 XGEN Model Gateway는 아직 없다. ADR-0018에서 generic bounded driver와 ReadOnly/Artifact Receipt 기반을 fake port로 검증했고, ADR-0019에서 typed output sidecar와 restart-safe verification 입력을 추가했다. ADR-0020은 generation-checked PlanningContext v2와 prompt v2를 추가해 SQLite 재시작 뒤 exact completed output이 다음 model turn 및 loopback OpenAI-compatible HTTP body에 한 번만 전달됨을 검증했다. 다음 vertical slice는 durable completion output을 닫고 actual filesystem adapter를 연결한 뒤, 동일 driver를 go50902 live provider로 실증한다. 현재 rustls trust는 public web PKI 기준이므로 사내 CA/custom trust root가 필요한 HTTPS provider 구성도 후속 설계 범위다.
+사용자용 `xgeny run`, 실제 filesystem/process Capability와 XGEN Model Gateway는 아직 없다. ADR-0018에서 generic bounded driver와 ReadOnly/Artifact Receipt 기반을 fake port로 검증했고, ADR-0019에서 typed output sidecar와 restart-safe verification 입력을 추가했다. ADR-0020은 generation-checked PlanningContext v2와 prompt v2를 추가해 SQLite 재시작 뒤 exact completed output이 다음 model turn 및 loopback OpenAI-compatible HTTP body에 한 번만 전달됨을 검증했다. ADR-0021은 exact completion summary를 schema 8에 원자 저장하고 loopback server가 사라진 뒤에도 HTTP 재호출 없이 복원하는 경계를 닫았다. 다음 vertical slice는 actual filesystem adapter이며, public composition을 연결한 뒤 동일 driver를 go50902 live provider로 실증한다. 현재 rustls trust는 public web PKI 기준이므로 사내 CA/custom trust root가 필요한 HTTPS provider 구성도 후속 설계 범위다.
 
 설계 근거와 failure matrix는 [ADR-0017](../adr/0017-openai-compatible-provider-adapter.md)을 따른다.

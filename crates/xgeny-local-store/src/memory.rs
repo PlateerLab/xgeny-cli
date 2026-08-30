@@ -2,19 +2,21 @@ use std::collections::BTreeMap;
 
 use xgeny_domain::ExecutionReceiptBody;
 use xgeny_workgraph::{
-    EventRecord, InvocationMaterialRecord, PlannedInvocationMaterialRecord, RunEvent, RunState,
-    ToolOutputRecord,
+    CompletionOutputRecord, EventRecord, InvocationMaterialRecord, PlannedInvocationMaterialRecord,
+    RunEvent, RunState, ToolOutputRecord,
 };
 
 use crate::{
     AuditMetrics, Commit, CommitAnchors, CommitSidecars, ExpectedHead, RunPlanningSnapshot,
-    RunSnapshot, RunStore, RunVerificationSnapshot, StoreError, StoredExecutionReceipt,
-    StoredToolOutput, VerifiedRunIndex, audit_snapshot, build_planning_snapshot, prepare_commit,
-    verify_material_bundle, verify_material_point, verify_material_records,
-    verify_plan_input_bundle, verify_plan_input_point, verify_plan_input_records,
-    verify_planned_material_retention, verify_receipt_bundle, verify_receipt_candidate,
-    verify_receipt_records, verify_tool_output_bundle, verify_tool_output_candidate,
-    verify_tool_output_point, verify_tool_output_records,
+    RunSnapshot, RunStore, RunVerificationSnapshot, StoreError, StoredCompletionOutput,
+    StoredExecutionReceipt, StoredToolOutput, VerifiedRunIndex, audit_snapshot,
+    build_completion_output, build_planning_snapshot, prepare_commit,
+    verify_completion_output_bundle, verify_completion_output_candidate,
+    verify_completion_output_record, verify_material_bundle, verify_material_point,
+    verify_material_records, verify_plan_input_bundle, verify_plan_input_point,
+    verify_plan_input_records, verify_planned_material_retention, verify_receipt_bundle,
+    verify_receipt_candidate, verify_receipt_records, verify_tool_output_bundle,
+    verify_tool_output_candidate, verify_tool_output_point, verify_tool_output_records,
 };
 
 #[derive(Debug, Default)]
@@ -25,6 +27,7 @@ pub struct MemoryRunStore {
     materials: BTreeMap<String, InvocationMaterialRecord>,
     receipts: Vec<StoredExecutionReceipt>,
     outputs: BTreeMap<String, StoredToolOutput>,
+    completion_output: Option<StoredCompletionOutput>,
     index: VerifiedRunIndex,
 }
 
@@ -41,6 +44,7 @@ impl RunStore for MemoryRunStore {
         verify_material_bundle(&event, None)?;
         verify_receipt_bundle(&event, None)?;
         verify_tool_output_bundle(&event, None)?;
+        verify_completion_output_bundle(&event, None)?;
         let commit = prepare_commit(&self.index, expected, event)?;
         self.records.push(commit.record.clone());
         self.projection = Some(commit.state.clone());
@@ -59,6 +63,7 @@ impl RunStore for MemoryRunStore {
         verify_material_bundle(&event, None)?;
         verify_receipt_bundle(&event, None)?;
         verify_tool_output_bundle(&event, None)?;
+        verify_completion_output_bundle(&event, None)?;
         let commit = prepare_commit(&self.index, expected, event)?;
         for input in &inputs {
             if self.index.plan_input_step_ids.contains(input.step_id())
@@ -93,6 +98,7 @@ impl RunStore for MemoryRunStore {
         verify_material_bundle(&event, Some(&material))?;
         verify_receipt_bundle(&event, None)?;
         verify_tool_output_bundle(&event, None)?;
+        verify_completion_output_bundle(&event, None)?;
         let planned_input = match &event.body {
             xgeny_workgraph::RunEventBody::EffectIntentCommitted { step_id, .. } => {
                 self.plan_inputs.get(step_id)
@@ -141,6 +147,7 @@ impl RunStore for MemoryRunStore {
         verify_material_bundle(&event, None)?;
         verify_receipt_bundle(&event, Some(&receipt))?;
         verify_tool_output_bundle(&event, None)?;
+        verify_completion_output_bundle(&event, None)?;
         let commit = prepare_commit(&self.index, expected, event)?;
         let receipt_anchor = verify_receipt_candidate(&self.index, &commit.record, &receipt)?;
         let effect_id = match &commit.record.event.body {
@@ -183,6 +190,7 @@ impl RunStore for MemoryRunStore {
         verify_material_bundle(&event, None)?;
         verify_receipt_bundle(&event, None)?;
         verify_tool_output_bundle(&event, Some(&output))?;
+        verify_completion_output_bundle(&event, None)?;
         let commit = prepare_commit(&self.index, expected, event)?;
         let output_anchor = verify_tool_output_candidate(&self.index, &commit.record, &output)?;
         if self.outputs.contains_key(output.effect_id()) {
@@ -219,6 +227,47 @@ impl RunStore for MemoryRunStore {
         Ok(commit)
     }
 
+    fn append_with_completion_output(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        output: CompletionOutputRecord,
+    ) -> Result<Commit, StoreError> {
+        verify_plan_input_bundle(&event, None)?;
+        verify_material_bundle(&event, None)?;
+        verify_receipt_bundle(&event, None)?;
+        verify_tool_output_bundle(&event, None)?;
+        verify_completion_output_bundle(&event, Some(&output))?;
+        let commit = prepare_commit(&self.index, expected, event)?;
+        let output_anchor =
+            verify_completion_output_candidate(&self.index, &commit.record, &output)?;
+        if self.completion_output.is_some() {
+            return Err(StoreError::Corrupt(
+                "duplicate completion output".to_owned(),
+            ));
+        }
+        self.records.push(commit.record.clone());
+        self.projection = Some(commit.state.clone());
+        self.completion_output = Some(StoredCompletionOutput {
+            event_sequence: commit.record.sequence,
+            record: output,
+        });
+        let output = &self
+            .completion_output
+            .as_ref()
+            .expect("committed completion output must be retained")
+            .record;
+        self.index.apply_committed(
+            &commit,
+            CommitSidecars::completion_output(output),
+            CommitAnchors {
+                completion_output: Some(output_anchor),
+                ..CommitAnchors::default()
+            },
+        );
+        Ok(commit)
+    }
+
     fn load(&self) -> Result<Option<RunSnapshot>, StoreError> {
         let mut metrics = AuditMetrics::default();
         let (snapshot, mut audited_index) =
@@ -227,6 +276,7 @@ impl RunStore for MemoryRunStore {
         verify_material_records(&mut audited_index, &self.materials, &mut metrics)?;
         verify_tool_output_records(&mut audited_index, &self.outputs, &mut metrics)?;
         verify_receipt_records(&mut audited_index, &self.receipts, &mut metrics)?;
+        verify_completion_output_record(&audited_index, self.completion_output.as_ref())?;
         if audited_index != self.index {
             return Err(StoreError::Corrupt(
                 "in-memory verified index differs from committed data".to_owned(),
@@ -269,6 +319,19 @@ impl RunStore for MemoryRunStore {
         let output = self.outputs.get(effect_id);
         verify_tool_output_point(&self.index, effect_id, output)?;
         Ok(output.map(|stored| stored.record.clone()))
+    }
+
+    fn load_completion_output(
+        &self,
+        expected: ExpectedHead,
+        candidate_id: &str,
+    ) -> Result<Option<CompletionOutputRecord>, StoreError> {
+        build_completion_output(
+            &self.index,
+            expected,
+            candidate_id,
+            self.completion_output.clone(),
+        )
     }
 
     fn load_with_execution_receipts(

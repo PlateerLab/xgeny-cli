@@ -9,14 +9,15 @@ use xgeny_domain::{CapabilityRef, CriticalAction, EffectClass, ExecutionStyle};
 use xgeny_local_store::{ExpectedHead, RunStore, StoreError};
 use xgeny_policy::ResourceResolver;
 use xgeny_workgraph::{
-    AcceptedPlanStep, AgentLoopBudget, CompletionCandidateState, ContinuationAction,
-    DependencyBlockReason, ExpectedPlanningTurn, FrontierAction, MAX_ACCEPTED_OBJECTIVE_BYTES,
-    MAX_ACCEPTED_PLAN_EDGES, MAX_ACCEPTED_PLAN_STEPS, ModelCallAbandonmentReason, ModelCallBudget,
-    ModelCallRejectionReason, ModelCallReservation, ModelCallSettlement, ModelCallStatus,
-    ModelCallUnknownReason, PlannedExecutionProfile, PlannedInvocationMaterialRecord,
-    PlannedInvocationSpec, PlanningContractError, ReconstructableMaterialReference, RunEvent,
-    RunEventBody, RunState, StepStatus, ToolOutputRecord, WorkFrontier,
-    dependency_release_block_reason, derive_frontier, receipt_releases_dependency,
+    AcceptedPlanStep, AgentLoopBudget, CompletionCandidateState, CompletionOutputError,
+    CompletionOutputRecord, ContinuationAction, DependencyBlockReason, ExpectedPlanningTurn,
+    FrontierAction, MAX_ACCEPTED_OBJECTIVE_BYTES, MAX_ACCEPTED_PLAN_EDGES, MAX_ACCEPTED_PLAN_STEPS,
+    ModelCallAbandonmentReason, ModelCallBudget, ModelCallRejectionReason, ModelCallReservation,
+    ModelCallSettlement, ModelCallStatus, ModelCallUnknownReason, PlannedExecutionProfile,
+    PlannedInvocationMaterialRecord, PlannedInvocationSpec, PlanningContractError,
+    ReconstructableMaterialReference, RunEvent, RunEventBody, RunState, StepStatus,
+    ToolOutputRecord, WorkFrontier, dependency_release_block_reason, derive_frontier,
+    receipt_releases_dependency, validate_completion_summary_candidate,
 };
 
 use crate::admission::{definition_contract_digest, prepare_invocation_facts};
@@ -28,7 +29,6 @@ use crate::{
 const PLANNING_CONTEXT_PROFILE_V2: &str = "xgeny.planning-context/v2";
 const MAX_PROPOSAL_BYTES: usize = 256 * 1024;
 const MAX_PROPOSAL_KEY_BYTES: usize = 128;
-const MAX_COMPLETION_SUMMARY_BYTES: usize = 5_000;
 const MAX_CAPABILITY_SUMMARY_BYTES: usize = 512;
 const MAX_PLANNING_CONTEXT_BYTES: u64 = 512 * 1024;
 const MAX_PLANNING_CATALOG_DEFINITIONS: usize = 1_024;
@@ -801,6 +801,8 @@ pub enum AgentLoopTick {
     },
     CompletionCandidate {
         candidate: CompletionCandidateState,
+        /// Exact local summary sidecar. `None` is reserved for replayed schema-7 candidates.
+        output: Option<Box<CompletionOutputRecord>>,
         newly_recorded: bool,
         head: AgentLoopHead,
     },
@@ -981,8 +983,37 @@ impl AgentLoop {
         }
 
         if let Some(candidate) = &loop_state.completion_candidate {
+            let output = if let Some(expected_record_digest) =
+                candidate.completion_output_record_digest.as_deref()
+            {
+                let output = store
+                    .load_completion_output(
+                        ExpectedHead::from_state(&state),
+                        &candidate.candidate_id,
+                    )?
+                    .ok_or(AgentLoopError::CompletionOutputMissing)?;
+                let decision = output.decision()?;
+                output.verify_for(
+                    &state.run_id,
+                    &decision,
+                    &candidate.candidate_id,
+                    &candidate.summary_digest,
+                )?;
+                if output.record_digest() != expected_record_digest
+                    || output.context_digest() != candidate.context_digest
+                    || output.proposal_digest() != candidate.proposal_digest
+                {
+                    return Err(AgentLoopError::CompletionOutputMismatch);
+                }
+                Some(output)
+            } else {
+                // Schema-7 candidates have no raw summary sidecar. Do not require a new store
+                // extension and never call the provider to invent or reconstruct one.
+                None
+            };
             return Ok(AgentLoopTick::CompletionCandidate {
                 candidate: candidate.clone(),
+                output: output.map(Box::new),
                 newly_recorded: false,
                 head: AgentLoopHead::from_state(&state),
             });
@@ -1400,7 +1431,7 @@ impl AgentLoop {
                 ProposalRejection::CompletionWithoutReceiptCompletedPlan,
             );
         }
-        if !valid_bounded_text(summary, MAX_COMPLETION_SUMMARY_BYTES) {
+        if validate_completion_summary_candidate(summary).is_err() {
             return Self::record_proposal_rejection(
                 store,
                 events,
@@ -1409,44 +1440,16 @@ impl AgentLoop {
                 ProposalRejection::InvalidCompletionSummary,
             );
         }
-        let proposal_digest = digest_serializable(&CompletionProposalDigestInput {
-            domain: "xgeny.completion-proposal/v1",
-            context_digest: context.context_digest(),
-            summary,
-        })?;
-        if canonical_size(&CompletionProposalDigestInput {
-            domain: "xgeny.completion-proposal/v1",
-            context_digest: context.context_digest(),
-            summary,
-        })? > MAX_PROPOSAL_BYTES
-        {
-            return Self::record_proposal_rejection(
-                store,
-                events,
-                reserved_state,
-                call_id,
-                ProposalRejection::ProposalTooLarge,
-            );
-        }
-        let summary_digest = digest_serializable(&CompletionSummaryDigestInput {
-            domain: "xgeny.completion-summary/v1",
-            summary,
-        })?;
-        let candidate_id = content_id(
-            "completion",
-            &digest_serializable(&CompletionCandidateIdInput {
-                domain: "xgeny.completion-candidate-id/v1",
-                run_id: &base_state.run_id,
-                context_digest: context.context_digest(),
-                proposal_digest: &proposal_digest,
-            })?,
-        );
-        let decision = ExpectedPlanningTurn::for_model_call(
+        let completion_output = CompletionOutputRecord::bind(
+            &base_state.run_id,
             next_turn_index(base_state)?,
             call_id,
             context.context_digest(),
-            &proposal_digest,
+            summary,
         )?;
+        let decision = completion_output.decision()?;
+        let candidate_id = completion_output.candidate_id().to_owned();
+        let summary_digest = completion_output.summary_digest().to_owned();
         let event = create_event(
             events,
             reserved_state,
@@ -1454,9 +1457,14 @@ impl AgentLoop {
                 decision,
                 candidate_id: candidate_id.clone(),
                 summary_digest: summary_digest.clone(),
+                completion_output_record_digest: Some(completion_output.record_digest().to_owned()),
             },
         )?;
-        let commit = match store.append(ExpectedHead::from_state(reserved_state), event) {
+        let commit = match store.append_with_completion_output(
+            ExpectedHead::from_state(reserved_state),
+            event,
+            completion_output.clone(),
+        ) {
             Ok(commit) => commit,
             Err(StoreError::HeadConflict { .. }) => {
                 return Self::record_stale_model_call(store, events, call_id);
@@ -1471,6 +1479,7 @@ impl AgentLoop {
             .ok_or(AgentLoopError::CompletionCandidateNotProjected)?;
         Ok(AgentLoopTick::CompletionCandidate {
             candidate,
+            output: Some(Box::new(completion_output)),
             newly_recorded: true,
             head: AgentLoopHead::from_state(&commit.state),
         })
@@ -2828,34 +2837,12 @@ struct PreflightStepIdDigestInput<'a> {
     proposal_key: &'a str,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CompletionProposalDigestInput<'a> {
-    domain: &'static str,
-    context_digest: &'a str,
-    summary: &'a str,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CompletionSummaryDigestInput<'a> {
-    domain: &'static str,
-    summary: &'a str,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CompletionCandidateIdInput<'a> {
-    domain: &'static str,
-    run_id: &'a str,
-    context_digest: &'a str,
-    proposal_digest: &'a str,
-}
-
 #[derive(Debug, Error)]
 pub enum AgentLoopError {
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error(transparent)]
+    CompletionOutput(#[from] CompletionOutputError),
     #[error(transparent)]
     EventFactory(#[from] EventFactoryError),
     #[error(transparent)]
@@ -2894,6 +2881,10 @@ pub enum AgentLoopError {
     PlanningSnapshotMismatch,
     #[error("completion candidate event did not project a candidate")]
     CompletionCandidateNotProjected,
+    #[error("digest-bound completion candidate has no durable output")]
+    CompletionOutputMissing,
+    #[error("durable completion output differs from its projected candidate")]
+    CompletionOutputMismatch,
 }
 
 #[cfg(test)]

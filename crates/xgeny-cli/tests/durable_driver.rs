@@ -2,6 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::num::NonZeroU32;
+use std::process::Command;
 use std::rc::Rc;
 
 use serde_json::{Value, json};
@@ -36,8 +37,9 @@ use xgeny_runtime::{
     VerifierOutputDigest,
 };
 use xgeny_workgraph::{
-    AgentLoopBudget, EventRecord, PlannedExecutionProfile, ReconstructableMaterialReference,
-    RunEvent, RunEventBody, RunState, StepStatus, ToolOutputRecord, apply_record,
+    AgentLoopBudget, CompletionOutputRecord, EventRecord, PlannedExecutionProfile,
+    ReconstructableMaterialReference, RunEvent, RunEventBody, RunState, StepStatus,
+    ToolOutputRecord, apply_record,
 };
 
 const RUN_ID: &str = "run-cli-driver-read-only";
@@ -49,6 +51,14 @@ const EVIDENCE_DIGEST: &str =
     "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const ARTIFACT_DIGEST: &str =
     "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const COMPLETION_SUMMARY: &str = "FINAL-CLI-SUMMARY \"quote\" \\ slash\n\t- 한글과 UTF-8 결과";
+const RESTART_CHILD_MARKER: &str = "XGENY_CLI_COMPLETION_RESTART_CHILD";
+const RESTART_DATABASE_PATH: &str = "XGENY_CLI_COMPLETION_RESTART_DATABASE";
+const RESTART_LEASE_PATH: &str = "XGENY_CLI_COMPLETION_RESTART_LEASE";
+const RESTART_PROOF_PATH: &str = "XGENY_CLI_COMPLETION_RESTART_PROOF";
+const RESTART_PROOF_BYTES: &[u8] = b"xgeny-completion-restart-replayed";
+const RESTART_TEST_NAME: &str =
+    "sqlite_driver_completes_read_only_plan_with_core_bound_artifact_and_replays";
 
 #[derive(Debug, Default)]
 struct DeterministicEvents;
@@ -125,6 +135,7 @@ impl PlannerPort for ScriptedPlanner {
 struct PlanningProjectionStore {
     state: RunState,
     outputs: BTreeMap<String, ToolOutputRecord>,
+    completion_output: Option<CompletionOutputRecord>,
 }
 
 impl RunStore for PlanningProjectionStore {
@@ -159,6 +170,33 @@ impl RunStore for PlanningProjectionStore {
             records: Vec::new(),
             state: self.state.clone(),
         }))
+    }
+
+    fn append_with_completion_output(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        output: CompletionOutputRecord,
+    ) -> Result<Commit, StoreError> {
+        let commit = self.append(expected, event)?;
+        self.completion_output = Some(output);
+        Ok(commit)
+    }
+
+    fn load_completion_output(
+        &self,
+        expected: ExpectedHead,
+        candidate_id: &str,
+    ) -> Result<Option<CompletionOutputRecord>, StoreError> {
+        let actual = ExpectedHead::from_state(&self.state);
+        if expected != actual {
+            return Err(StoreError::HeadConflict { expected, actual });
+        }
+        Ok(self
+            .completion_output
+            .as_ref()
+            .filter(|output| output.candidate_id() == candidate_id)
+            .cloned())
     }
 
     fn load_current(&self) -> Result<Option<RunState>, StoreError> {
@@ -432,8 +470,14 @@ impl EffectVerifier for ArtifactVerifier {
 #[test]
 #[allow(clippy::too_many_lines)] // Keep one vertical-slice setup and all postconditions together.
 fn sqlite_driver_completes_read_only_plan_with_core_bound_artifact_and_replays() {
+    if std::env::var_os(RESTART_CHILD_MARKER).is_some() {
+        run_completion_restart_child();
+        return;
+    }
+
     let directory = tempdir().expect("temporary Run directory should exist");
     let database = directory.path().join("run.sqlite3");
+    let lease_path = directory.path().join("run.lock");
     let definition = definition_fixture();
     let instance = instance_fixture(&definition);
     let capability = CapabilityRef {
@@ -493,7 +537,7 @@ fn sqlite_driver_completes_read_only_plan_with_core_bound_artifact_and_replays()
                 capability.clone(),
                 json!({"path": RAW_PATH}),
             )]),
-            PlanProposal::completion_candidate("test-only completion"),
+            PlanProposal::completion_candidate(COMPLETION_SUMMARY),
         ]),
         calls: Rc::clone(&planner_calls),
         contexts: Rc::clone(&planner_contexts),
@@ -521,8 +565,7 @@ fn sqlite_driver_completes_read_only_plan_with_core_bound_artifact_and_replays()
             },
         )
         .expect("Run should initialize");
-    let lease = LocalRunLease::try_acquire(RUN_ID, directory.path().join("run.lock"))
-        .expect("Run lease should acquire");
+    let lease = LocalRunLease::try_acquire(RUN_ID, &lease_path).expect("Run lease should acquire");
     let budget = AgentLoopBudget::new(2, 1, 1, 262_144).expect("budget should validate");
 
     let mut pending = PendingApproval;
@@ -788,6 +831,7 @@ fn sqlite_driver_completes_read_only_plan_with_core_bound_artifact_and_replays()
         let mut forged_store = PlanningProjectionStore {
             state: completed_state.clone(),
             outputs,
+            completion_output: None,
         };
         let forged_before = forged_store.state.clone();
         let forged = AgentLoop::new(budget.clone()).tick(
@@ -828,7 +872,49 @@ fn sqlite_driver_completes_read_only_plan_with_core_bound_artifact_and_replays()
             &mut approvals,
         )
         .expect("completed Step should allow the scripted completion candidate");
-    assert!(matches!(completion, DriverOutcome::CompletionCandidate(_)));
+    let completion_debug = format!("{completion:?}");
+    let DriverOutcome::CompletionCandidate {
+        candidate: completion_candidate,
+        output: Some(completion_output),
+    } = completion
+    else {
+        panic!("new completion must return its exact durable output")
+    };
+    assert_eq!(
+        completion_output.summary().as_bytes(),
+        COMPLETION_SUMMARY.as_bytes()
+    );
+    assert_eq!(
+        completion_output.candidate_id(),
+        completion_candidate.candidate_id
+    );
+    assert_eq!(
+        Some(completion_output.record_digest()),
+        completion_candidate
+            .completion_output_record_digest
+            .as_deref()
+    );
+    assert!(!format!("{completion_output:?}").contains(COMPLETION_SUMMARY));
+    let completion_snapshot = reopened
+        .load()
+        .expect("completion snapshot should verify")
+        .expect("Run should exist");
+    let completion_head = ExpectedHead::from_state(&completion_snapshot.state);
+    let completion_event_count = completion_snapshot.records.len();
+    for public_surface in [
+        String::from_utf8(reopened.export_jsonl().expect("journal should export"))
+            .expect("journal should be UTF-8"),
+        String::from_utf8(
+            reopened
+                .export_execution_receipts_jsonl()
+                .expect("Receipts should export"),
+        )
+        .expect("Receipt export should be UTF-8"),
+        serde_json::to_string(&completion_snapshot.state).expect("projection should serialize"),
+        completion_debug,
+    ] {
+        assert!(!public_surface.contains(COMPLETION_SUMMARY));
+    }
     assert_eq!(planner_calls.get(), 2);
     let contexts = planner_contexts.borrow();
     assert_eq!(contexts.len(), 2);
@@ -898,6 +984,7 @@ fn sqlite_driver_completes_read_only_plan_with_core_bound_artifact_and_replays()
         let mut candidate_store = PlanningProjectionStore {
             state: candidate_state,
             outputs: BTreeMap::from([(completed_output.step_id().to_owned(), output)]),
+            completion_output: None,
         };
         let tick = AgentLoop::new(budget.clone())
             .tick(
@@ -945,6 +1032,7 @@ fn sqlite_driver_completes_read_only_plan_with_core_bound_artifact_and_replays()
         let mut candidate_store = PlanningProjectionStore {
             state: candidate_state,
             outputs: output_map.clone(),
+            completion_output: None,
         };
         let before = candidate_store.state.clone();
         let tick = AgentLoop::new(candidate_budget)
@@ -1025,13 +1113,135 @@ fn sqlite_driver_completes_read_only_plan_with_core_bound_artifact_and_replays()
             &mut approvals,
         )
         .expect("completed Run should replay without external calls");
-    assert!(matches!(replay, DriverOutcome::CompletionCandidate(_)));
+    let DriverOutcome::CompletionCandidate {
+        candidate: replayed_candidate,
+        output: Some(replayed_output),
+    } = replay
+    else {
+        panic!("reopened completion must return its exact durable output")
+    };
+    assert_eq!(replayed_candidate, completion_candidate);
+    assert_eq!(replayed_output, completion_output);
+    assert_eq!(
+        replayed_output.summary().as_bytes(),
+        COMPLETION_SUMMARY.as_bytes()
+    );
+    let replayed_snapshot = reopened
+        .load()
+        .expect("replayed snapshot should verify")
+        .expect("Run should exist");
+    assert_eq!(
+        ExpectedHead::from_state(&replayed_snapshot.state),
+        completion_head
+    );
+    assert_eq!(replayed_snapshot.records.len(), completion_event_count);
     assert_eq!(planner_calls.get(), 2);
     assert_eq!(execute_calls.get(), 1);
     assert_eq!(verify_calls.get(), 1);
     drop(reopened);
     drop(lease);
+
+    let restart_proof = directory.path().join("completion-restart.proof");
+    let child = Command::new(std::env::current_exe().expect("test executable should resolve"))
+        .arg("--exact")
+        .arg(RESTART_TEST_NAME)
+        .arg("--nocapture")
+        .env(RESTART_CHILD_MARKER, "1")
+        .env(RESTART_DATABASE_PATH, &database)
+        .env(RESTART_LEASE_PATH, &lease_path)
+        .env(RESTART_PROOF_PATH, &restart_proof)
+        .output()
+        .expect("restart child should execute");
+    assert!(
+        child.status.success(),
+        "restart child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+    assert_eq!(
+        fs::read(&restart_proof).expect("restart child must publish its exact replay proof"),
+        RESTART_PROOF_BYTES,
+        "a successful test process without the selected child test is not sufficient"
+    );
     assert_persisted_files_exclude(directory.path(), &[RAW_PATH, CANONICAL_PATH]);
+}
+
+fn run_completion_restart_child() {
+    let database = std::env::var_os(RESTART_DATABASE_PATH)
+        .map(std::path::PathBuf::from)
+        .expect("restart database path should be supplied");
+    let lease_path = std::env::var_os(RESTART_LEASE_PATH)
+        .map(std::path::PathBuf::from)
+        .expect("restart lease path should be supplied");
+    let proof_path = std::env::var_os(RESTART_PROOF_PATH)
+        .map(std::path::PathBuf::from)
+        .expect("restart proof path should be supplied");
+    let mut store = SqliteRunStore::open(database).expect("restart child should open SQLite");
+    let before = store
+        .load()
+        .expect("restart child snapshot should verify")
+        .expect("restart child Run should exist");
+    let lease =
+        LocalRunLease::try_acquire(RUN_ID, lease_path).expect("restart child lease should acquire");
+    let budget = AgentLoopBudget::new(2, 1, 1, 262_144).expect("budget should validate");
+    let planner_calls = Rc::new(Cell::new(0));
+    let mut planner = ScriptedPlanner {
+        proposals: VecDeque::new(),
+        calls: Rc::clone(&planner_calls),
+        contexts: Rc::new(RefCell::new(Vec::new())),
+        context_sizes: Rc::new(RefCell::new(Vec::new())),
+        context_digests: Rc::new(RefCell::new(Vec::new())),
+    };
+    let mut materializer = MemoryRecipeMaterializer {
+        state: RecipeState(Rc::new(RefCell::new(BTreeMap::new()))),
+        next: 0,
+    };
+    let mut providers = MaterialProviderRegistry::new();
+    let mut adapters = EffectAdapterRegistry::new();
+    let mut verifiers = EffectVerifierRegistry::new();
+    let mut routes = ExactReadOnlyRoute {
+        capability: CapabilityRef {
+            capability_id: "restart-unused".to_owned(),
+            contract_version: "restart-unused".to_owned(),
+        },
+        instance_id: "restart-unused".to_owned(),
+    };
+    let mut approvals = AllowExactRequest;
+    let mut events = DeterministicEvents;
+    let outcome = RunDriver::new(AgentLoop::new(budget), NonZeroU32::new(1).unwrap())
+        .drive_until_pause(
+            &mut store,
+            &mut events,
+            &lease,
+            &CapabilityRegistry::new(),
+            &CanonicalResolver,
+            &mut planner,
+            &mut materializer,
+            &mut providers,
+            &mut adapters,
+            &mut verifiers,
+            &mut routes,
+            &mut approvals,
+        )
+        .expect("restart child should replay without external calls");
+    let DriverOutcome::CompletionCandidate {
+        output: Some(output),
+        ..
+    } = outcome
+    else {
+        panic!("restart child should recover the exact completion output")
+    };
+    assert_eq!(output.summary().as_bytes(), COMPLETION_SUMMARY.as_bytes());
+    assert_eq!(planner_calls.get(), 0, "restart must not recall the model");
+    let after = store
+        .load()
+        .expect("restart child snapshot should re-verify")
+        .expect("restart child Run should remain");
+    assert_eq!(
+        after, before,
+        "restart replay must not append or mutate state"
+    );
+    fs::write(proof_path, RESTART_PROOF_BYTES).expect("restart child should publish replay proof");
 }
 
 fn assert_persisted_files_exclude(directory: &std::path::Path, sentinels: &[&str]) {

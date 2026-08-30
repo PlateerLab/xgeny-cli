@@ -614,6 +614,7 @@ fn completion_candidate_atomically_settles_exact_reserved_call() {
             decision: model_decision(&call, &proposal_digest),
             candidate_id: "completion-candidate-1".to_owned(),
             summary_digest: digest('s'),
+            completion_output_record_digest: None,
         },
     );
     let loop_state = completed.agent_loop.as_ref().unwrap();

@@ -118,24 +118,25 @@ COMMIT
 
 `Ephemeral` record는 argument를 durable store에 넣지 않는다. 정상 commit 뒤 같은 process에 남아 있는 opaque material handle만 사용할 수 있다. Commit 성공 여부가 불확실하거나 process가 재시작되어 handle을 찾을 수 없으면 자동으로 argument를 재생성하지 않는다.
 
-## SQLite schema 7과 material 호환성
+## SQLite schema 8과 material 호환성
 
-Material sidecar가 없는 schema 1과 2 intent를 실행 가능하다고 해석할 수 없으므로 migration하지 않는다. Schema 3은 이 문서의 material 계약을 도입한 형식이고 schema 4는 Receipt table을, schema 5는 dependency 의미 fence를 추가했다. ADR-0015의 schema 6은 accepted-plan input table을, ADR-0019의 schema 7은 event-anchored tool-output table을 추가하며 기존 journal/projection/material/Receipt/plan blob을 다시 쓰지 않는다.
+Material sidecar가 없는 schema 1과 2 intent를 실행 가능하다고 해석할 수 없으므로 migration하지 않는다. Schema 3은 이 문서의 material 계약을 도입한 형식이고 schema 4는 Receipt table을, schema 5는 dependency 의미 fence를 추가했다. ADR-0015의 schema 6은 accepted-plan input table을, ADR-0019의 schema 7은 event-anchored tool-output table을, ADR-0021의 schema 8은 event-anchored completion-output table을 추가하며 기존 journal/projection/material/Receipt/plan/tool-output blob을 다시 쓰지 않는다.
 
 | 발견한 `user_version` | 동작 |
 |---|---|
-| `0` | schema 7 신규 생성 |
-| `3` | record와 projection 검증, Receipt·planned-input·tool-output table 추가 후 schema 7로 원자 migration |
-| `4` | material·Receipt를 포함한 전체 derived state 검증, planned-input·tool-output table 추가 후 schema 7로 원자 migration |
-| `5` | 기존 durable row 전체 검증, planned-input·tool-output table 추가 후 schema 7로 원자 migration |
-| `6` | material·Receipt·planned input 전체 검증, 빈 tool-output table 추가 후 schema 7로 원자 migration |
-| `7` | material·Receipt·planned input·tool output 전체 검증 후 open |
+| `0` | schema 8 신규 생성 |
+| `3` | record와 projection 검증, Receipt·planned-input·tool-output·completion-output table 추가 후 schema 8로 원자 migration |
+| `4` | material·Receipt를 포함한 전체 derived state 검증, planned-input·tool-output·completion-output table 추가 후 schema 8로 원자 migration |
+| `5` | 기존 durable row 전체 검증, planned-input·tool-output·completion-output table 추가 후 schema 8로 원자 migration |
+| `6` | material·Receipt·planned input 전체 검증, 빈 tool-output·completion-output table 추가 후 schema 8로 원자 migration |
+| `7` | material·Receipt·planned input·tool output 전체 검증, 빈 completion-output table 추가 후 schema 8로 원자 migration |
+| `8` | 모든 event/projection/sidecar 전체 검증 후 open |
 | `1`, `2` | mutation 없이 `UnsupportedSchemaVersion` |
-| `8+` | mutation 없이 `UnsupportedSchemaVersion` |
+| `9+` | mutation 없이 `UnsupportedSchemaVersion` |
 
 Version 2 record에 `Ephemeral`을 자동 backfill하지 않는다. 그렇게 하면 실제 material이 없는 legacy intent를 정상적인 same-process invocation처럼 보이게 할 수 있다. 연구 중 생성한 기존 database가 필요하면 deterministic JSONL export 등 명시적인 보존 절차를 거친 뒤 새 Run을 만든다.
 
-Schema 7 load는 material에 대해 최소 다음을 대조한다.
+Schema 8 load는 material에 대해 최소 다음을 대조한다.
 
 - 모든 effect intent에 정확히 하나의 material record가 있는가
 - Orphan material record가 없는가
@@ -274,9 +275,9 @@ POSIX 테스트는 DB가 열린 동안 현재 존재하는 WAL/SHM을 포함해 
 
 - Raw argument, canonical path와 credential sentinel이 DB/WAL/JSONL/Debug/Error에 없다.
 - Reference ID를 포함한 opaque type이 derived `Debug`로 원문을 노출하지 않는다.
-- Fresh database가 schema 7로 생성되고 reopen된다.
-- Schema 3 material Run이 journal bytes를 유지한 채 schema 7로 migration된다.
-- Schema 4/5/6 Run이 journal/projection/intent/authorization/material/Receipt/plan row를 유지한 채 schema 7로 migration된다.
+- Fresh database가 schema 8로 생성되고 reopen된다.
+- Schema 3 material Run이 journal bytes를 유지한 채 schema 8로 migration된다.
+- Schema 4/5/6/7 Run이 journal/projection/intent/authorization/material/Receipt/plan/tool-output row를 유지한 채 schema 8로 migration된다.
 - Schema 1과 2를 변경 없이 거부한다.
 - Future schema version을 변경 없이 거부한다.
 - Linux, macOS와 Windows CI에서 portable unit/contract test가 통과한다.

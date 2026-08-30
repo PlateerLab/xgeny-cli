@@ -20,10 +20,10 @@ use xgeny_runtime::{
     ProposalRejection, ProposedPlanStep, RunLease,
 };
 use xgeny_workgraph::{
-    AgentLoopBudget, AgentLoopState, ContinuationAction, EventRecord, ModelCallBudget,
-    ModelCallLifecycleState, ModelCallRejectionReason, ModelCallSettlement, ModelCallUnknownReason,
-    PlannedExecutionProfile, ReconstructableMaterialReference, RunEvent, RunEventBody, RunState,
-    StepState, StepStatus, apply_record,
+    AgentLoopBudget, AgentLoopState, CompletionOutputRecord, ContinuationAction, EventRecord,
+    ModelCallBudget, ModelCallLifecycleState, ModelCallRejectionReason, ModelCallSettlement,
+    ModelCallUnknownReason, PlannedExecutionProfile, ReconstructableMaterialReference, RunEvent,
+    RunEventBody, RunState, StepState, StepStatus, apply_record,
 };
 
 const AUTHORITY: &str = "local:test";
@@ -195,6 +195,30 @@ impl ResourceResolver for AlternatingResolver {
 struct ProjectionStore {
     state: RunState,
     last_body: Option<RunEventBody>,
+    completion_output: Option<CompletionOutputRecord>,
+}
+
+struct LegacyCompletionStore {
+    state: RunState,
+}
+
+impl RunStore for LegacyCompletionStore {
+    fn append(&mut self, _expected: ExpectedHead, _event: RunEvent) -> Result<Commit, StoreError> {
+        Err(StoreError::Corrupt(
+            "legacy completion fixture must remain read-only".to_owned(),
+        ))
+    }
+
+    fn load(&self) -> Result<Option<RunSnapshot>, StoreError> {
+        Ok(Some(RunSnapshot {
+            records: Vec::new(),
+            state: self.state.clone(),
+        }))
+    }
+
+    fn load_current(&self) -> Result<Option<RunState>, StoreError> {
+        Ok(Some(self.state.clone()))
+    }
 }
 
 impl ProjectionStore {
@@ -202,6 +226,7 @@ impl ProjectionStore {
         Self {
             state,
             last_body: None,
+            completion_output: None,
         }
     }
 }
@@ -237,6 +262,33 @@ impl RunStore for ProjectionStore {
             records: Vec::new(),
             state: self.state.clone(),
         }))
+    }
+
+    fn append_with_completion_output(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        output: CompletionOutputRecord,
+    ) -> Result<Commit, StoreError> {
+        let commit = self.append(expected, event)?;
+        self.completion_output = Some(output);
+        Ok(commit)
+    }
+
+    fn load_completion_output(
+        &self,
+        expected: ExpectedHead,
+        candidate_id: &str,
+    ) -> Result<Option<CompletionOutputRecord>, StoreError> {
+        let actual = ExpectedHead::from_state(&self.state);
+        if expected != actual {
+            return Err(StoreError::HeadConflict { expected, actual });
+        }
+        Ok(self
+            .completion_output
+            .as_ref()
+            .filter(|output| output.candidate_id() == candidate_id)
+            .cloned())
     }
 
     fn load_current(&self) -> Result<Option<RunState>, StoreError> {
@@ -575,6 +627,7 @@ impl RunStore for StalePlanOutcomeStore {
 enum AckLossStage {
     Reservation,
     AcceptedPlan,
+    Completion,
 }
 
 struct CommitAckLossStore<S> {
@@ -625,6 +678,28 @@ impl<S: RunStore> RunStore for CommitAckLossStore<S> {
         Ok(commit)
     }
 
+    fn append_with_completion_output(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        output: CompletionOutputRecord,
+    ) -> Result<Commit, StoreError> {
+        let lose_ack = self.stage == AckLossStage::Completion
+            && !self.injected
+            && matches!(
+                &event.body,
+                RunEventBody::CompletionCandidateRecorded { .. }
+            );
+        let commit = self
+            .inner
+            .append_with_completion_output(expected, event, output)?;
+        if lose_ack {
+            self.injected = true;
+            return Err(StoreError::Corrupt(RAW_ACK_LOSS.to_owned()));
+        }
+        Ok(commit)
+    }
+
     fn load(&self) -> Result<Option<RunSnapshot>, StoreError> {
         self.inner.load()
     }
@@ -647,6 +722,14 @@ impl<S: RunStore> RunStore for CommitAckLossStore<S> {
         step_id: &str,
     ) -> Result<Option<xgeny_workgraph::PlannedInvocationMaterialRecord>, StoreError> {
         self.inner.load_planned_invocation(step_id)
+    }
+
+    fn load_completion_output(
+        &self,
+        expected: ExpectedHead,
+        candidate_id: &str,
+    ) -> Result<Option<CompletionOutputRecord>, StoreError> {
+        self.inner.load_completion_output(expected, candidate_id)
     }
 }
 
@@ -2345,6 +2428,7 @@ fn omitted_capability_and_step_cannot_be_guessed_by_proposal() {
 
 #[test]
 fn completion_candidate_is_durable_and_does_not_complete_run() {
+    const SUMMARY: &str = "FINAL-RUNTIME-SUMMARY \"quote\" \\ slash\n\t- 한글 결과";
     let run_id = "run-agent-loop-completion";
     let loop_budget = budget(2, 2, 2, 32_768);
     let mut store = ProjectionStore::new(projected_state(
@@ -2353,9 +2437,7 @@ fn completion_candidate_is_durable_and_does_not_complete_run() {
         0,
         vec![manual_step("step-done", StepStatus::Completed, 1)],
     ));
-    let mut planner = ScriptedPlanner::returning(PlanProposal::completion_candidate(
-        "all receipt-bound work is complete",
-    ));
+    let mut planner = ScriptedPlanner::returning(PlanProposal::completion_candidate(SUMMARY));
     let agent_loop = AgentLoop::new(loop_budget);
     let first = agent_loop
         .tick(
@@ -2370,12 +2452,22 @@ fn completion_candidate_is_durable_and_does_not_complete_run() {
         .expect("candidate should commit");
     let AgentLoopTick::CompletionCandidate {
         candidate,
+        output,
         newly_recorded: true,
         head,
     } = first
     else {
         panic!("expected new completion candidate")
     };
+    let output = output.expect("new completion must retain its exact output");
+    assert_eq!(output.summary().as_bytes(), SUMMARY.as_bytes());
+    assert_eq!(output.candidate_id(), candidate.candidate_id);
+    assert_eq!(output.summary_digest(), candidate.summary_digest);
+    assert_eq!(
+        Some(output.record_digest()),
+        candidate.completion_output_record_digest.as_deref()
+    );
+    assert!(!format!("{output:?}").contains(SUMMARY));
     assert_eq!(planner.calls, 1);
     assert!(candidate.candidate_id.starts_with("completion-"));
     assert!(matches!(
@@ -2393,13 +2485,171 @@ fn completion_candidate_is_durable_and_does_not_complete_run() {
             &mut RecordingMaterializer::default(),
         )
         .expect("durable candidate should be replayed");
+    let AgentLoopTick::CompletionCandidate {
+        candidate: replayed_candidate,
+        output: Some(replayed_output),
+        newly_recorded: false,
+        head: existing_head,
+    } = second
+    else {
+        panic!("expected exact durable completion replay")
+    };
+    assert_eq!(existing_head, head);
+    assert_eq!(replayed_candidate, candidate);
+    assert_eq!(replayed_output, output);
+    assert_eq!(replayed_output.summary().as_bytes(), SUMMARY.as_bytes());
+    assert_eq!(planner.calls, 1);
+}
+
+#[test]
+fn lost_completion_commit_ack_replays_exact_summary_without_a_second_model_call() {
+    const SUMMARY: &str = "ACK-LOSS-COMPLETION-SUMMARY\n\t- exact";
+    let run_id = "run-agent-loop-completion-ack-loss";
+    let loop_budget = budget(2, 2, 2, 32_768);
+    let inner = ProjectionStore::new(projected_state(
+        run_id,
+        loop_budget.clone(),
+        0,
+        vec![manual_step("step-done", StepStatus::Completed, 1)],
+    ));
+    let mut store = CommitAckLossStore::new(inner, AckLossStage::Completion);
+    let mut planner = ScriptedPlanner::returning(PlanProposal::completion_candidate(SUMMARY));
+    let agent_loop = AgentLoop::new(loop_budget);
+
+    let first = agent_loop.tick(
+        &mut store,
+        &mut DeterministicEvents,
+        &FixedLease(run_id.to_owned()),
+        &xgeny_runtime::CapabilityRegistry::new(),
+        &CanonicalResolver::default(),
+        &mut planner,
+        &mut RecordingMaterializer::default(),
+    );
     assert!(matches!(
-        second,
+        first,
+        Err(AgentLoopError::Store(StoreError::Corrupt(message))) if message == RAW_ACK_LOSS
+    ));
+    assert_eq!(planner.calls, 1);
+
+    let replay = agent_loop
+        .tick(
+            &mut store,
+            &mut DeterministicEvents,
+            &FixedLease(run_id.to_owned()),
+            &xgeny_runtime::CapabilityRegistry::new(),
+            &CanonicalResolver::default(),
+            &mut planner,
+            &mut RecordingMaterializer::default(),
+        )
+        .expect("committed completion should replay after acknowledgement loss");
+    let AgentLoopTick::CompletionCandidate {
+        output: Some(output),
+        newly_recorded: false,
+        ..
+    } = replay
+    else {
+        panic!("ack-loss replay should return exact durable completion")
+    };
+    assert_eq!(output.summary().as_bytes(), SUMMARY.as_bytes());
+    assert_eq!(planner.calls, 1);
+}
+
+#[test]
+fn legacy_completion_replays_without_new_store_extension_or_model_call() {
+    let run_id = "run-agent-loop-legacy-completion";
+    let loop_budget = budget(2, 2, 2, 32_768);
+    let mut source = ProjectionStore::new(projected_state(
+        run_id,
+        loop_budget.clone(),
+        0,
+        vec![manual_step("step-done", StepStatus::Completed, 1)],
+    ));
+    let mut initial_planner =
+        ScriptedPlanner::returning(PlanProposal::completion_candidate("legacy summary"));
+    AgentLoop::new(loop_budget.clone())
+        .tick(
+            &mut source,
+            &mut DeterministicEvents,
+            &FixedLease(run_id.to_owned()),
+            &xgeny_runtime::CapabilityRegistry::new(),
+            &CanonicalResolver::default(),
+            &mut initial_planner,
+            &mut RecordingMaterializer::default(),
+        )
+        .expect("source completion should commit");
+    source
+        .state
+        .agent_loop
+        .as_mut()
+        .unwrap()
+        .completion_candidate
+        .as_mut()
+        .unwrap()
+        .completion_output_record_digest = None;
+    let mut legacy = LegacyCompletionStore {
+        state: source.state,
+    };
+    let mut planner = ScriptedPlanner::default();
+
+    let replay = AgentLoop::new(loop_budget)
+        .tick(
+            &mut legacy,
+            &mut DeterministicEvents,
+            &FixedLease(run_id.to_owned()),
+            &xgeny_runtime::CapabilityRegistry::new(),
+            &CanonicalResolver::default(),
+            &mut planner,
+            &mut RecordingMaterializer::default(),
+        )
+        .expect("legacy completion should replay without a new loader");
+    assert!(matches!(
+        replay,
         AgentLoopTick::CompletionCandidate {
+            output: None,
             newly_recorded: false,
-            head: existing_head,
             ..
-        } if existing_head == head
+        }
+    ));
+    assert_eq!(planner.calls, 0);
+}
+
+#[test]
+fn digest_bound_completion_never_degrades_a_missing_output_to_legacy() {
+    let run_id = "run-agent-loop-missing-completion-output";
+    let loop_budget = budget(2, 2, 2, 32_768);
+    let mut store = ProjectionStore::new(projected_state(
+        run_id,
+        loop_budget.clone(),
+        0,
+        vec![manual_step("step-done", StepStatus::Completed, 1)],
+    ));
+    let mut planner =
+        ScriptedPlanner::returning(PlanProposal::completion_candidate("strict summary"));
+    AgentLoop::new(loop_budget.clone())
+        .tick(
+            &mut store,
+            &mut DeterministicEvents,
+            &FixedLease(run_id.to_owned()),
+            &xgeny_runtime::CapabilityRegistry::new(),
+            &CanonicalResolver::default(),
+            &mut planner,
+            &mut RecordingMaterializer::default(),
+        )
+        .expect("completion should commit");
+    store.completion_output = None;
+
+    let replay = AgentLoop::new(loop_budget).tick(
+        &mut store,
+        &mut DeterministicEvents,
+        &FixedLease(run_id.to_owned()),
+        &xgeny_runtime::CapabilityRegistry::new(),
+        &CanonicalResolver::default(),
+        &mut planner,
+        &mut RecordingMaterializer::default(),
+    );
+    assert!(matches!(
+        replay,
+        Err(AgentLoopError::CompletionOutputMissing)
     ));
     assert_eq!(planner.calls, 1);
 }

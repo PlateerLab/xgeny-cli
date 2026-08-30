@@ -3,7 +3,7 @@
 - 기준일: 2026-08-30
 - 상태: reservation/recovery 기본형 + 첫 OpenAI-compatible leaf adapter
 - 공개 protocol v0.1 schema 변경: 없음
-- local store schema: 7
+- local store schema: 8
 - 정본 결정: [ADR-0016](../adr/0016-durable-model-call-lifecycle.md)
 
 ## 현재 가능한 것
@@ -228,7 +228,7 @@ Model-call uncertainty는 WorkGraph safety transition을 전역 freeze하지 않
 
 Memory store는 reducer가 candidate를 모두 검증한 뒤 event, projection과 verified index를 갱신한다. 정상 `Result` 경로의 논리적 none-or-all과 replay parity를 검증하지만 process crash persistence는 제공하지 않는다.
 
-### Model-call data in SQLite (introduced at schema 6; current schema 7)
+### Model-call data in SQLite (introduced at schema 6; current schema 8)
 
 Model-call table, column 또는 sidecar를 추가하지 않는다.
 
@@ -258,7 +258,7 @@ PlanAccepted / CompletionCandidateRecorded
   -> exact active model call의 accepted settlement
 ```
 
-Model-call lifecycle slice 자체는 schema 6에서 새 table을 추가하지 않았고 과거 schema 6 blob도 다시 쓰지 않았다. 현재 store version은 ADR-0019의 `tool_outputs` sidecar 때문에 7이다. 과거 binary는 새 lifecycle event/projection을 이해하지 못하면 decode/replay에서 fail-closed해야 하며 새 의미를 legacy Plan으로 무시해서는 안 된다. 새 binary는 과거 값에 없던 optional field를 serialization에서 새로 방출해 과거 event digest를 바꾸면 안 된다.
+Model-call lifecycle slice 자체는 schema 6에서 새 table을 추가하지 않았고 과거 schema 6 blob도 다시 쓰지 않았다. ADR-0019의 `tool_outputs` sidecar가 schema 7을, ADR-0021의 `completion_outputs` sidecar가 current schema 8을 도입했다. 과거 binary는 새 lifecycle event/projection을 이해하지 못하면 decode/replay에서 fail-closed해야 하며 새 의미를 legacy Plan으로 무시해서는 안 된다. 새 binary는 과거 값에 없던 optional field를 serialization에서 새로 방출해 과거 event digest를 바꾸면 안 된다.
 
 SQLite verified cache는 기존 `data_version + durable journal head` identity를 사용한다. 다른 connection이 event/projection을 바꾸면 cold full audit로 전환하며 warm normal append는 historical event/sidecar를 다시 scan하지 않는다. Model-call lifecycle의 순번과 stale binding은 runtime preflight만이 아니라 WorkGraph reducer replay에서도 검사해야 한다.
 
@@ -309,7 +309,7 @@ xgeny-local-store
   model-call-specific active reservation + PlanAccepted sidecar fault rollback
   shared process-exit/two-handle/cache-invalidation regressions remain green
   shared warm append historical scan zero and cold replay event-once
-  migration to current schema version 7 and all pre-existing row/blob preservation
+  migration to current schema version 8 and all pre-existing row/blob preservation
 
 xgeny-runtime
   reservation commit before planner invocation

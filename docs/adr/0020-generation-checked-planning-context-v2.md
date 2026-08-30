@@ -19,8 +19,9 @@ journal head를 바꿔 서로 다른 generation의 state와 output을 섞을 수
 3. mandatory output이 context budget을 넘을 때 어떻게 실패하는가?
 4. OpenAI-compatible provider가 이를 어떤 prompt/profile로 전송하는가?
 
-최종 completion summary의 durable 복원, 제품 filesystem adapter와 public `xgeny run`은
-별도 변경이다.
+최종 completion summary의 durable 복원은
+[ADR-0021](0021-durable-completion-output-and-schema-8.md)에서 닫는다. 제품 filesystem
+adapter와 public `xgeny run`은 별도 변경이다.
 
 ## 결정
 
@@ -153,7 +154,9 @@ provider로 보내도 된다는 권한을 부여하지 않는다.
 
 ## 후속 작업
 
-1. `CompletionOutputRecord`와 SQLite schema 8로 최종 summary를 재시작 후 복원한다.
-2. OS별 confinement를 갖춘 bounded UTF-8 filesystem read adapter를 구현한다.
-3. Public CLI composition에서 local/remote provider egress 승인을 분리한다.
-4. go50902 live model로 실제 file → tool output → follow-up completion을 실증한다.
+[ADR-0021](0021-durable-completion-output-and-schema-8.md)이 첫 항목을 완료했다. 남은 순서는
+다음과 같다.
+
+1. OS별 confinement를 갖춘 bounded UTF-8 filesystem read adapter를 구현한다.
+2. Public CLI composition에서 local/remote provider egress 승인을 분리한다.
+3. go50902 live model로 실제 file → tool output → follow-up completion을 실증한다.

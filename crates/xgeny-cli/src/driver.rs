@@ -13,8 +13,8 @@ use xgeny_runtime::{
     RouteRequest, RunLease, VerificationRunner, VerificationRunnerError,
 };
 use xgeny_workgraph::{
-    CompletionCandidateState, ContinuationAction, ModelCallRejectionReason, ModelCallUnknownReason,
-    RunState, StepStatus,
+    CompletionCandidateState, CompletionOutputRecord, ContinuationAction, ModelCallRejectionReason,
+    ModelCallUnknownReason, RunState, StepStatus,
 };
 
 /// Host boundary that turns one durable planned Step into an exact deterministic route request.
@@ -83,7 +83,11 @@ pub enum ApprovalPortFailure {
 /// Why a bounded driver invocation yielded control to its caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriverOutcome {
-    CompletionCandidate(CompletionCandidateState),
+    CompletionCandidate {
+        candidate: CompletionCandidateState,
+        /// Exact local summary sidecar. `None` is reserved for replayed schema-7 candidates.
+        output: Option<Box<CompletionOutputRecord>>,
+    },
     Quiescent(AgentLoopQuiescence),
     ApprovalPending {
         step_id: String,
@@ -279,8 +283,10 @@ impl RunDriver {
                         )?;
                     }
                 },
-                AgentLoopTick::CompletionCandidate { candidate, .. } => {
-                    return Ok(DriverOutcome::CompletionCandidate(candidate));
+                AgentLoopTick::CompletionCandidate {
+                    candidate, output, ..
+                } => {
+                    return Ok(DriverOutcome::CompletionCandidate { candidate, output });
                 }
                 AgentLoopTick::Quiescent { reason, .. } => {
                     return Ok(DriverOutcome::Quiescent(reason));

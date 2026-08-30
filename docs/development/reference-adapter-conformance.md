@@ -3,7 +3,7 @@
 - 기준일: 2026-08-29
 - 상태: 비제품·비배포 public-port 참조 구현
 - 공개 protocol v0.1 변경: 없음
-- Receipt 도입 schema: 4; current local store schema: 7
+- Receipt 도입 schema: 4; current local store schema: 8
 
 ## 목적
 
@@ -49,7 +49,7 @@ opaque targetRef + marker
 - executable binding digest
 - idempotency key
 
-기록 byte의 SHA-256을 adapter outcome의 `evidence_digest`로 전달한다. 이는 실제 파일 byte와 연결되는 실행 evidence이며 protocol Receipt가 아니다. 이후 별도 verifier가 같은 preopened handle을 read-only로 다시 읽고 digest를 비교한다. Core는 그 결과와 admission provenance로 protocol `ExecutionReceipt`를 만들고 current SQLite schema 7에 terminal event와 함께 저장한다. 이 reference adapter의 effectful v1 경로는 typed tool output을 생성하지 않는다.
+기록 byte의 SHA-256을 adapter outcome의 `evidence_digest`로 전달한다. 이는 실제 파일 byte와 연결되는 실행 evidence이며 protocol Receipt가 아니다. 이후 별도 verifier가 같은 preopened handle을 read-only로 다시 읽고 digest를 비교한다. Core는 그 결과와 admission provenance로 protocol `ExecutionReceipt`를 만들고 current SQLite schema 8에 terminal event와 함께 저장한다. 이 reference adapter의 effectful v1 경로는 typed tool output을 생성하지 않는다.
 
 Reference adapter에는 typed tool output이 없으므로 Receipt `outputDigest`는 canonical empty object의 고정 digest다. Artifact 또는 실제 output body를 제공한다는 뜻이 아니다.
 
@@ -108,6 +108,6 @@ Workspace CI가 Linux, macOS, Windows에서 이 integration test를 함께 실�
 - credential resolution, approval UI, CLI 명령과 model loop
 - in-process hostile plugin 격리
 
-실제 filesystem adapter는 이 참조 구현을 이름만 바꿔 확장하지 않는다. ADR-0018이 WorkGraph ReadOnly profile과 bounded Artifact descriptor/Receipt v2 의미를 먼저 고정했고, ADR-0019가 exact Definition output schema에 결합된 bounded typed output body와 local schema 7 sidecar를 추가했다. 제품 adapter에는 여전히 failure/unknown Receipt, root directory capability와 OS별 path race 규칙을 위한 별도 ADR과 실패 테스트가 필요하다. ReadOnly Admission도 현재 accepted planned-invocation 경로에만 열려 있고 legacy direct path는 닫혀 있다. Tracked/Persistent WorkGraph와 restart frontier는 ADR-0014에서 구현했지만 제품 adapter나 output-aware model loop를 연결한 것은 아니다.
+실제 filesystem adapter는 이 참조 구현을 이름만 바꿔 확장하지 않는다. ADR-0018이 WorkGraph ReadOnly profile과 bounded Artifact descriptor/Receipt v2 의미를 먼저 고정했고, ADR-0019가 exact Definition output schema에 결합된 bounded typed output body와 local schema 7 sidecar를 추가했다. 제품 adapter에는 여전히 failure/unknown Receipt, root directory capability와 OS별 path race 규칙을 위한 별도 ADR과 실패 테스트가 필요하다. ReadOnly Admission도 현재 accepted planned-invocation 경로에만 열려 있고 legacy direct path는 닫혀 있다. Tracked/Persistent WorkGraph와 output-aware model loop는 Core/driver에 구현됐지만, 이 effectful preopened-handle reference adapter 자체는 그 제품 ReadOnly loop에 연결되지 않는다.
 
 공통 adapter contract testkit은 두 번째 실제 adapter가 생길 때 이 suite에서 구현별 fixture를 분리해 추출한다. 지금은 재사용 추상화를 미리 고정하지 않고 public-port conformance의 첫 실행 가능한 기준으로 유지한다.
