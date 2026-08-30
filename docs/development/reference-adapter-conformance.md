@@ -3,7 +3,7 @@
 - 기준일: 2026-08-29
 - 상태: 비제품·비배포 public-port 참조 구현
 - 공개 protocol v0.1 변경: 없음
-- Receipt 도입 schema: 4; current local store schema: 5
+- Receipt 도입 schema: 4; current local store schema: 6
 
 ## 목적
 
@@ -49,7 +49,7 @@ opaque targetRef + marker
 - executable binding digest
 - idempotency key
 
-기록 byte의 SHA-256을 adapter outcome의 `evidence_digest`로 전달한다. 이는 실제 파일 byte와 연결되는 실행 evidence이며 protocol Receipt가 아니다. 이후 별도 verifier가 같은 preopened handle을 read-only로 다시 읽고 digest를 비교한다. Core는 그 결과와 admission provenance로 protocol `ExecutionReceipt`를 만들고 current SQLite schema 5에 terminal event와 함께 저장한다.
+기록 byte의 SHA-256을 adapter outcome의 `evidence_digest`로 전달한다. 이는 실제 파일 byte와 연결되는 실행 evidence이며 protocol Receipt가 아니다. 이후 별도 verifier가 같은 preopened handle을 read-only로 다시 읽고 digest를 비교한다. Core는 그 결과와 admission provenance로 protocol `ExecutionReceipt`를 만들고 current SQLite schema 6에 terminal event와 함께 저장한다.
 
 Reference adapter에는 typed tool output이 없으므로 Receipt `outputDigest`는 canonical empty object의 고정 digest다. Artifact 또는 실제 output body를 제공한다는 뜻이 아니다.
 

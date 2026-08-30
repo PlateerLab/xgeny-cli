@@ -6,17 +6,31 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use xgeny_domain::{ExecutionReceiptBody, ProtocolDocument};
 use xgeny_workgraph::{
-    EffectIntent, EventRecord, InvocationMaterialRecord, RunEvent, RunEventBody, RunState,
+    EffectIntent, EventRecord, InvocationMaterialRecord, PlannedInvocationMaterialRecord, RunEvent,
+    RunEventBody, RunState,
 };
 
 use crate::{
     AuditMetrics, Commit, ExpectedHead, RunSnapshot, RunStore, RunVerificationSnapshot, StoreError,
     StoredExecutionReceipt, VerifiedRunIndex, audit_snapshot, prepare_commit,
-    verify_material_bundle, verify_material_point, verify_material_records, verify_receipt_bundle,
-    verify_receipt_candidate, verify_receipt_records,
+    verify_material_bundle, verify_material_point, verify_material_records,
+    verify_plan_input_bundle, verify_plan_input_point, verify_plan_input_records,
+    verify_planned_material_retention, verify_receipt_bundle, verify_receipt_candidate,
+    verify_receipt_records,
 };
 
-const STORE_SCHEMA_VERSION: i64 = 5;
+const STORE_SCHEMA_VERSION: i64 = 6;
+
+const CREATE_PLAN_INPUT_SCHEMA: &str = r"
+CREATE TABLE IF NOT EXISTS planned_invocations (
+    step_id TEXT PRIMARY KEY,
+    event_sequence INTEGER NOT NULL CHECK (event_sequence >= 1),
+    plan_id TEXT NOT NULL UNIQUE,
+    record_digest TEXT NOT NULL UNIQUE,
+    record_json BLOB NOT NULL,
+    FOREIGN KEY (event_sequence) REFERENCES run_events(sequence)
+) STRICT;
+";
 
 const CREATE_RECEIPT_SCHEMA: &str = r"
 CREATE TABLE execution_receipts (
@@ -75,6 +89,15 @@ CREATE TABLE IF NOT EXISTS invocation_materials (
     FOREIGN KEY (effect_id) REFERENCES effect_intents(effect_id)
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS planned_invocations (
+    step_id TEXT PRIMARY KEY,
+    event_sequence INTEGER NOT NULL CHECK (event_sequence >= 1),
+    plan_id TEXT NOT NULL UNIQUE,
+    record_digest TEXT NOT NULL UNIQUE,
+    record_json BLOB NOT NULL,
+    FOREIGN KEY (event_sequence) REFERENCES run_events(sequence)
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS execution_receipts (
     receipt_id TEXT PRIMARY KEY,
     event_sequence INTEGER NOT NULL UNIQUE CHECK (event_sequence >= 1),
@@ -130,6 +153,10 @@ impl SqliteRunStore {
                 configure_connection(&connection)?;
                 migrate_schema_four(&mut connection)?;
             }
+            5 => {
+                configure_connection(&connection)?;
+                migrate_schema_five(&mut connection)?;
+            }
             STORE_SCHEMA_VERSION => configure_connection(&connection)?,
             unsupported => return Err(StoreError::UnsupportedSchemaVersion(unsupported)),
         }
@@ -147,10 +174,12 @@ impl SqliteRunStore {
         &mut self,
         expected: ExpectedHead,
         event: RunEvent,
+        plan_inputs: Option<&[PlannedInvocationMaterialRecord]>,
         material: Option<&InvocationMaterialRecord>,
         receipt: Option<&ExecutionReceiptBody>,
         mut checkpoint: impl FnMut(CommitStage) -> Result<(), StoreError>,
     ) -> Result<Commit, StoreError> {
+        verify_plan_input_bundle(&event, plan_inputs)?;
         verify_material_bundle(&event, material)?;
         verify_receipt_bundle(&event, receipt)?;
         let Self {
@@ -169,12 +198,30 @@ impl SqliteRunStore {
                 .as_ref()
                 .expect("cache refresh must install a verified index")
                 .index;
+            if let Some(material) = material {
+                let planned_input = match &event.body {
+                    RunEventBody::EffectIntentCommitted { step_id, .. } => {
+                        load_planned_invocation(&transaction, step_id)?
+                    }
+                    _ => None,
+                };
+                verify_planned_material_retention(index, &event, material, planned_input.as_ref())?;
+            }
             let commit = prepare_commit(index, expected, event)?;
             if let Some(material) = material
                 && index.material_effect_ids.contains(material.effect_id())
             {
                 return Err(StoreError::Corrupt(
                     "duplicate invocation material effect ID".to_owned(),
+                ));
+            }
+            if let Some(inputs) = plan_inputs
+                && inputs
+                    .iter()
+                    .any(|input| index.plan_input_step_ids.contains(input.step_id()))
+            {
+                return Err(StoreError::Corrupt(
+                    "duplicate planned invocation input Step ID".to_owned(),
                 ));
             }
             let receipt_anchor = receipt
@@ -184,6 +231,9 @@ impl SqliteRunStore {
         };
         {
             let mut metrics = metrics.borrow_mut();
+            metrics.record_candidate_plan_inputs(
+                plan_inputs.map_or(0, <[PlannedInvocationMaterialRecord]>::len),
+            );
             metrics.record_candidate(material.is_some(), receipt.is_some());
         }
 
@@ -194,6 +244,8 @@ impl SqliteRunStore {
             checkpoint(CommitStage::EffectIntentIndex)?;
             insert_authorization_consumption(&transaction, &commit.record)?;
             checkpoint(CommitStage::AuthorizationConsumption)?;
+            insert_planned_invocations(&transaction, &commit.record, plan_inputs)?;
+            checkpoint(CommitStage::PlannedInvocation)?;
             insert_invocation_material(&transaction, material)?;
             checkpoint(CommitStage::InvocationMaterial)?;
             insert_execution_receipt(&transaction, &commit.record, receipt)?;
@@ -212,7 +264,7 @@ impl SqliteRunStore {
             .as_mut()
             .expect("successful commit must retain its verified prefix")
             .index
-            .apply_committed(&commit, material, receipt, receipt_anchor);
+            .apply_committed(&commit, plan_inputs, material, receipt, receipt_anchor);
         Ok(commit)
     }
 
@@ -224,7 +276,24 @@ impl SqliteRunStore {
         material: &InvocationMaterialRecord,
         fault: CommitStage,
     ) -> Result<Commit, StoreError> {
-        self.append_internal(expected, event, Some(material), None, |stage| {
+        self.append_internal(expected, event, None, Some(material), None, |stage| {
+            if stage == fault {
+                Err(StoreError::InjectedFault(stage.label()))
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn append_plan_with_fault(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        inputs: &[PlannedInvocationMaterialRecord],
+        fault: CommitStage,
+    ) -> Result<Commit, StoreError> {
+        self.append_internal(expected, event, Some(inputs), None, None, |stage| {
             if stage == fault {
                 Err(StoreError::InjectedFault(stage.label()))
             } else {
@@ -241,7 +310,7 @@ impl SqliteRunStore {
         receipt: &ExecutionReceiptBody,
         fault: CommitStage,
     ) -> Result<Commit, StoreError> {
-        self.append_internal(expected, event, None, Some(receipt), |stage| {
+        self.append_internal(expected, event, None, None, Some(receipt), |stage| {
             if stage == fault {
                 Err(StoreError::InjectedFault(stage.label()))
             } else {
@@ -258,7 +327,7 @@ impl SqliteRunStore {
         receipt: &ExecutionReceiptBody,
         fault: CommitStage,
     ) -> Result<Commit, StoreError> {
-        self.append_internal(expected, event, None, Some(receipt), |stage| {
+        self.append_internal(expected, event, None, None, Some(receipt), |stage| {
             if stage == fault {
                 std::process::exit(86);
             }
@@ -274,7 +343,7 @@ impl SqliteRunStore {
         material: &InvocationMaterialRecord,
         fault: CommitStage,
     ) -> Result<Commit, StoreError> {
-        self.append_internal(expected, event, Some(material), None, |stage| {
+        self.append_internal(expected, event, None, Some(material), None, |stage| {
             if stage == fault {
                 std::process::exit(86);
             }
@@ -315,6 +384,11 @@ impl SqliteRunStore {
     #[cfg(test)]
     pub(crate) fn invocation_material_count(&self) -> Result<u64, StoreError> {
         table_count(&self.connection, "invocation_materials")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn planned_invocation_count(&self) -> Result<u64, StoreError> {
+        table_count(&self.connection, "planned_invocations")
     }
 
     #[cfg(test)]
@@ -551,6 +625,8 @@ fn validate_derived_state_without_receipts(
     validate_foreign_keys(connection)?;
     validate_effect_intent_index(connection, index)?;
     validate_authorization_index(connection, index)?;
+    let plan_inputs = load_planned_invocations(connection, index)?;
+    verify_plan_input_records(index, &plan_inputs, metrics)?;
     let materials = load_invocation_materials(connection)?;
     verify_material_records(index, &materials, metrics)
 }
@@ -581,6 +657,7 @@ pub(crate) fn migrate_schema_three(connection: &mut Connection) -> Result<(), St
     let version: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match version {
         3 => {
+            transaction.execute_batch(CREATE_PLAN_INPUT_SCHEMA)?;
             let records = load_records(&transaction)?;
             let projection = load_projection(&transaction)?;
             let mut metrics = AuditMetrics::default();
@@ -596,6 +673,15 @@ pub(crate) fn migrate_schema_three(connection: &mut Connection) -> Result<(), St
             // Another schema-4 binary may have completed the 3 -> 4 migration after `open`
             // observed version 3 but before this immediate transaction acquired the writer lock.
             // Re-audit the now-current format and converge instead of requiring a process restart.
+            transaction.execute_batch(CREATE_PLAN_INPUT_SCHEMA)?;
+            let mut metrics = AuditMetrics::default();
+            let _ = load_verified_store_data(&transaction, &mut metrics)?;
+            transaction.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
+            transaction.commit()?;
+            Ok(())
+        }
+        5 => {
+            transaction.execute_batch(CREATE_PLAN_INPUT_SCHEMA)?;
             let mut metrics = AuditMetrics::default();
             let _ = load_verified_store_data(&transaction, &mut metrics)?;
             transaction.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
@@ -614,7 +700,28 @@ fn migrate_schema_four(connection: &mut Connection) -> Result<(), StoreError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let version: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match version {
-        4 => {
+        4 | 5 => {
+            transaction.execute_batch(CREATE_PLAN_INPUT_SCHEMA)?;
+            let mut metrics = AuditMetrics::default();
+            let _ = load_verified_store_data(&transaction, &mut metrics)?;
+            transaction.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
+            transaction.commit()?;
+            Ok(())
+        }
+        STORE_SCHEMA_VERSION => {
+            transaction.commit()?;
+            Ok(())
+        }
+        unsupported => Err(StoreError::UnsupportedSchemaVersion(unsupported)),
+    }
+}
+
+fn migrate_schema_five(connection: &mut Connection) -> Result<(), StoreError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let version: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    match version {
+        5 => {
+            transaction.execute_batch(CREATE_PLAN_INPUT_SCHEMA)?;
             let mut metrics = AuditMetrics::default();
             let _ = load_verified_store_data(&transaction, &mut metrics)?;
             transaction.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
@@ -705,7 +812,16 @@ fn ensure_verified_cache(
 
 impl RunStore for SqliteRunStore {
     fn append(&mut self, expected: ExpectedHead, event: RunEvent) -> Result<Commit, StoreError> {
-        self.append_internal(expected, event, None, None, |_| Ok(()))
+        self.append_internal(expected, event, None, None, None, |_| Ok(()))
+    }
+
+    fn append_with_plan_inputs(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        inputs: Vec<PlannedInvocationMaterialRecord>,
+    ) -> Result<Commit, StoreError> {
+        self.append_internal(expected, event, Some(&inputs), None, None, |_| Ok(()))
     }
 
     fn append_with_invocation_material(
@@ -714,7 +830,7 @@ impl RunStore for SqliteRunStore {
         event: RunEvent,
         material: InvocationMaterialRecord,
     ) -> Result<Commit, StoreError> {
-        self.append_internal(expected, event, Some(&material), None, |_| Ok(()))
+        self.append_internal(expected, event, None, Some(&material), None, |_| Ok(()))
     }
 
     fn append_with_execution_receipt(
@@ -723,7 +839,7 @@ impl RunStore for SqliteRunStore {
         event: RunEvent,
         receipt: ExecutionReceiptBody,
     ) -> Result<Commit, StoreError> {
-        self.append_internal(expected, event, None, Some(&receipt), |_| Ok(()))
+        self.append_internal(expected, event, None, None, Some(&receipt), |_| Ok(()))
     }
 
     fn load(&self) -> Result<Option<RunSnapshot>, StoreError> {
@@ -781,6 +897,27 @@ impl RunStore for SqliteRunStore {
         Ok(material)
     }
 
+    fn load_planned_invocation(
+        &self,
+        step_id: &str,
+    ) -> Result<Option<PlannedInvocationMaterialRecord>, StoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        ensure_verified_cache(&self.cache, &self.metrics, &transaction)?;
+        let input = load_planned_invocation(&transaction, step_id)?;
+        verify_plan_input_point(
+            &self
+                .cache
+                .borrow()
+                .as_ref()
+                .expect("cache refresh must install a verified index")
+                .index,
+            step_id,
+            input.as_ref(),
+        )?;
+        transaction.commit()?;
+        Ok(input)
+    }
+
     fn load_execution_receipts(&self) -> Result<Vec<ExecutionReceiptBody>, StoreError> {
         let transaction = self.connection.unchecked_transaction()?;
         ensure_verified_cache(&self.cache, &self.metrics, &transaction)?;
@@ -836,6 +973,7 @@ pub(crate) enum CommitStage {
     Event,
     EffectIntentIndex,
     AuthorizationConsumption,
+    PlannedInvocation,
     InvocationMaterial,
     ExecutionReceipt,
     Projection,
@@ -848,6 +986,7 @@ impl CommitStage {
             Self::Event => "event insert",
             Self::EffectIntentIndex => "effect intent index",
             Self::AuthorizationConsumption => "authorization consumption",
+            Self::PlannedInvocation => "planned invocation input",
             Self::InvocationMaterial => "invocation material",
             Self::ExecutionReceipt => "execution receipt",
             Self::Projection => "projection write",
@@ -905,6 +1044,33 @@ fn insert_authorization_consumption(
             max_uses
         ],
     )?;
+    Ok(())
+}
+
+fn insert_planned_invocations(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+    inputs: Option<&[PlannedInvocationMaterialRecord]>,
+) -> Result<(), StoreError> {
+    let Some(inputs) = inputs else {
+        return Ok(());
+    };
+    let sequence = i64::try_from(record.sequence).map_err(|_| StoreError::SequenceOutOfRange)?;
+    for input in inputs {
+        let record_json = serde_json::to_vec(input)?;
+        transaction.execute(
+            "INSERT INTO planned_invocations \
+             (step_id, event_sequence, plan_id, record_digest, record_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                input.step_id(),
+                sequence,
+                input.plan_id(),
+                input.record_digest(),
+                record_json
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -1015,6 +1181,79 @@ fn load_projection(connection: &Connection) -> Result<Option<RunState>, StoreErr
     state_json
         .map(|json| serde_json::from_slice(&json).map_err(StoreError::from))
         .transpose()
+}
+
+fn load_planned_invocations(
+    connection: &Connection,
+    index: &VerifiedRunIndex,
+) -> Result<BTreeMap<String, PlannedInvocationMaterialRecord>, StoreError> {
+    let mut statement = connection.prepare(
+        "SELECT step_id, event_sequence, plan_id, record_digest, record_json \
+         FROM planned_invocations ORDER BY step_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Vec<u8>>(4)?,
+        ))
+    })?;
+    let mut inputs = BTreeMap::new();
+    for row in rows {
+        let (step_id, event_sequence, plan_id, record_digest, record_json) = row?;
+        let event_sequence =
+            u64::try_from(event_sequence).map_err(|_| StoreError::SequenceOutOfRange)?;
+        let input: PlannedInvocationMaterialRecord = serde_json::from_slice(&record_json)?;
+        let anchor = index.planned_invocations.get(&step_id).ok_or_else(|| {
+            StoreError::Corrupt(format!(
+                "planned invocation input for Step `{step_id}` has no accepted event"
+            ))
+        })?;
+        if event_sequence != anchor.event_sequence
+            || step_id != input.step_id()
+            || plan_id != input.plan_id()
+            || record_digest != input.record_digest()
+        {
+            return Err(StoreError::Corrupt(format!(
+                "planned invocation index for Step `{step_id}` differs from its record"
+            )));
+        }
+        if inputs.insert(step_id.clone(), input).is_some() {
+            return Err(StoreError::Corrupt(format!(
+                "duplicate planned invocation input for Step `{step_id}`"
+            )));
+        }
+    }
+    Ok(inputs)
+}
+
+fn load_planned_invocation(
+    connection: &Connection,
+    step_id: &str,
+) -> Result<Option<PlannedInvocationMaterialRecord>, StoreError> {
+    let row: Option<(String, String, Vec<u8>)> = connection
+        .query_row(
+            "SELECT plan_id, record_digest, record_json \
+             FROM planned_invocations WHERE step_id = ?1",
+            [step_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    row.map(|(plan_id, record_digest, record_json)| {
+        let input: PlannedInvocationMaterialRecord = serde_json::from_slice(&record_json)?;
+        if step_id != input.step_id()
+            || plan_id != input.plan_id()
+            || record_digest != input.record_digest()
+        {
+            return Err(StoreError::Corrupt(format!(
+                "planned invocation index for Step `{step_id}` differs from its record"
+            )));
+        }
+        Ok(input)
+    })
+    .transpose()
 }
 
 fn load_invocation_materials(
@@ -1143,6 +1382,7 @@ fn table_count(connection: &Connection, table: &str) -> Result<u64, StoreError> 
         "run_events" => "SELECT COUNT(*) FROM run_events",
         "effect_intents" => "SELECT COUNT(*) FROM effect_intents",
         "authorization_consumption" => "SELECT COUNT(*) FROM authorization_consumption",
+        "planned_invocations" => "SELECT COUNT(*) FROM planned_invocations",
         "invocation_materials" => "SELECT COUNT(*) FROM invocation_materials",
         "execution_receipts" => "SELECT COUNT(*) FROM execution_receipts",
         _ => {

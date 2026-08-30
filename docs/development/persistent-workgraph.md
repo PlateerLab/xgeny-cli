@@ -3,7 +3,7 @@
 - 기준일: 2026-08-30
 - 상태: model-free Tracked/Persistent 연구 gate용 내부 구현
 - 공개 protocol v0.1 schema 변경: 없음
-- local store schema: 5
+- local store schema: 6 (dependency fence는 schema 5에서 도입)
 
 ## 현재 가능한 것
 
@@ -85,11 +85,11 @@ Action 순서는 `Executing recovery → EffectUnknown → Reconciling → Valid
 
 `all_steps_receipt_completed()`는 현재 graph의 모든 Step이 Receipt-bound completion인지 확인할 뿐 사용자 goal이나 Run의 완료를 선언하지 않는다.
 
-## SQLite schema 5
+## SQLite schema 5 dependency fence와 current schema 6
 
 새 table이나 column은 없다. Dependency는 event와 projection JSON에 이미 포함된다. Schema bump는 schema 4 binary가 새 dependency를 모른 채 child를 독립 실행하는 downgrade를 막기 위한 의미 fence다.
 
-Schema 4 store를 열면 `BEGIN IMMEDIATE` 안에서 event JSON/index, projection, effect intent, authorization, invocation material과 Receipt 전체를 감사한 뒤 row 수정 없이 `user_version`만 5로 올린다. 감사나 commit이 실패하면 version 4와 모든 row가 그대로 남는다. Schema 3은 Receipt table을 추가하고 finalization event에 빠진 Receipt가 없는지 확인하는 기존 migration과 전체 감사를 거쳐 바로 5가 되며, 동시에 구버전 migration이 먼저 4를 만든 경합도 transaction 안에서 5로 수렴한다.
+Schema 5는 이 dependency 의미를 도입한 역사적 fence다. ADR-0015의 current schema 6은 같은 `BEGIN IMMEDIATE` 안에서 기존 event JSON/index, projection, effect intent, authorization, invocation material과 Receipt 전체를 감사하고 빈 `planned_invocations` table을 추가한다. Schema 3/4/5는 기존 durable blob을 다시 쓰지 않고 바로 6으로 수렴하며, 감사나 commit이 실패하면 원래 version과 모든 row가 그대로 남는다.
 
 ## 검증 명령
 
@@ -112,7 +112,7 @@ cargo run --locked --quiet -p xgeny-cli -- protocol check
 cargo build --locked --release -p xgeny-cli
 ```
 
-테스트는 diamond release, 독립 branch, transitive failure/manual, partial·malformed legacy Receipt identity, reducer/admission 우회와 unknown dependency의 panic-free rejection, 10,000-Step non-recursive traversal, Memory/SQLite parity, reopen continuity, Receipt transaction fault/process-exit rollback, schema 4 → 5 성공·실패 원자성과 mixed-version 수렴을 포함한다.
+테스트는 diamond release, 독립 branch, transitive failure/manual, partial·malformed legacy Receipt identity, reducer/admission 우회와 unknown dependency의 panic-free rejection, 10,000-Step non-recursive traversal, Memory/SQLite parity, reopen continuity, Receipt transaction fault/process-exit rollback, schema 3/4/5 → 6 성공·실패 원자성과 mixed-version 수렴을 포함한다.
 
 ## 아직 할 수 없는 것
 

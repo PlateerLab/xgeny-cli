@@ -20,8 +20,10 @@ use xgeny_protocol::{
 };
 use xgeny_workgraph::{
     EffectClass, EffectIntent, EventRecord, InvocationMaterialError, InvocationMaterialRecord,
-    ReceiptPlacement, ReceiptVerificationStrategy, RecordError, ReplayError, RunEvent,
-    RunEventBody, RunState, TransitionError, VerificationDisposition, apply_record, replay,
+    InvocationMaterialRetention, PlannedInvocationBinding, PlannedInvocationMaterialRecord,
+    PlanningContractError, ReceiptPlacement, ReceiptVerificationStrategy, RecordError, ReplayError,
+    RunEvent, RunEventBody, RunState, TransitionError, VerificationDisposition, apply_record,
+    replay,
 };
 
 pub use memory::MemoryRunStore;
@@ -88,6 +90,12 @@ struct EffectStartAnchor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct PlannedInvocationAnchor {
+    event_sequence: u64,
+    binding: PlannedInvocationBinding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ReceiptEventAnchor {
     event_sequence: u64,
     run_id: String,
@@ -105,6 +113,8 @@ struct VerifiedRunIndex {
     state: Option<RunState>,
     last_record: Option<EventRecord>,
     event_ids: BTreeSet<String>,
+    planned_invocations: BTreeMap<String, PlannedInvocationAnchor>,
+    plan_input_step_ids: BTreeSet<String>,
     intents: BTreeMap<String, EffectIntentAnchor>,
     effect_starts: BTreeMap<String, EffectStartAnchor>,
     receipt_events: Vec<ReceiptEventAnchor>,
@@ -124,11 +134,15 @@ struct AuditMetrics {
     #[cfg(test)]
     historical_materials: u64,
     #[cfg(test)]
+    historical_plan_inputs: u64,
+    #[cfg(test)]
     historical_receipts: u64,
     #[cfg(test)]
     candidate_events: u64,
     #[cfg(test)]
     candidate_materials: u64,
+    #[cfg(test)]
+    candidate_plan_inputs: u64,
     #[cfg(test)]
     candidate_receipts: u64,
     #[cfg(test)]
@@ -163,6 +177,28 @@ impl AuditMetrics {
         {
             self.historical_materials = self
                 .historical_materials
+                .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        }
+        #[cfg(not(test))]
+        let _ = (self, count);
+    }
+
+    fn record_historical_plan_inputs(&mut self, count: usize) {
+        #[cfg(test)]
+        {
+            self.historical_plan_inputs = self
+                .historical_plan_inputs
+                .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        }
+        #[cfg(not(test))]
+        let _ = (self, count);
+    }
+
+    fn record_candidate_plan_inputs(&mut self, count: usize) {
+        #[cfg(test)]
+        {
+            self.candidate_plan_inputs = self
+                .candidate_plan_inputs
                 .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
         }
         #[cfg(not(test))]
@@ -230,6 +266,25 @@ pub trait RunStore {
     ///
     /// Returns an error for stale heads, invalid transitions, serialization, or storage faults.
     fn append(&mut self, expected: ExpectedHead, event: RunEvent) -> Result<Commit, StoreError>;
+
+    /// Atomically append one accepted plan and every secret-free reconstructable input sidecar.
+    ///
+    /// Stores that do not implement this bundle fail closed. A `PlanAccepted` event must never be
+    /// sent through plain [`RunStore::append`], because that could publish runnable Steps without
+    /// restart material.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported stores, missing/orphan/mismatched inputs, stale heads,
+    /// invalid graph transitions, serialization, or storage faults.
+    fn append_with_plan_inputs(
+        &mut self,
+        _expected: ExpectedHead,
+        _event: RunEvent,
+        _inputs: Vec<PlannedInvocationMaterialRecord>,
+    ) -> Result<Commit, StoreError> {
+        Err(StoreError::PlannedInvocationStoreUnsupported)
+    }
 
     /// Atomically append one effect intent and its secret-free invocation material descriptor.
     ///
@@ -300,6 +355,19 @@ pub trait RunStore {
         _effect_id: &str,
     ) -> Result<Option<InvocationMaterialRecord>, StoreError> {
         Err(StoreError::InvocationMaterialStoreUnsupported)
+    }
+
+    /// Load one verified accepted-plan input by Step ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store does not support plan inputs or committed data is missing,
+    /// corrupt, or inconsistent with its journal binding.
+    fn load_planned_invocation(
+        &self,
+        _step_id: &str,
+    ) -> Result<Option<PlannedInvocationMaterialRecord>, StoreError> {
+        Err(StoreError::PlannedInvocationStoreUnsupported)
     }
 
     /// Load every verified Receipt in journal order.
@@ -395,6 +463,148 @@ pub trait RunStore {
             .map(|receipt| ProtocolDocument::ExecutionReceipt(Box::new(receipt)))
             .collect();
         canonical_jsonl(&documents)
+    }
+}
+
+fn verify_plan_input_bundle(
+    event: &RunEvent,
+    inputs: Option<&[PlannedInvocationMaterialRecord]>,
+) -> Result<(), StoreError> {
+    match (&event.body, inputs) {
+        (RunEventBody::PlanAccepted { steps, .. }, Some(inputs)) => {
+            if inputs.len() != steps.len() {
+                return Err(StoreError::PlannedInvocationInputCountMismatch {
+                    expected: steps.len(),
+                    actual: inputs.len(),
+                });
+            }
+            let mut by_step = BTreeMap::new();
+            for input in inputs {
+                if by_step.insert(input.step_id(), input).is_some() {
+                    return Err(StoreError::DuplicatePlannedInvocationInput(
+                        input.step_id().to_owned(),
+                    ));
+                }
+            }
+            for step in steps {
+                let input = by_step.get(step.step_id.as_str()).ok_or_else(|| {
+                    StoreError::PlannedInvocationInputMissing(step.step_id.clone())
+                })?;
+                input.verify_for(&event.run_id, &step.step_id, &step.invocation)?;
+            }
+            Ok(())
+        }
+        (RunEventBody::PlanAccepted { .. }, None) => {
+            Err(StoreError::PlannedInvocationInputsRequired)
+        }
+        (_, Some(inputs)) if !inputs.is_empty() => {
+            Err(StoreError::UnexpectedPlannedInvocationInputs)
+        }
+        (_, Some(_) | None) => Ok(()),
+    }
+}
+
+fn verify_plan_input_records(
+    index: &mut VerifiedRunIndex,
+    inputs: &BTreeMap<String, PlannedInvocationMaterialRecord>,
+    metrics: &mut AuditMetrics,
+) -> Result<(), StoreError> {
+    metrics.record_historical_plan_inputs(inputs.len());
+    for (step_id, anchor) in &index.planned_invocations {
+        let input = inputs.get(step_id).ok_or_else(|| {
+            StoreError::Corrupt(format!(
+                "planned Step `{step_id}` has no invocation input sidecar"
+            ))
+        })?;
+        let run_id = index
+            .state
+            .as_ref()
+            .map(|state| state.run_id.as_str())
+            .ok_or_else(|| StoreError::Corrupt("planned input exists without a Run".to_owned()))?;
+        input
+            .verify_for(run_id, step_id, &anchor.binding)
+            .map_err(|error| {
+                StoreError::Corrupt(format!(
+                    "planned invocation input for Step `{step_id}` is invalid: {error}"
+                ))
+            })?;
+    }
+    if inputs.len() != index.planned_invocations.len() {
+        return Err(StoreError::Corrupt(format!(
+            "planned invocation input count differs from accepted Steps: expected {}, actual {}",
+            index.planned_invocations.len(),
+            inputs.len()
+        )));
+    }
+    index.plan_input_step_ids = inputs.keys().cloned().collect();
+    Ok(())
+}
+
+fn verify_plan_input_point(
+    index: &VerifiedRunIndex,
+    step_id: &str,
+    input: Option<&PlannedInvocationMaterialRecord>,
+) -> Result<(), StoreError> {
+    match (index.planned_invocations.get(step_id), input) {
+        (None, None) => Ok(()),
+        (None, Some(_)) => Err(StoreError::Corrupt(
+            "planned invocation input has no accepted Step".to_owned(),
+        )),
+        (Some(_), None) => Err(StoreError::Corrupt(
+            "accepted Step has no planned invocation input".to_owned(),
+        )),
+        (Some(anchor), Some(input)) => {
+            let run_id = index
+                .state
+                .as_ref()
+                .map(|state| state.run_id.as_str())
+                .ok_or_else(|| {
+                    StoreError::Corrupt("planned input exists without a Run".to_owned())
+                })?;
+            input
+                .verify_for(run_id, step_id, &anchor.binding)
+                .map_err(|error| {
+                    StoreError::Corrupt(format!(
+                        "planned invocation input for Step `{step_id}` is invalid: {error}"
+                    ))
+                })
+        }
+    }
+}
+
+fn verify_planned_material_retention(
+    index: &VerifiedRunIndex,
+    event: &RunEvent,
+    material: &InvocationMaterialRecord,
+    input: Option<&PlannedInvocationMaterialRecord>,
+) -> Result<(), StoreError> {
+    let RunEventBody::EffectIntentCommitted { step_id, .. } = &event.body else {
+        return Ok(());
+    };
+    match (index.planned_invocations.get(step_id), input) {
+        (None, None) => Ok(()),
+        (None, Some(_)) => Err(StoreError::Corrupt(
+            "planned input exists for a legacy effect Step".to_owned(),
+        )),
+        (Some(_), None) => Err(StoreError::PlannedInvocationInputMissing(step_id.clone())),
+        (Some(anchor), Some(input)) => {
+            let run_id = index
+                .state
+                .as_ref()
+                .map(|state| state.run_id.as_str())
+                .ok_or_else(|| {
+                    StoreError::Corrupt("planned input exists without a Run".to_owned())
+                })?;
+            input.verify_for(run_id, step_id, &anchor.binding)?;
+            let expected =
+                InvocationMaterialRetention::ReconstructableReference(input.reference().clone());
+            if material.retention() != &expected {
+                return Err(StoreError::PlannedInvocationRetentionMismatch(
+                    step_id.clone(),
+                ));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -552,6 +762,25 @@ impl VerifiedRunIndex {
                 ));
             }
             match &record.event.body {
+                RunEventBody::PlanAccepted { steps, .. } => {
+                    for step in steps {
+                        if index
+                            .planned_invocations
+                            .insert(
+                                step.step_id.clone(),
+                                PlannedInvocationAnchor {
+                                    event_sequence: record.sequence,
+                                    binding: step.invocation.clone(),
+                                },
+                            )
+                            .is_some()
+                        {
+                            return Err(StoreError::Corrupt(
+                                "journal contains a duplicate planned invocation".to_owned(),
+                            ));
+                        }
+                    }
+                }
                 RunEventBody::EffectIntentCommitted { step_id, intent } => {
                     if index
                         .intents
@@ -670,12 +899,24 @@ impl VerifiedRunIndex {
     fn apply_committed(
         &mut self,
         commit: &Commit,
+        plan_inputs: Option<&[PlannedInvocationMaterialRecord]>,
         material: Option<&InvocationMaterialRecord>,
         receipt: Option<&ExecutionReceiptBody>,
         receipt_anchor: Option<ReceiptEventAnchor>,
     ) {
         self.event_ids.insert(commit.record.event.event_id.clone());
         match &commit.record.event.body {
+            RunEventBody::PlanAccepted { steps, .. } => {
+                for step in steps {
+                    self.planned_invocations.insert(
+                        step.step_id.clone(),
+                        PlannedInvocationAnchor {
+                            event_sequence: commit.record.sequence,
+                            binding: step.invocation.clone(),
+                        },
+                    );
+                }
+            }
             RunEventBody::EffectIntentCommitted { step_id, intent } => {
                 self.intents.insert(
                     intent.effect_id.clone(),
@@ -700,6 +941,10 @@ impl VerifiedRunIndex {
                 receipt_anchor.expect("verified Receipt commit must retain its event anchor"),
             ),
             _ => {}
+        }
+        if let Some(inputs) = plan_inputs {
+            self.plan_input_step_ids
+                .extend(inputs.iter().map(|input| input.step_id().to_owned()));
         }
         if let Some(material) = material {
             self.material_effect_ids
@@ -1025,6 +1270,8 @@ pub enum StoreError {
     #[error(transparent)]
     InvocationMaterial(#[from] InvocationMaterialError),
     #[error(transparent)]
+    PlanningContract(#[from] PlanningContractError),
+    #[error(transparent)]
     Replay(#[from] ReplayError),
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
@@ -1044,6 +1291,20 @@ pub enum StoreError {
     Corrupt(String),
     #[error("an effect intent requires an atomic invocation material descriptor")]
     InvocationMaterialRequired,
+    #[error("an accepted plan requires all planned invocation input sidecars atomically")]
+    PlannedInvocationInputsRequired,
+    #[error("planned invocation inputs were supplied for an event that is not an accepted plan")]
+    UnexpectedPlannedInvocationInputs,
+    #[error("this Run store does not support durable planned invocation inputs")]
+    PlannedInvocationStoreUnsupported,
+    #[error("accepted plan expected {expected} input sidecars, got {actual}")]
+    PlannedInvocationInputCountMismatch { expected: usize, actual: usize },
+    #[error("accepted Step `{0}` has no planned invocation input sidecar")]
+    PlannedInvocationInputMissing(String),
+    #[error("planned invocation input for Step `{0}` is duplicated")]
+    DuplicatePlannedInvocationInput(String),
+    #[error("effect material for planned Step `{0}` does not retain its accepted recipe reference")]
+    PlannedInvocationRetentionMismatch(String),
     #[error("invocation material was supplied for an event that is not an effect intent")]
     UnexpectedInvocationMaterial,
     #[error("this Run store does not support durable invocation material descriptors")]
@@ -1079,12 +1340,15 @@ mod tests {
     };
     use xgeny_protocol::canonical_digest_without_field;
     use xgeny_workgraph::{
-        AuthorizationBinding, AuthorizationUse, ContinuationAction, EffectClass, EffectIntent,
-        InvocationBinding, InvocationMaterialRecord, InvocationMaterialRetention, ReceiptPlacement,
+        AcceptedPlanStep, AgentLoopBudget, AuthorizationBinding, AuthorizationUse,
+        ContinuationAction, EffectClass, EffectIntent, ExpectedPlanningTurn, InvocationBinding,
+        InvocationMaterialRecord, InvocationMaterialRetention, PlannedExecutionProfile,
+        PlannedInvocationMaterialRecord, PlannedInvocationSpec, ReceiptPlacement,
         ReceiptProvenance, ReceiptVerificationRule, ReceiptVerificationStrategy,
-        ReconciliationResolution, RunEvent, RunEventBody, RunState, SinkGuarantee, StepStatus,
-        VerificationDisposition, authorization_digest, derive_frontier, invocation_material_digest,
-        invocation_material_retention_digest, once_authorization_id, receipt_provenance_digest,
+        ReconciliationResolution, ReconstructableMaterialReference, RunEvent, RunEventBody,
+        RunState, SinkGuarantee, StepStatus, VerificationDisposition, authorization_digest,
+        derive_frontier, invocation_material_digest, invocation_material_retention_digest,
+        once_authorization_id, receipt_provenance_digest,
     };
 
     use super::*;
@@ -1249,6 +1513,546 @@ mod tests {
                 ),
             )
             .expect("step plan should commit")
+    }
+
+    fn plan_input(
+        step_id: &str,
+        proposal_digest: &str,
+        marker: char,
+    ) -> (AcceptedPlanStep, PlannedInvocationMaterialRecord) {
+        let hex = |value: char| format!("sha256:{}", value.to_string().repeat(64));
+        let spec = PlannedInvocationSpec::new(
+            "test.read",
+            "1.0.0",
+            hex('a'),
+            hex(marker),
+            hex('e'),
+            PlannedExecutionProfile::LocalSyncOnceV1,
+            "linux",
+            "x86_64",
+        )
+        .expect("plan spec should be valid");
+        let reference = ReconstructableMaterialReference::new(
+            "test-recipes",
+            format!("recipe-{marker}"),
+            "rev-1",
+        )
+        .expect("recipe reference should be valid");
+        let (binding, record) = PlannedInvocationMaterialRecord::bind(
+            "run-1",
+            step_id,
+            proposal_digest,
+            spec,
+            reference,
+        )
+        .expect("plan input should bind");
+        (
+            AcceptedPlanStep {
+                step_id: step_id.to_owned(),
+                objective: format!("perform {step_id}"),
+                depends_on: Vec::new(),
+                invocation: binding,
+            },
+            record,
+        )
+    }
+
+    fn seed_planning_context<S: RunStore>(store: &mut S) -> Commit {
+        let created = store
+            .append(
+                ExpectedHead::Empty,
+                event(
+                    "plan-test-run-created",
+                    RunEventBody::RunCreated {
+                        goal: "durable plan failure tests".to_owned(),
+                    },
+                ),
+            )
+            .expect("Run should be created");
+        store
+            .append(
+                ExpectedHead::from_state(&created.state),
+                event(
+                    "plan-test-loop-configured",
+                    RunEventBody::AgentLoopConfigured {
+                        budget: AgentLoopBudget::new(4, 8, 8, 16_384)
+                            .expect("budget should be valid"),
+                    },
+                ),
+            )
+            .expect("loop should configure")
+    }
+
+    fn accepted_plan_event(
+        event_id: &str,
+        proposal_digest: &str,
+        steps: Vec<AcceptedPlanStep>,
+    ) -> RunEvent {
+        event(
+            event_id,
+            RunEventBody::PlanAccepted {
+                decision: ExpectedPlanningTurn::new(
+                    1,
+                    format!("sha256:{}", "d".repeat(64)),
+                    proposal_digest,
+                )
+                .expect("turn should bind"),
+                steps,
+            },
+        )
+    }
+
+    fn append_plan_bundle<S: RunStore>(store: &mut S) -> Commit {
+        let created = store
+            .append(
+                ExpectedHead::Empty,
+                event(
+                    "plan-run-created",
+                    RunEventBody::RunCreated {
+                        goal: "durable plan".to_owned(),
+                    },
+                ),
+            )
+            .expect("Run should be created");
+        let configured = store
+            .append(
+                ExpectedHead::from_state(&created.state),
+                event(
+                    "plan-loop-configured",
+                    RunEventBody::AgentLoopConfigured {
+                        budget: AgentLoopBudget::new(4, 8, 8, 16_384)
+                            .expect("budget should be valid"),
+                    },
+                ),
+            )
+            .expect("loop should configure");
+        let proposal_digest = format!("sha256:{}", "f".repeat(64));
+        let (step_a, input_a) = plan_input("step-a", &proposal_digest, 'b');
+        let (mut step_b, input_b) = plan_input("step-b", &proposal_digest, 'c');
+        step_b.depends_on.push("step-a".to_owned());
+        let event = event(
+            "plan-accepted",
+            RunEventBody::PlanAccepted {
+                decision: ExpectedPlanningTurn::new(
+                    1,
+                    format!("sha256:{}", "d".repeat(64)),
+                    proposal_digest,
+                )
+                .expect("turn should bind"),
+                steps: vec![step_b, step_a],
+            },
+        );
+        store
+            .append_with_plan_inputs(
+                ExpectedHead::from_state(&configured.state),
+                event,
+                vec![input_b, input_a],
+            )
+            .expect("plan and inputs should commit atomically")
+    }
+
+    fn planned_effect_bundle(
+        state: &RunState,
+        step_id: &str,
+        retention: InvocationMaterialRetention,
+    ) -> (RunEvent, InvocationMaterialRecord) {
+        let planned = state.steps[step_id]
+            .planned_invocation
+            .as_ref()
+            .expect("accepted Step should have a planned binding");
+        let invocation = InvocationBinding {
+            capability_id: planned.capability_id().to_owned(),
+            contract_version: planned.contract_version().to_owned(),
+            definition_digest: planned.definition_digest().to_owned(),
+            instance_id: "test.planned.instance".to_owned(),
+            instance_binding_digest: format!("sha256:{}", "8".repeat(64)),
+        };
+        let provenance = ReceiptProvenance {
+            profile_version: CORE_RECEIPT_PROFILE_V1.to_owned(),
+            invocation_id: "invocation-planned-step".to_owned(),
+            plan_id: planned.plan_id().to_owned(),
+            policy_decision_id: "decision-planned-step".to_owned(),
+            policy_decision_digest: format!("sha256:{}", "7".repeat(64)),
+            executor_id: "xgeny-local".to_owned(),
+            executor_placement: ReceiptPlacement::Local,
+            executor_platform: format!("{}-{}", planned.target_os(), planned.target_arch()),
+            input_summary: CORE_RECEIPT_INPUT_SUMMARY_V1.to_owned(),
+            verification_plan: Vec::new(),
+        };
+        let binding = AuthorizationBinding {
+            run_id: state.run_id.clone(),
+            step_id: step_id.to_owned(),
+            authority: state.authority.clone(),
+            authority_epoch: state.authority_epoch,
+            issued_at_sequence: state.journal_sequence,
+            issued_at_head_digest: state.journal_head_digest.clone(),
+            capability_id: invocation.capability_id.clone(),
+            contract_version: invocation.contract_version.clone(),
+            definition_digest: invocation.definition_digest.clone(),
+            instance_id: invocation.instance_id.clone(),
+            instance_binding_digest: invocation.instance_binding_digest.clone(),
+            action_digest: planned.action_digest().to_owned(),
+            material_digest: planned.plan_input_digest().to_owned(),
+            material_retention_digest: invocation_material_retention_digest(&retention)
+                .expect("retention should digest"),
+            policy_evidence_digest: format!("sha256:{}", "6".repeat(64)),
+            receipt_provenance_digest: Some(
+                receipt_provenance_digest(&provenance).expect("provenance should digest"),
+            ),
+        };
+        let intent = EffectIntent {
+            effect_id: format!("effect-{step_id}"),
+            action_digest: planned.action_digest().to_owned(),
+            invocation,
+            effect_class: EffectClass::Idempotent,
+            idempotency_key: Some(format!("key-{step_id}")),
+            sink_guarantee: SinkGuarantee::None,
+            authorization: AuthorizationUse {
+                grant_id: once_authorization_id(&state.run_id, planned.action_digest())
+                    .expect("authorization ID should derive"),
+                grant_digest: authorization_digest(&binding, 1)
+                    .expect("authorization should digest"),
+                max_uses: 1,
+                binding,
+            },
+            receipt_provenance: Some(provenance),
+        };
+        let material = InvocationMaterialRecord::new(
+            &state.run_id,
+            step_id,
+            &intent,
+            planned.plan_input_digest(),
+            retention,
+        )
+        .expect("material should bind");
+        (
+            event(
+                "planned-effect-intent",
+                RunEventBody::EffectIntentCommitted {
+                    step_id: step_id.to_owned(),
+                    intent: Box::new(intent),
+                },
+            ),
+            material,
+        )
+    }
+
+    #[test]
+    fn memory_and_sqlite_atomically_retain_all_plan_inputs() {
+        let mut memory = MemoryRunStore::new();
+        let memory_commit = append_plan_bundle(&mut memory);
+        assert_eq!(memory_commit.state.steps.len(), 2);
+        assert_eq!(
+            memory
+                .load_planned_invocation("step-a")
+                .expect("memory plan input should load")
+                .expect("step-a input should exist")
+                .step_id(),
+            "step-a"
+        );
+
+        let directory = tempdir().expect("temp directory should exist");
+        let path = directory.path().join("planned.db");
+        let sqlite_commit = {
+            let mut sqlite = SqliteRunStore::open(&path).expect("SQLite should open");
+            append_plan_bundle(&mut sqlite)
+        };
+        let reopened = SqliteRunStore::open(&path).expect("SQLite should reopen");
+        assert_eq!(
+            reopened
+                .load_current()
+                .expect("projection should load")
+                .expect("Run should exist"),
+            sqlite_commit.state
+        );
+        assert_eq!(
+            reopened
+                .load_planned_invocation("step-b")
+                .expect("SQLite plan input should load")
+                .expect("step-b input should exist")
+                .step_id(),
+            "step-b"
+        );
+    }
+
+    fn assert_planned_recipe_replacement_is_rejected<S: RunStore>(store: &mut S) {
+        let planned = append_plan_bundle(store);
+        let before = store
+            .load()
+            .expect("planned store should verify")
+            .expect("Run should exist");
+        let replacement = InvocationMaterialRetention::ReconstructableReference(
+            ReconstructableMaterialReference::new("other-recipes", "replacement", "rev-9")
+                .expect("replacement reference should validate"),
+        );
+        let (event, material) = planned_effect_bundle(&planned.state, "step-a", replacement);
+
+        let result = store.append_with_invocation_material(
+            ExpectedHead::from_state(&planned.state),
+            event,
+            material,
+        );
+
+        assert!(matches!(
+            result,
+            Err(StoreError::PlannedInvocationRetentionMismatch(step_id)) if step_id == "step-a"
+        ));
+        assert_eq!(
+            store.load().expect("rejected store should still verify"),
+            Some(before)
+        );
+    }
+
+    #[test]
+    fn memory_and_sqlite_pin_final_effect_material_to_the_accepted_recipe() {
+        let mut memory = MemoryRunStore::new();
+        assert_planned_recipe_replacement_is_rejected(&mut memory);
+
+        let directory = tempdir().expect("temp directory should exist");
+        let mut sqlite = SqliteRunStore::open(directory.path().join("planned-retention.db"))
+            .expect("SQLite should open");
+        assert_planned_recipe_replacement_is_rejected(&mut sqlite);
+    }
+
+    fn assert_plan_input_bundle_rejections_leave_store_unchanged<S: RunStore>(store: &mut S) {
+        let configured = seed_planning_context(store);
+        let before = store
+            .load()
+            .expect("seeded store should verify")
+            .expect("seeded Run should exist");
+        let expected = ExpectedHead::from_state(&configured.state);
+        let proposal_digest = format!("sha256:{}", "f".repeat(64));
+        let (step_a, input_a) = plan_input("step-a", &proposal_digest, 'a');
+
+        let plain = store.append(
+            expected.clone(),
+            accepted_plan_event(
+                "plain-plan-accepted",
+                &proposal_digest,
+                vec![step_a.clone()],
+            ),
+        );
+        assert!(matches!(
+            plain,
+            Err(StoreError::PlannedInvocationInputsRequired)
+        ));
+        assert_eq!(
+            store.load().expect("plain rejection should verify"),
+            Some(before.clone())
+        );
+
+        let (step_b, _input_b) = plan_input("step-b", &proposal_digest, 'b');
+        let (_step_c, orphan_input) = plan_input("step-c", &proposal_digest, 'c');
+        let missing = store.append_with_plan_inputs(
+            expected.clone(),
+            accepted_plan_event(
+                "missing-plan-input",
+                &proposal_digest,
+                vec![step_a.clone(), step_b],
+            ),
+            vec![input_a.clone(), orphan_input],
+        );
+        assert!(matches!(
+            missing,
+            Err(StoreError::PlannedInvocationInputMissing(step_id)) if step_id == "step-b"
+        ));
+        assert_eq!(
+            store.load().expect("missing rejection should verify"),
+            Some(before.clone())
+        );
+
+        let orphan = store.append_with_plan_inputs(
+            expected.clone(),
+            event(
+                "orphan-plan-input",
+                RunEventBody::StepPlanned {
+                    step_id: "legacy-step".to_owned(),
+                    objective: "legacy manual planning".to_owned(),
+                    depends_on: Vec::new(),
+                },
+            ),
+            vec![input_a.clone()],
+        );
+        assert!(matches!(
+            orphan,
+            Err(StoreError::UnexpectedPlannedInvocationInputs)
+        ));
+        assert_eq!(
+            store.load().expect("orphan rejection should verify"),
+            Some(before.clone())
+        );
+
+        let (_same_step, mismatched_input) = plan_input("step-a", &proposal_digest, '9');
+        let mismatched = store.append_with_plan_inputs(
+            expected,
+            accepted_plan_event("mismatched-plan-input", &proposal_digest, vec![step_a]),
+            vec![mismatched_input],
+        );
+        assert!(matches!(mismatched, Err(StoreError::PlanningContract(_))));
+        assert_eq!(
+            store.load().expect("mismatch rejection should verify"),
+            Some(before)
+        );
+        assert!(
+            store
+                .load_planned_invocation("step-a")
+                .expect("uncommitted input lookup should verify")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn memory_and_sqlite_reject_incomplete_or_mismatched_plan_bundles_without_mutation() {
+        let mut memory = MemoryRunStore::new();
+        assert_plan_input_bundle_rejections_leave_store_unchanged(&mut memory);
+
+        let directory = tempdir().expect("temp directory should exist");
+        let mut sqlite =
+            SqliteRunStore::open(directory.path().join("planned.db")).expect("SQLite should open");
+        assert_plan_input_bundle_rejections_leave_store_unchanged(&mut sqlite);
+        assert_eq!(
+            sqlite
+                .planned_invocation_count()
+                .expect("planned invocation count"),
+            0
+        );
+    }
+
+    #[test]
+    fn sqlite_rolls_back_plan_event_sidecars_and_projection_at_each_plan_write_stage() {
+        for fault in [
+            AppendFault::Event,
+            AppendFault::PlannedInvocation,
+            AppendFault::Projection,
+        ] {
+            let directory = tempdir().expect("temp directory should exist");
+            let mut store = SqliteRunStore::open(directory.path().join("planned.db"))
+                .expect("SQLite should open");
+            let configured = seed_planning_context(&mut store);
+            let before = store
+                .load()
+                .expect("seeded store should verify")
+                .expect("seeded Run should exist");
+            let proposal_digest = format!("sha256:{}", "f".repeat(64));
+            let (step_a, input_a) = plan_input("step-a", &proposal_digest, 'a');
+            let (step_b, input_b) = plan_input("step-b", &proposal_digest, 'b');
+            let candidate =
+                accepted_plan_event("faulted-plan", &proposal_digest, vec![step_a, step_b]);
+            let inputs = vec![input_a, input_b];
+
+            let result = store.append_plan_with_fault(
+                ExpectedHead::from_state(&configured.state),
+                candidate.clone(),
+                &inputs,
+                fault,
+            );
+            assert!(matches!(result, Err(StoreError::InjectedFault(_))));
+            assert_eq!(
+                store.load().expect("rolled-back store should verify"),
+                Some(before)
+            );
+            assert_eq!(store.run_event_count().expect("event count"), 2);
+            assert_eq!(
+                store
+                    .planned_invocation_count()
+                    .expect("planned invocation count"),
+                0
+            );
+
+            let committed = store
+                .append_with_plan_inputs(
+                    ExpectedHead::from_state(&configured.state),
+                    candidate,
+                    inputs,
+                )
+                .expect("retry should atomically commit the plan bundle");
+            assert_eq!(committed.record.sequence, 3);
+            assert_eq!(store.run_event_count().expect("event count"), 3);
+            assert_eq!(
+                store
+                    .planned_invocation_count()
+                    .expect("planned invocation count"),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_detects_missing_tampered_and_orphan_planned_invocation_sidecars() {
+        let populate = |path: &std::path::Path| {
+            let mut store = SqliteRunStore::open(path).expect("SQLite should open");
+            append_plan_bundle(&mut store);
+            assert_eq!(
+                store
+                    .planned_invocation_count()
+                    .expect("planned invocation count"),
+                2
+            );
+        };
+
+        let missing_directory = tempdir().expect("temp directory should exist");
+        let missing_path = missing_directory.path().join("missing.db");
+        populate(&missing_path);
+        let connection = rusqlite::Connection::open(&missing_path).expect("raw SQLite should open");
+        connection
+            .execute(
+                "DELETE FROM planned_invocations WHERE step_id = 'step-a'",
+                [],
+            )
+            .expect("sidecar deletion should commit");
+        drop(connection);
+        assert!(matches!(
+            SqliteRunStore::open(&missing_path),
+            Err(StoreError::Corrupt(_))
+        ));
+
+        let tampered_directory = tempdir().expect("temp directory should exist");
+        let tampered_path = tampered_directory.path().join("tampered.db");
+        populate(&tampered_path);
+        let connection =
+            rusqlite::Connection::open(&tampered_path).expect("raw SQLite should open");
+        let record_json: Vec<u8> = connection
+            .query_row(
+                "SELECT record_json FROM planned_invocations WHERE step_id = 'step-a'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("planned invocation should load");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&record_json).expect("record should decode");
+        assert_eq!(record["reference"]["revision"], "rev-1");
+        record["reference"]["revision"] = serde_json::Value::String("rev-2".to_owned());
+        connection
+            .execute(
+                "UPDATE planned_invocations SET record_json = ?1 WHERE step_id = 'step-a'",
+                [serde_json::to_vec(&record).expect("tampered record should encode")],
+            )
+            .expect("sidecar tampering should commit");
+        drop(connection);
+        assert!(matches!(
+            SqliteRunStore::open(&tampered_path),
+            Err(StoreError::Corrupt(_))
+        ));
+
+        let orphan_directory = tempdir().expect("temp directory should exist");
+        let orphan_path = orphan_directory.path().join("orphan.db");
+        populate(&orphan_path);
+        let connection = rusqlite::Connection::open(&orphan_path).expect("raw SQLite should open");
+        connection
+            .execute(
+                "INSERT INTO planned_invocations \
+                 (step_id, event_sequence, plan_id, record_digest, record_json) \
+                 SELECT 'orphan-step', event_sequence, plan_id || '-orphan', \
+                        record_digest || '-orphan', record_json \
+                 FROM planned_invocations WHERE step_id = 'step-a'",
+                [],
+            )
+            .expect("orphan sidecar insertion should commit");
+        drop(connection);
+        assert!(matches!(
+            SqliteRunStore::open(&orphan_path),
+            Err(StoreError::Corrupt(_))
+        ));
     }
 
     fn material(state: &RunState, effect: &EffectIntent) -> InvocationMaterialRecord {
@@ -2394,7 +3198,7 @@ mod tests {
         let connection = rusqlite::Connection::open(&path).expect("SQLite file should open");
         drop(connection);
 
-        for version in [1_i64, 2_i64, 6_i64] {
+        for version in [1_i64, 2_i64, 7_i64] {
             let connection = rusqlite::Connection::open(&path).expect("SQLite file should open");
             connection
                 .pragma_update(None, "user_version", version)
@@ -2414,7 +3218,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_sqlite_store_uses_schema_version_five() {
+    fn fresh_sqlite_store_uses_schema_version_six() {
         let directory = tempdir().expect("temp directory should exist");
         let path = directory.path().join("run.db");
         drop(SqliteRunStore::open(&path).expect("fresh SQLite should open"));
@@ -2422,7 +3226,160 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("schema version should be readable");
+        assert_eq!(version, 6);
+    }
+
+    #[test]
+    fn sqlite_migrates_schema_five_without_rewriting_existing_durable_data() {
+        let directory = tempdir().expect("temp directory should exist");
+        let path = directory.path().join("run.db");
+        {
+            let mut store = SqliteRunStore::open(&path).expect("schema six store should open");
+            commit_two_receipt_chain(&mut store);
+            assert_eq!(
+                store
+                    .planned_invocation_count()
+                    .expect("planned invocation count"),
+                0
+            );
+        }
+
+        let connection = rusqlite::Connection::open(&path).expect("raw SQLite should open");
+        let expected_events = sqlite_event_rows(&connection);
+        let expected_projection = sqlite_blob_rows(
+            &connection,
+            "SELECT state_json FROM run_projection ORDER BY singleton",
+        );
+        let expected_intents = sqlite_blob_rows(
+            &connection,
+            "SELECT intent_json FROM effect_intents ORDER BY effect_id",
+        );
+        let expected_authorizations = sqlite_authorization_rows(&connection);
+        let expected_materials = sqlite_blob_rows(
+            &connection,
+            "SELECT record_json FROM invocation_materials ORDER BY effect_id",
+        );
+        let expected_receipts = sqlite_blob_rows(
+            &connection,
+            "SELECT receipt_json FROM execution_receipts ORDER BY event_sequence",
+        );
+        connection
+            .execute("DROP TABLE planned_invocations", [])
+            .expect("schema-five fixture should not have plan input storage");
+        connection
+            .pragma_update(None, "user_version", 5_i64)
+            .expect("fixture should declare schema five");
+        drop(connection);
+
+        let migrated = SqliteRunStore::open(&path).expect("schema five should migrate");
+        assert_eq!(
+            migrated
+                .planned_invocation_count()
+                .expect("planned invocation count"),
+            0
+        );
+        migrated
+            .load()
+            .expect("migrated store should verify")
+            .expect("Run should remain");
+        drop(migrated);
+
+        let connection = rusqlite::Connection::open(&path).expect("SQLite should reopen");
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("schema version should load");
+        assert_eq!(version, 6);
+        assert_eq!(sqlite_event_rows(&connection), expected_events);
+        assert_eq!(
+            sqlite_blob_rows(
+                &connection,
+                "SELECT state_json FROM run_projection ORDER BY singleton"
+            ),
+            expected_projection
+        );
+        assert_eq!(
+            sqlite_blob_rows(
+                &connection,
+                "SELECT intent_json FROM effect_intents ORDER BY effect_id"
+            ),
+            expected_intents
+        );
+        assert_eq!(
+            sqlite_authorization_rows(&connection),
+            expected_authorizations
+        );
+        assert_eq!(
+            sqlite_blob_rows(
+                &connection,
+                "SELECT record_json FROM invocation_materials ORDER BY effect_id"
+            ),
+            expected_materials
+        );
+        assert_eq!(
+            sqlite_blob_rows(
+                &connection,
+                "SELECT receipt_json FROM execution_receipts ORDER BY event_sequence"
+            ),
+            expected_receipts
+        );
+    }
+
+    #[test]
+    fn corrupt_schema_five_migration_rolls_back_schema_and_version() {
+        let directory = tempdir().expect("temp directory should exist");
+        let path = directory.path().join("run.db");
+        {
+            let mut store = SqliteRunStore::open(&path).expect("schema six store should open");
+            let seeded = seed(&mut store);
+            append_intent(&mut store, &seeded);
+        }
+
+        let connection = rusqlite::Connection::open(&path).expect("raw SQLite should open");
+        connection
+            .execute("DROP TABLE planned_invocations", [])
+            .expect("schema-five fixture should not have plan input storage");
+        connection
+            .execute(
+                "UPDATE effect_intents SET action_digest = 'sha256:corrupted'",
+                [],
+            )
+            .expect("derived index should be corrupted");
+        connection
+            .pragma_update(None, "user_version", 5_i64)
+            .expect("fixture should declare schema five");
+        drop(connection);
+
+        let Err(error) = SqliteRunStore::open(&path) else {
+            panic!("corrupt schema five must not migrate");
+        };
+        assert!(
+            matches!(&error, StoreError::Corrupt(_)),
+            "unexpected migration error: {error}"
+        );
+
+        let connection = rusqlite::Connection::open(&path).expect("SQLite should reopen");
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("schema version should load");
+        let planned_table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'planned_invocations'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("schema should remain inspectable");
+        let action_digest: String = connection
+            .query_row(
+                "SELECT action_digest FROM effect_intents LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("corrupt fixture should remain intact");
+
         assert_eq!(version, 5);
+        assert_eq!(planned_table_count, 0);
+        assert_eq!(action_digest, "sha256:corrupted");
     }
 
     #[test]
@@ -2430,7 +3387,7 @@ mod tests {
         let directory = tempdir().expect("temp directory should exist");
         let path = directory.path().join("run.db");
         let (expected_state, expected_jsonl, expected_events) = {
-            let mut store = SqliteRunStore::open(&path).expect("schema five store should open");
+            let mut store = SqliteRunStore::open(&path).expect("schema six store should open");
             let seed = seed(&mut store);
             let committed = append_intent(&mut store, &seed);
             let jsonl = store.export_jsonl().expect("journal should export");
@@ -2468,7 +3425,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("schema version should load");
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         let mut statement = connection
             .prepare("SELECT event_json FROM run_events ORDER BY sequence")
             .expect("event query should prepare");
@@ -2481,11 +3438,11 @@ mod tests {
     }
 
     #[test]
-    fn schema_three_with_receipt_finalization_fails_without_publishing_schema_five() {
+    fn schema_three_with_receipt_finalization_fails_without_publishing_schema_six() {
         let directory = tempdir().expect("temp directory should exist");
         let path = directory.path().join("run.db");
         {
-            let mut store = SqliteRunStore::open(&path).expect("schema five store should open");
+            let mut store = SqliteRunStore::open(&path).expect("schema six store should open");
             commit_two_receipt_chain(&mut store);
         }
         let expected_events = {
@@ -2536,7 +3493,7 @@ mod tests {
             materials,
             receipt_rows,
         ) = {
-            let mut store = SqliteRunStore::open(&path).expect("schema five store should open");
+            let mut store = SqliteRunStore::open(&path).expect("schema six store should open");
             commit_two_receipt_chain(&mut store);
             let journal = store.export_jsonl().expect("journal should export");
             let receipts = store
@@ -2591,7 +3548,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("schema version should load");
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         assert_eq!(sqlite_event_rows(&connection), events);
         assert_eq!(
             sqlite_blob_rows(
@@ -2629,7 +3586,7 @@ mod tests {
         let directory = tempdir().expect("temp directory should exist");
         let path = directory.path().join("run.db");
         {
-            let mut store = SqliteRunStore::open(&path).expect("schema five store should open");
+            let mut store = SqliteRunStore::open(&path).expect("schema six store should open");
             commit_two_receipt_chain(&mut store);
         }
         let mut connection = rusqlite::Connection::open(&path).expect("SQLite should reopen");
@@ -2646,7 +3603,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("schema version should load");
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         drop(connection);
         SqliteRunStore::open(&path).expect("converged store should pass full open verification");
     }
@@ -2656,7 +3613,7 @@ mod tests {
         let directory = tempdir().expect("temp directory should exist");
         let path = directory.path().join("run.db");
         {
-            let mut store = SqliteRunStore::open(&path).expect("schema five store should open");
+            let mut store = SqliteRunStore::open(&path).expect("schema six store should open");
             commit_two_receipt_chain(&mut store);
         }
         let before = {

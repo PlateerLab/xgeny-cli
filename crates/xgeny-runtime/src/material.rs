@@ -12,10 +12,12 @@ use xgeny_workgraph::{
 };
 
 use crate::admission::{
-    AdmissionError, definition_contract_digest, executable_binding_digest, semantic_action_digest,
-    validate_arguments,
+    AdmissionError, AdmissionRequest, InvocationAdmission, PendingInvocation,
+    definition_contract_digest, executable_binding_digest, require_admission_ready_step,
+    semantic_action_digest, validate_arguments, verify_planned_definition_binding,
+    verify_planned_route_binding,
 };
-use crate::{CapabilityRegistry, EventFactory, EventFactoryError, RunLease};
+use crate::{CapabilityRegistry, EventFactory, EventFactoryError, RouteRequest, RunLease};
 
 /// Fixed, non-sensitive failure classes returned by a trusted material provider.
 ///
@@ -200,10 +202,97 @@ impl crate::AdmittedEffect {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct InvocationMaterialRecovery;
 
+/// Host-selected Step and route used to reconstruct one accepted planned invocation.
+#[derive(Debug, Clone)]
+pub struct PlannedAdmissionRequest {
+    step_id: String,
+    route: RouteRequest,
+}
+
+impl PlannedAdmissionRequest {
+    #[must_use]
+    pub fn new(step_id: impl Into<String>, route: RouteRequest) -> Self {
+        Self {
+            step_id: step_id.into(),
+            route,
+        }
+    }
+}
+
 impl InvocationMaterialRecovery {
     #[must_use]
     pub const fn new() -> Self {
         Self
+    }
+
+    /// Reconstruct one accepted plan input and prepare it for ordinary policy admission.
+    ///
+    /// The model never receives or chooses the provider recipe. This method loads the atomically
+    /// committed sidecar, verifies its exact Run/Step binding, reconstructs candidate arguments
+    /// behind the trusted provider boundary, and delegates all schema, resource, semantic digest,
+    /// target, and capability checks to [`InvocationAdmission`]. No effect is started or committed.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed for a missing plan binding or sidecar, wrong lease, provider failure, corrupt
+    /// binding, or any ordinary admission-preparation error.
+    pub fn prepare_planned_admission<S, R, L>(
+        &self,
+        store: &S,
+        lease: &L,
+        registry: &CapabilityRegistry,
+        resolver: &R,
+        providers: &mut MaterialProviderRegistry,
+        request: PlannedAdmissionRequest,
+    ) -> Result<PendingInvocation, MaterialRecoveryError>
+    where
+        S: RunStore,
+        R: ResourceResolver,
+        L: RunLease,
+    {
+        let PlannedAdmissionRequest { step_id, route } = request;
+        let state = store
+            .load_current()?
+            .ok_or(MaterialRecoveryError::RunNotInitialized)?;
+        verify_lease(lease, &state.run_id)?;
+        let step = state
+            .steps
+            .get(&step_id)
+            .ok_or_else(|| MaterialRecoveryError::StepNotFound(step_id.clone()))?;
+        if step.status != StepStatus::Planned {
+            return Err(MaterialRecoveryError::StepNotPlanned {
+                step_id,
+                actual: step.status,
+            });
+        }
+        require_admission_ready_step(&state, &step_id)?;
+        verify_planned_route_binding(&state, &step_id, &route)?;
+        verify_planned_definition_binding(&state, &step_id, registry)?;
+        let binding = step
+            .planned_invocation
+            .as_ref()
+            .ok_or_else(|| MaterialRecoveryError::PlannedInvocationMissing(step_id.clone()))?;
+        let input = store
+            .load_planned_invocation(&step_id)?
+            .ok_or_else(|| MaterialRecoveryError::PlannedInputRecordMissing(step_id.clone()))?;
+        input.verify_for(&state.run_id, &step_id, binding)?;
+        let reference = input.reference().clone();
+        let reconstructed = providers
+            .provider_mut(reference.provider_id())?
+            .reconstruct(reference.reference_id(), reference.revision())
+            .map_err(MaterialRecoveryError::Provider)?;
+        let pending = InvocationAdmission::new().prepare(
+            store,
+            lease,
+            registry,
+            resolver,
+            AdmissionRequest {
+                step_id,
+                route,
+                arguments: reconstructed,
+            },
+        )?;
+        Ok(pending)
     }
 
     /// Recover exact canonical arguments for an `IntentCommitted` Step.
@@ -398,6 +487,8 @@ pub enum MaterialRecoveryError {
     InvocationResolution(#[from] InvocationResolutionError),
     #[error(transparent)]
     MaterialRecord(#[from] xgeny_workgraph::InvocationMaterialError),
+    #[error(transparent)]
+    PlanningContract(#[from] xgeny_workgraph::PlanningContractError),
     #[error("durable Run is not initialized")]
     RunNotInitialized,
     #[error("step `{0}` does not exist")]
@@ -406,6 +497,12 @@ pub enum MaterialRecoveryError {
     IntentMissing(String),
     #[error("step `{step_id}` cannot recover material from status {actual:?}")]
     StepNotIntentCommitted { step_id: String, actual: StepStatus },
+    #[error("step `{step_id}` cannot prepare planned material from status {actual:?}")]
+    StepNotPlanned { step_id: String, actual: StepStatus },
+    #[error("step `{0}` has no durable planned invocation binding")]
+    PlannedInvocationMissing(String),
+    #[error("step `{0}` has no durable planned invocation input record")]
+    PlannedInputRecordMissing(String),
     #[error("effect `{effect_id}` has no invocation material descriptor")]
     MaterialRecordMissing { effect_id: String },
     #[error("ephemeral invocation material is unavailable after process loss")]

@@ -28,6 +28,18 @@ pub enum RunEventBody {
     RunCreated {
         goal: String,
     },
+    AgentLoopConfigured {
+        budget: AgentLoopBudget,
+    },
+    PlanAccepted {
+        decision: ExpectedPlanningTurn,
+        steps: Vec<AcceptedPlanStep>,
+    },
+    CompletionCandidateRecorded {
+        decision: ExpectedPlanningTurn,
+        candidate_id: String,
+        summary_digest: String,
+    },
     StepPlanned {
         step_id: String,
         objective: String,
@@ -99,6 +111,9 @@ impl RunEventBody {
     fn kind(&self) -> &'static str {
         match self {
             Self::RunCreated { .. } => "run_created",
+            Self::AgentLoopConfigured { .. } => "agent_loop_configured",
+            Self::PlanAccepted { .. } => "plan_accepted",
+            Self::CompletionCandidateRecorded { .. } => "completion_candidate_recorded",
             Self::StepPlanned { .. } => "step_planned",
             Self::EffectIntentCommitted { .. } => "effect_intent_committed",
             Self::InvocationMaterialUnavailable { .. } => "invocation_material_unavailable",
@@ -302,6 +317,620 @@ impl std::fmt::Debug for InvocationMaterialRetention {
                 .finish(),
         }
     }
+}
+
+pub const PLANNED_INVOCATION_FORMAT_VERSION: u32 = 1;
+pub const MAX_ACCEPTED_PLAN_STEPS: usize = 32;
+pub const MAX_ACCEPTED_PLAN_EDGES: usize = 128;
+pub const MAX_ACCEPTED_OBJECTIVE_BYTES: usize = 5_000;
+
+/// Durable limits for the model-owned portion of one local Runtime-mode Run.
+///
+/// `max_tool_calls` counts external effect starts (`StepState::attempts`), not conservative
+/// reconciliation probes or Core verification. Those safety actions must remain available after
+/// the model budget is exhausted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentLoopBudget {
+    pub max_model_turns: u32,
+    pub max_planned_steps: u32,
+    pub max_tool_calls: u32,
+    pub max_context_bytes: u64,
+}
+
+impl AgentLoopBudget {
+    /// Build a non-zero bounded loop budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any limit is zero.
+    pub fn new(
+        max_model_turns: u32,
+        max_planned_steps: u32,
+        max_tool_calls: u32,
+        max_context_bytes: u64,
+    ) -> Result<Self, PlanningContractError> {
+        let budget = Self {
+            max_model_turns,
+            max_planned_steps,
+            max_tool_calls,
+            max_context_bytes,
+        };
+        budget.validate()?;
+        Ok(budget)
+    }
+
+    fn validate(&self) -> Result<(), PlanningContractError> {
+        for (field, value) in [
+            ("max_model_turns", u64::from(self.max_model_turns)),
+            ("max_planned_steps", u64::from(self.max_planned_steps)),
+            ("max_tool_calls", u64::from(self.max_tool_calls)),
+            ("max_context_bytes", self.max_context_bytes),
+        ] {
+            if value == 0 {
+                return Err(PlanningContractError::ZeroBudget(field));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Host-owned binding for one accepted planner decision.
+///
+/// The model does not echo or choose these values. The Core binds the decision to the exact
+/// context and accepted proposal digests before appending it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExpectedPlanningTurn {
+    turn_index: u32,
+    context_digest: String,
+    proposal_digest: String,
+}
+
+impl ExpectedPlanningTurn {
+    /// Build a self-validating accepted-turn binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for turn zero or malformed digests.
+    pub fn new(
+        turn_index: u32,
+        context_digest: impl Into<String>,
+        proposal_digest: impl Into<String>,
+    ) -> Result<Self, PlanningContractError> {
+        let turn = Self {
+            turn_index,
+            context_digest: context_digest.into(),
+            proposal_digest: proposal_digest.into(),
+        };
+        turn.validate()?;
+        Ok(turn)
+    }
+
+    #[must_use]
+    pub const fn turn_index(&self) -> u32 {
+        self.turn_index
+    }
+
+    #[must_use]
+    pub fn context_digest(&self) -> &str {
+        &self.context_digest
+    }
+
+    #[must_use]
+    pub fn proposal_digest(&self) -> &str {
+        &self.proposal_digest
+    }
+
+    fn validate(&self) -> Result<(), PlanningContractError> {
+        if self.turn_index == 0 {
+            return Err(PlanningContractError::TurnIndexZero);
+        }
+        require_planning_digest("context_digest", &self.context_digest)?;
+        require_planning_digest("proposal_digest", &self.proposal_digest)
+    }
+}
+
+/// Host-selected execution semantics for a planned invocation.
+///
+/// The initial profile deliberately excludes Instance, trust, data-boundary, policy and approval
+/// choices. Those remain trusted routing/admission decisions after planning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlannedExecutionProfile {
+    LocalSyncOnceV1,
+}
+
+/// Secret-free semantic facts calculated from normalized transient arguments before plan commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedInvocationSpec {
+    capability_id: String,
+    contract_version: String,
+    definition_digest: String,
+    action_digest: String,
+    plan_input_digest: String,
+    execution_profile: PlannedExecutionProfile,
+    target_os: String,
+    target_arch: String,
+}
+
+impl PlannedInvocationSpec {
+    /// Build the immutable invocation facts that an accepted Step must later admit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty identifiers, unsupported target names, or malformed digests.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        capability_id: impl Into<String>,
+        contract_version: impl Into<String>,
+        definition_digest: impl Into<String>,
+        action_digest: impl Into<String>,
+        plan_input_digest: impl Into<String>,
+        execution_profile: PlannedExecutionProfile,
+        target_os: impl Into<String>,
+        target_arch: impl Into<String>,
+    ) -> Result<Self, PlanningContractError> {
+        let spec = Self {
+            capability_id: capability_id.into(),
+            contract_version: contract_version.into(),
+            definition_digest: definition_digest.into(),
+            action_digest: action_digest.into(),
+            plan_input_digest: plan_input_digest.into(),
+            execution_profile,
+            target_os: target_os.into(),
+            target_arch: target_arch.into(),
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    fn validate(&self) -> Result<(), PlanningContractError> {
+        require_planning_identifier("capability_id", &self.capability_id)?;
+        require_planning_identifier("contract_version", &self.contract_version)?;
+        require_planning_identifier("target_os", &self.target_os)?;
+        require_planning_identifier("target_arch", &self.target_arch)?;
+        if !matches!(self.target_os.as_str(), "linux" | "macos" | "windows") {
+            return Err(PlanningContractError::UnsupportedTarget("target_os"));
+        }
+        if !matches!(self.target_arch.as_str(), "x86_64" | "aarch64") {
+            return Err(PlanningContractError::UnsupportedTarget("target_arch"));
+        }
+        require_planning_digest("definition_digest", &self.definition_digest)?;
+        require_planning_digest("action_digest", &self.action_digest)?;
+        require_planning_digest("plan_input_digest", &self.plan_input_digest)
+    }
+}
+
+/// Journal-safe binding between one accepted Step and its exact future admission input.
+///
+/// Raw arguments and the local provider reference are deliberately absent. The latter lives only
+/// in the atomically committed [`PlannedInvocationMaterialRecord`] sidecar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlannedInvocationBinding {
+    format_version: u32,
+    plan_id: String,
+    proposal_digest: String,
+    capability_id: String,
+    contract_version: String,
+    definition_digest: String,
+    action_digest: String,
+    plan_input_digest: String,
+    execution_profile: PlannedExecutionProfile,
+    target_os: String,
+    target_arch: String,
+    spec_digest: String,
+    plan_input_record_digest: String,
+}
+
+impl PlannedInvocationBinding {
+    #[must_use]
+    pub fn plan_id(&self) -> &str {
+        &self.plan_id
+    }
+
+    #[must_use]
+    pub fn proposal_digest(&self) -> &str {
+        &self.proposal_digest
+    }
+
+    #[must_use]
+    pub fn capability_id(&self) -> &str {
+        &self.capability_id
+    }
+
+    #[must_use]
+    pub fn contract_version(&self) -> &str {
+        &self.contract_version
+    }
+
+    #[must_use]
+    pub fn definition_digest(&self) -> &str {
+        &self.definition_digest
+    }
+
+    #[must_use]
+    pub fn action_digest(&self) -> &str {
+        &self.action_digest
+    }
+
+    #[must_use]
+    pub fn plan_input_digest(&self) -> &str {
+        &self.plan_input_digest
+    }
+
+    #[must_use]
+    pub const fn execution_profile(&self) -> PlannedExecutionProfile {
+        self.execution_profile
+    }
+
+    #[must_use]
+    pub fn target_os(&self) -> &str {
+        &self.target_os
+    }
+
+    #[must_use]
+    pub fn target_arch(&self) -> &str {
+        &self.target_arch
+    }
+
+    #[must_use]
+    pub fn plan_input_record_digest(&self) -> &str {
+        &self.plan_input_record_digest
+    }
+
+    fn as_spec(&self) -> PlannedInvocationSpec {
+        PlannedInvocationSpec {
+            capability_id: self.capability_id.clone(),
+            contract_version: self.contract_version.clone(),
+            definition_digest: self.definition_digest.clone(),
+            action_digest: self.action_digest.clone(),
+            plan_input_digest: self.plan_input_digest.clone(),
+            execution_profile: self.execution_profile,
+            target_os: self.target_os.clone(),
+            target_arch: self.target_arch.clone(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), PlanningContractError> {
+        if self.format_version != PLANNED_INVOCATION_FORMAT_VERSION {
+            return Err(PlanningContractError::UnsupportedFormatVersion(
+                self.format_version,
+            ));
+        }
+        require_planning_identifier("plan_id", &self.plan_id)?;
+        require_planning_digest("proposal_digest", &self.proposal_digest)?;
+        require_planning_digest("spec_digest", &self.spec_digest)?;
+        require_planning_digest("plan_input_record_digest", &self.plan_input_record_digest)?;
+        self.as_spec().validate()?;
+        let expected = planned_invocation_spec_digest(&self.as_spec())?;
+        if expected != self.spec_digest {
+            return Err(PlanningContractError::SpecDigestMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Local-store sidecar containing the opaque immutable recipe for one planned invocation.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlannedInvocationMaterialRecord {
+    format_version: u32,
+    run_id: String,
+    step_id: String,
+    plan_id: String,
+    proposal_digest: String,
+    spec_digest: String,
+    reference: ReconstructableMaterialReference,
+    record_digest: String,
+}
+
+impl PlannedInvocationMaterialRecord {
+    /// Bind an immutable provider recipe to one journal-safe planned invocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identities, references, or canonical digest failures.
+    pub fn bind(
+        run_id: impl Into<String>,
+        step_id: impl Into<String>,
+        proposal_digest: impl Into<String>,
+        spec: PlannedInvocationSpec,
+        reference: ReconstructableMaterialReference,
+    ) -> Result<(PlannedInvocationBinding, Self), PlanningContractError> {
+        let run_id = run_id.into();
+        let step_id = step_id.into();
+        let proposal_digest = proposal_digest.into();
+        require_planning_identifier("run_id", &run_id)?;
+        require_planning_identifier("step_id", &step_id)?;
+        require_planning_digest("proposal_digest", &proposal_digest)?;
+        spec.validate()?;
+        reference.validate()?;
+        let spec_digest = planned_invocation_spec_digest(&spec)?;
+        let plan_id = planned_invocation_id(&run_id, &step_id, &proposal_digest, &spec_digest)?;
+        let mut record = Self {
+            format_version: PLANNED_INVOCATION_FORMAT_VERSION,
+            run_id,
+            step_id,
+            plan_id: plan_id.clone(),
+            proposal_digest: proposal_digest.clone(),
+            spec_digest: spec_digest.clone(),
+            reference,
+            record_digest: String::new(),
+        };
+        record.record_digest = planned_invocation_material_record_digest(&record)?;
+        let binding = PlannedInvocationBinding {
+            format_version: PLANNED_INVOCATION_FORMAT_VERSION,
+            plan_id,
+            proposal_digest,
+            capability_id: spec.capability_id,
+            contract_version: spec.contract_version,
+            definition_digest: spec.definition_digest,
+            action_digest: spec.action_digest,
+            plan_input_digest: spec.plan_input_digest,
+            execution_profile: spec.execution_profile,
+            target_os: spec.target_os,
+            target_arch: spec.target_arch,
+            spec_digest,
+            plan_input_record_digest: record.record_digest.clone(),
+        };
+        record.verify_for(&record.run_id, &record.step_id, &binding)?;
+        Ok((binding, record))
+    }
+
+    /// Verify the sidecar's exact Run/Step/spec binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for tampering, unsupported versions, or cross-Step reuse.
+    pub fn verify_for(
+        &self,
+        run_id: &str,
+        step_id: &str,
+        binding: &PlannedInvocationBinding,
+    ) -> Result<(), PlanningContractError> {
+        if self.format_version != PLANNED_INVOCATION_FORMAT_VERSION {
+            return Err(PlanningContractError::UnsupportedFormatVersion(
+                self.format_version,
+            ));
+        }
+        binding.validate()?;
+        self.reference.validate()?;
+        if self.run_id != run_id {
+            return Err(PlanningContractError::BindingMismatch("run_id"));
+        }
+        if self.step_id != step_id {
+            return Err(PlanningContractError::BindingMismatch("step_id"));
+        }
+        if self.plan_id != binding.plan_id {
+            return Err(PlanningContractError::BindingMismatch("plan_id"));
+        }
+        if self.proposal_digest != binding.proposal_digest {
+            return Err(PlanningContractError::BindingMismatch("proposal_digest"));
+        }
+        if self.spec_digest != binding.spec_digest {
+            return Err(PlanningContractError::BindingMismatch("spec_digest"));
+        }
+        let expected_plan_id =
+            planned_invocation_id(run_id, step_id, &self.proposal_digest, &self.spec_digest)?;
+        if expected_plan_id != self.plan_id {
+            return Err(PlanningContractError::PlanIdMismatch);
+        }
+        let expected_record_digest = planned_invocation_material_record_digest(self)?;
+        if expected_record_digest != self.record_digest
+            || self.record_digest != binding.plan_input_record_digest
+        {
+            return Err(PlanningContractError::RecordDigestMismatch);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    #[must_use]
+    pub fn step_id(&self) -> &str {
+        &self.step_id
+    }
+
+    #[must_use]
+    pub fn plan_id(&self) -> &str {
+        &self.plan_id
+    }
+
+    #[must_use]
+    pub const fn reference(&self) -> &ReconstructableMaterialReference {
+        &self.reference
+    }
+
+    #[must_use]
+    pub fn record_digest(&self) -> &str {
+        &self.record_digest
+    }
+}
+
+impl std::fmt::Debug for PlannedInvocationMaterialRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PlannedInvocationMaterialRecord")
+            .field("format_version", &self.format_version)
+            .field("run_id", &self.run_id)
+            .field("step_id", &self.step_id)
+            .field("plan_id", &self.plan_id)
+            .field("proposal_digest", &self.proposal_digest)
+            .field("spec_digest", &self.spec_digest)
+            .field("reference", &self.reference)
+            .field("record_digest", &self.record_digest)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AcceptedPlanStep {
+    pub step_id: String,
+    pub objective: String,
+    pub depends_on: Vec<String>,
+    pub invocation: PlannedInvocationBinding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CompletionCandidateState {
+    pub candidate_id: String,
+    pub context_digest: String,
+    pub proposal_digest: String,
+    pub summary_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentLoopState {
+    pub budget: AgentLoopBudget,
+    pub accepted_model_turns: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_candidate: Option<CompletionCandidateState>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlannedInvocationSpecDigestInput<'a> {
+    domain: &'static str,
+    capability_id: &'a str,
+    contract_version: &'a str,
+    definition_digest: &'a str,
+    action_digest: &'a str,
+    plan_input_digest: &'a str,
+    execution_profile: PlannedExecutionProfile,
+    target_os: &'a str,
+    target_arch: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlannedInvocationIdInput<'a> {
+    domain: &'static str,
+    run_id: &'a str,
+    step_id: &'a str,
+    proposal_digest: &'a str,
+    spec_digest: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlannedInvocationMaterialRecordDigestInput<'a> {
+    domain: &'static str,
+    format_version: u32,
+    run_id: &'a str,
+    step_id: &'a str,
+    plan_id: &'a str,
+    proposal_digest: &'a str,
+    spec_digest: &'a str,
+    reference: &'a ReconstructableMaterialReference,
+}
+
+fn planned_invocation_spec_digest(
+    spec: &PlannedInvocationSpec,
+) -> Result<String, PlanningContractError> {
+    let canonical = serde_jcs::to_vec(&PlannedInvocationSpecDigestInput {
+        domain: "xgeny.planned-invocation.spec/v1",
+        capability_id: &spec.capability_id,
+        contract_version: &spec.contract_version,
+        definition_digest: &spec.definition_digest,
+        action_digest: &spec.action_digest,
+        plan_input_digest: &spec.plan_input_digest,
+        execution_profile: spec.execution_profile,
+        target_os: &spec.target_os,
+        target_arch: &spec.target_arch,
+    })
+    .map_err(|error| PlanningContractError::Canonicalization(error.to_string()))?;
+    Ok(sha256_digest(&canonical))
+}
+
+fn planned_invocation_id(
+    run_id: &str,
+    step_id: &str,
+    proposal_digest: &str,
+    spec_digest: &str,
+) -> Result<String, PlanningContractError> {
+    let canonical = serde_jcs::to_vec(&PlannedInvocationIdInput {
+        domain: "xgeny.planned-invocation.id/v1",
+        run_id,
+        step_id,
+        proposal_digest,
+        spec_digest,
+    })
+    .map_err(|error| PlanningContractError::Canonicalization(error.to_string()))?;
+    let digest = sha256_digest(&canonical);
+    let encoded = digest.strip_prefix("sha256:").unwrap_or(&digest);
+    Ok(format!("plan-{encoded}"))
+}
+
+fn planned_invocation_material_record_digest(
+    record: &PlannedInvocationMaterialRecord,
+) -> Result<String, PlanningContractError> {
+    let canonical = serde_jcs::to_vec(&PlannedInvocationMaterialRecordDigestInput {
+        domain: "xgeny.planned-invocation.material-record/v1",
+        format_version: record.format_version,
+        run_id: &record.run_id,
+        step_id: &record.step_id,
+        plan_id: &record.plan_id,
+        proposal_digest: &record.proposal_digest,
+        spec_digest: &record.spec_digest,
+        reference: &record.reference,
+    })
+    .map_err(|error| PlanningContractError::Canonicalization(error.to_string()))?;
+    Ok(sha256_digest(&canonical))
+}
+
+fn require_planning_identifier(
+    field: &'static str,
+    value: &str,
+) -> Result<(), PlanningContractError> {
+    const MAX_IDENTIFIER_BYTES: usize = 256;
+    if value.is_empty() || value.len() > MAX_IDENTIFIER_BYTES || value.chars().any(char::is_control)
+    {
+        return Err(PlanningContractError::InvalidIdentifier(field));
+    }
+    Ok(())
+}
+
+fn require_planning_digest(field: &'static str, value: &str) -> Result<(), PlanningContractError> {
+    if !is_sha256_digest(value) {
+        return Err(PlanningContractError::InvalidDigest(field));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum PlanningContractError {
+    #[error("planning budget `{0}` must be greater than zero")]
+    ZeroBudget(&'static str),
+    #[error("planning turn index must be greater than zero")]
+    TurnIndexZero,
+    #[error("planning identifier `{0}` is invalid")]
+    InvalidIdentifier(&'static str),
+    #[error("planned invocation target `{0}` is unsupported")]
+    UnsupportedTarget(&'static str),
+    #[error("planning digest `{0}` must be a lowercase SHA-256 digest")]
+    InvalidDigest(&'static str),
+    #[error("planned invocation format version {0} is unsupported")]
+    UnsupportedFormatVersion(u32),
+    #[error("planned invocation spec digest differs from its fields")]
+    SpecDigestMismatch,
+    #[error("planned invocation material binding differs at `{0}`")]
+    BindingMismatch(&'static str),
+    #[error("planned invocation plan ID differs from its binding")]
+    PlanIdMismatch,
+    #[error("planned invocation material record digest differs from its binding")]
+    RecordDigestMismatch,
+    #[error("planning canonicalization failed: {0}")]
+    Canonicalization(String),
+    #[error(transparent)]
+    InvocationMaterial(#[from] InvocationMaterialError),
 }
 
 /// Durable, secret-free sidecar binding for one exact effect intent.
@@ -871,6 +1500,8 @@ pub struct RunState {
     pub journal_head_digest: String,
     pub steps: BTreeMap<String, StepState>,
     pub authorization_consumption: BTreeMap<String, AuthorizationConsumption>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_loop: Option<AgentLoopState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -880,6 +1511,8 @@ pub struct StepState {
     pub objective: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_invocation: Option<PlannedInvocationBinding>,
     pub status: StepStatus,
     pub attempts: u32,
     pub intent: Option<EffectIntent>,
@@ -1445,6 +2078,7 @@ pub fn apply_record(
             journal_head_digest: String::new(),
             steps: BTreeMap::new(),
             authorization_consumption: BTreeMap::new(),
+            agent_loop: None,
         },
         (None, _) => return Err(TransitionError::FirstEventMustCreateRun),
         (Some(_), RunEventBody::RunCreated { .. }) => {
@@ -1504,11 +2138,20 @@ fn verify_record_against_state(
 fn apply_body(state: &mut RunState, body: &RunEventBody) -> Result<(), TransitionError> {
     match body {
         RunEventBody::RunCreated { .. } => unreachable!("handled by apply_record"),
+        RunEventBody::AgentLoopConfigured { budget } => configure_agent_loop(state, budget)?,
+        RunEventBody::PlanAccepted { decision, steps } => {
+            accept_plan(state, decision, steps)?;
+        }
+        RunEventBody::CompletionCandidateRecorded {
+            decision,
+            candidate_id,
+            summary_digest,
+        } => record_completion_candidate(state, decision, candidate_id, summary_digest)?,
         RunEventBody::StepPlanned {
             step_id,
             objective,
             depends_on,
-        } => plan_step(state, step_id, objective, depends_on)?,
+        } => plan_step(state, step_id, objective, depends_on, None)?,
         RunEventBody::EffectIntentCommitted { step_id, intent } => {
             commit_effect_intent(state, step_id, intent)?;
         }
@@ -1517,12 +2160,339 @@ fn apply_body(state: &mut RunState, body: &RunEventBody) -> Result<(), Transitio
     Ok(())
 }
 
+fn configure_agent_loop(
+    state: &mut RunState,
+    budget: &AgentLoopBudget,
+) -> Result<(), TransitionError> {
+    budget.validate()?;
+    if state.agent_loop.is_some() {
+        return Err(TransitionError::AgentLoopAlreadyConfigured);
+    }
+    let planned_steps =
+        u32::try_from(state.steps.len()).map_err(|_| TransitionError::PlannedStepBudgetExceeded)?;
+    if planned_steps > budget.max_planned_steps {
+        return Err(TransitionError::PlannedStepBudgetExceeded);
+    }
+    let tool_calls = state.steps.values().try_fold(0_u32, |total, step| {
+        total
+            .checked_add(step.attempts)
+            .ok_or(TransitionError::ToolCallBudgetExceeded)
+    })?;
+    if tool_calls > budget.max_tool_calls {
+        return Err(TransitionError::ToolCallBudgetExceeded);
+    }
+    state.agent_loop = Some(AgentLoopState {
+        budget: budget.clone(),
+        accepted_model_turns: 0,
+        completion_candidate: None,
+    });
+    Ok(())
+}
+
+fn accept_plan(
+    state: &mut RunState,
+    decision: &ExpectedPlanningTurn,
+    steps: &[AcceptedPlanStep],
+) -> Result<(), TransitionError> {
+    decision.validate()?;
+    let loop_state = state
+        .agent_loop
+        .as_ref()
+        .ok_or(TransitionError::AgentLoopNotConfigured)?;
+    if loop_state.completion_candidate.is_some() {
+        return Err(TransitionError::CompletionCandidateAlreadyRecorded);
+    }
+    let expected_turn = loop_state
+        .accepted_model_turns
+        .checked_add(1)
+        .ok_or(TransitionError::ModelTurnBudgetExceeded)?;
+    if decision.turn_index != expected_turn {
+        return Err(TransitionError::UnexpectedPlanningTurn {
+            expected: expected_turn,
+            actual: decision.turn_index,
+        });
+    }
+    if expected_turn > loop_state.budget.max_model_turns {
+        return Err(TransitionError::ModelTurnBudgetExceeded);
+    }
+    if steps.is_empty() || steps.len() > MAX_ACCEPTED_PLAN_STEPS {
+        return Err(TransitionError::AcceptedPlanStepCountInvalid {
+            actual: steps.len(),
+        });
+    }
+    let total_steps = state
+        .steps
+        .len()
+        .checked_add(steps.len())
+        .ok_or(TransitionError::PlannedStepBudgetExceeded)?;
+    if u32::try_from(total_steps).map_or(true, |total| total > loop_state.budget.max_planned_steps)
+    {
+        return Err(TransitionError::PlannedStepBudgetExceeded);
+    }
+
+    let proposed_ids = validate_accepted_plan_headers(state, decision, steps)?;
+    let mut candidate = build_accepted_plan_candidate(state, steps, &proposed_ids)?;
+    derive_frontier(&candidate).map_err(map_plan_frontier_error)?;
+    candidate
+        .agent_loop
+        .as_mut()
+        .expect("candidate retains configured loop")
+        .accepted_model_turns = expected_turn;
+    *state = candidate;
+    Ok(())
+}
+
+fn validate_accepted_plan_headers(
+    state: &RunState,
+    decision: &ExpectedPlanningTurn,
+    steps: &[AcceptedPlanStep],
+) -> Result<BTreeSet<String>, TransitionError> {
+    let mut proposed_ids = BTreeSet::new();
+    let mut action_owners = existing_action_owners(state)?;
+    for step in steps {
+        require_planning_identifier("step_id", &step.step_id)?;
+        validate_accepted_objective(&step.objective)?;
+        step.invocation.validate()?;
+        if let Some(existing_step_id) = action_owners
+            .insert(
+                step.invocation.action_digest().to_owned(),
+                step.step_id.clone(),
+            )
+            .filter(|existing_step_id| existing_step_id != &step.step_id)
+        {
+            return Err(TransitionError::DuplicatePlannedAction {
+                step_id: step.step_id.clone(),
+                existing_step_id,
+            });
+        }
+        if step.invocation.proposal_digest != decision.proposal_digest {
+            return Err(TransitionError::PlanProposalDigestMismatch {
+                step_id: step.step_id.clone(),
+            });
+        }
+        if state.steps.contains_key(&step.step_id) || !proposed_ids.insert(step.step_id.clone()) {
+            return Err(TransitionError::DuplicateStep(step.step_id.clone()));
+        }
+    }
+    Ok(proposed_ids)
+}
+
+fn existing_action_owners(state: &RunState) -> Result<BTreeMap<String, String>, TransitionError> {
+    let mut owners = BTreeMap::new();
+    for step in state.steps.values() {
+        for action_digest in step
+            .planned_invocation
+            .as_ref()
+            .map(PlannedInvocationBinding::action_digest)
+            .into_iter()
+            .chain(
+                step.intent
+                    .as_ref()
+                    .map(|intent| intent.action_digest.as_str()),
+            )
+        {
+            if let Some(existing_step_id) = owners
+                .insert(action_digest.to_owned(), step.step_id.clone())
+                .filter(|existing_step_id| existing_step_id != &step.step_id)
+            {
+                return Err(TransitionError::DuplicatePlannedAction {
+                    step_id: step.step_id.clone(),
+                    existing_step_id,
+                });
+            }
+        }
+    }
+    Ok(owners)
+}
+
+fn build_accepted_plan_candidate(
+    state: &RunState,
+    steps: &[AcceptedPlanStep],
+    proposed_ids: &BTreeSet<String>,
+) -> Result<RunState, TransitionError> {
+    let blocked_existing: BTreeSet<_> = derive_frontier(state)
+        .map_err(map_plan_frontier_error)?
+        .blocked
+        .into_iter()
+        .map(|blocked| blocked.step_id)
+        .collect();
+    let mut candidate = state.clone();
+    let mut edge_count = 0_usize;
+    for step in steps {
+        let mut unique = BTreeSet::new();
+        for dependency_id in &step.depends_on {
+            edge_count = edge_count
+                .checked_add(1)
+                .ok_or(TransitionError::AcceptedPlanEdgeBudgetExceeded)?;
+            if edge_count > MAX_ACCEPTED_PLAN_EDGES {
+                return Err(TransitionError::AcceptedPlanEdgeBudgetExceeded);
+            }
+            if dependency_id == &step.step_id {
+                return Err(TransitionError::SelfDependency {
+                    step_id: step.step_id.clone(),
+                });
+            }
+            if !unique.insert(dependency_id.as_str()) {
+                return Err(TransitionError::DuplicateDependency {
+                    step_id: step.step_id.clone(),
+                    dependency_id: dependency_id.clone(),
+                });
+            }
+            if !state.steps.contains_key(dependency_id) && !proposed_ids.contains(dependency_id) {
+                return Err(TransitionError::UnknownDependency {
+                    step_id: step.step_id.clone(),
+                    dependency_id: dependency_id.clone(),
+                });
+            }
+            if let Some(existing) = state.steps.get(dependency_id) {
+                let reason = if blocked_existing.contains(dependency_id) {
+                    Some(DependencyBlockReason::DependencyBlocked)
+                } else {
+                    dependency_release_block_reason(existing)
+                };
+                if matches!(
+                    reason,
+                    Some(
+                        DependencyBlockReason::Failed
+                            | DependencyBlockReason::ManualRequired
+                            | DependencyBlockReason::ReceiptMissing
+                            | DependencyBlockReason::DependencyBlocked
+                    )
+                ) {
+                    return Err(TransitionError::PlanDependencyBlocked {
+                        step_id: step.step_id.clone(),
+                        dependency_id: dependency_id.clone(),
+                        reason: reason.expect("matched reason must exist"),
+                    });
+                }
+            }
+        }
+        candidate.steps.insert(
+            step.step_id.clone(),
+            StepState {
+                step_id: step.step_id.clone(),
+                objective: step.objective.clone(),
+                depends_on: step.depends_on.clone(),
+                planned_invocation: Some(step.invocation.clone()),
+                status: StepStatus::Planned,
+                attempts: 0,
+                intent: None,
+                effect_evidence_digest: None,
+                execution_receipt_id: None,
+                execution_receipt_digest: None,
+                uncertainty_reason: None,
+                reconciliation_evidence_digest: None,
+            },
+        );
+    }
+    Ok(candidate)
+}
+
+fn map_plan_frontier_error(error: FrontierError) -> TransitionError {
+    match error {
+        FrontierError::SelfDependency { step_id } => TransitionError::SelfDependency { step_id },
+        FrontierError::DuplicateDependency {
+            step_id,
+            dependency_id,
+        } => TransitionError::DuplicateDependency {
+            step_id,
+            dependency_id,
+        },
+        FrontierError::UnknownDependency {
+            step_id,
+            dependency_id,
+        } => TransitionError::UnknownDependency {
+            step_id,
+            dependency_id,
+        },
+        FrontierError::DependencyCycle => TransitionError::DependencyCycle,
+        FrontierError::ActiveDependencyNotReleased {
+            step_id,
+            dependency_id,
+            reason,
+        } => TransitionError::DependencyNotReleased {
+            step_id,
+            dependency_id,
+            reason,
+        },
+    }
+}
+
+fn validate_accepted_objective(objective: &str) -> Result<(), TransitionError> {
+    if objective.is_empty()
+        || objective.len() > MAX_ACCEPTED_OBJECTIVE_BYTES
+        || objective.chars().any(char::is_control)
+    {
+        return Err(TransitionError::InvalidAcceptedObjective);
+    }
+    Ok(())
+}
+
+fn record_completion_candidate(
+    state: &mut RunState,
+    decision: &ExpectedPlanningTurn,
+    candidate_id: &str,
+    summary_digest: &str,
+) -> Result<(), TransitionError> {
+    decision.validate()?;
+    require_planning_identifier("candidate_id", candidate_id)?;
+    require_planning_digest("summary_digest", summary_digest)?;
+    let frontier = derive_frontier(state).map_err(map_plan_frontier_error)?;
+    if !frontier.all_steps_receipt_completed() {
+        return Err(TransitionError::CompletionCandidateRequiresReceiptCompletedPlan);
+    }
+    let loop_state = state
+        .agent_loop
+        .as_mut()
+        .ok_or(TransitionError::AgentLoopNotConfigured)?;
+    if loop_state.completion_candidate.is_some() {
+        return Err(TransitionError::CompletionCandidateAlreadyRecorded);
+    }
+    let expected_turn = loop_state
+        .accepted_model_turns
+        .checked_add(1)
+        .ok_or(TransitionError::ModelTurnBudgetExceeded)?;
+    if decision.turn_index != expected_turn {
+        return Err(TransitionError::UnexpectedPlanningTurn {
+            expected: expected_turn,
+            actual: decision.turn_index,
+        });
+    }
+    if expected_turn > loop_state.budget.max_model_turns {
+        return Err(TransitionError::ModelTurnBudgetExceeded);
+    }
+    loop_state.accepted_model_turns = expected_turn;
+    loop_state.completion_candidate = Some(CompletionCandidateState {
+        candidate_id: candidate_id.to_owned(),
+        context_digest: decision.context_digest.clone(),
+        proposal_digest: decision.proposal_digest.clone(),
+        summary_digest: summary_digest.to_owned(),
+    });
+    Ok(())
+}
+
 fn plan_step(
     state: &mut RunState,
     step_id: &str,
     objective: &str,
     depends_on: &[String],
+    planned_invocation: Option<PlannedInvocationBinding>,
 ) -> Result<(), TransitionError> {
+    if let Some(loop_state) = &state.agent_loop {
+        if loop_state.completion_candidate.is_some() {
+            return Err(TransitionError::CompletionCandidateAlreadyRecorded);
+        }
+        let total_steps = state
+            .steps
+            .len()
+            .checked_add(1)
+            .ok_or(TransitionError::PlannedStepBudgetExceeded)?;
+        if u32::try_from(total_steps)
+            .map_or(true, |total| total > loop_state.budget.max_planned_steps)
+        {
+            return Err(TransitionError::PlannedStepBudgetExceeded);
+        }
+    }
     if state.steps.contains_key(step_id) {
         return Err(TransitionError::DuplicateStep(step_id.to_owned()));
     }
@@ -1552,6 +2522,7 @@ fn plan_step(
             step_id: step_id.to_owned(),
             objective: objective.to_owned(),
             depends_on: depends_on.to_vec(),
+            planned_invocation,
             status: StepStatus::Planned,
             attempts: 0,
             intent: None,
@@ -1571,6 +2542,9 @@ fn apply_effect_lifecycle(
 ) -> Result<(), TransitionError> {
     match body {
         RunEventBody::RunCreated { .. }
+        | RunEventBody::AgentLoopConfigured { .. }
+        | RunEventBody::PlanAccepted { .. }
+        | RunEventBody::CompletionCandidateRecorded { .. }
         | RunEventBody::StepPlanned { .. }
         | RunEventBody::EffectIntentCommitted { .. } => {
             unreachable!("handled by apply_body")
@@ -1670,6 +2644,16 @@ fn record_execution_started(
     effect_id: &str,
     body: &RunEventBody,
 ) -> Result<(), TransitionError> {
+    if let Some(loop_state) = &state.agent_loop {
+        let starts = state.steps.values().try_fold(0_u32, |total, step| {
+            total
+                .checked_add(step.attempts)
+                .ok_or(TransitionError::ToolCallBudgetExceeded)
+        })?;
+        if starts >= loop_state.budget.max_tool_calls {
+            return Err(TransitionError::ToolCallBudgetExceeded);
+        }
+    }
     let step = matching_step_mut(state, step_id, effect_id)?;
     require_status(step, StepStatus::IntentCommitted, body)?;
     step.status = StepStatus::Executing;
@@ -1858,6 +2842,7 @@ fn commit_effect_intent(
         });
     }
 
+    validate_planned_invocation_binding(step, intent)?;
     validate_authorization_binding(state, step_id, intent)?;
 
     let consumption = state
@@ -1891,6 +2876,81 @@ fn commit_effect_intent(
         .expect("step was checked before authorization mutation");
     step.intent = Some(intent.clone());
     step.status = StepStatus::IntentCommitted;
+    Ok(())
+}
+
+fn validate_planned_invocation_binding(
+    step: &StepState,
+    intent: &EffectIntent,
+) -> Result<(), TransitionError> {
+    let Some(planned) = &step.planned_invocation else {
+        return Ok(());
+    };
+    planned.validate()?;
+    for (field, matches) in [
+        (
+            "capability_id",
+            planned.capability_id == intent.invocation.capability_id,
+        ),
+        (
+            "contract_version",
+            planned.contract_version == intent.invocation.contract_version,
+        ),
+        (
+            "definition_digest",
+            planned.definition_digest == intent.invocation.definition_digest,
+        ),
+        (
+            "action_digest",
+            planned.action_digest == intent.action_digest,
+        ),
+        (
+            "plan_input_digest",
+            planned.plan_input_digest == intent.authorization.binding.material_digest,
+        ),
+    ] {
+        if !matches {
+            return Err(TransitionError::PlannedInvocationMismatch {
+                step_id: step.step_id.clone(),
+                field,
+            });
+        }
+    }
+    let Some(provenance) = intent.receipt_provenance.as_ref() else {
+        return Err(TransitionError::PlannedInvocationMismatch {
+            step_id: step.step_id.clone(),
+            field: "receipt_provenance.plan_id",
+        });
+    };
+    if provenance.plan_id != planned.plan_id {
+        return Err(TransitionError::PlannedInvocationMismatch {
+            step_id: step.step_id.clone(),
+            field: "receipt_provenance.plan_id",
+        });
+    }
+    match planned.execution_profile {
+        PlannedExecutionProfile::LocalSyncOnceV1 => {
+            if intent.idempotency_key.as_ref().is_none_or(String::is_empty) {
+                return Err(TransitionError::PlannedInvocationMismatch {
+                    step_id: step.step_id.clone(),
+                    field: "idempotency_key",
+                });
+            }
+            if provenance.executor_placement != ReceiptPlacement::Local {
+                return Err(TransitionError::PlannedInvocationMismatch {
+                    step_id: step.step_id.clone(),
+                    field: "receipt_provenance.executor_placement",
+                });
+            }
+            let expected_platform = format!("{}-{}", planned.target_os, planned.target_arch);
+            if provenance.executor_platform != expected_platform {
+                return Err(TransitionError::PlannedInvocationMismatch {
+                    step_id: step.step_id.clone(),
+                    field: "receipt_provenance.executor_platform",
+                });
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2095,6 +3155,42 @@ pub enum TransitionError {
     FirstEventMustCreateRun,
     #[error("run is already created")]
     RunAlreadyCreated,
+    #[error(transparent)]
+    PlanningContract(#[from] PlanningContractError),
+    #[error("agent loop is already configured")]
+    AgentLoopAlreadyConfigured,
+    #[error("agent loop is not configured")]
+    AgentLoopNotConfigured,
+    #[error("planning turn mismatch: expected {expected}, got {actual}")]
+    UnexpectedPlanningTurn { expected: u32, actual: u32 },
+    #[error("accepted model-turn budget is exhausted")]
+    ModelTurnBudgetExceeded,
+    #[error("planned Step budget is exhausted")]
+    PlannedStepBudgetExceeded,
+    #[error("external tool-call budget is exhausted")]
+    ToolCallBudgetExceeded,
+    #[error("accepted plan must contain 1..=32 Steps, got {actual}")]
+    AcceptedPlanStepCountInvalid { actual: usize },
+    #[error("accepted plan exceeds the 128-edge limit")]
+    AcceptedPlanEdgeBudgetExceeded,
+    #[error("accepted plan objective is empty, oversized, or contains control characters")]
+    InvalidAcceptedObjective,
+    #[error("accepted Step `{step_id}` has a proposal digest that differs from its turn")]
+    PlanProposalDigestMismatch { step_id: String },
+    #[error(
+        "accepted Step `{step_id}` depends on terminally blocked Step `{dependency_id}` ({reason:?})"
+    )]
+    PlanDependencyBlocked {
+        step_id: String,
+        dependency_id: String,
+        reason: DependencyBlockReason,
+    },
+    #[error("accepted plan contains a dependency cycle")]
+    DependencyCycle,
+    #[error("a completion candidate is already recorded")]
+    CompletionCandidateAlreadyRecorded,
+    #[error("a completion candidate requires a non-empty Receipt-completed current plan")]
+    CompletionCandidateRequiresReceiptCompletedPlan,
     #[error("event sequence mismatch: expected {expected}, got {actual}")]
     UnexpectedSequence { expected: u64, actual: u64 },
     #[error("event {sequence} previous digest mismatch")]
@@ -2133,6 +3229,18 @@ pub enum TransitionError {
     },
     #[error("effect `{0}` already has a committed intent")]
     DuplicateEffect(String),
+    #[error("planned invocation for Step `{step_id}` differs at `{field}`")]
+    PlannedInvocationMismatch {
+        step_id: String,
+        field: &'static str,
+    },
+    #[error(
+        "planned Step `{step_id}` repeats the semantic action owned by Step `{existing_step_id}`"
+    )]
+    DuplicatePlannedAction {
+        step_id: String,
+        existing_step_id: String,
+    },
     #[error("step `{step_id}` expected effect {expected:?}, got `{actual}`")]
     EffectMismatch {
         step_id: String,
@@ -2965,6 +4073,7 @@ mod tests {
             step_id: "step-legacy".to_owned(),
             objective: "legacy plan".to_owned(),
             depends_on: Vec::new(),
+            planned_invocation: None,
             status: StepStatus::Planned,
             attempts: 0,
             intent: None,
@@ -2997,6 +4106,7 @@ mod tests {
                 step_id: step_id.clone(),
                 objective: step_id.clone(),
                 depends_on,
+                planned_invocation: None,
                 status: StepStatus::Completed,
                 attempts: 1,
                 intent: None,
@@ -3023,6 +4133,7 @@ mod tests {
             journal_head_digest: "sha256:head".to_owned(),
             steps,
             authorization_consumption: BTreeMap::new(),
+            agent_loop: None,
         };
         let mut metrics = FrontierMetrics::default();
 

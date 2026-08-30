@@ -3,7 +3,7 @@
 - 기준일: 2026-08-30
 - 상태: ADR-0013 연구 gate 기본형
 - 공개 protocol v0.1 변경: 없음
-- 도입 당시 schema: 4; current local store schema: 5
+- 도입 당시 schema: 4; current local store schema: 6
 
 > ADR-0014는 index row 구조를 바꾸지 않고 Persistent WorkGraph frontier를 추가했다. Schema 5는 dependency 의미 downgrade를 막는 version fence이며 schema 4 blob을 다시 쓰지 않는다.
 

@@ -3,7 +3,7 @@
 - 기준일: 2026-08-29
 - 상태: ADR-0012 연구 gate용 기본형
 - 공개 protocol v0.1 변경: 없음
-- Receipt 도입 schema: 4; current local store schema: 5
+- Receipt 도입 schema: 4; current local store schema: 6
 
 ## 구현된 사용자 시나리오
 
@@ -129,7 +129,7 @@ Admission은 Receipt가 참조하는 transient `PolicyDecisionBody`를 bundled s
 
 `RunStore::export_jsonl`은 기존 journal-only canonical stream이다. Complete Receipt는 `export_execution_receipts_jsonl`에서 `kind: ExecutionReceipt`를 포함한 protocol document로 chain 순서에 export한다. 현재 두 export는 하나의 atomic archive/import format이 아니며, SQLite built-in의 `load_with_execution_receipts`만 한 read transaction에서 Run과 Receipt chain을 읽는다. Runtime의 Receipt finalization은 전체 vector 대신 같은 verified generation에서 state, start 시각과 이전 Receipt digest만 반환하는 `load_verification_snapshot`을 사용한다.
 
-Schema 4에서 도입되어 current schema 5에도 유지되는 Receipt transaction은 다음 순서로 수행한다.
+Schema 4에서 도입되어 current schema 6에도 유지되는 Receipt transaction은 다음 순서로 수행한다.
 
 ```text
 BEGIN IMMEDIATE
@@ -147,7 +147,7 @@ Receipt insert 또는 projection write에서 실패하면 event를 포함한 전
 
 과거 journal event의 Rust 필드명은 evidence 의미로 정리했지만 serialized JSON key `receiptDigest`는 유지한다. Optional provenance와 execution Receipt projection field는 없는 경우 serialize하지 않아 schema 3 event의 canonical bytes와 digest를 바꾸지 않는다.
 
-Schema 3 open은 기존 journal과 sidecar를 검증한 뒤 빈 `execution_receipts` table을 원자적으로 추가하고 current schema 5로 올린다. 과거 terminal event에 Receipt를 조작해 backfill하지 않는다. 실제 provenance 없는 pending/Validating schema 3 fixture로 migration과 journal byte 보존을 검증한다. Legacy Run은 그대로 replay할 수 있지만 current store에서 provenance 없는 intent를 새 append하는 것은 금지한다. Schema 4는 full audit과 byte 보존 뒤 dependency downgrade fence인 schema 5로 이동한다.
+Schema 3 open은 기존 journal과 sidecar를 검증한 뒤 빈 `execution_receipts`와 `planned_invocations` table을 원자적으로 추가하고 current schema 6으로 올린다. 과거 terminal event에 Receipt나 계획 입력을 조작해 backfill하지 않는다. 실제 provenance 없는 pending/Validating schema 3 fixture로 migration과 journal byte 보존을 검증한다. Legacy Run은 그대로 replay할 수 있지만 current store에서 provenance 없는 intent를 새 append하는 것은 금지한다. Schema 4/5도 full audit과 byte 보존 뒤 current schema 6으로 이동한다.
 
 Schema 3의 `IntentCommitted`, `EffectUnknown` 또는 `Reconciling` intent에는 provenance가 없으므로 자동 실행·reconciliation을 금지한다. Direct Executor는 material/adapter 접근과 Started event 전에 `ReceiptProvenanceUnavailable`로 닫는다. Schema 3의 `Validating`도 profile과 verification plan을 추측하지 않아 `ReceiptProvenanceMissing`으로 닫고 verifier 0회·상태 보존을 보장한다. 사용자가 legacy effect를 새 schema 4 의미로 재승인·대체하거나 종결하는 workflow는 후속 migration 정책이다.
 
