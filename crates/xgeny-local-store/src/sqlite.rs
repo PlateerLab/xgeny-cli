@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -229,6 +229,8 @@ impl SqliteRunStore {
     pub fn create(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
         validate_durable_path(path)?;
+        let physical_path =
+            physical_new_database_path(path).map_err(|()| StoreError::DatabaseCreateFailed)?;
         let mut reservation_options = OpenOptions::new();
         reservation_options.read(true).write(true).create_new(true);
         #[cfg(unix)]
@@ -236,7 +238,7 @@ impl SqliteRunStore {
             use std::os::unix::fs::OpenOptionsExt as _;
             reservation_options.mode(0o600);
         }
-        let reservation = match reservation_options.open(path) {
+        let reservation = match reservation_options.open(&physical_path) {
             Ok(file) => file,
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                 return Err(StoreError::DatabaseAlreadyExists);
@@ -244,7 +246,7 @@ impl SqliteRunStore {
             Err(_) => return Err(StoreError::DatabaseCreateFailed),
         };
 
-        let connection = Connection::open_with_flags(path, durable_file_flags())
+        let connection = Connection::open_with_flags(&physical_path, durable_file_flags())
             .map_err(|_| StoreError::DatabaseCreateFailed)?;
         drop(reservation);
         Self::finish_open(connection, SchemaOpenMode::Create)
@@ -262,7 +264,9 @@ impl SqliteRunStore {
     pub fn open_existing(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
         validate_durable_path(path)?;
-        let connection = Connection::open_with_flags(path, durable_file_flags())
+        let physical_path =
+            physical_existing_database_path(path).map_err(|()| StoreError::DatabaseOpenFailed)?;
+        let connection = Connection::open_with_flags(&physical_path, durable_file_flags())
             .map_err(|_| StoreError::DatabaseOpenFailed)?;
         Self::finish_open(connection, SchemaOpenMode::Existing)
     }
@@ -282,7 +286,9 @@ impl SqliteRunStore {
     pub fn open_existing_read_only(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
         validate_durable_path(path)?;
-        let read_only = open_read_only_preflight(path)?;
+        let physical_path =
+            physical_existing_database_path(path).map_err(|()| StoreError::DatabaseOpenFailed)?;
+        let read_only = open_read_only_preflight(&physical_path)?;
         read_only.connection.busy_timeout(Duration::from_secs(5))?;
         let version: i64 =
             read_only
@@ -323,8 +329,19 @@ impl SqliteRunStore {
         let path = path.as_ref();
         let connection = if path == Path::new(":memory:") {
             Connection::open_in_memory().map_err(|_| StoreError::DatabaseOpenFailed)?
-        } else {
+        } else if path.as_os_str().is_empty() {
             Connection::open_with_flags(path, compatibility_file_flags())
+                .map_err(|_| StoreError::DatabaseOpenFailed)?
+        } else {
+            let physical_path = match fs::symlink_metadata(path) {
+                Ok(_) => physical_existing_database_path(path),
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    physical_new_database_path(path)
+                }
+                Err(_) => Err(()),
+            }
+            .map_err(|()| StoreError::DatabaseOpenFailed)?;
+            Connection::open_with_flags(&physical_path, compatibility_file_flags())
                 .map_err(|_| StoreError::DatabaseOpenFailed)?
         };
         Self::finish_open(connection, SchemaOpenMode::Compatibility)
@@ -940,6 +957,51 @@ fn validate_durable_path(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn physical_new_database_path(path: &Path) -> Result<PathBuf, ()> {
+    let file_name = path.file_name().ok_or(())?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let physical_parent = fs::canonicalize(parent).map_err(|_| ())?;
+    if !fs::metadata(&physical_parent).map_err(|_| ())?.is_dir() {
+        return Err(());
+    }
+    Ok(physical_parent.join(file_name))
+}
+
+fn physical_existing_database_path(path: &Path) -> Result<PathBuf, ()> {
+    let file_name = path.file_name().ok_or(())?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let physical_parent = fs::canonicalize(parent).map_err(|_| ())?;
+    let physical_path = physical_parent.join(file_name);
+    let metadata = fs::symlink_metadata(&physical_path).map_err(|_| ())?;
+    if !is_regular_non_reparse_file(&metadata) {
+        return Err(());
+    }
+    Ok(physical_path)
+}
+
+fn is_regular_non_reparse_file(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_file() && !is_windows_reparse_point(metadata)
+}
+
+#[cfg(windows)]
+fn is_windows_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+const fn is_windows_reparse_point(_: &fs::Metadata) -> bool {
+    false
+}
+
 fn durable_file_flags() -> OpenFlags {
     OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
@@ -974,7 +1036,7 @@ fn open_read_only_preflight(path: &Path) -> Result<ReadOnlyOpen, StoreError> {
                 }
             }
         }
-        Ok(metadata) if !metadata.file_type().is_file() => {
+        Ok(metadata) if !is_regular_non_reparse_file(&metadata) => {
             return Err(StoreError::DatabaseOpenFailed);
         }
         Ok(_) => {}
@@ -1004,7 +1066,7 @@ fn open_read_only_preflight(path: &Path) -> Result<ReadOnlyOpen, StoreError> {
 
     match std::fs::symlink_metadata(&source_wal) {
         Ok(metadata) => {
-            if !metadata.file_type().is_file() {
+            if !is_regular_non_reparse_file(&metadata) {
                 return Err(StoreError::DatabaseOpenFailed);
             }
             copy_private_regular_file(
@@ -1026,7 +1088,7 @@ fn open_read_only_preflight(path: &Path) -> Result<ReadOnlyOpen, StoreError> {
 
 fn copy_private_regular_file(source: &Path, destination: &Path) -> Result<(), StoreError> {
     let metadata = std::fs::symlink_metadata(source).map_err(|_| StoreError::DatabaseOpenFailed)?;
-    if !metadata.file_type().is_file() {
+    if !is_regular_non_reparse_file(&metadata) {
         return Err(StoreError::DatabaseOpenFailed);
     }
 

@@ -103,6 +103,9 @@ cargo test --locked -p xgeny-cli --test public_run_resume
 - 미완료 resume의 DB 사전검사는 schema-8 read-only이고, workspace/catalog/profile 확인 뒤 writable
   reopen 시 같은 state를 다시 검증한다. Clean DB는 immutable open으로 sidecar를 만들지 않고,
   crash WAL은 private adjacent snapshot에서만 replay하여 source DB/WAL/SHM을 건드리지 않는다.
+- DB와 snapshot source의 final symlink/Windows reparse는 물리 parent 아래에서 정적으로 거부한다.
+  Windows SQLite VFS의 writable sidecar open과 hostile same-UID entry 교체를 원자적으로 봉쇄하는
+  hardening은 현재 프로토타입 범위 밖이다.
 - Manifest의 local execution profile은 capability/instance, adapter 제한, route/materializer와
   approval/policy revision을 묶는다.
 - schema-8 completion sidecar가 없거나 manifest/store binding이 다르면 exit `70`이다.

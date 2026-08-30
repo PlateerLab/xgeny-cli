@@ -148,8 +148,10 @@ Drive letter로 숨겨진 mapped network volume은 표준 path syntax만으로 �
   URI로 안전하게 표현할 수 없는 local path는 lease 아래 DB/WAL을 같은 private `0700` scratch에
   `0600`으로 복사하고 source SHM은 복사하지 않은 채 복사본에서만 WAL-index를 재생성한다. 따라서
   authoritative DB/WAL/SHM은 read-only이며 최신 committed page도 잃지 않는다.
-- 일반 파일 open과 snapshot source copy는 no-follow로 열며, URI는 clean immutable fast path에서만
-  사용한다.
+- DB final symlink와 Windows reparse point는 물리 parent 아래에서 정적으로 거부한다. Snapshot
+  source copy는 OS no-follow로 열고 SQLite open에도 VFS no-follow flag를 전달하며, URI는 clean
+  immutable fast path에서만 사용한다. 이는 hostile same-UID process가 검사 직후 entry를 바꾸는
+  경쟁까지 원자적으로 막는다는 보장은 아니다.
 - lease를 manifest/DB open과 외부 호출보다 먼저 잡고 process가 끝날 때까지 유지한다.
 - store와 lease `Debug`/공개 오류는 path를 출력하지 않는다.
 
@@ -224,6 +226,9 @@ Linux, macOS, Windows 전체 workspace test와 release build가 merge gate다. �
 - hostile same-UID process에 대한 OS sandbox, encrypted/sealed material, ACL hardening은 후속이다.
 - Windows mapped-drive/network volume 탐지와 local-volume attestation은 후속이다. Drive-letter
   namespace를 통과했다는 사실만으로 local storage라고 간주하면 안 된다.
+- Windows SQLite VFS에서 writable DB와 `-wal`/`-shm`/`-journal` entry를 handle-relative로 열어
+  reparse 교체를 원자적으로 차단하는 hardening은 hostile same-UID 격리와 함께 후속이다. 현재는
+  app-owned private Run directory와 open 전 정적 final-reparse 거부를 경계로 삼는다.
 - Run directory 생성 중 전원 장애로 생긴 partial layout은 자동 덮어쓰거나 복구하지 않고 안전 오류로
   남긴다. 명시적 진단/정리 UX가 필요하다.
 - Crash WAL 사전검증용 private snapshot은 정상 반환/error unwind에서 RAII로 지운다. SIGKILL 또는

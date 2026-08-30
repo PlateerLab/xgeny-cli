@@ -6318,6 +6318,14 @@ mod tests {
         let store =
             SqliteRunStore::open(":memory:").expect("in-memory SQLite should remain usable");
         assert!(store.load().expect("in-memory store should load").is_none());
+        let temporary = SqliteRunStore::open("")
+            .expect("an empty compatibility path should retain SQLite temporary DB support");
+        assert!(
+            temporary
+                .load()
+                .expect("temporary store should load")
+                .is_none()
+        );
 
         for invalid_path in ["", ":memory:"] {
             assert!(matches!(
@@ -6370,6 +6378,44 @@ mod tests {
             before,
             "rejected symlink opens must not mutate the target"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_file_open_modes_accept_a_physical_file_below_an_ancestor_symlink() {
+        let directory = tempdir().expect("temp directory should exist");
+        let physical_parent = directory.path().join("physical-parent");
+        let alias_parent = directory.path().join("alias-parent");
+        fs::create_dir(&physical_parent).expect("physical parent should be created");
+        std::os::unix::fs::symlink(&physical_parent, &alias_parent)
+            .expect("ancestor symlink should be created");
+
+        let explicit_path = alias_parent.join("explicit.db");
+        drop(
+            SqliteRunStore::create(&explicit_path)
+                .expect("create should accept a physical file below an ancestor symlink"),
+        );
+        drop(
+            SqliteRunStore::open_existing(&explicit_path)
+                .expect("writable resume should accept the same physical file"),
+        );
+        drop(
+            SqliteRunStore::open_existing_read_only(&explicit_path)
+                .expect("read-only preflight should accept the same physical file"),
+        );
+
+        let compatibility_path = alias_parent.join("compatibility.db");
+        drop(
+            SqliteRunStore::open(&compatibility_path)
+                .expect("compatibility create should accept an ancestor symlink"),
+        );
+        drop(
+            SqliteRunStore::open(&compatibility_path)
+                .expect("compatibility resume should accept an ancestor symlink"),
+        );
+
+        assert!(physical_parent.join("explicit.db").is_file());
+        assert!(physical_parent.join("compatibility.db").is_file());
     }
 
     #[test]
