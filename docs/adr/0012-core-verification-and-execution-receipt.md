@@ -6,6 +6,8 @@
 - 공개 protocol v0.1 변경: 없음
 - local store schema: 3 → 4
 
+> 후속 상태: ADR-0013이 schema와 wire를 바꾸지 않고 one-pass Receipt anchor 검증, connection-local VerifiedRunIndex와 runtime 최소 view를 추가했다. 아래 장기 Run index 비목표는 ADR-0012 결정 당시의 범위를 기록한다.
+
 ## 문맥
 
 ADR-0011까지의 Direct Executor는 외부 effect의 성공 evidence를 기록한 뒤 Step을 `Validating`에 남겼다. 그러나 adapter outcome의 digest가 실제 protocol `ExecutionReceipt`처럼 이름 붙어 있었고, 검증 주체·Receipt 작성 주체·원자 저장 단위가 정해지지 않았다. 이 상태에서는 다음을 보장할 수 없다.

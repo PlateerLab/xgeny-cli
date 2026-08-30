@@ -3,7 +3,7 @@
 mod memory;
 mod sqlite;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -19,9 +19,9 @@ use xgeny_protocol::{
     core_verification_summary_v1, evaluate_core_verification_v1, validate_execution_receipt,
 };
 use xgeny_workgraph::{
-    EffectClass, EventRecord, InvocationMaterialError, InvocationMaterialRecord, ReceiptPlacement,
-    ReceiptVerificationStrategy, RecordError, ReplayError, RunEvent, RunEventBody, RunState,
-    TransitionError, VerificationDisposition, apply_record, replay,
+    EffectClass, EffectIntent, EventRecord, InvocationMaterialError, InvocationMaterialRecord,
+    ReceiptPlacement, ReceiptVerificationStrategy, RecordError, ReplayError, RunEvent,
+    RunEventBody, RunState, TransitionError, VerificationDisposition, apply_record, replay,
 };
 
 pub use memory::MemoryRunStore;
@@ -58,11 +58,169 @@ pub struct RunSnapshot {
     pub state: RunState,
 }
 
+/// Minimal verified view used by the runtime hot path when finalizing one Receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunVerificationSnapshot {
+    pub state: RunState,
+    pub effect_started_at: Option<String>,
+    pub previous_receipt_digest: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StoredExecutionReceipt {
     pub event_sequence: u64,
     pub effect_id: String,
     pub receipt: ExecutionReceiptBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EffectIntentAnchor {
+    event_sequence: u64,
+    step_id: String,
+    intent: EffectIntent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EffectStartAnchor {
+    event_sequence: u64,
+    step_id: String,
+    recorded_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReceiptEventAnchor {
+    event_sequence: u64,
+    run_id: String,
+    step_id: String,
+    effect_id: String,
+    disposition: VerificationDisposition,
+    receipt_id: String,
+    receipt_digest: String,
+    started_at: String,
+    ended_at: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct VerifiedRunIndex {
+    state: Option<RunState>,
+    last_record: Option<EventRecord>,
+    event_ids: BTreeSet<String>,
+    intents: BTreeMap<String, EffectIntentAnchor>,
+    effect_starts: BTreeMap<String, EffectStartAnchor>,
+    receipt_events: Vec<ReceiptEventAnchor>,
+    material_effect_ids: BTreeSet<String>,
+    receipt_ids: BTreeSet<String>,
+    receipt_digests: BTreeSet<String>,
+    receipt_effect_ids: BTreeSet<String>,
+    receipt_head_digest: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct AuditMetrics {
+    #[cfg(test)]
+    full_audits: u64,
+    #[cfg(test)]
+    historical_events: u64,
+    #[cfg(test)]
+    historical_materials: u64,
+    #[cfg(test)]
+    historical_receipts: u64,
+    #[cfg(test)]
+    candidate_events: u64,
+    #[cfg(test)]
+    candidate_materials: u64,
+    #[cfg(test)]
+    candidate_receipts: u64,
+    #[cfg(test)]
+    receipt_anchor_intent_lookups: u64,
+    #[cfg(test)]
+    receipt_anchor_start_lookups: u64,
+    #[cfg(test)]
+    receipt_binding_intent_lookups: u64,
+}
+
+impl AuditMetrics {
+    fn record_full_audit(&mut self) {
+        #[cfg(test)]
+        {
+            self.full_audits = self.full_audits.saturating_add(1);
+        }
+        #[cfg(not(test))]
+        let _ = self;
+    }
+
+    fn record_historical_event(&mut self) {
+        #[cfg(test)]
+        {
+            self.historical_events = self.historical_events.saturating_add(1);
+        }
+        #[cfg(not(test))]
+        let _ = self;
+    }
+
+    fn record_historical_materials(&mut self, count: usize) {
+        #[cfg(test)]
+        {
+            self.historical_materials = self
+                .historical_materials
+                .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        }
+        #[cfg(not(test))]
+        let _ = (self, count);
+    }
+
+    fn record_historical_receipt(&mut self) {
+        #[cfg(test)]
+        {
+            self.historical_receipts = self.historical_receipts.saturating_add(1);
+        }
+        #[cfg(not(test))]
+        let _ = self;
+    }
+
+    fn record_candidate(&mut self, has_material: bool, has_receipt: bool) {
+        #[cfg(test)]
+        {
+            self.candidate_events = self.candidate_events.saturating_add(1);
+            if has_material {
+                self.candidate_materials = self.candidate_materials.saturating_add(1);
+            }
+            if has_receipt {
+                self.candidate_receipts = self.candidate_receipts.saturating_add(1);
+            }
+        }
+        #[cfg(not(test))]
+        let _ = (self, has_material, has_receipt);
+    }
+
+    fn record_receipt_anchor_intent_lookup(&mut self) {
+        #[cfg(test)]
+        {
+            self.receipt_anchor_intent_lookups =
+                self.receipt_anchor_intent_lookups.saturating_add(1);
+        }
+        #[cfg(not(test))]
+        let _ = self;
+    }
+
+    fn record_receipt_anchor_start_lookup(&mut self) {
+        #[cfg(test)]
+        {
+            self.receipt_anchor_start_lookups = self.receipt_anchor_start_lookups.saturating_add(1);
+        }
+        #[cfg(not(test))]
+        let _ = self;
+    }
+
+    fn record_receipt_binding_intent_lookup(&mut self) {
+        #[cfg(test)]
+        {
+            self.receipt_binding_intent_lookups =
+                self.receipt_binding_intent_lookups.saturating_add(1);
+        }
+        #[cfg(not(test))]
+        let _ = self;
+    }
 }
 
 pub trait RunStore {
@@ -115,6 +273,18 @@ pub trait RunStore {
     /// Returns an error if storage cannot be read or its projection differs from replay.
     fn load(&self) -> Result<Option<RunSnapshot>, StoreError>;
 
+    /// Load only the current verified projection for runtime coordination.
+    ///
+    /// The default preserves compatibility by using a full audit. Built-in stores override this
+    /// with a generation-checked index so callers do not materialize the historical journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the current projection cannot be verified.
+    fn load_current(&self) -> Result<Option<RunState>, StoreError> {
+        Ok(self.load()?.map(|snapshot| snapshot.state))
+    }
+
     /// Load one verified secret-free descriptor by effect ID.
     ///
     /// # Errors
@@ -149,6 +319,49 @@ pub trait RunStore {
         &self,
     ) -> Result<(Option<RunSnapshot>, Vec<ExecutionReceiptBody>), StoreError> {
         Ok((self.load()?, self.load_execution_receipts()?))
+    }
+
+    /// Load the minimal verified state needed to finalize a Step Receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Run, journal, or Receipt chain cannot be verified.
+    fn load_verification_snapshot(
+        &self,
+        step_id: &str,
+    ) -> Result<Option<RunVerificationSnapshot>, StoreError> {
+        let (snapshot, receipts) = self.load_with_execution_receipts()?;
+        let Some(snapshot) = snapshot else {
+            return Ok(None);
+        };
+        let effect_id = snapshot
+            .state
+            .steps
+            .get(step_id)
+            .and_then(|step| step.intent.as_ref())
+            .map(|intent| intent.effect_id.as_str());
+        let effect_started_at = effect_id.and_then(|effect_id| {
+            snapshot
+                .records
+                .iter()
+                .rev()
+                .find_map(|record| match &record.event.body {
+                    RunEventBody::EffectExecutionStarted {
+                        step_id: candidate_step,
+                        effect_id: candidate_effect,
+                    } if candidate_step == step_id && candidate_effect == effect_id => {
+                        Some(record.event.recorded_at.clone())
+                    }
+                    _ => None,
+                })
+        });
+        Ok(Some(RunVerificationSnapshot {
+            state: snapshot.state,
+            effect_started_at,
+            previous_receipt_digest: receipts
+                .last()
+                .map(|receipt| receipt.receipt_digest.clone()),
+        }))
     }
 
     /// Export committed journal records as RFC 8785 canonical JSON Lines in sequence order.
@@ -207,37 +420,76 @@ fn verify_material_bundle(
 }
 
 fn verify_material_records(
-    records: &[EventRecord],
+    index: &mut VerifiedRunIndex,
     materials: &BTreeMap<String, InvocationMaterialRecord>,
+    metrics: &mut AuditMetrics,
 ) -> Result<(), StoreError> {
-    let mut expected_count = 0_usize;
-    for record in records {
-        let RunEventBody::EffectIntentCommitted { step_id, intent } = &record.event.body else {
-            continue;
-        };
-        expected_count += 1;
-        let material = materials.get(&intent.effect_id).ok_or_else(|| {
+    metrics.record_historical_materials(materials.len());
+    for (effect_id, anchor) in &index.intents {
+        let material = materials.get(effect_id).ok_or_else(|| {
             StoreError::Corrupt(format!(
-                "effect `{}` has no invocation material descriptor",
-                intent.effect_id
+                "effect `{effect_id}` has no invocation material descriptor"
             ))
         })?;
         material
-            .verify_for(&record.event.run_id, step_id, intent)
+            .verify_for(
+                index
+                    .state
+                    .as_ref()
+                    .map(|state| state.run_id.as_str())
+                    .ok_or_else(|| {
+                        StoreError::Corrupt("invocation material exists without a Run".to_owned())
+                    })?,
+                &anchor.step_id,
+                &anchor.intent,
+            )
             .map_err(|error| {
                 StoreError::Corrupt(format!(
-                    "invocation material for effect `{}` is invalid: {error}",
-                    intent.effect_id
+                    "invocation material for effect `{effect_id}` is invalid: {error}"
                 ))
             })?;
     }
-    if materials.len() != expected_count {
+    if materials.len() != index.intents.len() {
         return Err(StoreError::Corrupt(format!(
-            "invocation material count differs from effect intents: expected {expected_count}, actual {}",
+            "invocation material count differs from effect intents: expected {}, actual {}",
+            index.intents.len(),
             materials.len()
         )));
     }
+    index.material_effect_ids = materials.keys().cloned().collect();
     Ok(())
+}
+
+fn verify_material_point(
+    index: &VerifiedRunIndex,
+    effect_id: &str,
+    material: Option<&InvocationMaterialRecord>,
+) -> Result<(), StoreError> {
+    match (index.intents.get(effect_id), material) {
+        (None, None) => Ok(()),
+        (None, Some(_)) => Err(StoreError::Corrupt(
+            "invocation material has no committed effect intent".to_owned(),
+        )),
+        (Some(_), None) => Err(StoreError::Corrupt(
+            "committed effect intent has no invocation material descriptor".to_owned(),
+        )),
+        (Some(anchor), Some(material)) => {
+            let run_id = index
+                .state
+                .as_ref()
+                .map(|state| state.run_id.as_str())
+                .ok_or_else(|| {
+                    StoreError::Corrupt("invocation material exists without a Run".to_owned())
+                })?;
+            material
+                .verify_for(run_id, &anchor.step_id, &anchor.intent)
+                .map_err(|error| {
+                    StoreError::Corrupt(format!(
+                        "invocation material for effect `{effect_id}` is invalid: {error}"
+                    ))
+                })
+        }
+    }
 }
 
 fn verify_receipt_bundle(
@@ -276,24 +528,80 @@ fn verify_receipt_bundle(
     }
 }
 
-fn verify_receipt_records(
-    records: &[EventRecord],
-    receipts: &[StoredExecutionReceipt],
-) -> Result<(), StoreError> {
-    let expected: Vec<_> = records
-        .iter()
-        .filter(|record| matches!(record.event.body, RunEventBody::VerificationRecorded { .. }))
-        .collect();
-    if expected.len() != receipts.len() {
-        return Err(StoreError::Corrupt(format!(
-            "execution receipt count differs from finalization events: expected {}, actual {}",
-            expected.len(),
-            receipts.len()
-        )));
+impl VerifiedRunIndex {
+    fn from_snapshot(
+        snapshot: Option<&RunSnapshot>,
+        metrics: &mut AuditMetrics,
+    ) -> Result<Self, StoreError> {
+        let Some(snapshot) = snapshot else {
+            return Ok(Self::default());
+        };
+        let mut index = Self {
+            state: Some(snapshot.state.clone()),
+            ..Self::default()
+        };
+        for record in &snapshot.records {
+            metrics.record_historical_event();
+            if !index.event_ids.insert(record.event.event_id.clone()) {
+                return Err(StoreError::Corrupt(
+                    "journal contains a duplicate event identifier".to_owned(),
+                ));
+            }
+            match &record.event.body {
+                RunEventBody::EffectIntentCommitted { step_id, intent } => {
+                    if index
+                        .intents
+                        .insert(
+                            intent.effect_id.clone(),
+                            EffectIntentAnchor {
+                                event_sequence: record.sequence,
+                                step_id: step_id.clone(),
+                                intent: intent.as_ref().clone(),
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err(StoreError::Corrupt(
+                            "journal contains a duplicate effect intent".to_owned(),
+                        ));
+                    }
+                }
+                RunEventBody::EffectExecutionStarted { step_id, effect_id } => {
+                    index.effect_starts.insert(
+                        effect_id.clone(),
+                        EffectStartAnchor {
+                            event_sequence: record.sequence,
+                            step_id: step_id.clone(),
+                            recorded_at: record.event.recorded_at.clone(),
+                        },
+                    );
+                }
+                RunEventBody::VerificationRecorded { .. } => {
+                    index
+                        .receipt_events
+                        .push(index.receipt_anchor_for(record, Some(metrics))?);
+                }
+                _ => {}
+            }
+            index.last_record = Some(record.clone());
+        }
+        Ok(index)
     }
 
-    let mut previous_digest: Option<&str> = None;
-    for (record, stored) in expected.into_iter().zip(receipts) {
+    fn head(&self) -> ExpectedHead {
+        self.last_record
+            .as_ref()
+            .map_or(ExpectedHead::Empty, |record| ExpectedHead::Exact {
+                sequence: record.sequence,
+                digest: record.digest.clone(),
+            })
+    }
+
+    fn receipt_anchor_for(
+        &self,
+        record: &EventRecord,
+        mut metrics: Option<&mut AuditMetrics>,
+    ) -> Result<ReceiptEventAnchor, StoreError> {
         let RunEventBody::VerificationRecorded {
             step_id,
             effect_id,
@@ -302,53 +610,203 @@ fn verify_receipt_records(
             receipt_digest,
         } = &record.event.body
         else {
-            unreachable!("filtered above")
+            return Err(StoreError::UnexpectedExecutionReceipt);
         };
+        if let Some(metrics) = metrics.as_mut() {
+            metrics.record_receipt_anchor_intent_lookup();
+        }
+        let intent = self.intents.get(effect_id).ok_or_else(|| {
+            StoreError::Corrupt("execution receipt has no committed effect intent".to_owned())
+        })?;
+        if intent.step_id != *step_id || intent.event_sequence >= record.sequence {
+            return Err(StoreError::Corrupt(
+                "execution receipt precedes or differs from its effect intent".to_owned(),
+            ));
+        }
+        if let Some(metrics) = metrics.as_mut() {
+            metrics.record_receipt_anchor_start_lookup();
+        }
+        let started = self.effect_starts.get(effect_id).ok_or_else(|| {
+            StoreError::Corrupt("execution receipt has no start event".to_owned())
+        })?;
+        if started.step_id != *step_id || started.event_sequence >= record.sequence {
+            return Err(StoreError::Corrupt(
+                "execution receipt precedes or differs from its start event".to_owned(),
+            ));
+        }
+        Ok(ReceiptEventAnchor {
+            event_sequence: record.sequence,
+            run_id: record.event.run_id.clone(),
+            step_id: step_id.clone(),
+            effect_id: effect_id.clone(),
+            disposition: *disposition,
+            receipt_id: receipt_id.clone(),
+            receipt_digest: receipt_digest.clone(),
+            started_at: started.recorded_at.clone(),
+            ended_at: record.event.recorded_at.clone(),
+        })
+    }
+
+    fn verification_snapshot(&self, step_id: &str) -> Option<RunVerificationSnapshot> {
+        let state = self.state.clone()?;
+        let effect_started_at = state
+            .steps
+            .get(step_id)
+            .and_then(|step| step.intent.as_ref())
+            .and_then(|intent| self.effect_starts.get(&intent.effect_id))
+            .filter(|started| started.step_id == step_id)
+            .map(|started| started.recorded_at.clone());
+        Some(RunVerificationSnapshot {
+            state,
+            effect_started_at,
+            previous_receipt_digest: self.receipt_head_digest.clone(),
+        })
+    }
+
+    fn apply_committed(
+        &mut self,
+        commit: &Commit,
+        material: Option<&InvocationMaterialRecord>,
+        receipt: Option<&ExecutionReceiptBody>,
+        receipt_anchor: Option<ReceiptEventAnchor>,
+    ) {
+        self.event_ids.insert(commit.record.event.event_id.clone());
+        match &commit.record.event.body {
+            RunEventBody::EffectIntentCommitted { step_id, intent } => {
+                self.intents.insert(
+                    intent.effect_id.clone(),
+                    EffectIntentAnchor {
+                        event_sequence: commit.record.sequence,
+                        step_id: step_id.clone(),
+                        intent: intent.as_ref().clone(),
+                    },
+                );
+            }
+            RunEventBody::EffectExecutionStarted { step_id, effect_id } => {
+                self.effect_starts.insert(
+                    effect_id.clone(),
+                    EffectStartAnchor {
+                        event_sequence: commit.record.sequence,
+                        step_id: step_id.clone(),
+                        recorded_at: commit.record.event.recorded_at.clone(),
+                    },
+                );
+            }
+            RunEventBody::VerificationRecorded { .. } => self.receipt_events.push(
+                receipt_anchor.expect("verified Receipt commit must retain its event anchor"),
+            ),
+            _ => {}
+        }
+        if let Some(material) = material {
+            self.material_effect_ids
+                .insert(material.effect_id().to_owned());
+        }
+        if let Some(receipt) = receipt {
+            self.receipt_ids.insert(receipt.receipt_id.clone());
+            self.receipt_digests.insert(receipt.receipt_digest.clone());
+            if let RunEventBody::VerificationRecorded { effect_id, .. } = &commit.record.event.body
+            {
+                self.receipt_effect_ids.insert(effect_id.clone());
+            }
+            self.receipt_head_digest = Some(receipt.receipt_digest.clone());
+        }
+        self.state = Some(commit.state.clone());
+        self.last_record = Some(commit.record.clone());
+    }
+}
+
+fn verify_receipt_records(
+    index: &mut VerifiedRunIndex,
+    receipts: &[StoredExecutionReceipt],
+    metrics: &mut AuditMetrics,
+) -> Result<(), StoreError> {
+    if index.receipt_events.len() != receipts.len() {
+        return Err(StoreError::Corrupt(format!(
+            "execution receipt count differs from finalization events: expected {}, actual {}",
+            index.receipt_events.len(),
+            receipts.len()
+        )));
+    }
+
+    let mut previous_digest: Option<&str> = None;
+    for (anchor, stored) in index.receipt_events.iter().zip(receipts) {
+        metrics.record_historical_receipt();
         let receipt = &stored.receipt;
         validate_execution_receipt(receipt)
             .map_err(|_| StoreError::Corrupt("execution receipt document is invalid".to_owned()))?;
-        if stored.event_sequence != record.sequence
-            || stored.effect_id != *effect_id
-            || receipt.receipt_id != *receipt_id
-            || receipt.receipt_digest != *receipt_digest
-            || receipt.run_id != record.event.run_id
-            || receipt.step_id != *step_id
+        if stored.event_sequence != anchor.event_sequence
+            || stored.effect_id != anchor.effect_id
+            || receipt.receipt_id != anchor.receipt_id
+            || receipt.receipt_digest != anchor.receipt_digest
+            || receipt.run_id != anchor.run_id
+            || receipt.step_id != anchor.step_id
             || receipt.previous_receipt_digest.as_deref() != previous_digest
         {
             return Err(StoreError::Corrupt(
                 "execution receipt differs from its journal binding".to_owned(),
             ));
         }
-
-        let (intent_record, intent) = records
-            .iter()
-            .find_map(|candidate| {
-                let RunEventBody::EffectIntentCommitted {
-                    step_id: intent_step_id,
-                    intent,
-                } = &candidate.event.body
-                else {
-                    return None;
-                };
-                (intent.effect_id == *effect_id && intent_step_id == step_id)
-                    .then_some((candidate, intent.as_ref()))
-            })
-            .ok_or_else(|| {
-                StoreError::Corrupt("execution receipt has no committed effect intent".to_owned())
-            })?;
-        if intent_record.sequence >= record.sequence {
-            return Err(StoreError::Corrupt(
-                "execution receipt precedes its effect intent".to_owned(),
-            ));
-        }
+        metrics.record_receipt_binding_intent_lookup();
+        let intent = &index
+            .intents
+            .get(&anchor.effect_id)
+            .expect("Receipt anchor creation verifies the effect intent")
+            .intent;
         let provenance = intent.receipt_provenance.as_ref().ok_or_else(|| {
             StoreError::Corrupt("execution receipt has no durable provenance".to_owned())
         })?;
-        verify_receipt_intent_binding(receipt, intent, provenance, *disposition)?;
-        verify_receipt_timestamps(records, record.sequence, step_id, effect_id, receipt)?;
+        verify_receipt_intent_binding(receipt, intent, provenance, anchor.disposition)?;
+        verify_receipt_timestamps(anchor, receipt)?;
+        if !index.receipt_ids.insert(receipt.receipt_id.clone())
+            || !index.receipt_digests.insert(receipt.receipt_digest.clone())
+            || !index.receipt_effect_ids.insert(anchor.effect_id.clone())
+        {
+            return Err(StoreError::Corrupt(
+                "execution receipt identity is duplicated".to_owned(),
+            ));
+        }
         previous_digest = Some(&receipt.receipt_digest);
     }
+    index.receipt_head_digest = previous_digest.map(ToOwned::to_owned);
     Ok(())
+}
+
+fn verify_receipt_candidate(
+    index: &VerifiedRunIndex,
+    record: &EventRecord,
+    receipt: &ExecutionReceiptBody,
+) -> Result<ReceiptEventAnchor, StoreError> {
+    let anchor = index.receipt_anchor_for(record, None)?;
+    if index.receipt_ids.contains(&receipt.receipt_id)
+        || index.receipt_digests.contains(&receipt.receipt_digest)
+        || index.receipt_effect_ids.contains(&anchor.effect_id)
+    {
+        return Err(StoreError::Corrupt(
+            "duplicate execution receipt identity".to_owned(),
+        ));
+    }
+    if receipt.receipt_id != anchor.receipt_id
+        || receipt.receipt_digest != anchor.receipt_digest
+        || receipt.run_id != anchor.run_id
+        || receipt.step_id != anchor.step_id
+        || receipt.previous_receipt_digest != index.receipt_head_digest
+    {
+        return Err(StoreError::Corrupt(
+            "execution receipt differs from its verified journal or chain anchor".to_owned(),
+        ));
+    }
+    let intent = &index
+        .intents
+        .get(&anchor.effect_id)
+        .expect("Receipt anchor creation verifies the effect intent")
+        .intent;
+    let provenance = intent
+        .receipt_provenance
+        .as_ref()
+        .ok_or(StoreError::ReceiptProvenanceRequired)?;
+    verify_receipt_intent_binding(receipt, intent, provenance, anchor.disposition)?;
+    verify_receipt_timestamps(&anchor, receipt)?;
+    Ok(anchor)
 }
 
 fn verify_receipt_intent_binding(
@@ -422,39 +880,18 @@ fn verify_receipt_intent_binding(
 }
 
 fn verify_receipt_timestamps(
-    records: &[EventRecord],
-    final_sequence: u64,
-    step_id: &str,
-    effect_id: &str,
+    anchor: &ReceiptEventAnchor,
     receipt: &ExecutionReceiptBody,
 ) -> Result<(), StoreError> {
-    let started_at = records
-        .iter()
-        .rev()
-        .filter(|record| record.sequence < final_sequence)
-        .find_map(|record| match &record.event.body {
-            RunEventBody::EffectExecutionStarted {
-                step_id: candidate_step,
-                effect_id: candidate_effect,
-            } if candidate_step == step_id && candidate_effect == effect_id => {
-                Some(record.event.recorded_at.as_str())
-            }
-            _ => None,
-        })
-        .ok_or_else(|| StoreError::Corrupt("execution receipt has no start event".to_owned()))?;
-    let final_record = records
-        .iter()
-        .find(|record| record.sequence == final_sequence)
-        .expect("final sequence comes from records");
-    if receipt.started_at != started_at
-        || receipt.effect.started_at.as_deref() != Some(started_at)
-        || receipt.ended_at != final_record.event.recorded_at
+    if receipt.started_at != anchor.started_at
+        || receipt.effect.started_at.as_deref() != Some(anchor.started_at.as_str())
+        || receipt.ended_at != anchor.ended_at
     {
         return Err(StoreError::Corrupt(
             "execution receipt timestamps differ from the journal".to_owned(),
         ));
     }
-    let started = OffsetDateTime::parse(started_at, &Rfc3339).map_err(|_| {
+    let started = OffsetDateTime::parse(&anchor.started_at, &Rfc3339).map_err(|_| {
         StoreError::Corrupt("execution receipt start timestamp is invalid".to_owned())
     })?;
     let ended = OffsetDateTime::parse(&receipt.ended_at, &Rfc3339).map_err(|_| {
@@ -504,33 +941,20 @@ const fn protocol_verification_strategy(
     }
 }
 
-fn actual_head(records: &[EventRecord]) -> ExpectedHead {
-    records
-        .last()
-        .map_or(ExpectedHead::Empty, |record| ExpectedHead::Exact {
-            sequence: record.sequence,
-            digest: record.digest.clone(),
-        })
-}
-
 fn prepare_commit(
-    records: &[EventRecord],
-    state: Option<&RunState>,
+    index: &VerifiedRunIndex,
     expected: ExpectedHead,
     event: RunEvent,
 ) -> Result<Commit, StoreError> {
-    let actual = actual_head(records);
+    let actual = index.head();
     if expected != actual {
         return Err(StoreError::HeadConflict { expected, actual });
     }
-    if records
-        .iter()
-        .any(|record| record.event.event_id == event.event_id)
-    {
+    if index.event_ids.contains(&event.event_id) {
         return Err(StoreError::DuplicateEventId(event.event_id));
     }
-    let record = EventRecord::next(records.last(), event)?;
-    let state = apply_record(state, &record)?;
+    let record = EventRecord::next(index.last_record.as_ref(), event)?;
+    let state = apply_record(index.state.as_ref(), &record)?;
     Ok(Commit { record, state })
 }
 
@@ -559,6 +983,16 @@ fn verified_snapshot(
             }))
         }
     }
+}
+
+fn audit_snapshot(
+    records: Vec<EventRecord>,
+    persisted: Option<RunState>,
+    metrics: &mut AuditMetrics,
+) -> Result<(Option<RunSnapshot>, VerifiedRunIndex), StoreError> {
+    let snapshot = verified_snapshot(records, persisted)?;
+    let index = VerifiedRunIndex::from_snapshot(snapshot.as_ref(), metrics)?;
+    Ok((snapshot, index))
 }
 
 fn canonical_jsonl<T: Serialize>(records: &[T]) -> Result<Vec<u8>, StoreError> {
@@ -849,6 +1283,30 @@ mod tests {
             Some(receipt_provenance_digest(provenance).expect("provenance should canonicalize"));
         effect.authorization.grant_digest = authorization_digest(&effect.authorization.binding, 1)
             .expect("second authorization should canonicalize");
+        effect
+    }
+
+    fn numbered_receipt_intent(state: &RunState, step_id: &str, ordinal: u16) -> EffectIntent {
+        let mut effect = receipt_intent(state);
+        effect.effect_id = format!("receipt-scale-effect-{ordinal}");
+        effect.action_digest = format!("sha256:receipt-scale-action-{ordinal}");
+        effect.idempotency_key = Some(format!("receipt-scale-key-{ordinal}"));
+        effect.authorization.binding.step_id = step_id.to_owned();
+        effect.authorization.binding.action_digest = effect.action_digest.clone();
+        effect.authorization.grant_id = once_authorization_id(&state.run_id, &effect.action_digest)
+            .expect("scaled authorization ID should canonicalize");
+        let provenance = effect
+            .receipt_provenance
+            .as_mut()
+            .expect("Receipt provenance should exist");
+        provenance.invocation_id = format!("receipt-scale-invocation-{ordinal}");
+        provenance.plan_id = format!("receipt-scale-plan-{ordinal}");
+        provenance.policy_decision_id = format!("receipt-scale-decision-{ordinal}");
+        provenance.policy_decision_digest = format!("sha256:{}", "c".repeat(64));
+        effect.authorization.binding.receipt_provenance_digest =
+            Some(receipt_provenance_digest(provenance).expect("provenance should canonicalize"));
+        effect.authorization.grant_digest = authorization_digest(&effect.authorization.binding, 1)
+            .expect("scaled authorization should canonicalize");
         effect
     }
 
@@ -2008,7 +2466,10 @@ mod tests {
             material,
         );
 
-        assert!(matches!(result, Err(StoreError::HeadConflict { .. })));
+        assert!(
+            matches!(result, Err(StoreError::HeadConflict { .. })),
+            "stale writer returned {result:?}"
+        );
         assert_eq!(
             stale
                 .load()
@@ -2018,6 +2479,23 @@ mod tests {
                 .len(),
             3
         );
+        let refreshed = stale
+            .load_current()
+            .expect("verified current state should load")
+            .expect("run should exist");
+        let retried = stale
+            .append(
+                ExpectedHead::from_state(&refreshed),
+                event(
+                    "event-after-refresh",
+                    RunEventBody::StepPlanned {
+                        step_id: "step-after-refresh".to_owned(),
+                        objective: "continue after observing the winning writer".to_owned(),
+                    },
+                ),
+            )
+            .expect("refreshed writer should append without reopening");
+        assert_eq!(retried.state.journal_sequence, 4);
     }
 
     #[test]
@@ -2322,6 +2800,420 @@ mod tests {
             .expect("applied evidence should resolve uncertainty");
         assert_eq!(applied.state.steps["step-1"].status, StepStatus::Validating);
         assert_eq!(physical_effect_count, 1);
+    }
+
+    #[test]
+    fn sqlite_cold_audit_indexes_each_event_once_and_warm_append_skips_historical_rows() {
+        // In-memory SQLite keeps this structural test independent of filesystem fsync latency.
+        let mut store = SqliteRunStore::open(":memory:").expect("sqlite should open");
+        let mut head = seed(&mut store);
+        store.reset_test_metrics();
+        for index in 0..1_000_u16 {
+            let event_id = format!("scale-event-{index}");
+            let step_id = format!("scale-step-{index}");
+            head = store
+                .append(
+                    ExpectedHead::from_state(&head.state),
+                    event(
+                        &event_id,
+                        RunEventBody::StepPlanned {
+                            step_id,
+                            objective: "exercise warm append".to_owned(),
+                        },
+                    ),
+                )
+                .expect("warm append should commit");
+        }
+        let metrics = store.test_metrics();
+        assert_eq!(metrics.full_audits, 0);
+        assert_eq!(metrics.historical_events, 0);
+        assert_eq!(metrics.historical_materials, 0);
+        assert_eq!(metrics.historical_receipts, 0);
+        assert_eq!(metrics.candidate_events, 1_000);
+        let historical_event_count = store.run_event_count().expect("event count");
+
+        store.invalidate_cache();
+        store.reset_test_metrics();
+        store
+            .load_current()
+            .expect("cold current state should load")
+            .expect("Run should exist");
+        let cold = store.test_metrics();
+        assert_eq!(cold.full_audits, 1);
+        assert_eq!(cold.historical_events, historical_event_count);
+        assert_eq!(cold.historical_materials, 0);
+        assert_eq!(cold.historical_receipts, 0);
+
+        store.reset_test_metrics();
+        let state = store
+            .load_current()
+            .expect("current state should load")
+            .expect("Run should exist");
+        store
+            .append(
+                ExpectedHead::from_state(&state),
+                event(
+                    "scale-event-final",
+                    RunEventBody::StepPlanned {
+                        step_id: "scale-step-final".to_owned(),
+                        objective: "prove cached append".to_owned(),
+                    },
+                ),
+            )
+            .expect("cached append should commit");
+        let warm = store.test_metrics();
+        assert_eq!(warm.full_audits, 0);
+        assert_eq!(warm.historical_events, 0);
+        assert_eq!(warm.historical_materials, 0);
+        assert_eq!(warm.historical_receipts, 0);
+        assert_eq!(warm.candidate_events, 1);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keeps the complete Receipt lifecycle workload auditable.
+    fn sqlite_receipt_heavy_run_uses_one_lookup_per_binding_and_no_warm_history_scan() {
+        let mut store = SqliteRunStore::open(":memory:").expect("sqlite should open");
+        let mut head = store
+            .append(
+                ExpectedHead::Empty,
+                event(
+                    "receipt-scale-created",
+                    RunEventBody::RunCreated {
+                        goal: "exercise a nontrivial Receipt history".to_owned(),
+                    },
+                ),
+            )
+            .expect("Run should be created");
+        let mut previous_receipt_digest = None;
+
+        for ordinal in 1..=40_u16 {
+            let step_id = format!("receipt-scale-step-{ordinal}");
+            head = store
+                .append(
+                    ExpectedHead::from_state(&head.state),
+                    event(
+                        &format!("receipt-scale-plan-{ordinal}"),
+                        RunEventBody::StepPlanned {
+                            step_id: step_id.clone(),
+                            objective: "exercise Receipt indexing".to_owned(),
+                        },
+                    ),
+                )
+                .expect("Step should be planned");
+            let effect = numbered_receipt_intent(&head.state, &step_id, ordinal);
+            head = store
+                .append_with_invocation_material(
+                    ExpectedHead::from_state(&head.state),
+                    event(
+                        &format!("receipt-scale-intent-{ordinal}"),
+                        RunEventBody::EffectIntentCommitted {
+                            step_id: step_id.clone(),
+                            intent: Box::new(effect.clone()),
+                        },
+                    ),
+                    material_for(&head.state, &step_id, &effect),
+                )
+                .expect("intent and material should commit");
+
+            for retry in 0..5_u8 {
+                head = store
+                    .append(
+                        ExpectedHead::from_state(&head.state),
+                        event(
+                            &format!("receipt-scale-{ordinal}-{retry}-started"),
+                            RunEventBody::EffectExecutionStarted {
+                                step_id: step_id.clone(),
+                                effect_id: effect.effect_id.clone(),
+                            },
+                        ),
+                    )
+                    .expect("effect should start");
+                head = store
+                    .append(
+                        ExpectedHead::from_state(&head.state),
+                        event(
+                            &format!("receipt-scale-{ordinal}-{retry}-unknown"),
+                            RunEventBody::EffectBecameUnknown {
+                                step_id: step_id.clone(),
+                                effect_id: effect.effect_id.clone(),
+                                reason: "simulated_lost_ack".to_owned(),
+                            },
+                        ),
+                    )
+                    .expect("effect should become uncertain");
+                head = store
+                    .append(
+                        ExpectedHead::from_state(&head.state),
+                        event(
+                            &format!("receipt-scale-{ordinal}-{retry}-reconciling"),
+                            RunEventBody::ReconciliationStarted {
+                                step_id: step_id.clone(),
+                                effect_id: effect.effect_id.clone(),
+                            },
+                        ),
+                    )
+                    .expect("reconciliation should start");
+                head = store
+                    .append(
+                        ExpectedHead::from_state(&head.state),
+                        event(
+                            &format!("receipt-scale-{ordinal}-{retry}-retry"),
+                            RunEventBody::ReconciliationResolved {
+                                step_id: step_id.clone(),
+                                effect_id: effect.effect_id.clone(),
+                                resolution: ReconciliationResolution::ProvedNotApplied,
+                                evidence_digest: format!("sha256:{}", "a".repeat(64)),
+                            },
+                        ),
+                    )
+                    .expect("intent should become retryable");
+            }
+
+            head = store
+                .append(
+                    ExpectedHead::from_state(&head.state),
+                    event(
+                        &format!("receipt-scale-final-start-{ordinal}"),
+                        RunEventBody::EffectExecutionStarted {
+                            step_id: step_id.clone(),
+                            effect_id: effect.effect_id.clone(),
+                        },
+                    ),
+                )
+                .expect("final effect attempt should start");
+            head = store
+                .append(
+                    ExpectedHead::from_state(&head.state),
+                    event(
+                        &format!("receipt-scale-succeeded-{ordinal}"),
+                        RunEventBody::EffectSucceeded {
+                            step_id: step_id.clone(),
+                            effect_id: effect.effect_id.clone(),
+                            evidence_digest: format!("sha256:{}", "d".repeat(64)),
+                        },
+                    ),
+                )
+                .expect("effect evidence should commit");
+
+            let mut receipt = successful_receipt(&effect);
+            receipt.receipt_id = core_receipt_id_v1(&effect.effect_id);
+            receipt.step_id.clone_from(&step_id);
+            receipt.previous_receipt_digest = previous_receipt_digest;
+            seal_receipt(&mut receipt);
+            let next_receipt_digest = Some(receipt.receipt_digest.clone());
+            if ordinal == 40 {
+                store.reset_test_metrics();
+            }
+            head = store
+                .append_with_execution_receipt(
+                    ExpectedHead::from_state(&head.state),
+                    receipt_event_for(
+                        &format!("receipt-scale-verified-{ordinal}"),
+                        &step_id,
+                        &effect,
+                        &receipt,
+                    ),
+                    receipt,
+                )
+                .expect("Receipt should commit");
+            previous_receipt_digest = next_receipt_digest;
+        }
+
+        assert_eq!(head.state.journal_sequence, 1_001);
+        assert_eq!(store.execution_receipt_count().expect("Receipt count"), 40);
+        let warm = store.test_metrics();
+        assert_eq!(warm.full_audits, 0);
+        assert_eq!(warm.historical_events, 0);
+        assert_eq!(warm.historical_materials, 0);
+        assert_eq!(warm.historical_receipts, 0);
+        assert_eq!(warm.candidate_events, 1);
+        assert_eq!(warm.candidate_materials, 0);
+        assert_eq!(warm.candidate_receipts, 1);
+
+        store.invalidate_cache();
+        store.reset_test_metrics();
+        let audited = store
+            .load_current()
+            .expect("cold audit should pass")
+            .expect("Run should exist");
+        assert_eq!(audited, head.state);
+        let cold = store.test_metrics();
+        assert_eq!(cold.full_audits, 1);
+        assert_eq!(cold.historical_events, 1_001);
+        assert_eq!(cold.historical_materials, 40);
+        assert_eq!(cold.historical_receipts, 40);
+        assert_eq!(cold.receipt_anchor_intent_lookups, 40);
+        assert_eq!(cold.receipt_anchor_start_lookups, 40);
+        assert_eq!(cold.receipt_binding_intent_lookups, 40);
+    }
+
+    #[test]
+    fn sqlite_ten_thousand_event_run_has_bounded_warm_verification_and_linear_cold_audit() {
+        let mut store = SqliteRunStore::open(":memory:").expect("sqlite should open");
+        let planned = seed(&mut store);
+        let mut head = append_intent(&mut store, &planned);
+        store.reset_test_metrics();
+
+        for cycle in 0..2_499_u16 {
+            head = store
+                .append(
+                    ExpectedHead::from_state(&head.state),
+                    event(
+                        &format!("long-start-{cycle}"),
+                        RunEventBody::EffectExecutionStarted {
+                            step_id: "step-1".to_owned(),
+                            effect_id: "effect-1".to_owned(),
+                        },
+                    ),
+                )
+                .expect("effect should start");
+            head = store
+                .append(
+                    ExpectedHead::from_state(&head.state),
+                    event(
+                        &format!("long-unknown-{cycle}"),
+                        RunEventBody::EffectBecameUnknown {
+                            step_id: "step-1".to_owned(),
+                            effect_id: "effect-1".to_owned(),
+                            reason: "simulated_lost_ack".to_owned(),
+                        },
+                    ),
+                )
+                .expect("effect should become uncertain");
+            head = store
+                .append(
+                    ExpectedHead::from_state(&head.state),
+                    event(
+                        &format!("long-reconcile-{cycle}"),
+                        RunEventBody::ReconciliationStarted {
+                            step_id: "step-1".to_owned(),
+                            effect_id: "effect-1".to_owned(),
+                        },
+                    ),
+                )
+                .expect("reconciliation should start");
+            head = store
+                .append(
+                    ExpectedHead::from_state(&head.state),
+                    event(
+                        &format!("long-retry-{cycle}"),
+                        RunEventBody::ReconciliationResolved {
+                            step_id: "step-1".to_owned(),
+                            effect_id: "effect-1".to_owned(),
+                            resolution: ReconciliationResolution::ProvedNotApplied,
+                            evidence_digest: format!("sha256:{}", "a".repeat(64)),
+                        },
+                    ),
+                )
+                .expect("effect should return to its committed intent");
+        }
+        head = store
+            .append(
+                ExpectedHead::from_state(&head.state),
+                event(
+                    "long-final-start",
+                    RunEventBody::EffectExecutionStarted {
+                        step_id: "step-1".to_owned(),
+                        effect_id: "effect-1".to_owned(),
+                    },
+                ),
+            )
+            .expect("ten-thousandth event should commit");
+
+        assert_eq!(head.state.journal_sequence, 10_000);
+        let warm = store.test_metrics();
+        assert_eq!(warm.full_audits, 0);
+        assert_eq!(warm.historical_events, 0);
+        assert_eq!(warm.historical_materials, 0);
+        assert_eq!(warm.historical_receipts, 0);
+        assert_eq!(warm.candidate_events, 9_997);
+
+        store.invalidate_cache();
+        store.reset_test_metrics();
+        let audited = store
+            .load_current()
+            .expect("cold audit should pass")
+            .expect("Run should exist");
+        assert_eq!(audited, head.state);
+        let cold = store.test_metrics();
+        assert_eq!(cold.full_audits, 1);
+        assert_eq!(cold.historical_events, 10_000);
+        assert_eq!(cold.historical_materials, 1);
+        assert_eq!(cold.historical_receipts, 0);
+    }
+
+    #[test]
+    fn sqlite_external_projection_mutation_invalidates_the_verified_cache() {
+        let directory = tempdir().expect("temp directory should exist");
+        let path = directory.path().join("run.db");
+        let mut store = SqliteRunStore::open(&path).expect("sqlite should open");
+        seed(&mut store);
+        store.reset_test_metrics();
+
+        let outsider = rusqlite::Connection::open(&path).expect("outside connection should open");
+        outsider
+            .execute(
+                "UPDATE run_projection SET state_json = ?1 WHERE singleton = 1",
+                [br#"{"tampered":true}"#.as_slice()],
+            )
+            .expect("outside mutation should commit");
+        drop(outsider);
+
+        assert!(store.load_current().is_err());
+        assert_eq!(store.test_metrics().full_audits, 1);
+    }
+
+    #[test]
+    fn sqlite_external_material_mutation_is_detected_before_point_read() {
+        let directory = tempdir().expect("temp directory should exist");
+        let path = directory.path().join("run.db");
+        let mut store = SqliteRunStore::open(&path).expect("sqlite should open");
+        let seeded = seed(&mut store);
+        append_intent(&mut store, &seeded);
+        store.reset_test_metrics();
+
+        let outsider = rusqlite::Connection::open(&path).expect("outside connection should open");
+        outsider
+            .execute(
+                "UPDATE invocation_materials SET material_digest = 'sha256:externally-corrupted'",
+                [],
+            )
+            .expect("outside mutation should commit");
+        drop(outsider);
+
+        assert!(store.load_invocation_material("effect-1").is_err());
+        assert_eq!(store.test_metrics().full_audits, 1);
+    }
+
+    #[test]
+    fn sqlite_external_receipt_mutation_invalidates_the_verified_cache() {
+        let directory = tempdir().expect("temp directory should exist");
+        let path = directory.path().join("run.db");
+        let mut store = SqliteRunStore::open(&path).expect("sqlite should open");
+        commit_two_receipt_chain(&mut store);
+        store.reset_test_metrics();
+
+        let outsider = rusqlite::Connection::open(&path).expect("outside connection should open");
+        let receipt_json: Vec<u8> = outsider
+            .query_row(
+                "SELECT receipt_json FROM execution_receipts ORDER BY event_sequence LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("Receipt should load");
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&receipt_json).expect("Receipt should decode");
+        document["outputDigest"] = serde_json::Value::String(format!("sha256:{}", "9".repeat(64)));
+        outsider
+            .execute(
+                "UPDATE execution_receipts SET receipt_json = ?1 WHERE event_sequence = (SELECT MIN(event_sequence) FROM execution_receipts)",
+                [serde_json::to_vec(&document).expect("Receipt should encode")],
+            )
+            .expect("outside mutation should commit");
+        drop(outsider);
+
+        assert!(store.load_execution_receipts().is_err());
+        assert_eq!(store.test_metrics().full_audits, 1);
     }
 
     fn result_transition(result: &Result<Commit, StoreError>) -> Option<StepStatus> {

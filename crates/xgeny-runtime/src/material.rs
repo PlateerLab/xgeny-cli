@@ -230,12 +230,11 @@ impl InvocationMaterialRecovery {
         R: ResourceResolver,
         L: RunLease,
     {
-        let snapshot = store
-            .load()?
+        let state = store
+            .load_current()?
             .ok_or(MaterialRecoveryError::RunNotInitialized)?;
-        verify_lease(lease, &snapshot.state.run_id)?;
-        let step = snapshot
-            .state
+        verify_lease(lease, &state.run_id)?;
+        let step = state
             .steps
             .get(step_id)
             .ok_or_else(|| MaterialRecoveryError::StepNotFound(step_id.to_owned()))?;
@@ -254,7 +253,7 @@ impl InvocationMaterialRecovery {
             .ok_or_else(|| MaterialRecoveryError::MaterialRecordMissing {
                 effect_id: intent.effect_id.clone(),
             })?;
-        record.verify_for(&snapshot.state.run_id, step_id, intent)?;
+        record.verify_for(&state.run_id, step_id, intent)?;
 
         let InvocationMaterialRetention::ReconstructableReference(reference) = record.retention()
         else {
@@ -292,7 +291,7 @@ impl InvocationMaterialRecovery {
         let request_id = format!("material-recovery-{}", record.material_id());
         let recovered_request = PermissionRequestResolver::new(resolver).resolve_invocation(
             &request_id,
-            &snapshot.state.run_id,
+            &state.run_id,
             step_id,
             definition,
             &reconstructed,
@@ -344,12 +343,11 @@ impl InvocationMaterialRecovery {
         F: EventFactory,
         L: RunLease,
     {
-        let snapshot = store
-            .load()?
+        let state = store
+            .load_current()?
             .ok_or(MaterialRecoveryError::RunNotInitialized)?;
-        verify_lease(lease, &snapshot.state.run_id)?;
-        let step = snapshot
-            .state
+        verify_lease(lease, &state.run_id)?;
+        let step = state
             .steps
             .get(step_id)
             .ok_or_else(|| MaterialRecoveryError::StepNotFound(step_id.to_owned()))?;
@@ -357,15 +355,15 @@ impl InvocationMaterialRecovery {
             .intent
             .as_ref()
             .ok_or_else(|| MaterialRecoveryError::IntentMissing(step_id.to_owned()))?;
-        let metadata = events.create_metadata(&snapshot.state)?;
+        let metadata = events.create_metadata(&state)?;
         store
             .append(
-                ExpectedHead::from_state(&snapshot.state),
+                ExpectedHead::from_state(&state),
                 RunEvent {
                     event_id: metadata.event_id,
-                    run_id: snapshot.state.run_id.clone(),
-                    authority: snapshot.state.authority.clone(),
-                    authority_epoch: snapshot.state.authority_epoch,
+                    run_id: state.run_id.clone(),
+                    authority: state.authority.clone(),
+                    authority_epoch: state.authority_epoch,
                     recorded_at: metadata.recorded_at,
                     body: RunEventBody::InvocationMaterialUnavailable {
                         step_id: step_id.to_owned(),

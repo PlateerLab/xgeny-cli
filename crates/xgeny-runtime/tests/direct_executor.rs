@@ -15,7 +15,8 @@ use xgeny_domain::{
     VerificationResult,
 };
 use xgeny_local_store::{
-    Commit, ExpectedHead, MemoryRunStore, RunSnapshot, RunStore, SqliteRunStore, StoreError,
+    Commit, ExpectedHead, MemoryRunStore, RunSnapshot, RunStore, RunVerificationSnapshot,
+    SqliteRunStore, StoreError,
 };
 use xgeny_policy::{
     PolicyAllowance, PolicyContribution, PolicyInputs, ResolvedPermissionRequest,
@@ -209,6 +210,70 @@ impl RunStore for RecordingStore {
 struct LostReceiptAckStore<S> {
     inner: S,
     lose_once: bool,
+}
+
+#[derive(Debug, Default)]
+struct MinimalViewOnlyStore {
+    inner: MemoryRunStore,
+    full_load_calls: Cell<u32>,
+}
+
+impl RunStore for MinimalViewOnlyStore {
+    fn append(&mut self, expected: ExpectedHead, event: RunEvent) -> Result<Commit, StoreError> {
+        self.inner.append(expected, event)
+    }
+
+    fn load(&self) -> Result<Option<RunSnapshot>, StoreError> {
+        self.full_load_calls
+            .set(self.full_load_calls.get().saturating_add(1));
+        Err(StoreError::InjectedFault(
+            "runtime hot path requested full history",
+        ))
+    }
+
+    fn load_current(&self) -> Result<Option<RunState>, StoreError> {
+        self.inner.load_current()
+    }
+
+    fn append_with_invocation_material(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        material: InvocationMaterialRecord,
+    ) -> Result<Commit, StoreError> {
+        self.inner
+            .append_with_invocation_material(expected, event, material)
+    }
+
+    fn load_invocation_material(
+        &self,
+        effect_id: &str,
+    ) -> Result<Option<InvocationMaterialRecord>, StoreError> {
+        self.inner.load_invocation_material(effect_id)
+    }
+
+    fn append_with_execution_receipt(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        receipt: xgeny_domain::ExecutionReceiptBody,
+    ) -> Result<Commit, StoreError> {
+        self.inner
+            .append_with_execution_receipt(expected, event, receipt)
+    }
+
+    fn load_execution_receipts(
+        &self,
+    ) -> Result<Vec<xgeny_domain::ExecutionReceiptBody>, StoreError> {
+        self.inner.load_execution_receipts()
+    }
+
+    fn load_verification_snapshot(
+        &self,
+        step_id: &str,
+    ) -> Result<Option<RunVerificationSnapshot>, StoreError> {
+        self.inner.load_verification_snapshot(step_id)
+    }
 }
 
 impl<S: RunStore> RunStore for LostReceiptAckStore<S> {
@@ -2513,6 +2578,50 @@ fn legacy_validating_step_stays_closed_without_invoking_a_verifier() {
             .steps[STEP_ID]
             .status,
         StepStatus::Validating
+    );
+}
+
+#[test]
+fn admission_execution_and_verification_hot_path_never_loads_full_history() {
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, instance.clone());
+    let (_lease_directory, lease) = acquire_lease();
+    let mut store = MinimalViewOnlyStore::default();
+    let counters = execute_to_validating(&mut store, &lease, &registry, &definition, &instance);
+
+    let verifier_calls = Rc::new(Cell::new(0));
+    let mut verifiers = EffectVerifierRegistry::new();
+    verifiers
+        .register(
+            &instance.binding,
+            PassingVerifier {
+                calls: Rc::clone(&verifier_calls),
+            },
+        )
+        .expect("exact verifier should register");
+    let mut events = DeterministicEvents;
+    let verified = VerificationRunner::new()
+        .drive_step(
+            &mut store,
+            &mut events,
+            &lease,
+            &registry,
+            &mut verifiers,
+            STEP_ID,
+        )
+        .expect("minimal verified views should complete the effect");
+
+    assert_eq!(verified.state.steps[STEP_ID].status, StepStatus::Completed);
+    assert_eq!(counters.executes.get(), 1);
+    assert_eq!(verifier_calls.get(), 1);
+    assert_eq!(store.full_load_calls.get(), 0);
+    assert_eq!(
+        store
+            .load_execution_receipts()
+            .expect("Receipt should load")
+            .len(),
+        1
     );
 }
 

@@ -261,9 +261,11 @@ impl InvocationAdmission {
         R: ResourceResolver,
         L: RunLease,
     {
-        let snapshot = store.load()?.ok_or(AdmissionError::RunNotInitialized)?;
-        verify_lease(lease, &snapshot.state)?;
-        require_planned_step(&snapshot.state, &request.step_id)?;
+        let state = store
+            .load_current()?
+            .ok_or(AdmissionError::RunNotInitialized)?;
+        verify_lease(lease, &state)?;
+        require_planned_step(&state, &request.step_id)?;
         if request.route.required_features.execution_style != ExecutionStyle::Sync {
             return Err(AdmissionError::UnsupportedExecutionStyle);
         }
@@ -285,7 +287,7 @@ impl InvocationAdmission {
 
         let request_identity = digest_serializable(&RequestIdentityDigestInput {
             domain: "xgeny.permission-request/v1",
-            run_id: &snapshot.state.run_id,
+            run_id: &state.run_id,
             step_id: &request.step_id,
             capability: &request.route.capability,
             arguments: &request.arguments,
@@ -293,7 +295,7 @@ impl InvocationAdmission {
         let request_id = content_id("permission", &request_identity);
         let derived_request = PermissionRequestResolver::new(resolver).resolve_invocation(
             &request_id,
-            &snapshot.state.run_id,
+            &state.run_id,
             &request.step_id,
             definition,
             &request.arguments,
@@ -312,7 +314,7 @@ impl InvocationAdmission {
         let material_digest = invocation_material_digest(derived_request.normalized_arguments())?;
 
         Ok(PendingInvocation {
-            run_binding: PendingRunBinding::from_state(&snapshot.state),
+            run_binding: PendingRunBinding::from_state(&state),
             route: request.route,
             normalized_arguments: derived_request.normalized_arguments().clone(),
             permission_request: derived_request.permission_request().clone(),
@@ -348,12 +350,14 @@ impl InvocationAdmission {
         if policy_inputs.is_managed() {
             return Err(AdmissionError::ManagedPolicyUnsupported);
         }
-        let snapshot = store.load()?.ok_or(AdmissionError::RunNotInitialized)?;
-        verify_lease(lease, &snapshot.state)?;
-        if !pending.run_binding.matches(&snapshot.state) {
+        let state = store
+            .load_current()?
+            .ok_or(AdmissionError::RunNotInitialized)?;
+        verify_lease(lease, &state)?;
+        if !pending.run_binding.matches(&state) {
             return Err(AdmissionError::RunHeadChanged);
         }
-        require_planned_step(&snapshot.state, pending.permission_request.step_id())?;
+        require_planned_step(&state, pending.permission_request.step_id())?;
 
         let definition = registry
             .definition(&pending.route.capability)
@@ -388,11 +392,11 @@ impl InvocationAdmission {
             });
         }
 
-        let metadata = events.create_metadata(&snapshot.state)?;
+        let metadata = events.create_metadata(&state)?;
         metadata.validate()?;
         let issued = issue_once_effect(
             &pending,
-            &snapshot.state,
+            &state,
             definition,
             instance,
             &selected_instance_id,
@@ -401,9 +405,9 @@ impl InvocationAdmission {
         )?;
         let event = RunEvent {
             event_id: metadata.event_id,
-            run_id: snapshot.state.run_id.clone(),
-            authority: snapshot.state.authority.clone(),
-            authority_epoch: snapshot.state.authority_epoch,
+            run_id: state.run_id.clone(),
+            authority: state.authority.clone(),
+            authority_epoch: state.authority_epoch,
             recorded_at: metadata.recorded_at,
             body: RunEventBody::EffectIntentCommitted {
                 step_id: pending.permission_request.step_id().to_owned(),
@@ -412,7 +416,7 @@ impl InvocationAdmission {
         };
         let material_record = issued.material_record.clone();
         let commit = store.append_with_invocation_material(
-            ExpectedHead::from_state(&snapshot.state),
+            ExpectedHead::from_state(&state),
             event,
             issued.material_record,
         )?;
