@@ -20,17 +20,18 @@ use xgeny_runtime::{
 };
 use xgeny_workgraph::{
     AgentLoopBudget, AgentLoopState, AuthorizationBinding, AuthorizationUse,
-    EffectClass as WorkEffectClass, EffectIntent, EventRecord, InvocationBinding, ModelCallBudget,
-    ModelCallLifecycleState, ModelCallRejectionReason, ModelCallReservation, ModelCallSettlement,
-    ReceiptPlacement, ReceiptProvenance, ReconstructableMaterialReference, RunEvent, RunEventBody,
-    RunState, SinkGuarantee, StepState, StepStatus, TOOL_OUTPUT_PROFILE_V1, ToolOutputRecord,
-    apply_record,
+    CompletionOutputRecord, EffectClass as WorkEffectClass, EffectIntent, EventRecord,
+    InvocationBinding, ModelCallBudget, ModelCallLifecycleState, ModelCallRejectionReason,
+    ModelCallReservation, ModelCallSettlement, ReceiptPlacement, ReceiptProvenance,
+    ReconstructableMaterialReference, RunEvent, RunEventBody, RunState, SinkGuarantee, StepState,
+    StepStatus, TOOL_OUTPUT_PROFILE_V1, ToolOutputRecord, apply_record,
 };
 
 const AUTHORITY: &str = "local:test";
 const RUN_ID: &str = "run-openai-http-contract";
 const RAW_RESPONSE_SENTINEL: &str = "RAW-PROVIDER-RESPONSE-MUST-NOT-BE-DURABLE";
 const TOOL_OUTPUT_SENTINEL: &str = "TOOL-OUTPUT-SENTINEL-EXACTLY-ONCE";
+const COMPLETION_SUMMARY: &str = "observed exact local output\n\t- 한글 summary";
 
 #[derive(Debug)]
 struct FixedLease;
@@ -193,6 +194,7 @@ struct OutputSnapshotStore {
     state: RunState,
     outputs: BTreeMap<String, ToolOutputRecord>,
     last_reservation: Option<ModelCallReservation>,
+    completion_output: Option<CompletionOutputRecord>,
 }
 
 impl RunStore for OutputSnapshotStore {
@@ -234,6 +236,33 @@ impl RunStore for OutputSnapshotStore {
             records: Vec::new(),
             state: self.state.clone(),
         }))
+    }
+
+    fn append_with_completion_output(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        output: CompletionOutputRecord,
+    ) -> Result<Commit, StoreError> {
+        let commit = self.append(expected, event)?;
+        self.completion_output = Some(output);
+        Ok(commit)
+    }
+
+    fn load_completion_output(
+        &self,
+        expected: ExpectedHead,
+        candidate_id: &str,
+    ) -> Result<Option<CompletionOutputRecord>, StoreError> {
+        let actual = ExpectedHead::from_state(&self.state);
+        if expected != actual {
+            return Err(StoreError::HeadConflict { expected, actual });
+        }
+        Ok(self
+            .completion_output
+            .as_ref()
+            .filter(|output| output.candidate_id() == candidate_id)
+            .cloned())
     }
 
     fn load_current(&self) -> Result<Option<RunState>, StoreError> {
@@ -378,6 +407,7 @@ fn completed_output_store() -> (OutputSnapshotStore, AgentLoopBudget, Value) {
             state,
             outputs: BTreeMap::from([(step_id.to_owned(), output)]),
             last_reservation: None,
+            completion_output: None,
         },
         budget,
         raw_output,
@@ -575,12 +605,13 @@ fn one_reservation_sends_one_strict_request_and_commits_one_plan() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Keep request capture, durable completion, and offline replay together.
 fn receipt_completed_tool_output_is_sent_once_and_exactly_in_the_http_context() {
     let response = provider_response(&json!({
         "formatVersion": 1,
         "kind": "completion_candidate",
         "steps": [],
-        "summary": "observed exact local output"
+        "summary": COMPLETION_SUMMARY
     }));
     let server = TestServer::spawn("200 OK", response);
     let mut planner = planner(&server.base_url);
@@ -615,13 +646,18 @@ fn receipt_completed_tool_output_is_sent_once_and_exactly_in_the_http_context() 
             &mut EphemeralMaterializer,
         )
         .expect("completed output should reach one completion planner turn");
-    assert!(matches!(
-        tick,
-        AgentLoopTick::CompletionCandidate {
-            newly_recorded: true,
-            ..
-        }
-    ));
+    let AgentLoopTick::CompletionCandidate {
+        candidate,
+        output: Some(output),
+        newly_recorded: true,
+        head,
+    } = tick
+    else {
+        panic!("provider completion must retain exact output")
+    };
+    assert_eq!(output.summary().as_bytes(), COMPLETION_SUMMARY.as_bytes());
+    assert_eq!(output.candidate_id(), candidate.candidate_id);
+    assert!(!format!("{output:?}").contains(COMPLETION_SUMMARY));
 
     let request = server.finish();
     let request_text = String::from_utf8(request.clone()).expect("HTTP request should be UTF-8");
@@ -663,6 +699,38 @@ fn receipt_completed_tool_output_is_sent_once_and_exactly_in_the_http_context() 
             .expect("projection should serialize")
             .contains(TOOL_OUTPUT_SENTINEL)
     );
+    let durable_completion = serde_json::to_string(
+        store
+            .completion_output
+            .as_ref()
+            .expect("completion output should be retained"),
+    )
+    .expect("completion output should serialize");
+    assert!(!durable_completion.contains(RAW_RESPONSE_SENTINEL));
+
+    let replay = AgentLoop::new(AgentLoopBudget::new(2, 2, 2, 262_144).unwrap())
+        .tick(
+            &mut store,
+            &mut DeterministicEvents,
+            &FixedLease,
+            &synthetic_registry(),
+            &IdentityResolver::default(),
+            &mut planner,
+            &mut EphemeralMaterializer,
+        )
+        .expect("durable completion should replay after the HTTP server is gone");
+    let AgentLoopTick::CompletionCandidate {
+        candidate: replayed_candidate,
+        output: Some(replayed_output),
+        newly_recorded: false,
+        head: replayed_head,
+    } = replay
+    else {
+        panic!("provider completion replay should be exact")
+    };
+    assert_eq!(replayed_head, head);
+    assert_eq!(replayed_candidate, candidate);
+    assert_eq!(replayed_output, output);
 }
 
 #[test]

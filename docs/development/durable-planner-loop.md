@@ -3,7 +3,7 @@
 - 기준일: 2026-08-30
 - 상태: provider-neutral durable planning + 첫 OpenAI-compatible adapter
 - 공개 protocol v0.1 schema 변경: 없음
-- local store schema: 7
+- local store schema: 8
 
 ## 현재 가능한 것
 
@@ -124,7 +124,7 @@ Plan acceptance도 preflight identity로 한 번 정규화한 뒤 semantic propo
 
 Remote lookup이나 credential이 없으면 identity를 만들 수 없는 Capability는 현재 profile에서 plan acceptance할 수 없다. 이런 Capability는 추후 unresolved proposal commitment와 admission-time resolved commitment를 나누는 2단계 binding 계약이 생기기 전까지 fail-closed한다.
 
-## SQLite schema 6 planner table과 current schema 7
+## SQLite schema 6 planner table과 current schema 8
 
 Schema 6은 다음 table을 추가한다.
 
@@ -149,7 +149,7 @@ SQLite transaction은 event, effect/authorization index, planned input rows, inv
 
 Open과 `load()`는 journal replay만 맞는지 검사하고 끝내지 않는다. `PlanAccepted` anchor와 sidecar 전체를 대조하고 missing/orphan/index-column/serialized-record/digest 차이를 corruption으로 닫는다. `load_planned_invocation(step_id)`도 verified current generation과 point record를 다시 결합한다.
 
-Version 5 → 6 migration은 역사적으로 이 빈 table을 추가했다. Current schema 7 migration은 schema 3/4/5/6의 기존 event/projection/effect/authorization/material/Receipt/plan row와 blob을 다시 쓰지 않고 `tool_outputs` table을 추가한다. 감사가 실패하면 새 table과 `user_version` 변경을 같은 transaction에서 모두 rollback한다. Version 1/2와 8 이상은 지원하지 않는다.
+Version 5 → 6 migration은 역사적으로 이 빈 table을 추가했다. Schema 7은 기존 durable bytes를 다시 쓰지 않고 `tool_outputs` table을 추가했고, current schema 8은 같은 방식으로 `completion_outputs` table을 추가한다. Schema 3/4/5/6/7 migration은 해당 legacy topology의 event/projection/effect/authorization/material/Receipt/plan/tool-output row를 full audit한 뒤 8로 수렴한다. 감사가 실패하면 새 table과 `user_version` 변경을 같은 transaction에서 모두 rollback한다. Version 1/2와 9 이상은 지원하지 않는다.
 
 ## Admission 이중 binding
 
@@ -325,9 +325,10 @@ Graph가 모두 끝났다는 것과 사용자 goal이 충족됐다는 것은 다
 - 모든 Step이 Receipt-bound `Completed`다.
 - exact next accepted turn이고 budget 안이다.
 - candidate/context/proposal/summary digest가 유효하다.
+- 새 candidate는 model call/context/proposal에 결합된 bounded `CompletionOutputRecord`와 event를 원자 commit한다.
 - 이전 candidate가 없다.
 
-Candidate가 생기면 현재 기본형은 추가 plan을 받지 않고 pause한다. 별도 goal verifier나 사용자 확인이 candidate의 evidence를 검증한 뒤 terminal lifecycle을 결정해야 하지만, 그 event와 state machine은 아직 없다.
+Exact UTF-8 summary는 schema 8 local sidecar에만 남고 journal/projection에는 record digest만 남는다. Process restart와 commit acknowledgement 유실 뒤에는 모델을 다시 부르지 않고 sidecar를 검증해 같은 bytes를 반환한다. Schema 7 legacy candidate에는 summary를 발명하지 않고 `None`을 반환한다. Candidate가 생기면 현재 기본형은 추가 plan을 받지 않고 pause한다. 별도 goal verifier나 사용자 확인이 candidate의 evidence를 검증한 뒤 terminal lifecycle을 결정해야 하지만, 그 event와 state machine은 아직 없다.
 
 ## XGEN과 외부 harness
 
@@ -359,11 +360,13 @@ xgeny-local-store
   Memory/SQLite plan bundle parity and reopen
   missing/extra/orphan/tampered sidecar audit
   Event/PlannedInvocation/Projection fault rollback
-  schema 3/4/5/6 -> 7 preservation and failed migration rollback
+  schema 3/4/5/6/7 -> 8 preservation and failed migration rollback
+  completion Event/sidecar/Projection fault and child-process rollback
+  schema 7 legacy completion no-backfill plus schema 8 exact output replay
   model-call-specific Unknown reopen parity
   model-call-specific reservation/Unknown event-projection and active-Plan sidecar fault rollback
   shared process-exit/two-handle/cache regressions remain green
-  schema 7 tool-output addition and pre-existing durable row/blob preservation
+  schema 7 tool-output bytes preservation plus schema 8 completion-output addition
 
 xgeny-runtime
   deterministic context/order/round-robin whole-item packing/byte budget/redaction
@@ -377,6 +380,7 @@ xgeny-runtime
   stale planning response new-head rebase zero
   planned-input reconstruction and admission double binding
   raw prompt/response/error/credential durable/log exposure zero
+  completion commit-ack loss and process restart provider recall zero
   observer-mode provider/store mutation zero
 ```
 

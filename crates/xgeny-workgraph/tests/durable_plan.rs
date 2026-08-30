@@ -770,6 +770,7 @@ fn completion_candidate_seals_legacy_planning() {
                 .expect("turn should bind"),
             candidate_id: "completion-done".to_owned(),
             summary_digest: digest('3'),
+            completion_output_record_digest: None,
         },
     );
     let reopened = record_after(

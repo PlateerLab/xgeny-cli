@@ -233,14 +233,16 @@ Schema 7 output durability만으로 사용자용 prototype은 완성되지 않�
 
 [ADR-0020](0020-generation-checked-planning-context-v2.md)이 `Completed + passed Receipt + exact output`의 same-generation snapshot, PlanningContext v2, OpenAI prompt v2와 output/Receipt commit 뒤 SQLite restart E2E를 완료했다. 남은 항목은 다음과 같다.
 
-1. model call/context/proposal/candidate와 raw final summary를 원자 저장하는 `CompletionOutputRecord`
-2. restart 뒤 completion을 모델 재호출 없이 복원하는 public run/resume 표현
-3. process restart에도 invocation argument를 복원할 권한 제한 durable recipe provider
-4. 실제 bounded filesystem adapter와 descriptor-relative/no-follow confinement
-5. filesystem read 승인과 model egress 승인 분리 및 public composition 적용
-6. 같은 ReadOnly semantic action을 다시 관찰할 occurrence/generation identity
-7. completion commit 뒤 실제 process restart E2E
-8. packaged Linux/macOS/Windows binary와 opt-in live provider/tool smoke
+[ADR-0021](0021-durable-completion-output-and-schema-8.md)이 model
+call/context/proposal/candidate에 결합된 `CompletionOutputRecord`, schema 8과 실제 별도 process
+restart no-model-recall E2E를 완료했다. 남은 항목은 다음과 같다.
+
+1. public `run/resume`에서 durable completion을 사용자에게 표현하고 승인하는 lifecycle
+2. process restart에도 invocation argument를 복원할 권한 제한 durable recipe provider
+3. 실제 bounded filesystem adapter와 descriptor-relative/no-follow confinement
+4. filesystem read 승인과 model egress 승인 분리 및 public composition 적용
+5. 같은 ReadOnly semantic action을 다시 관찰할 occurrence/generation identity
+6. packaged Linux/macOS/Windows binary와 opt-in live provider/tool smoke
 
 현재 table은 effect당 bounded final JSON 하나만 지원한다. Streaming output, 여러 output generation, retention/GC, encryption과 remote synchronization은 이 schema의 암묵적 기능이 아니며 후속 schema 결정이 필요하다.
 
@@ -253,7 +255,7 @@ Schema 7 output durability만으로 사용자용 prototype은 완성되지 않�
 - Streaming/chunked output과 effect당 여러 final output
 - 동일 ReadOnly action 반복 관찰
 - 실제 filesystem confinement와 public `xgeny run`
-- durable completion 본문
+- durable completion 본문(당시 비목표이며 ADR-0021에서 local sidecar로 후속 구현)
 - write/process/network/MCP/XGEN adapter
 
 ## 결과

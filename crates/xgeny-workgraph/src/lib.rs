@@ -53,6 +53,8 @@ pub enum RunEventBody {
         decision: ExpectedPlanningTurn,
         candidate_id: String,
         summary_digest: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        completion_output_record_digest: Option<String>,
     },
     StepPlanned {
         step_id: String,
@@ -256,6 +258,409 @@ pub const MAX_TOOL_OUTPUT_DEPTH: usize = 64;
 /// Maximum JSON values and object members accepted in one output.
 pub const MAX_TOOL_OUTPUT_NODES: usize = 32_768;
 const MAX_TOOL_OUTPUT_TEXT_BYTES: usize = MAX_TOOL_OUTPUT_CANONICAL_BYTES;
+
+/// Current self-verifying completion-output sidecar format.
+pub const COMPLETION_OUTPUT_FORMAT_VERSION: u32 = 1;
+/// Maximum UTF-8 bytes retained for one final completion summary.
+pub const MAX_COMPLETION_SUMMARY_BYTES: usize = 5_000;
+
+/// Self-verifying local sidecar for one exact final model summary.
+///
+/// The raw summary is intentionally absent from the journal and `RunState`. Its custom `Debug`
+/// implementation redacts the summary while retaining the non-sensitive durable bindings.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CompletionOutputRecord {
+    format_version: u32,
+    candidate_id: String,
+    run_id: String,
+    turn_index: u32,
+    model_call_id: String,
+    context_digest: String,
+    proposal_digest: String,
+    summary_size_bytes: u64,
+    summary_digest: String,
+    summary: String,
+    record_digest: String,
+}
+
+impl CompletionOutputRecord {
+    /// Construct every completion identity from one exact provider summary and call context.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fixed error for malformed identity, invalid summary content, or
+    /// canonicalization failure.
+    pub fn bind(
+        run_id: impl Into<String>,
+        turn_index: u32,
+        model_call_id: impl Into<String>,
+        context_digest: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Result<Self, CompletionOutputError> {
+        let run_id = run_id.into();
+        let model_call_id = model_call_id.into();
+        let context_digest = context_digest.into();
+        let summary = summary.into();
+        validate_completion_summary_candidate(&summary)?;
+        require_planning_identifier("run_id", &run_id)?;
+        require_planning_digest("context_digest", &context_digest)?;
+        let proposal_digest = completion_proposal_digest(&context_digest, &summary)?;
+        let decision = ExpectedPlanningTurn::for_model_call(
+            turn_index,
+            model_call_id,
+            &context_digest,
+            &proposal_digest,
+        )?;
+        let candidate_id = completion_candidate_id(&run_id, &context_digest, &proposal_digest)?;
+        let summary_digest = completion_summary_digest(&summary)?;
+        Self::new(run_id, &decision, candidate_id, summary_digest, summary)
+    }
+
+    /// Bind one bounded summary to the exact accepted completion decision.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fixed error for malformed identity, a legacy decision without a model-call
+    /// binding, invalid summary content, canonicalization, or any digest mismatch.
+    pub fn new(
+        run_id: impl Into<String>,
+        decision: &ExpectedPlanningTurn,
+        candidate_id: impl Into<String>,
+        summary_digest: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Result<Self, CompletionOutputError> {
+        let model_call_id = decision
+            .model_call_id()
+            .ok_or(CompletionOutputError::MissingModelCallBinding)?
+            .to_owned();
+        let summary = summary.into();
+        let mut record = Self {
+            format_version: COMPLETION_OUTPUT_FORMAT_VERSION,
+            candidate_id: candidate_id.into(),
+            run_id: run_id.into(),
+            turn_index: decision.turn_index(),
+            model_call_id,
+            context_digest: decision.context_digest().to_owned(),
+            proposal_digest: decision.proposal_digest().to_owned(),
+            summary_size_bytes: u64::try_from(summary.len())
+                .map_err(|_| CompletionOutputError::SummaryTooLarge)?,
+            summary_digest: summary_digest.into(),
+            summary,
+            record_digest: String::new(),
+        };
+        record.record_digest = completion_output_record_digest(&record)?;
+        record.verify_for(
+            &record.run_id,
+            decision,
+            &record.candidate_id,
+            &record.summary_digest,
+        )?;
+        Ok(record)
+    }
+
+    /// Recompute every content and identity binding for this record.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fixed error for tampering, cross-call reuse, excessive content, or an
+    /// unsupported format.
+    pub fn verify_for(
+        &self,
+        run_id: &str,
+        decision: &ExpectedPlanningTurn,
+        candidate_id: &str,
+        summary_digest: &str,
+    ) -> Result<(), CompletionOutputError> {
+        if self.format_version != COMPLETION_OUTPUT_FORMAT_VERSION {
+            return Err(CompletionOutputError::UnsupportedFormatVersion(
+                self.format_version,
+            ));
+        }
+        decision.validate()?;
+        let model_call_id = decision
+            .model_call_id()
+            .ok_or(CompletionOutputError::MissingModelCallBinding)?;
+        require_planning_identifier("run_id", run_id)?;
+        require_planning_identifier("candidate_id", candidate_id)?;
+        require_planning_digest("summary_digest", summary_digest)?;
+        for (field, matches) in [
+            ("run_id", self.run_id == run_id),
+            ("candidate_id", self.candidate_id == candidate_id),
+            ("turn_index", self.turn_index == decision.turn_index()),
+            ("model_call_id", self.model_call_id == model_call_id),
+            (
+                "context_digest",
+                self.context_digest == decision.context_digest(),
+            ),
+            (
+                "proposal_digest",
+                self.proposal_digest == decision.proposal_digest(),
+            ),
+            ("summary_digest", self.summary_digest == summary_digest),
+        ] {
+            if !matches {
+                return Err(CompletionOutputError::BindingMismatch(field));
+            }
+        }
+        validate_completion_summary_candidate(&self.summary)?;
+        let summary_size_bytes = u64::try_from(self.summary.len())
+            .map_err(|_| CompletionOutputError::SummaryTooLarge)?;
+        if self.summary_size_bytes != summary_size_bytes {
+            return Err(CompletionOutputError::SummarySizeMismatch);
+        }
+        let expected_summary_digest = completion_summary_digest(&self.summary)?;
+        if self.summary_digest != expected_summary_digest {
+            return Err(CompletionOutputError::SummaryDigestMismatch);
+        }
+        let expected_proposal_digest =
+            completion_proposal_digest(&self.context_digest, &self.summary)?;
+        if self.proposal_digest != expected_proposal_digest {
+            return Err(CompletionOutputError::ProposalDigestMismatch);
+        }
+        let expected_candidate_id =
+            completion_candidate_id(&self.run_id, &self.context_digest, &self.proposal_digest)?;
+        if self.candidate_id != expected_candidate_id {
+            return Err(CompletionOutputError::CandidateIdMismatch);
+        }
+        if self.record_digest != completion_output_record_digest(self)? {
+            return Err(CompletionOutputError::RecordDigestMismatch);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn candidate_id(&self) -> &str {
+        &self.candidate_id
+    }
+
+    #[must_use]
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    #[must_use]
+    pub const fn turn_index(&self) -> u32 {
+        self.turn_index
+    }
+
+    #[must_use]
+    pub fn model_call_id(&self) -> &str {
+        &self.model_call_id
+    }
+
+    #[must_use]
+    pub fn context_digest(&self) -> &str {
+        &self.context_digest
+    }
+
+    #[must_use]
+    pub fn proposal_digest(&self) -> &str {
+        &self.proposal_digest
+    }
+
+    #[must_use]
+    pub const fn summary_size_bytes(&self) -> u64 {
+        self.summary_size_bytes
+    }
+
+    #[must_use]
+    pub fn summary_digest(&self) -> &str {
+        &self.summary_digest
+    }
+
+    #[must_use]
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    #[must_use]
+    pub fn record_digest(&self) -> &str {
+        &self.record_digest
+    }
+
+    /// Reconstruct the exact accepted-turn decision committed by this record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if the deserialized record contains malformed identity fields.
+    pub fn decision(&self) -> Result<ExpectedPlanningTurn, CompletionOutputError> {
+        Ok(ExpectedPlanningTurn::for_model_call(
+            self.turn_index,
+            &self.model_call_id,
+            &self.context_digest,
+            &self.proposal_digest,
+        )?)
+    }
+}
+
+impl std::fmt::Debug for CompletionOutputRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CompletionOutputRecord")
+            .field("format_version", &self.format_version)
+            .field("candidate_id", &self.candidate_id)
+            .field("run_id", &self.run_id)
+            .field("turn_index", &self.turn_index)
+            .field("model_call_id", &self.model_call_id)
+            .field("context_digest", &self.context_digest)
+            .field("proposal_digest", &self.proposal_digest)
+            .field("summary_size_bytes", &self.summary_size_bytes)
+            .field("summary_digest", &self.summary_digest)
+            .field("summary", &"<redacted>")
+            .field("record_digest", &self.record_digest)
+            .finish()
+    }
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum CompletionOutputError {
+    #[error("completion output format version {0} is unsupported")]
+    UnsupportedFormatVersion(u32),
+    #[error("completion output requires a durable model-call binding")]
+    MissingModelCallBinding,
+    #[error("completion output summary is invalid")]
+    InvalidSummary,
+    #[error("completion output summary exceeds the fixed limit")]
+    SummaryTooLarge,
+    #[error("completion output differs from its `{0}` binding")]
+    BindingMismatch(&'static str),
+    #[error("completion output summary size is invalid")]
+    SummarySizeMismatch,
+    #[error("completion output summary digest is invalid")]
+    SummaryDigestMismatch,
+    #[error("completion output proposal digest is invalid")]
+    ProposalDigestMismatch,
+    #[error("completion output candidate identifier is invalid")]
+    CandidateIdMismatch,
+    #[error("completion output record digest is invalid")]
+    RecordDigestMismatch,
+    #[error("completion output canonicalization failed")]
+    Canonicalization,
+    #[error(transparent)]
+    PlanningContract(#[from] PlanningContractError),
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompletionSummaryDigestInput<'a> {
+    domain: &'static str,
+    summary: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompletionProposalDigestInput<'a> {
+    domain: &'static str,
+    context_digest: &'a str,
+    summary: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompletionCandidateIdDigestInput<'a> {
+    domain: &'static str,
+    run_id: &'a str,
+    context_digest: &'a str,
+    proposal_digest: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompletionOutputRecordDigestInput<'a> {
+    domain: &'static str,
+    format_version: u32,
+    candidate_id: &'a str,
+    run_id: &'a str,
+    turn_index: u32,
+    model_call_id: &'a str,
+    context_digest: &'a str,
+    proposal_digest: &'a str,
+    summary_size_bytes: u64,
+    summary_digest: &'a str,
+}
+
+/// Validate one exact UTF-8 completion summary before durable identity construction.
+///
+/// LF and TAB are retained for Markdown/text output. Other control characters, including CR,
+/// are rejected so hosts do not silently normalize the committed bytes across operating systems.
+///
+/// # Errors
+///
+/// Returns a fixed error for empty, oversized, or unsafe control-character content.
+pub fn validate_completion_summary_candidate(summary: &str) -> Result<(), CompletionOutputError> {
+    if summary.is_empty()
+        || summary
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
+    {
+        return Err(CompletionOutputError::InvalidSummary);
+    }
+    if summary.len() > MAX_COMPLETION_SUMMARY_BYTES {
+        return Err(CompletionOutputError::SummaryTooLarge);
+    }
+    Ok(())
+}
+
+fn completion_summary_digest(summary: &str) -> Result<String, CompletionOutputError> {
+    serde_jcs::to_vec(&CompletionSummaryDigestInput {
+        domain: "xgeny.completion-summary/v1",
+        summary,
+    })
+    .map(|canonical| sha256_digest(&canonical))
+    .map_err(|_| CompletionOutputError::Canonicalization)
+}
+
+fn completion_proposal_digest(
+    context_digest: &str,
+    summary: &str,
+) -> Result<String, CompletionOutputError> {
+    serde_jcs::to_vec(&CompletionProposalDigestInput {
+        domain: "xgeny.completion-proposal/v1",
+        context_digest,
+        summary,
+    })
+    .map(|canonical| sha256_digest(&canonical))
+    .map_err(|_| CompletionOutputError::Canonicalization)
+}
+
+fn completion_candidate_id(
+    run_id: &str,
+    context_digest: &str,
+    proposal_digest: &str,
+) -> Result<String, CompletionOutputError> {
+    let canonical = serde_jcs::to_vec(&CompletionCandidateIdDigestInput {
+        domain: "xgeny.completion-candidate-id/v1",
+        run_id,
+        context_digest,
+        proposal_digest,
+    })
+    .map_err(|_| CompletionOutputError::Canonicalization)?;
+    let digest = sha256_digest(&canonical);
+    Ok(format!(
+        "completion-{}",
+        digest.strip_prefix("sha256:").unwrap_or(&digest)
+    ))
+}
+
+fn completion_output_record_digest(
+    record: &CompletionOutputRecord,
+) -> Result<String, CompletionOutputError> {
+    serde_jcs::to_vec(&CompletionOutputRecordDigestInput {
+        domain: "xgeny.completion-output.record/v1",
+        format_version: record.format_version,
+        candidate_id: &record.candidate_id,
+        run_id: &record.run_id,
+        turn_index: record.turn_index,
+        model_call_id: &record.model_call_id,
+        context_digest: &record.context_digest,
+        proposal_digest: &record.proposal_digest,
+        summary_size_bytes: record.summary_size_bytes,
+        summary_digest: &record.summary_digest,
+    })
+    .map(|canonical| sha256_digest(&canonical))
+    .map_err(|_| CompletionOutputError::Canonicalization)
+}
 
 /// Self-verifying local sidecar for one exact, bounded tool observation.
 ///
@@ -1599,6 +2004,8 @@ pub struct CompletionCandidateState {
     pub context_digest: String,
     pub proposal_digest: String,
     pub summary_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_output_record_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3067,7 +3474,14 @@ fn apply_body(state: &mut RunState, body: &RunEventBody) -> Result<(), Transitio
             decision,
             candidate_id,
             summary_digest,
-        } => record_completion_candidate(state, decision, candidate_id, summary_digest)?,
+            completion_output_record_digest,
+        } => record_completion_candidate(
+            state,
+            decision,
+            candidate_id,
+            summary_digest,
+            completion_output_record_digest.as_deref(),
+        )?,
         RunEventBody::StepPlanned {
             step_id,
             objective,
@@ -3601,11 +4015,15 @@ fn record_completion_candidate(
     decision: &ExpectedPlanningTurn,
     candidate_id: &str,
     summary_digest: &str,
+    completion_output_record_digest: Option<&str>,
 ) -> Result<(), TransitionError> {
     decision.validate()?;
     validate_model_call_success(state, decision)?;
     require_planning_identifier("candidate_id", candidate_id)?;
     require_planning_digest("summary_digest", summary_digest)?;
+    if let Some(record_digest) = completion_output_record_digest {
+        require_planning_digest("completion_output_record_digest", record_digest)?;
+    }
     let frontier = derive_frontier(state).map_err(map_plan_frontier_error)?;
     if !frontier.all_steps_receipt_completed() {
         return Err(TransitionError::CompletionCandidateRequiresReceiptCompletedPlan);
@@ -3636,6 +4054,7 @@ fn record_completion_candidate(
         context_digest: decision.context_digest.clone(),
         proposal_digest: decision.proposal_digest.clone(),
         summary_digest: summary_digest.to_owned(),
+        completion_output_record_digest: completion_output_record_digest.map(str::to_owned),
     });
     settle_successful_model_call(loop_state)
 }
@@ -5871,6 +6290,120 @@ mod tests {
         assert_eq!(
             metrics.classification_dependencies,
             u64::from(step_count - 1)
+        );
+    }
+
+    fn completion_output_fixture(summary: &str) -> CompletionOutputRecord {
+        let context_digest = format!("sha256:{}", "c".repeat(64));
+        let proposal_digest = completion_proposal_digest(&context_digest, summary)
+            .expect("proposal digest should canonicalize");
+        let decision = ExpectedPlanningTurn::for_model_call(
+            2,
+            format!("model-call-{}", "a".repeat(64)),
+            &context_digest,
+            &proposal_digest,
+        )
+        .expect("decision should validate");
+        let candidate_id = completion_candidate_id(RUN_ID, &context_digest, &proposal_digest)
+            .expect("candidate identity should canonicalize");
+        let summary_digest =
+            completion_summary_digest(summary).expect("summary digest should canonicalize");
+        CompletionOutputRecord::new(RUN_ID, &decision, candidate_id, summary_digest, summary)
+            .expect("completion output should validate")
+    }
+
+    #[test]
+    fn completion_output_round_trips_exact_utf8_and_redacts_debug() {
+        let summary = "FINAL-SUMMARY-SENTINEL \"quote\" \\ slash\n\t- 한글과 UTF-8 결과";
+        let record = completion_output_fixture(summary);
+        let encoded = serde_json::to_vec(&record).expect("record should serialize");
+        let decoded: CompletionOutputRecord =
+            serde_json::from_slice(&encoded).expect("record should deserialize");
+
+        assert_eq!(decoded.summary(), summary);
+        assert_eq!(decoded.summary_size_bytes(), summary.len() as u64);
+        assert_eq!(decoded, record);
+        let debug = format!("{record:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("FINAL-SUMMARY-SENTINEL"));
+    }
+
+    #[test]
+    fn completion_output_enforces_exact_utf8_byte_and_control_limits() {
+        let exact = format!("{}aa", "가".repeat(1_666));
+        assert_eq!(exact.len(), MAX_COMPLETION_SUMMARY_BYTES);
+        assert_eq!(completion_output_fixture(&exact).summary(), exact);
+
+        let oversized = format!("{exact}x");
+        assert_eq!(
+            validate_completion_summary_candidate(&oversized),
+            Err(CompletionOutputError::SummaryTooLarge)
+        );
+        assert_eq!(
+            validate_completion_summary_candidate(""),
+            Err(CompletionOutputError::InvalidSummary)
+        );
+        assert_eq!(
+            validate_completion_summary_candidate("unsafe\rsummary"),
+            Err(CompletionOutputError::InvalidSummary)
+        );
+        assert!(validate_completion_summary_candidate("markdown\n\titem").is_ok());
+    }
+
+    #[test]
+    fn completion_output_detects_body_index_and_binding_tampering() {
+        let summary = "exact final summary";
+        let record = completion_output_fixture(summary);
+        let context_digest = record.context_digest().to_owned();
+        let decision = ExpectedPlanningTurn::for_model_call(
+            record.turn_index(),
+            record.model_call_id(),
+            &context_digest,
+            record.proposal_digest(),
+        )
+        .expect("decision should validate");
+
+        let mut body_tampered = record.clone();
+        body_tampered.summary.push('!');
+        assert!(
+            body_tampered
+                .verify_for(
+                    RUN_ID,
+                    &decision,
+                    record.candidate_id(),
+                    record.summary_digest(),
+                )
+                .is_err()
+        );
+
+        let mut size_tampered = record.clone();
+        size_tampered.summary_size_bytes += 1;
+        assert_eq!(
+            size_tampered.verify_for(
+                RUN_ID,
+                &decision,
+                record.candidate_id(),
+                record.summary_digest(),
+            ),
+            Err(CompletionOutputError::SummarySizeMismatch)
+        );
+
+        let other_context = format!("sha256:{}", "d".repeat(64));
+        let other_decision = ExpectedPlanningTurn::for_model_call(
+            record.turn_index(),
+            record.model_call_id(),
+            other_context,
+            record.proposal_digest(),
+        )
+        .expect("other decision should validate");
+        assert_eq!(
+            record.verify_for(
+                RUN_ID,
+                &other_decision,
+                record.candidate_id(),
+                record.summary_digest(),
+            ),
+            Err(CompletionOutputError::BindingMismatch("context_digest"))
         );
     }
 

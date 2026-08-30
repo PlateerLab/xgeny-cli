@@ -21,7 +21,8 @@ use xgeny_protocol::{
     core_verification_summary_v1, evaluate_core_verification_v1, validate_execution_receipt,
 };
 use xgeny_workgraph::{
-    EffectClass, EffectIntent, EventRecord, InvocationMaterialError, InvocationMaterialRecord,
+    CompletionOutputError, CompletionOutputRecord, EffectClass, EffectIntent, EventRecord,
+    ExpectedPlanningTurn, InvocationMaterialError, InvocationMaterialRecord,
     InvocationMaterialRetention, PlannedInvocationBinding, PlannedInvocationMaterialRecord,
     PlanningContractError, ReceiptPlacement, ReceiptVerificationStrategy, RecordError, ReplayError,
     RunEvent, RunEventBody, RunState, StepStatus, TOOL_OUTPUT_PROFILE_V1, ToolOutputError,
@@ -149,6 +150,22 @@ pub(crate) struct StoredToolOutput {
     pub record: ToolOutputRecord,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct StoredCompletionOutput {
+    pub event_sequence: u64,
+    pub record: CompletionOutputRecord,
+}
+
+impl std::fmt::Debug for StoredCompletionOutput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StoredCompletionOutput")
+            .field("event_sequence", &self.event_sequence)
+            .field("record", &self.record)
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for StoredToolOutput {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -204,11 +221,25 @@ struct ToolOutputEventAnchor {
     execution_attempt: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompletionOutputEventAnchor {
+    event_sequence: u64,
+    run_id: String,
+    candidate_id: String,
+    turn_index: u32,
+    model_call_id: String,
+    context_digest: String,
+    proposal_digest: String,
+    summary_digest: String,
+    record_digest: String,
+}
+
 #[derive(Clone, Copy, Default)]
 struct CommitSidecars<'a> {
     plan_inputs: Option<&'a [PlannedInvocationMaterialRecord]>,
     material: Option<&'a InvocationMaterialRecord>,
     output: Option<&'a ToolOutputRecord>,
+    completion_output: Option<&'a CompletionOutputRecord>,
     receipt: Option<&'a ExecutionReceiptBody>,
 }
 
@@ -234,6 +265,13 @@ impl<'a> CommitSidecars<'a> {
         }
     }
 
+    fn completion_output(output: &'a CompletionOutputRecord) -> Self {
+        Self {
+            completion_output: Some(output),
+            ..Self::default()
+        }
+    }
+
     fn receipt(receipt: &'a ExecutionReceiptBody) -> Self {
         Self {
             receipt: Some(receipt),
@@ -245,6 +283,7 @@ impl<'a> CommitSidecars<'a> {
 #[derive(Default)]
 struct CommitAnchors {
     output: Option<ToolOutputEventAnchor>,
+    completion_output: Option<CompletionOutputEventAnchor>,
     receipt: Option<ReceiptEventAnchor>,
 }
 
@@ -270,6 +309,7 @@ struct VerifiedRunIndex {
     tool_output_record_digests: BTreeSet<String>,
     tool_output_digests: BTreeMap<String, String>,
     tool_output_sizes: BTreeMap<String, u64>,
+    completion_output_event: Option<CompletionOutputEventAnchor>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -442,7 +482,8 @@ fn verify_commit_sidecars(
     verify_plan_input_bundle(event, sidecars.plan_inputs)?;
     verify_material_bundle(event, sidecars.material)?;
     verify_receipt_bundle(event, sidecars.receipt)?;
-    verify_tool_output_bundle(event, sidecars.output)
+    verify_tool_output_bundle(event, sidecars.output)?;
+    verify_completion_output_bundle(event, sidecars.completion_output)
 }
 
 pub trait RunStore {
@@ -522,6 +563,21 @@ pub trait RunStore {
         Err(StoreError::ToolOutputStoreUnsupported)
     }
 
+    /// Atomically append one completion candidate and its exact local summary sidecar.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported stores, legacy or detached events, stale heads,
+    /// mismatched bindings, transition failures, serialization, or storage faults.
+    fn append_with_completion_output(
+        &mut self,
+        _expected: ExpectedHead,
+        _event: RunEvent,
+        _output: CompletionOutputRecord,
+    ) -> Result<Commit, StoreError> {
+        Err(StoreError::CompletionOutputStoreUnsupported)
+    }
+
     /// Load and replay-verify all committed data.
     ///
     /// # Errors
@@ -587,6 +643,22 @@ pub trait RunStore {
     /// Returns an error when output storage is unsupported or committed data is inconsistent.
     fn load_tool_output(&self, _effect_id: &str) -> Result<Option<ToolOutputRecord>, StoreError> {
         Err(StoreError::ToolOutputStoreUnsupported)
+    }
+
+    /// Load the exact final summary bound to one candidate at the expected Run head.
+    ///
+    /// A `None` result is valid only for an absent Run/candidate or a replayed legacy candidate
+    /// whose event has no completion-output digest. A digest-bound missing record is corruption.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported stores, stale heads, or inconsistent committed data.
+    fn load_completion_output(
+        &self,
+        _expected: ExpectedHead,
+        _candidate_id: &str,
+    ) -> Result<Option<CompletionOutputRecord>, StoreError> {
+        Err(StoreError::CompletionOutputStoreUnsupported)
     }
 
     /// Load one replay-verified Run and its complete Receipt chain from one logical snapshot.
@@ -1136,6 +1208,146 @@ fn verify_tool_output_point(
     }
 }
 
+fn verify_completion_output_bundle(
+    event: &RunEvent,
+    output: Option<&CompletionOutputRecord>,
+) -> Result<(), StoreError> {
+    match (&event.body, output) {
+        (
+            RunEventBody::CompletionCandidateRecorded {
+                completion_output_record_digest: Some(expected),
+                ..
+            },
+            Some(output),
+        ) if expected == output.record_digest() => Ok(()),
+        (RunEventBody::CompletionCandidateRecorded { .. }, Some(_)) => {
+            Err(StoreError::CompletionOutputBindingMismatch)
+        }
+        (RunEventBody::CompletionCandidateRecorded { .. }, None) => {
+            Err(StoreError::CompletionOutputRequired)
+        }
+        (_, Some(_)) => Err(StoreError::UnexpectedCompletionOutput),
+        (_, None) => Ok(()),
+    }
+}
+
+fn completion_anchor_decision(
+    anchor: &CompletionOutputEventAnchor,
+) -> Result<ExpectedPlanningTurn, StoreError> {
+    Ok(ExpectedPlanningTurn::for_model_call(
+        anchor.turn_index,
+        &anchor.model_call_id,
+        &anchor.context_digest,
+        &anchor.proposal_digest,
+    )?)
+}
+
+fn verify_completion_output_candidate(
+    index: &VerifiedRunIndex,
+    record: &EventRecord,
+    output: &CompletionOutputRecord,
+) -> Result<CompletionOutputEventAnchor, StoreError> {
+    if index.completion_output_event.is_some() {
+        return Err(StoreError::Corrupt(
+            "duplicate completion-output identity".to_owned(),
+        ));
+    }
+    let anchor = VerifiedRunIndex::completion_output_anchor_for(record)?;
+    let decision = completion_anchor_decision(&anchor)?;
+    output
+        .verify_for(
+            &anchor.run_id,
+            &decision,
+            &anchor.candidate_id,
+            &anchor.summary_digest,
+        )
+        .map_err(|_| StoreError::CompletionOutputBindingMismatch)?;
+    if output.record_digest() != anchor.record_digest {
+        return Err(StoreError::CompletionOutputBindingMismatch);
+    }
+    Ok(anchor)
+}
+
+fn verify_stored_completion_output(
+    anchor: &CompletionOutputEventAnchor,
+    stored: &StoredCompletionOutput,
+) -> Result<(), StoreError> {
+    if stored.event_sequence != anchor.event_sequence
+        || stored.record.candidate_id() != anchor.candidate_id
+        || stored.record.record_digest() != anchor.record_digest
+    {
+        return Err(StoreError::Corrupt(
+            "completion output differs from its journal binding".to_owned(),
+        ));
+    }
+    let decision = completion_anchor_decision(anchor)?;
+    stored
+        .record
+        .verify_for(
+            &anchor.run_id,
+            &decision,
+            &anchor.candidate_id,
+            &anchor.summary_digest,
+        )
+        .map_err(|_| StoreError::Corrupt("completion output record is invalid".to_owned()))
+}
+
+fn verify_completion_output_record(
+    index: &VerifiedRunIndex,
+    stored: Option<&StoredCompletionOutput>,
+) -> Result<(), StoreError> {
+    match (&index.completion_output_event, stored) {
+        (None, None) => Ok(()),
+        (None, Some(_)) => Err(StoreError::Corrupt(
+            "completion output has no digest-bound completion event".to_owned(),
+        )),
+        (Some(_), None) => Err(StoreError::Corrupt(
+            "digest-bound completion event has no durable output".to_owned(),
+        )),
+        (Some(anchor), Some(stored)) => verify_stored_completion_output(anchor, stored),
+    }
+}
+
+fn build_completion_output(
+    index: &VerifiedRunIndex,
+    expected: ExpectedHead,
+    candidate_id: &str,
+    stored: Option<StoredCompletionOutput>,
+) -> Result<Option<CompletionOutputRecord>, StoreError> {
+    let actual = index.head();
+    if expected != actual {
+        return Err(StoreError::HeadConflict { expected, actual });
+    }
+    let candidate = index
+        .state
+        .as_ref()
+        .and_then(|state| state.agent_loop.as_ref())
+        .and_then(|loop_state| loop_state.completion_candidate.as_ref());
+    let Some(candidate) = candidate else {
+        if stored.is_some() {
+            return Err(StoreError::Corrupt(
+                "completion output exists without a projected candidate".to_owned(),
+            ));
+        }
+        return Ok(None);
+    };
+    if candidate.candidate_id != candidate_id {
+        return Ok(None);
+    }
+    verify_completion_output_record(index, stored.as_ref())?;
+    match (candidate.completion_output_record_digest.as_deref(), stored) {
+        (None, None) => Ok(None),
+        (Some(expected_digest), Some(stored))
+            if expected_digest == stored.record.record_digest() =>
+        {
+            Ok(Some(stored.record))
+        }
+        _ => Err(StoreError::Corrupt(
+            "completion output differs from its projected candidate".to_owned(),
+        )),
+    }
+}
+
 fn build_planning_snapshot<F>(
     index: &VerifiedRunIndex,
     expected: ExpectedHead,
@@ -1315,6 +1527,7 @@ fn verify_receipt_bundle(
 }
 
 impl VerifiedRunIndex {
+    #[allow(clippy::too_many_lines)] // Keep every journal-to-index anchor in one audited pass.
     fn from_snapshot(
         snapshot: Option<&RunSnapshot>,
         metrics: &mut AuditMetrics,
@@ -1400,6 +1613,18 @@ impl VerifiedRunIndex {
                             "journal contains duplicate tool-output events".to_owned(),
                         ));
                     }
+                }
+                RunEventBody::CompletionCandidateRecorded {
+                    completion_output_record_digest: Some(_),
+                    ..
+                } => {
+                    if index.completion_output_event.is_some() {
+                        return Err(StoreError::Corrupt(
+                            "journal contains duplicate completion-output events".to_owned(),
+                        ));
+                    }
+                    index.completion_output_event =
+                        Some(Self::completion_output_anchor_for(record)?);
                 }
                 RunEventBody::VerificationRecorded { .. } => {
                     index.index_receipt_event(record, metrics)?;
@@ -1540,6 +1765,36 @@ impl VerifiedRunIndex {
         })
     }
 
+    fn completion_output_anchor_for(
+        record: &EventRecord,
+    ) -> Result<CompletionOutputEventAnchor, StoreError> {
+        let RunEventBody::CompletionCandidateRecorded {
+            decision,
+            candidate_id,
+            summary_digest,
+            completion_output_record_digest: Some(record_digest),
+        } = &record.event.body
+        else {
+            return Err(StoreError::UnexpectedCompletionOutput);
+        };
+        let model_call_id = decision.model_call_id().ok_or_else(|| {
+            StoreError::Corrupt(
+                "completion output event has no durable model-call binding".to_owned(),
+            )
+        })?;
+        Ok(CompletionOutputEventAnchor {
+            event_sequence: record.sequence,
+            run_id: record.event.run_id.clone(),
+            candidate_id: candidate_id.clone(),
+            turn_index: decision.turn_index(),
+            model_call_id: model_call_id.to_owned(),
+            context_digest: decision.context_digest().to_owned(),
+            proposal_digest: decision.proposal_digest().to_owned(),
+            summary_digest: summary_digest.clone(),
+            record_digest: record_digest.clone(),
+        })
+    }
+
     fn verification_snapshot(&self, step_id: &str) -> Option<RunVerificationSnapshot> {
         let state = self.state.clone()?;
         let effect_started_at = state
@@ -1557,6 +1812,7 @@ impl VerifiedRunIndex {
         })
     }
 
+    #[allow(clippy::too_many_lines)] // Mirror the cold index pass for every atomic sidecar kind.
     fn apply_committed(
         &mut self,
         commit: &Commit,
@@ -1567,10 +1823,12 @@ impl VerifiedRunIndex {
             plan_inputs,
             material,
             output,
+            completion_output: _,
             receipt,
         } = sidecars;
         let CommitAnchors {
             output: output_anchor,
+            completion_output: completion_output_anchor,
             receipt: receipt_anchor,
         } = anchors;
         self.event_ids.insert(commit.record.event.event_id.clone());
@@ -1619,6 +1877,15 @@ impl VerifiedRunIndex {
                     .expect("verified tool-output commit must retain its event anchor");
                 self.tool_output_events
                     .insert(anchor.effect_id.clone(), anchor);
+            }
+            RunEventBody::CompletionCandidateRecorded {
+                completion_output_record_digest: Some(_),
+                ..
+            } => {
+                self.completion_output_event = Some(
+                    completion_output_anchor
+                        .expect("verified completion-output commit must retain its event anchor"),
+                );
             }
             RunEventBody::VerificationRecorded { .. } => {
                 let anchor =
@@ -2028,6 +2295,8 @@ pub enum StoreError {
     #[error(transparent)]
     ToolOutput(#[from] ToolOutputError),
     #[error(transparent)]
+    CompletionOutput(#[from] CompletionOutputError),
+    #[error(transparent)]
     PlanningContract(#[from] PlanningContractError),
     #[error(transparent)]
     Replay(#[from] ReplayError),
@@ -2093,6 +2362,14 @@ pub enum StoreError {
     ToolOutputProfileRequired,
     #[error("this Run store does not support durable tool outputs")]
     ToolOutputStoreUnsupported,
+    #[error("a completion candidate requires an atomic CompletionOutputRecord")]
+    CompletionOutputRequired,
+    #[error("a CompletionOutputRecord was supplied for an unrelated event")]
+    UnexpectedCompletionOutput,
+    #[error("the CompletionOutputRecord differs from its completion event")]
+    CompletionOutputBindingMismatch,
+    #[error("this Run store does not support durable completion outputs")]
+    CompletionOutputStoreUnsupported,
     #[error("this Run store does not support generation-checked planning snapshots")]
     PlanningSnapshotStoreUnsupported,
     #[error("verified tool outputs exceed the planning snapshot byte budget")]
@@ -2138,8 +2415,19 @@ mod tests {
             .expect("blob rows should load")
     }
 
+    fn sqlite_table_count(connection: &rusqlite::Connection, table_name: &str) -> i64 {
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table_name],
+                |row| row.get(0),
+            )
+            .expect("schema should remain inspectable")
+    }
+
     type SqliteEventRow = (i64, String, Option<String>, String, Vec<u8>);
     type SqliteAuthorizationRow = (String, String, String, String, i64);
+    type SqliteStoreMutation = fn(&SqliteRunStore) -> Result<(), StoreError>;
     type ReceiptMutation = fn(&mut ExecutionReceiptBody);
 
     #[derive(Debug, PartialEq, Eq)]
@@ -2149,8 +2437,10 @@ mod tests {
         intents: Vec<Vec<u8>>,
         authorizations: Vec<SqliteAuthorizationRow>,
         materials: Vec<Vec<u8>>,
+        tool_outputs: Vec<Vec<u8>>,
         plans: Vec<Vec<u8>>,
         receipts: Vec<Vec<u8>>,
+        completion_outputs: Vec<Vec<u8>>,
     }
 
     fn sqlite_durable_rows(connection: &rusqlite::Connection) -> SqliteDurableRows {
@@ -2169,6 +2459,10 @@ mod tests {
                 connection,
                 "SELECT record_json FROM invocation_materials ORDER BY effect_id",
             ),
+            tool_outputs: sqlite_blob_rows(
+                connection,
+                "SELECT record_json FROM tool_outputs ORDER BY event_sequence, effect_id",
+            ),
             plans: sqlite_blob_rows(
                 connection,
                 "SELECT record_json FROM planned_invocations ORDER BY event_sequence, step_id",
@@ -2176,6 +2470,10 @@ mod tests {
             receipts: sqlite_blob_rows(
                 connection,
                 "SELECT receipt_json FROM execution_receipts ORDER BY event_sequence",
+            ),
+            completion_outputs: sqlite_blob_rows(
+                connection,
+                "SELECT record_json FROM completion_outputs ORDER BY event_sequence",
             ),
         }
     }
@@ -3768,6 +4066,352 @@ mod tests {
                 receipt_digest: receipt.receipt_digest.clone(),
             },
         )
+    }
+
+    fn prepare_completion_output<S: RunStore>(
+        store: &mut S,
+        summary: &str,
+    ) -> (Commit, RunEvent, CompletionOutputRecord) {
+        let (validating, effect) = seed_validating(store);
+        let receipt = successful_receipt(&effect);
+        let completed = store
+            .append_with_execution_receipt(
+                ExpectedHead::from_state(&validating.state),
+                receipt_event(&effect, &receipt),
+                receipt,
+            )
+            .expect("Receipt should complete the Step");
+        let configured = store
+            .append(
+                ExpectedHead::from_state(&completed.state),
+                event(
+                    "completion-loop-configured",
+                    RunEventBody::AgentLoopConfigured {
+                        budget: AgentLoopBudget::new(4, 8, 8, 16_384)
+                            .expect("loop budget should validate"),
+                    },
+                ),
+            )
+            .expect("loop should configure");
+        let lifecycle = store
+            .append(
+                ExpectedHead::from_state(&configured.state),
+                event(
+                    "completion-model-call-lifecycle",
+                    RunEventBody::ModelCallLifecycleConfigured {
+                        budget: ModelCallBudget::new(3).expect("model-call budget should validate"),
+                    },
+                ),
+            )
+            .expect("model-call lifecycle should configure");
+        let context_digest = format!("sha256:{}", "c".repeat(64));
+        let reservation = ModelCallReservation::new(
+            &lifecycle.state.run_id,
+            lifecycle.state.authority_epoch,
+            "xgeny.test.completion-planner",
+            1,
+            1,
+            lifecycle.state.journal_sequence,
+            &lifecycle.state.journal_head_digest,
+            &context_digest,
+            format!("sha256:{}", "d".repeat(64)),
+        )
+        .expect("completion model call should reserve");
+        let reserved = store
+            .append(
+                ExpectedHead::from_state(&lifecycle.state),
+                event(
+                    "completion-model-call-reserved",
+                    RunEventBody::ModelCallReserved {
+                        reservation: reservation.clone(),
+                    },
+                ),
+            )
+            .expect("completion model call should commit");
+        let output = CompletionOutputRecord::bind(
+            &reserved.state.run_id,
+            1,
+            reservation.call_id(),
+            context_digest,
+            summary,
+        )
+        .expect("completion output should bind");
+        let event = event(
+            "completion-candidate-recorded",
+            RunEventBody::CompletionCandidateRecorded {
+                decision: output.decision().expect("decision should reconstruct"),
+                candidate_id: output.candidate_id().to_owned(),
+                summary_digest: output.summary_digest().to_owned(),
+                completion_output_record_digest: Some(output.record_digest().to_owned()),
+            },
+        );
+        (reserved, event, output)
+    }
+
+    #[test]
+    fn memory_and_sqlite_atomically_restore_exact_completion_output() {
+        const SUMMARY: &str = "FINAL-SUMMARY-SENTINEL \"quote\" \\ slash\n\t- 한글과 UTF-8 결과";
+        let directory = tempdir().expect("temp directory should exist");
+        let path = directory.path().join("run.db");
+        let mut memory = MemoryRunStore::new();
+        let mut sqlite = SqliteRunStore::open(&path).expect("SQLite should open");
+        let (memory_reserved, memory_event, memory_output) =
+            prepare_completion_output(&mut memory, SUMMARY);
+        let (sqlite_reserved, sqlite_event, sqlite_output) =
+            prepare_completion_output(&mut sqlite, SUMMARY);
+
+        for (case, error) in [
+            (
+                "memory",
+                memory
+                    .append(
+                        ExpectedHead::from_state(&memory_reserved.state),
+                        memory_event.clone(),
+                    )
+                    .expect_err("plain memory append must fail"),
+            ),
+            (
+                "sqlite",
+                sqlite
+                    .append(
+                        ExpectedHead::from_state(&sqlite_reserved.state),
+                        sqlite_event.clone(),
+                    )
+                    .expect_err("plain SQLite append must fail"),
+            ),
+        ] {
+            assert!(
+                matches!(error, StoreError::CompletionOutputRequired),
+                "unexpected {case} error: {error:?}"
+            );
+        }
+
+        let memory_commit = memory
+            .append_with_completion_output(
+                ExpectedHead::from_state(&memory_reserved.state),
+                memory_event,
+                memory_output,
+            )
+            .expect("memory completion should commit");
+        let sqlite_commit = sqlite
+            .append_with_completion_output(
+                ExpectedHead::from_state(&sqlite_reserved.state),
+                sqlite_event,
+                sqlite_output,
+            )
+            .expect("SQLite completion should commit");
+        assert_eq!(memory_commit, sqlite_commit);
+        let expected_head = ExpectedHead::from_state(&sqlite_commit.state);
+        let candidate_id = &sqlite_commit
+            .state
+            .agent_loop
+            .as_ref()
+            .unwrap()
+            .completion_candidate
+            .as_ref()
+            .unwrap()
+            .candidate_id;
+        let memory_loaded = memory
+            .load_completion_output(expected_head.clone(), candidate_id)
+            .expect("memory completion should load")
+            .expect("memory completion should exist");
+        let sqlite_loaded = sqlite
+            .load_completion_output(expected_head.clone(), candidate_id)
+            .expect("SQLite completion should load")
+            .expect("SQLite completion should exist");
+        assert_eq!(memory_loaded, sqlite_loaded);
+        assert_eq!(sqlite_loaded.summary().as_bytes(), SUMMARY.as_bytes());
+        assert_eq!(
+            sqlite.completion_output_count().expect("completion count"),
+            1
+        );
+        assert!(!format!("{sqlite_loaded:?}").contains(SUMMARY));
+        assert!(
+            !String::from_utf8(sqlite.export_jsonl().expect("journal export"))
+                .expect("journal should be UTF-8")
+                .contains(SUMMARY)
+        );
+
+        drop(sqlite);
+        let reopened = SqliteRunStore::open(&path).expect("SQLite should reopen");
+        let reopened_output = reopened
+            .load_completion_output(expected_head, candidate_id)
+            .expect("reopened completion should load")
+            .expect("reopened completion should exist");
+        assert_eq!(reopened_output.summary().as_bytes(), SUMMARY.as_bytes());
+    }
+
+    #[test]
+    fn completion_output_binding_failures_leave_the_run_unchanged() {
+        let mut memory = MemoryRunStore::new();
+        let (reserved, candidate_event, output) =
+            prepare_completion_output(&mut memory, "BOUND-COMPLETION-SUMMARY");
+        let expected_state = reserved.state.clone();
+
+        let unrelated = event(
+            "unrelated-completion-sidecar",
+            RunEventBody::StepPlanned {
+                step_id: "unrelated-step".to_owned(),
+                objective: "must not commit".to_owned(),
+                depends_on: Vec::new(),
+            },
+        );
+        assert!(matches!(
+            memory.append_with_completion_output(
+                ExpectedHead::from_state(&expected_state),
+                unrelated,
+                output.clone(),
+            ),
+            Err(StoreError::UnexpectedCompletionOutput)
+        ));
+
+        let mut tampered_value =
+            serde_json::to_value(&output).expect("completion output should serialize");
+        tampered_value["summary"] = serde_json::json!("TAMPERED-COMPLETION-SUMMARY");
+        let tampered: CompletionOutputRecord = serde_json::from_value(tampered_value)
+            .expect("structurally valid tampered record should deserialize");
+        assert!(matches!(
+            memory.append_with_completion_output(
+                ExpectedHead::from_state(&expected_state),
+                candidate_event,
+                tampered,
+            ),
+            Err(StoreError::CompletionOutputBindingMismatch)
+        ));
+        assert_eq!(
+            memory.load_current().expect("state should load"),
+            Some(expected_state)
+        );
+    }
+
+    #[test]
+    fn sqlite_rolls_back_every_partial_completion_output_commit() {
+        for stage in [
+            AppendFault::Event,
+            AppendFault::CompletionOutput,
+            AppendFault::Projection,
+        ] {
+            let directory = tempdir().expect("temp directory should exist");
+            let path = directory.path().join("run.db");
+            let mut store = SqliteRunStore::open(&path).expect("SQLite should open");
+            let (reserved, event, output) =
+                prepare_completion_output(&mut store, "FAULT-COMPLETION-SUMMARY");
+            let event_count = store.run_event_count().expect("event count should load");
+
+            let error = store
+                .append_completion_output_with_fault(
+                    ExpectedHead::from_state(&reserved.state),
+                    event,
+                    &output,
+                    stage,
+                )
+                .expect_err("injected completion fault should fail");
+            assert!(matches!(error, StoreError::InjectedFault(_)));
+            assert_eq!(
+                store.run_event_count().expect("event count should load"),
+                event_count
+            );
+            assert_eq!(
+                store
+                    .completion_output_count()
+                    .expect("completion count should load"),
+                0
+            );
+            assert_eq!(
+                store.load_current().expect("state should load"),
+                Some(reserved.state)
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_process_exit_after_completion_output_insert_rolls_back_candidate_and_row() {
+        const CHILD_MARKER: &str = "XGENY_SQLITE_COMPLETION_CRASH_CHILD";
+        const DATABASE_PATH: &str = "XGENY_SQLITE_COMPLETION_CRASH_PATH";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let path = std::env::var_os(DATABASE_PATH).expect("child database path should exist");
+            let mut store = SqliteRunStore::open(path).expect("child SQLite fixture should open");
+            let (reserved, event, output) =
+                prepare_completion_output(&mut store, "CRASH-COMPLETION-SUMMARY");
+            let _never_returns = store.append_completion_output_and_exit_at(
+                ExpectedHead::from_state(&reserved.state),
+                event,
+                &output,
+                AppendFault::CompletionOutput,
+            );
+            unreachable!("completion crash injection must terminate the child process");
+        }
+
+        let directory = tempdir().expect("temp directory should exist");
+        let path = directory.path().join("completion-crash.db");
+        let status = Command::new(std::env::current_exe().expect("test binary should resolve"))
+            .arg("--exact")
+            .arg(
+                "tests::sqlite_process_exit_after_completion_output_insert_rolls_back_candidate_and_row",
+            )
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env(DATABASE_PATH, &path)
+            .status()
+            .expect("completion crash child should start");
+        assert_eq!(status.code(), Some(86));
+
+        let store = SqliteRunStore::open(&path).expect("SQLite should reopen after child exit");
+        assert_eq!(
+            store
+                .completion_output_count()
+                .expect("completion count should load"),
+            0
+        );
+        let state = store
+            .load_current()
+            .expect("state should verify")
+            .expect("Run should remain");
+        let loop_state = state.agent_loop.expect("loop should remain configured");
+        assert!(loop_state.completion_candidate.is_none());
+        assert!(
+            loop_state
+                .model_calls
+                .expect("model-call lifecycle should remain")
+                .active_call
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn sqlite_cold_audit_rejects_missing_and_tampered_completion_outputs() {
+        let mutations: [(&str, SqliteStoreMutation); 3] = [
+            ("missing", SqliteRunStore::delete_completion_output),
+            (
+                "tampered",
+                SqliteRunStore::corrupt_completion_output_document,
+            ),
+            ("orphan", SqliteRunStore::insert_orphan_completion_output),
+        ];
+        for (case, mutate) in mutations {
+            let directory = tempdir().expect("temp directory should exist");
+            let path = directory.path().join(format!("{case}.db"));
+            let mut store = SqliteRunStore::open(&path).expect("SQLite should open");
+            let (reserved, event, output) =
+                prepare_completion_output(&mut store, "AUDIT-COMPLETION-SUMMARY");
+            store
+                .append_with_completion_output(
+                    ExpectedHead::from_state(&reserved.state),
+                    event,
+                    output,
+                )
+                .expect("completion should commit");
+            mutate(&store).expect("fixture mutation should apply");
+            drop(store);
+
+            let error = SqliteRunStore::open(&path)
+                .expect_err("corrupt completion output must fail cold audit");
+            assert!(
+                matches!(error, StoreError::Corrupt(_)),
+                "unexpected {case} error: {error:?}"
+            );
+            assert!(!format!("{error:?}").contains("AUDIT-COMPLETION-SUMMARY"));
+        }
     }
 
     fn commit_two_receipt_chain<S: RunStore>(store: &mut S) {
@@ -5420,7 +6064,7 @@ mod tests {
         let connection = rusqlite::Connection::open(&path).expect("SQLite file should open");
         drop(connection);
 
-        for version in [1_i64, 2_i64, 8_i64] {
+        for version in [1_i64, 2_i64, 9_i64] {
             let connection = rusqlite::Connection::open(&path).expect("SQLite file should open");
             connection
                 .pragma_update(None, "user_version", version)
@@ -5440,7 +6084,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_sqlite_store_uses_schema_version_seven() {
+    fn fresh_sqlite_store_uses_schema_version_eight() {
         let directory = tempdir().expect("temp directory should exist");
         let path = directory.path().join("run.db");
         drop(SqliteRunStore::open(&path).expect("fresh SQLite should open"));
@@ -5448,11 +6092,277 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("schema version should be readable");
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
 
     #[test]
-    fn sqlite_migrates_schema_six_to_seven_without_rewriting_any_durable_bytes() {
+    fn sqlite_migrates_schema_seven_to_eight_without_rewriting_tool_output_bytes() {
+        let directory = tempdir().expect("temp directory should exist");
+        let path = directory.path().join("run.db");
+        let effect_id = {
+            let mut store = SqliteRunStore::open(&path).expect("schema eight store should open");
+            let (started, effect) = seed_read_only_executing(&mut store);
+            let (event, output) = tool_output_success(
+                &started.state,
+                &effect,
+                "schema-seven-tool-output",
+                serde_json::json!({"content": "SCHEMA-SEVEN-OUTPUT-SENTINEL"}),
+            );
+            store
+                .append_with_tool_output(ExpectedHead::from_state(&started.state), event, output)
+                .expect("tool output should commit");
+            effect.effect_id
+        };
+        let connection = rusqlite::Connection::open(&path).expect("raw SQLite should open");
+        let expected_rows = sqlite_durable_rows(&connection);
+        assert!(!expected_rows.tool_outputs.is_empty());
+        connection
+            .execute("DROP TABLE completion_outputs", [])
+            .expect("schema-seven fixture should not have completion outputs");
+        connection
+            .pragma_update(None, "user_version", 7_i64)
+            .expect("fixture should declare schema seven");
+        drop(connection);
+
+        let migrated = SqliteRunStore::open(&path).expect("schema seven should migrate");
+        assert!(
+            migrated
+                .load_tool_output(&effect_id)
+                .expect("tool output should load")
+                .is_some()
+        );
+        drop(migrated);
+        let connection = rusqlite::Connection::open(&path).expect("SQLite should reopen");
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("schema version should load");
+        assert_eq!(version, 8);
+        assert_eq!(sqlite_durable_rows(&connection), expected_rows);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One fixture proves byte-preserving legacy completion replay.
+    fn schema_seven_legacy_completion_migrates_without_inventing_a_summary() {
+        let directory = tempdir().expect("temp directory should exist");
+        let path = directory.path().join("legacy-completion.db");
+        let candidate_id = {
+            let mut store = SqliteRunStore::open(&path).expect("SQLite should open");
+            let (reserved, event, output) =
+                prepare_completion_output(&mut store, "LEGACY-SUMMARY-MUST-NOT-BE-INVENTED");
+            let commit = store
+                .append_with_completion_output(
+                    ExpectedHead::from_state(&reserved.state),
+                    event,
+                    output,
+                )
+                .expect("completion should commit");
+            commit
+                .state
+                .agent_loop
+                .unwrap()
+                .completion_candidate
+                .unwrap()
+                .candidate_id
+        };
+
+        let connection = rusqlite::Connection::open(&path).expect("raw SQLite should open");
+        let last_sequence: i64 = connection
+            .query_row("SELECT MAX(sequence) FROM run_events", [], |row| row.get(0))
+            .expect("last sequence should load");
+        let previous_row: (i64, Option<String>, Vec<u8>, String) = connection
+            .query_row(
+                "SELECT sequence, previous_digest, event_json, digest FROM run_events WHERE sequence = ?1",
+                [last_sequence - 1],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("previous event should load");
+        let previous = EventRecord {
+            sequence: u64::try_from(previous_row.0).expect("sequence should fit"),
+            previous_digest: previous_row.1,
+            event: serde_json::from_slice(&previous_row.2).expect("event should decode"),
+            digest: previous_row.3,
+        };
+        let mut last_event: RunEvent = connection
+            .query_row(
+                "SELECT event_json FROM run_events WHERE sequence = ?1",
+                [last_sequence],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .map(|bytes| serde_json::from_slice(&bytes).expect("last event should decode"))
+            .expect("last event should load");
+        let RunEventBody::CompletionCandidateRecorded {
+            completion_output_record_digest,
+            ..
+        } = &mut last_event.body
+        else {
+            panic!("last event should be a completion candidate")
+        };
+        *completion_output_record_digest = None;
+        let legacy_record = EventRecord::next(Some(&previous), last_event)
+            .expect("legacy completion record should hash");
+        let mut projection: RunState = connection
+            .query_row(
+                "SELECT state_json FROM run_projection WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .map(|bytes| serde_json::from_slice(&bytes).expect("projection should decode"))
+            .expect("projection should load");
+        projection.journal_head_digest = legacy_record.digest.clone();
+        projection
+            .agent_loop
+            .as_mut()
+            .unwrap()
+            .completion_candidate
+            .as_mut()
+            .unwrap()
+            .completion_output_record_digest = None;
+        connection
+            .execute(
+                "UPDATE run_events SET digest = ?1, event_json = ?2 WHERE sequence = ?3",
+                rusqlite::params![
+                    legacy_record.digest,
+                    serde_json::to_vec(&legacy_record.event).expect("event should encode"),
+                    last_sequence,
+                ],
+            )
+            .expect("legacy event should update");
+        connection
+            .execute(
+                "UPDATE run_projection SET state_json = ?1 WHERE singleton = 1",
+                [serde_json::to_vec(&projection).expect("projection should encode")],
+            )
+            .expect("legacy projection should update");
+        connection
+            .execute("DELETE FROM completion_outputs", [])
+            .expect("completion output should delete");
+        connection
+            .execute("DROP TABLE completion_outputs", [])
+            .expect("schema-seven fixture should drop completion table");
+        connection
+            .pragma_update(None, "user_version", 7_i64)
+            .expect("fixture should declare schema seven");
+        drop(connection);
+
+        let migrated = SqliteRunStore::open(&path).expect("legacy completion should migrate");
+        let state = migrated
+            .load_current()
+            .expect("state should load")
+            .expect("Run should exist");
+        let expected_head = ExpectedHead::from_state(&state);
+        assert!(
+            migrated
+                .load_completion_output(expected_head, &candidate_id)
+                .expect("legacy completion lookup should succeed")
+                .is_none()
+        );
+        assert_eq!(
+            migrated
+                .completion_output_count()
+                .expect("completion count should load"),
+            0
+        );
+    }
+
+    #[test]
+    fn corrupt_schema_seven_migration_rolls_back_completion_table_and_version() {
+        let directory = tempdir().expect("temp directory should exist");
+        let path = directory.path().join("corrupt-schema-seven.db");
+        {
+            let mut store = SqliteRunStore::open(&path).expect("schema eight store should open");
+            let seeded = seed(&mut store);
+            append_intent(&mut store, &seeded);
+        }
+
+        let expected_rows = {
+            let connection = rusqlite::Connection::open(&path).expect("raw SQLite should open");
+            connection
+                .execute(
+                    "UPDATE run_events SET event_id = 'schema-seven-index-tampered' WHERE sequence = 1",
+                    [],
+                )
+                .expect("fixture event index should be corrupted");
+            connection
+                .execute("DROP TABLE completion_outputs", [])
+                .expect("schema-seven fixture should omit completion-output storage");
+            connection
+                .pragma_update(None, "user_version", 7_i64)
+                .expect("fixture should declare schema seven");
+            (
+                sqlite_event_rows(&connection),
+                sqlite_blob_rows(
+                    &connection,
+                    "SELECT state_json FROM run_projection ORDER BY singleton",
+                ),
+                sqlite_blob_rows(
+                    &connection,
+                    "SELECT intent_json FROM effect_intents ORDER BY effect_id",
+                ),
+                sqlite_authorization_rows(&connection),
+                sqlite_blob_rows(
+                    &connection,
+                    "SELECT record_json FROM invocation_materials ORDER BY effect_id",
+                ),
+                sqlite_blob_rows(
+                    &connection,
+                    "SELECT receipt_json FROM execution_receipts ORDER BY event_sequence",
+                ),
+                sqlite_blob_rows(
+                    &connection,
+                    "SELECT record_json FROM tool_outputs ORDER BY event_sequence, effect_id",
+                ),
+                sqlite_blob_rows(
+                    &connection,
+                    "SELECT record_json FROM planned_invocations ORDER BY event_sequence, step_id",
+                ),
+            )
+        };
+
+        assert!(matches!(
+            SqliteRunStore::open(&path),
+            Err(StoreError::Corrupt(message))
+                if message == "run event ID index differs from the journal event"
+        ));
+
+        let connection = rusqlite::Connection::open(&path).expect("SQLite should reopen");
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("schema version should load");
+        assert_eq!(version, 7);
+        assert_eq!(sqlite_table_count(&connection, "completion_outputs"), 0);
+        let actual_rows = (
+            sqlite_event_rows(&connection),
+            sqlite_blob_rows(
+                &connection,
+                "SELECT state_json FROM run_projection ORDER BY singleton",
+            ),
+            sqlite_blob_rows(
+                &connection,
+                "SELECT intent_json FROM effect_intents ORDER BY effect_id",
+            ),
+            sqlite_authorization_rows(&connection),
+            sqlite_blob_rows(
+                &connection,
+                "SELECT record_json FROM invocation_materials ORDER BY effect_id",
+            ),
+            sqlite_blob_rows(
+                &connection,
+                "SELECT receipt_json FROM execution_receipts ORDER BY event_sequence",
+            ),
+            sqlite_blob_rows(
+                &connection,
+                "SELECT record_json FROM tool_outputs ORDER BY event_sequence, effect_id",
+            ),
+            sqlite_blob_rows(
+                &connection,
+                "SELECT record_json FROM planned_invocations ORDER BY event_sequence, step_id",
+            ),
+        );
+        assert_eq!(actual_rows, expected_rows);
+    }
+
+    #[test]
+    fn sqlite_migrates_schema_six_to_eight_without_rewriting_any_durable_bytes() {
         let directory = tempdir().expect("temp directory should exist");
         let path = directory.path().join("run.db");
         {
@@ -5487,6 +6397,9 @@ mod tests {
             .execute("DROP TABLE tool_outputs", [])
             .expect("schema-six fixture should not have tool-output storage");
         connection
+            .execute("DROP TABLE completion_outputs", [])
+            .expect("schema-six fixture should not have completion-output storage");
+        connection
             .pragma_update(None, "user_version", 6_i64)
             .expect("fixture should declare schema six");
         drop(connection);
@@ -5505,7 +6418,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("schema version should load");
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         assert_eq!(sqlite_durable_rows(&connection), expected_rows);
     }
 
@@ -5534,6 +6447,9 @@ mod tests {
         connection
             .execute("DROP TABLE tool_outputs", [])
             .expect("schema-six fixture should not have tool-output storage");
+        connection
+            .execute("DROP TABLE completion_outputs", [])
+            .expect("schema-six fixture should not have completion-output storage");
         connection
             .execute(
                 "UPDATE effect_intents SET action_digest = 'sha256:corrupted-schema-six'",
@@ -5580,6 +6496,7 @@ mod tests {
             .expect("corrupt fixture should remain intact");
         assert_eq!(version, 6);
         assert_eq!(output_table_count, 0);
+        assert_eq!(sqlite_table_count(&connection, "completion_outputs"), 0);
         assert_eq!(action_digest, "sha256:corrupted-schema-six");
         assert_eq!(sqlite_event_rows(&connection), expected_events);
         assert_eq!(
@@ -5639,6 +6556,9 @@ mod tests {
             .execute("DROP TABLE tool_outputs", [])
             .expect("schema-five fixture should not have tool-output storage");
         connection
+            .execute("DROP TABLE completion_outputs", [])
+            .expect("schema-five fixture should not have completion-output storage");
+        connection
             .pragma_update(None, "user_version", 5_i64)
             .expect("fixture should declare schema five");
         drop(connection);
@@ -5660,7 +6580,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("schema version should load");
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         assert_eq!(sqlite_event_rows(&connection), expected_events);
         assert_eq!(
             sqlite_blob_rows(
@@ -5714,6 +6634,9 @@ mod tests {
             .execute("DROP TABLE tool_outputs", [])
             .expect("schema-five fixture should not have tool-output storage");
         connection
+            .execute("DROP TABLE completion_outputs", [])
+            .expect("schema-five fixture should not have completion-output storage");
+        connection
             .execute(
                 "UPDATE effect_intents SET action_digest = 'sha256:corrupted'",
                 [],
@@ -5754,6 +6677,7 @@ mod tests {
 
         assert_eq!(version, 5);
         assert_eq!(planned_table_count, 0);
+        assert_eq!(sqlite_table_count(&connection, "completion_outputs"), 0);
         assert_eq!(action_digest, "sha256:corrupted");
     }
 
@@ -5785,6 +6709,9 @@ mod tests {
             .execute("DROP TABLE tool_outputs", [])
             .expect("schema-three fixture should not have tool-output storage");
         connection
+            .execute("DROP TABLE completion_outputs", [])
+            .expect("schema-three fixture should not have completion-output storage");
+        connection
             .execute("DROP TABLE planned_invocations", [])
             .expect("schema-three fixture should not have plan input storage");
         connection
@@ -5806,7 +6733,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("schema version should load");
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         let mut statement = connection
             .prepare("SELECT event_json FROM run_events ORDER BY sequence")
             .expect("event query should prepare");
@@ -5834,6 +6761,9 @@ mod tests {
             connection
                 .execute("DROP TABLE tool_outputs", [])
                 .expect("schema-three fixture should omit tool-output storage");
+            connection
+                .execute("DROP TABLE completion_outputs", [])
+                .expect("schema-three fixture should omit completion-output storage");
             connection
                 .execute("DROP TABLE planned_invocations", [])
                 .expect("schema-three fixture should omit plan input storage");
@@ -5863,6 +6793,7 @@ mod tests {
             )
             .expect("schema should be inspectable");
         assert_eq!(receipt_table_count, 0);
+        assert_eq!(sqlite_table_count(&connection, "completion_outputs"), 0);
         assert_eq!(sqlite_event_rows(&connection), expected_events);
     }
 
@@ -5883,6 +6814,9 @@ mod tests {
             connection
                 .execute("DROP TABLE tool_outputs", [])
                 .expect("schema-four fixture should not have tool-output storage");
+            connection
+                .execute("DROP TABLE completion_outputs", [])
+                .expect("schema-four fixture should not have completion-output storage");
             connection
                 .execute("DROP TABLE planned_invocations", [])
                 .expect("schema-four fixture should not have plan input storage");
@@ -5906,7 +6840,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("schema version should load");
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         assert_eq!(sqlite_durable_rows(&connection), expected_rows);
     }
 
@@ -5926,6 +6860,9 @@ mod tests {
             .execute("DROP TABLE tool_outputs", [])
             .expect("schema-four fixture should not have tool-output storage");
         connection
+            .execute("DROP TABLE completion_outputs", [])
+            .expect("schema-four fixture should not have completion-output storage");
+        connection
             .execute("DROP TABLE planned_invocations", [])
             .expect("schema-four fixture should not have plan input storage");
         connection
@@ -5938,7 +6875,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("schema version should load");
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         drop(connection);
         SqliteRunStore::open(&path).expect("converged store should pass full open verification");
     }
@@ -5962,6 +6899,9 @@ mod tests {
             connection
                 .execute("DROP TABLE tool_outputs", [])
                 .expect("schema-four fixture should not have tool-output storage");
+            connection
+                .execute("DROP TABLE completion_outputs", [])
+                .expect("schema-four fixture should not have completion-output storage");
             connection
                 .execute("DROP TABLE planned_invocations", [])
                 .expect("schema-four fixture should not have plan input storage");
@@ -6001,6 +6941,7 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("schema version should load");
         assert_eq!(version, 4);
+        assert_eq!(sqlite_table_count(&connection, "completion_outputs"), 0);
         let after = (
             sqlite_event_rows(&connection),
             sqlite_blob_rows(
