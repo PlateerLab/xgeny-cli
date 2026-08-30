@@ -93,4 +93,10 @@ model-egress/read 동의가 이 adapter에 연결됐다. 기본 CI는 loopback p
 XGEN Model Gateway는 별도 live/후속 slice다. 현재 rustls trust는 public web PKI 기준이므로 사내
 CA/custom trust root가 필요한 HTTPS provider 구성도 후속 설계 범위다.
 
+Public 2-turn live gate의 redacted 실행 절차와 인수 조건은
+[public local run/resume](public-local-run-resume.md#go50902-public-live-gate)에 둔다. 이 gate는 기존
+synthetic `PlanAccepted` smoke를 대체하지 않고, 같은 provider adapter를 public CLI, 실제 filesystem
+effect, SQLite restart와 offline completion replay까지 수직으로 검증한다. 통과 결과는 실행한 exact
+commit과 함께 별도로 기록하며, 실행 전에는 완료됐다고 주장하지 않는다.
+
 설계 근거와 failure matrix는 [ADR-0017](../adr/0017-openai-compatible-provider-adapter.md)을 따른다.

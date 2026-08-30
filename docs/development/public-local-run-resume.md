@@ -90,6 +90,65 @@ cargo test --locked -p xgeny-cli --test public_run_resume
 - 실제 read 뒤 outcome commit 실패 시 즉시 effect Unknown 분류, offline resume의
   Executing → EffectUnknown 1회와 자동 재실행 0
 
+## go50902 public live gate
+
+실제 Qwen과 public binary의 model → file → 다음 model turn → offline replay를 검증할 때는 별도
+terminal에서 tunnel을 열지 않는다. Ignored integration test가 tunnel lifecycle과 임시
+workspace/state 정리를 함께 소유한다. `go50902`의 host key가 기존 `known_hosts`에 등록돼 있어야 하며
+대화형 host-key 승인이나 password prompt는 허용하지 않는다. 전용 파일에는 `go50902`라는
+`HostKeyAlias`로 사전에 검증한 키를 등록하고, 실행 중 자동 등록하지 않는다. Test는 이 입력을 한 번만
+bounded read해 test-owned `0600` 안전 경로에 복사하고 두 tunnel이 같은 snapshot만 사용하게 한다.
+`KnownHostsCommand`, SSHFP/DNS 신뢰와 `UpdateHostKeys`도 끈다.
+
+```bash
+XGENY_LIVE_CONFIRM=xgeny-go50902-public-cli-v1 \
+XGENY_LIVE_KNOWN_HOSTS_FILE=/absolute/path/to/dedicated_known_hosts \
+XGENY_LIVE_OPENAI_BASE_URL=http://127.0.0.1:18000/v1 \
+cargo test --locked --release -p xgeny-cli \
+  --test live_go50902_public \
+  public_cli_two_turn_read_and_offline_replay \
+  -- --ignored --exact
+```
+
+`--nocapture`, `--show-output`, shell tracing과 `tee`를 붙이지 않는다. Test는 매 실행마다 무작위 상대
+파일명과 파일 내용 marker를 만들고 child stdout/stderr를 메모리에만 보관한다. 상대 파일명은 첫 Plan을
+위해 goal에 포함되지만 marker는 포함되지 않는다. 실패 assertion도 endpoint, SSH forward, Run ID,
+goal, path, marker, request/response와 ToolOutput을 출력하지 않는다. `XGENY_OPENAI_API_KEY`는 public
+child에서 제거한다. Test는 URL의 nonzero `127.0.0.1` port만 입력받아 SSH forward를
+`127.0.0.1:<port>:127.0.0.1:8000`으로 직접 구성하고 SSH target을 `go50902`로 고정한다.
+
+통과 조건은 exit `[10, 10, 0, 0]`, model-call lifecycle `reserved/settled/unknown = 2/2/0`,
+Plan/Step/effect/Receipt/completion 각 1개, 원본 삭제 뒤 두 번째 model turn 성공, tunnel·workspace 삭제 뒤
+완료 summary의 byte-exact offline replay와 journal 불변이다. 첫 model turn tunnel은 local-only read
+전에 종료하고 두 번째 model turn용 tunnel을 새로 열어 read process에 provider 경로가 없음을 고정한다.
+일반 CI는 이 test를 compile만 하고 외부 network 없이 ignore한다.
+
+## Clean-SHA live evidence (2026-08-31)
+
+2026-08-31 05:57 KST에 Linux x86_64, Rust 1.98.0, release profile에서 test 구현 commit
+`f58209ced19c6cedab33945818270e7db7dc1897`을 clean working tree로 실행했다. SSH target은
+`go50902`로 고정했고 두 tunnel 모두 같은 test-owned host-key snapshot으로 strict 검증했다. 이번 실행의
+snapshot은 기존 운영 alias로 접속해 읽은 public host key로 bootstrap했으므로 그 자체가 독립적인 host
+identity attestation은 아니다. 재현·승격 환경에서는 별도 경로로 사전 검증한 전용 known-host entry를
+입력해야 한다.
+
+같은 시점의 별도 read-only 운영 관측은 vLLM `0.27.1`, served model `qwen3.8-27b`, artifact basename
+`Qwen3.8-27B-FP8`, `max_model_len=524288`이었다. 이 값들은 비암호학적 운영 관측이며 gate가
+runtime/artifact/max length를 durable result에 bind하지 않는다. Gate가 요청하는 model은
+`qwen3.8-27b`, tokenizer identity는 `Qwen/Qwen3.8-27B-FP8`로 고정했다. 원격 endpoint, forward,
+host key, Run ID, 임시 path, 무작위 파일명, goal, marker, request/response, ToolOutput과 digest는 증거에
+남기지 않았다.
+
+실행 결과는 PASS였다. 관측된 public CLI exit sequence는 `[10, 10, 0, 0]`, model-call lifecycle은
+`reserved/settled/unknown = 2/2/0`이었고 Plan, Step, effect, Receipt, passed verification, completion은
+각각 하나였다. Effect attempt는 1회였다. 첫 tunnel 종료 뒤 local read를 수행했고, 원본 파일 삭제 뒤
+두 번째 model turn이 durable ToolOutput만으로 exact summary를 만들었다. 두 번째 tunnel과 workspace를
+삭제한 뒤의 offline replay도 byte-exact였으며 journal은 변하지 않았다. 금지한 runtime 값의
+노출 검사는 child 양쪽 stream의 base URL/workspace/state/상대 파일명, 모든 child stderr의 marker,
+manifest의 base URL/workspace/state/상대 파일명/marker를 대상으로 통과했다. Run ID는 status stderr와
+manifest에, marker는 completion/replay stdout에만 의도적으로 허용된다. Test harness는 capture한 stream
+원문을 출력하지 않았고 임시 state와 listener도 실행 종료 뒤 남지 않았다.
+
 ## 보안·운영 메모
 
 - `manifest.json`에는 endpoint, token, root path, allow-file path와 content가 없다.
