@@ -11,10 +11,11 @@
 - Memory/SQLite store가 v1 empty-artifact와 v2 artifact-bearing 의미를 각각 다시 검증한다.
 - `xgeny-cli` library의 `RunDriver`가 기존 AgentLoop, admission, executor와 verifier를 bounded 순서로 조합한다.
 - test-only fake planner/adapter로 approval pending/deny 무효과, IntentCommitted·Validating SQLite 재개, 완료와 no-call replay를 검증한다.
+- `xgeny-adapter-filesystem`이 root-bound resolver, component별 no-follow, 64 KiB strict UTF-8 read와 durable-output-only verifier를 제공한다. 실제 SQLite driver 회귀는 파일을 한 번 읽어 다음 planning turn에 전달하고 원본 삭제·재open 뒤 추가 file/model/verifier 호출 없이 completion을 복원한다.
 
 ## 아직 사용자에게 제공하지 않는 것
 
-`xgeny` binary에는 `run/resume` 명령이 없고 실제 사용자 workspace 파일을 여는 제품 adapter도 없다. 승인 UI와 local-output model egress composition도 연결되지 않았다. 따라서 fake adapter로 검증한 durable output/context/completion 기반만을 “Claude Code/Codex와 같은 실제 파일 읽기” 또는 “workspace sandbox 검증 완료”로 설명하면 안 된다.
+`xgeny` binary에는 아직 `run/resume` 명령이 없고 실제 model provider와 제품 filesystem adapter를 한 public composition으로 연결하지 않았다. 승인 UI와 local-output model egress 결정도 연결되지 않았다. 따라서 library driver의 실제 파일 회귀를 “Claude Code/Codex와 같은 사용자용 CLI 완성” 또는 “untrusted plugin/host 전체 sandbox”로 설명하면 안 된다.
 
 ## Driver 정지 조건
 
@@ -42,4 +43,4 @@ cargo test -p xgeny-cli --test durable_driver
 cargo test --workspace --locked
 ```
 
-ReadOnly/driver 기반은 [ADR-0018](../adr/0018-read-only-artifact-and-cli-driver-foundation.md), durable tool output은 [ADR-0019](../adr/0019-durable-tool-output-and-schema-7.md), next-turn context는 [ADR-0020](../adr/0020-generation-checked-planning-context-v2.md), durable completion은 [ADR-0021](../adr/0021-durable-completion-output-and-schema-8.md)을 따른다.
+ReadOnly/driver 기반은 [ADR-0018](../adr/0018-read-only-artifact-and-cli-driver-foundation.md), durable tool output은 [ADR-0019](../adr/0019-durable-tool-output-and-schema-7.md), next-turn context는 [ADR-0020](../adr/0020-generation-checked-planning-context-v2.md), durable completion은 [ADR-0021](../adr/0021-durable-completion-output-and-schema-8.md), 제품 filesystem read 경계는 [ADR-0022](../adr/0022-capability-confined-filesystem-read-adapter.md)를 따른다.

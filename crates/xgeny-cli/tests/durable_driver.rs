@@ -1,12 +1,18 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
+use std::fmt::Write as _;
 use std::fs;
 use std::num::NonZeroU32;
 use std::process::Command;
 use std::rc::Rc;
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tempfile::tempdir;
+use xgeny_adapter_filesystem::{
+    MAX_READ_TEXT_BYTES, ReadTextAdapter, ReadTextLimits, ReadTextVerifier, WorkspaceId,
+    WorkspaceRoot,
+};
 use xgeny_cli::{
     ApprovalDecision, ApprovalPort, ApprovalPortFailure, DriverOutcome, PlannedRouteFailure,
     PlannedRoutePort, RunDriver,
@@ -59,6 +65,9 @@ const RESTART_PROOF_PATH: &str = "XGENY_CLI_COMPLETION_RESTART_PROOF";
 const RESTART_PROOF_BYTES: &[u8] = b"xgeny-completion-restart-replayed";
 const RESTART_TEST_NAME: &str =
     "sqlite_driver_completes_read_only_plan_with_core_bound_artifact_and_replays";
+const REAL_RUN_ID: &str = "run-cli-driver-real-filesystem";
+const REAL_FILE_CONTENT: &str = "REAL-FILESYSTEM-ADAPTER-CONTENT \"quote\"\n\t한글과 UTF-8 관찰";
+const MVP_CONTEXT_BUDGET_BYTES: u64 = 512 * 1024;
 
 #[derive(Debug, Default)]
 struct DeterministicEvents;
@@ -107,7 +116,9 @@ impl PlannerPort for ScriptedPlanner {
     ) -> Result<PlanProposal, PlannerPortFailure> {
         self.calls.set(self.calls.get() + 1);
         assert!(!format!("{request:?}").contains("fixture-content"));
+        assert!(!format!("{request:?}").contains(REAL_FILE_CONTENT));
         assert!(!format!("{:?}", request.context()).contains("fixture-content"));
+        assert!(!format!("{:?}", request.context()).contains(REAL_FILE_CONTENT));
         assert!(
             request
                 .context()
@@ -418,6 +429,309 @@ impl EffectAdapter for ReadOnlyAdapter {
 
 struct ArtifactVerifier {
     calls: Rc<Cell<usize>>,
+}
+
+struct CountingReadAdapter {
+    inner: ReadTextAdapter,
+    prepare_calls: Rc<Cell<usize>>,
+    execute_calls: Rc<Cell<usize>>,
+}
+
+struct CountingReadSession {
+    inner: Box<dyn PreparedAdapterInvocation>,
+    execute_calls: Rc<Cell<usize>>,
+}
+
+impl PreparedAdapterInvocation for CountingReadSession {
+    fn execute(self: Box<Self>) -> AdapterExecutionObservation {
+        self.execute_calls.set(self.execute_calls.get() + 1);
+        self.inner.execute()
+    }
+}
+
+impl EffectAdapter for CountingReadAdapter {
+    fn prepare(
+        &mut self,
+        request: AdapterPrepareRequest<'_>,
+    ) -> Result<Box<dyn PreparedAdapterInvocation>, AdapterPrepareFailure> {
+        self.prepare_calls.set(self.prepare_calls.get() + 1);
+        let inner = self.inner.prepare(request)?;
+        Ok(Box::new(CountingReadSession {
+            inner,
+            execute_calls: Rc::clone(&self.execute_calls),
+        }))
+    }
+
+    fn reconcile(
+        &mut self,
+        request: AdapterReconcileRequest<'_>,
+    ) -> AdapterReconciliationObservation {
+        self.inner.reconcile(request)
+    }
+}
+
+struct CountingReadVerifier {
+    inner: ReadTextVerifier,
+    calls: Rc<Cell<usize>>,
+}
+
+impl EffectVerifier for CountingReadVerifier {
+    fn verify(
+        &mut self,
+        request: VerificationRequest<'_>,
+    ) -> Result<VerificationReport, VerificationPortFailure> {
+        self.calls.set(self.calls.get() + 1);
+        self.inner.verify(request)
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn real_filesystem_adapter_reaches_next_turn_and_replays_after_sqlite_reopen() {
+    let directory = tempdir().expect("temporary test directory should exist");
+    let workspace_path = directory.path().join("workspace");
+    fs::create_dir(&workspace_path).expect("workspace should create");
+    fs::write(workspace_path.join("README.md"), REAL_FILE_CONTENT)
+        .expect("workspace fixture should write");
+    let workspace = WorkspaceRoot::open_ambient(
+        &workspace_path,
+        WorkspaceId::new("fixture").expect("workspace ID should validate"),
+    )
+    .expect("workspace capability should open");
+    let resolver = workspace.resolver();
+
+    let definition = definition_fixture();
+    let mut instance = instance_fixture(&definition);
+    instance.binding = workspace.binding();
+    instance.features.cancellable = false;
+    assert!(instance.features.sync);
+    assert!(!instance.features.task);
+    assert!(!instance.features.cancellable);
+    assert!(!instance.features.idempotency_query);
+    let capability = CapabilityRef {
+        capability_id: definition.metadata.id.clone(),
+        contract_version: definition.metadata.contract_version.clone(),
+    };
+    let mut registry = CapabilityRegistry::new();
+    registry
+        .register_schema_validated_definition(definition)
+        .expect("definition should register");
+    registry
+        .register_schema_validated_instance(instance.clone())
+        .expect("root-bound instance should register");
+
+    let prepare_calls = Rc::new(Cell::new(0));
+    let execute_calls = Rc::new(Cell::new(0));
+    let verify_calls = Rc::new(Cell::new(0));
+    let adapter = workspace.read_text_adapter(ReadTextLimits::default());
+    let verifier = adapter.verifier();
+    let mut adapters = EffectAdapterRegistry::new();
+    adapters
+        .register(
+            &instance.binding,
+            CountingReadAdapter {
+                inner: adapter,
+                prepare_calls: Rc::clone(&prepare_calls),
+                execute_calls: Rc::clone(&execute_calls),
+            },
+        )
+        .expect("read adapter should register");
+    let mut verifiers = EffectVerifierRegistry::new();
+    verifiers
+        .register(
+            &instance.binding,
+            CountingReadVerifier {
+                inner: verifier,
+                calls: Rc::clone(&verify_calls),
+            },
+        )
+        .expect("read verifier should register");
+
+    let recipes = RecipeState(Rc::new(RefCell::new(BTreeMap::new())));
+    let mut materializer = MemoryRecipeMaterializer {
+        state: recipes.clone(),
+        next: 0,
+    };
+    let mut providers = MaterialProviderRegistry::new();
+    providers
+        .register("test-recipes", MemoryRecipeProvider(recipes))
+        .expect("material provider should register");
+    let planner_calls = Rc::new(Cell::new(0));
+    let planner_contexts = Rc::new(RefCell::new(Vec::new()));
+    let mut planner = ScriptedPlanner {
+        proposals: VecDeque::from([
+            PlanProposal::plan(vec![ProposedPlanStep::new(
+                "read",
+                "read one real workspace file",
+                Vec::new(),
+                capability.clone(),
+                json!({"path": "README.md"}),
+            )]),
+            PlanProposal::completion_candidate("REAL-FILESYSTEM-COMPLETION"),
+        ]),
+        calls: Rc::clone(&planner_calls),
+        contexts: Rc::clone(&planner_contexts),
+        context_sizes: Rc::new(RefCell::new(Vec::new())),
+        context_digests: Rc::new(RefCell::new(Vec::new())),
+    };
+    let mut routes = ExactReadOnlyRoute {
+        capability,
+        instance_id: instance.instance_id.clone(),
+    };
+    let database = directory.path().join("real-run.sqlite3");
+    let lease_path = directory.path().join("real-run.lock");
+    let mut store = SqliteRunStore::open(&database).expect("SQLite should open");
+    store
+        .append(
+            ExpectedHead::Empty,
+            RunEvent {
+                event_id: "real-filesystem-seed".to_owned(),
+                run_id: REAL_RUN_ID.to_owned(),
+                authority: "local:test".to_owned(),
+                authority_epoch: 1,
+                recorded_at: "2026-08-30T10:00:00Z".to_owned(),
+                body: RunEventBody::RunCreated {
+                    goal: "read a real local fixture".to_owned(),
+                },
+            },
+        )
+        .expect("Run should initialize");
+    let lease =
+        LocalRunLease::try_acquire(REAL_RUN_ID, &lease_path).expect("Run lease should acquire");
+    let budget = AgentLoopBudget::new(2, 1, 1, MVP_CONTEXT_BUDGET_BYTES)
+        .expect("MVP context budget should validate");
+    let mut approvals = AllowExactRequest;
+    let mut events = DeterministicEvents;
+
+    let outcome = RunDriver::new(AgentLoop::new(budget.clone()), NonZeroU32::new(32).unwrap())
+        .drive_until_pause(
+            &mut store,
+            &mut events,
+            &lease,
+            &registry,
+            &resolver,
+            &mut planner,
+            &mut materializer,
+            &mut providers,
+            &mut adapters,
+            &mut verifiers,
+            &mut routes,
+            &mut approvals,
+        )
+        .expect("real filesystem Run should complete");
+    let DriverOutcome::CompletionCandidate {
+        output: Some(completion),
+        ..
+    } = outcome
+    else {
+        panic!("real filesystem Run should return its completion output")
+    };
+    assert_eq!(completion.summary(), "REAL-FILESYSTEM-COMPLETION");
+    assert_eq!(planner_calls.get(), 2);
+    assert_eq!(prepare_calls.get(), 1);
+    assert_eq!(execute_calls.get(), 1);
+    assert_eq!(verify_calls.get(), 1);
+
+    let contexts = planner_contexts.borrow();
+    assert_eq!(contexts.len(), 2);
+    assert_eq!(contexts[0]["toolOutputs"], json!([]));
+    assert_eq!(
+        contexts[1]["toolOutputs"][0]["output"]["content"],
+        REAL_FILE_CONTENT
+    );
+    let mut worst_case_context = contexts[1].clone();
+    worst_case_context["toolOutputs"][0]["output"]["content"] =
+        Value::String("\0".repeat(MAX_READ_TEXT_BYTES));
+    let worst_case_context_bytes = u64::try_from(
+        serde_json::to_vec(&worst_case_context)
+            .expect("worst-case context should serialize")
+            .len(),
+    )
+    .expect("serialized context length should fit u64");
+    assert!(
+        worst_case_context_bytes <= budget.max_context_bytes,
+        "one maximum-size control-heavy read must fit the effective MVP planning-context budget"
+    );
+    drop(contexts);
+    let state = store.load_current().unwrap().unwrap();
+    let step = state.steps.values().next().expect("read Step should exist");
+    let intent = step
+        .intent
+        .as_ref()
+        .expect("read Step should retain intent");
+    let output = store
+        .load_tool_output(&intent.effect_id)
+        .expect("tool output lookup should succeed")
+        .expect("tool output should persist");
+    let expected_file_digest = test_sha256_digest(REAL_FILE_CONTENT.as_bytes());
+    assert_eq!(output.output()["content"], REAL_FILE_CONTENT);
+    assert_eq!(output.output()["digest"], expected_file_digest);
+    let receipts = store
+        .load_execution_receipts()
+        .expect("Receipt lookup should succeed");
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].output_digest, output.output_digest());
+    assert_eq!(receipts[0].artifacts.len(), 1);
+    assert_eq!(receipts[0].artifacts[0].digest, expected_file_digest);
+    assert_eq!(
+        receipts[0].artifacts[0].size,
+        u64::try_from(REAL_FILE_CONTENT.len()).expect("fixture length should fit")
+    );
+    for public_surface in [
+        String::from_utf8(store.export_jsonl().expect("journal should export"))
+            .expect("journal should be UTF-8"),
+        String::from_utf8(
+            store
+                .export_execution_receipts_jsonl()
+                .expect("Receipts should export"),
+        )
+        .expect("Receipt export should be UTF-8"),
+        serde_json::to_string(&state).expect("projection should serialize"),
+    ] {
+        assert!(!public_surface.contains("README.md"));
+        assert!(!public_surface.contains("workspace:fixture"));
+        assert!(!public_surface.contains(REAL_FILE_CONTENT));
+        assert!(!public_surface.contains(workspace_path.to_string_lossy().as_ref()));
+    }
+
+    drop(store);
+    fs::remove_file(workspace_path.join("README.md"))
+        .expect("source may be removed after durable completion");
+    let mut reopened = SqliteRunStore::open(&database).expect("SQLite should reopen");
+    let before = reopened.load().unwrap().unwrap();
+    let replay = RunDriver::new(AgentLoop::new(budget), NonZeroU32::new(1).unwrap())
+        .drive_until_pause(
+            &mut reopened,
+            &mut events,
+            &lease,
+            &registry,
+            &resolver,
+            &mut planner,
+            &mut materializer,
+            &mut providers,
+            &mut adapters,
+            &mut verifiers,
+            &mut routes,
+            &mut approvals,
+        )
+        .expect("completed Run should replay without file or model access");
+    let DriverOutcome::CompletionCandidate {
+        output: Some(replayed),
+        ..
+    } = replay
+    else {
+        panic!("reopened Run should replay its completion")
+    };
+    assert_eq!(replayed.summary(), "REAL-FILESYSTEM-COMPLETION");
+    assert_eq!(planner_calls.get(), 2, "replay must not recall the planner");
+    assert_eq!(
+        prepare_calls.get(),
+        1,
+        "replay must not prepare the adapter"
+    );
+    assert_eq!(execute_calls.get(), 1, "replay must not reread the file");
+    assert_eq!(verify_calls.get(), 1, "replay must not reverify the file");
+    assert_eq!(reopened.load().unwrap().unwrap(), before);
 }
 
 impl EffectVerifier for ArtifactVerifier {
@@ -1267,10 +1581,9 @@ fn definition_fixture() -> CapabilityDefinitionBody {
         "../../../protocol/fixtures/v1alpha1/valid/capability-definition.fs-read-text.json"
     ))
     .expect("definition fixture should deserialize");
-    let ProtocolDocument::CapabilityDefinition(mut definition) = document else {
+    let ProtocolDocument::CapabilityDefinition(definition) = document else {
         panic!("expected definition fixture")
     };
-    definition.spec.execution.idempotency_key_supported = false;
     *definition
 }
 
@@ -1314,4 +1627,13 @@ fn policy_source(kind: PolicySourceKind, id: &str, byte: char) -> PolicySource {
         id: id.to_owned(),
         digest: format!("sha256:{}", byte.to_string().repeat(64)),
     }
+}
+
+fn test_sha256_digest(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    format!("sha256:{encoded}")
 }

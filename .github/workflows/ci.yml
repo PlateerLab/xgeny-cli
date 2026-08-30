@@ -51,6 +51,9 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --locked
 
+      - name: Lint platform-specific filesystem adapter
+        run: cargo clippy --locked -p xgeny-adapter-filesystem --all-targets -- -D warnings
+
       - name: Check bundled protocol
         run: cargo run --locked --quiet -p xgeny-cli -- protocol check
 
