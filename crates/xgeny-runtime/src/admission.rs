@@ -699,6 +699,8 @@ fn build_receipt_provenance(
             | DomainEffectClass::Unknown => CORE_RECEIPT_PROFILE_V1,
         }
         .to_owned(),
+        tool_output_profile: (definition.spec.effect.class == DomainEffectClass::ReadOnly)
+            .then(|| xgeny_workgraph::TOOL_OUTPUT_PROFILE_V1.to_owned()),
         invocation_id: content_id("invocation", effect_identity_digest),
         plan_id: planned_plan_id
             .map_or_else(|| content_id("plan", effect_identity_digest), str::to_owned),

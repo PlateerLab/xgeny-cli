@@ -7,19 +7,38 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use xgeny_domain::{ExecutionReceiptBody, ProtocolDocument};
 use xgeny_workgraph::{
     EffectIntent, EventRecord, InvocationMaterialRecord, PlannedInvocationMaterialRecord, RunEvent,
-    RunEventBody, RunState,
+    RunEventBody, RunState, ToolOutputRecord,
 };
 
 use crate::{
-    AuditMetrics, Commit, ExpectedHead, RunSnapshot, RunStore, RunVerificationSnapshot, StoreError,
-    StoredExecutionReceipt, VerifiedRunIndex, audit_snapshot, prepare_commit,
-    verify_material_bundle, verify_material_point, verify_material_records,
-    verify_plan_input_bundle, verify_plan_input_point, verify_plan_input_records,
-    verify_planned_material_retention, verify_receipt_bundle, verify_receipt_candidate,
-    verify_receipt_records,
+    AuditMetrics, Commit, CommitAnchors, CommitSidecars, ExpectedHead, RunSnapshot, RunStore,
+    RunVerificationSnapshot, StoreError, StoredExecutionReceipt, StoredToolOutput,
+    VerifiedRunIndex, audit_snapshot, index_tool_output, prepare_commit, verify_commit_sidecars,
+    verify_material_point, verify_material_records, verify_plan_input_point,
+    verify_plan_input_records, verify_planned_material_retention, verify_receipt_candidate,
+    verify_receipt_records, verify_stored_tool_output, verify_tool_output_candidate,
+    verify_tool_output_point,
 };
 
-const STORE_SCHEMA_VERSION: i64 = 6;
+const STORE_SCHEMA_VERSION: i64 = 7;
+
+const CREATE_TOOL_OUTPUT_SCHEMA: &str = r"
+CREATE TABLE tool_outputs (
+    effect_id TEXT PRIMARY KEY,
+    event_sequence INTEGER NOT NULL UNIQUE CHECK (event_sequence >= 1),
+    step_id TEXT NOT NULL,
+    output_id TEXT NOT NULL UNIQUE,
+    capability_id TEXT NOT NULL,
+    contract_version TEXT NOT NULL,
+    definition_digest TEXT NOT NULL,
+    canonical_size_bytes INTEGER NOT NULL CHECK (canonical_size_bytes BETWEEN 1 AND 1048576),
+    output_digest TEXT NOT NULL,
+    record_digest TEXT NOT NULL UNIQUE,
+    record_json BLOB NOT NULL CHECK (length(record_json) BETWEEN 1 AND 1100000),
+    FOREIGN KEY (event_sequence) REFERENCES run_events(sequence),
+    FOREIGN KEY (effect_id) REFERENCES effect_intents(effect_id)
+) STRICT;
+";
 
 const CREATE_PLAN_INPUT_SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS planned_invocations (
@@ -86,6 +105,22 @@ CREATE TABLE IF NOT EXISTS invocation_materials (
     material_digest TEXT NOT NULL,
     record_digest TEXT NOT NULL UNIQUE,
     record_json BLOB NOT NULL,
+    FOREIGN KEY (effect_id) REFERENCES effect_intents(effect_id)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS tool_outputs (
+    effect_id TEXT PRIMARY KEY,
+    event_sequence INTEGER NOT NULL UNIQUE CHECK (event_sequence >= 1),
+    step_id TEXT NOT NULL,
+    output_id TEXT NOT NULL UNIQUE,
+    capability_id TEXT NOT NULL,
+    contract_version TEXT NOT NULL,
+    definition_digest TEXT NOT NULL,
+    canonical_size_bytes INTEGER NOT NULL CHECK (canonical_size_bytes BETWEEN 1 AND 1048576),
+    output_digest TEXT NOT NULL,
+    record_digest TEXT NOT NULL UNIQUE,
+    record_json BLOB NOT NULL CHECK (length(record_json) BETWEEN 1 AND 1100000),
+    FOREIGN KEY (event_sequence) REFERENCES run_events(sequence),
     FOREIGN KEY (effect_id) REFERENCES effect_intents(effect_id)
 ) STRICT;
 
@@ -157,6 +192,10 @@ impl SqliteRunStore {
                 configure_connection(&connection)?;
                 migrate_schema_five(&mut connection)?;
             }
+            6 => {
+                configure_connection(&connection)?;
+                migrate_schema_six(&mut connection)?;
+            }
             STORE_SCHEMA_VERSION => configure_connection(&connection)?,
             unsupported => return Err(StoreError::UnsupportedSchemaVersion(unsupported)),
         }
@@ -174,14 +213,16 @@ impl SqliteRunStore {
         &mut self,
         expected: ExpectedHead,
         event: RunEvent,
-        plan_inputs: Option<&[PlannedInvocationMaterialRecord]>,
-        material: Option<&InvocationMaterialRecord>,
-        receipt: Option<&ExecutionReceiptBody>,
+        sidecars: CommitSidecars<'_>,
         mut checkpoint: impl FnMut(CommitStage) -> Result<(), StoreError>,
     ) -> Result<Commit, StoreError> {
-        verify_plan_input_bundle(&event, plan_inputs)?;
-        verify_material_bundle(&event, material)?;
-        verify_receipt_bundle(&event, receipt)?;
+        let CommitSidecars {
+            plan_inputs,
+            material,
+            output,
+            receipt,
+        } = sidecars;
+        verify_commit_sidecars(&event, sidecars)?;
         let Self {
             connection,
             cache,
@@ -192,7 +233,7 @@ impl SqliteRunStore {
             cache.replace(None);
             return Err(error);
         }
-        let (commit, receipt_anchor) = {
+        let (commit, output_anchor, receipt_anchor) = {
             let cached = cache.borrow();
             let index = &cached
                 .as_ref()
@@ -227,15 +268,12 @@ impl SqliteRunStore {
             let receipt_anchor = receipt
                 .map(|receipt| verify_receipt_candidate(index, &commit.record, receipt))
                 .transpose()?;
-            (commit, receipt_anchor)
+            let output_anchor = output
+                .map(|output| verify_tool_output_candidate(index, &commit.record, output))
+                .transpose()?;
+            (commit, output_anchor, receipt_anchor)
         };
-        {
-            let mut metrics = metrics.borrow_mut();
-            metrics.record_candidate_plan_inputs(
-                plan_inputs.map_or(0, <[PlannedInvocationMaterialRecord]>::len),
-            );
-            metrics.record_candidate(material.is_some(), receipt.is_some());
-        }
+        metrics.borrow_mut().record_candidate_sidecars(sidecars);
 
         let write_result = (|| -> Result<(), StoreError> {
             insert_event(&transaction, &commit.record)?;
@@ -248,6 +286,8 @@ impl SqliteRunStore {
             checkpoint(CommitStage::PlannedInvocation)?;
             insert_invocation_material(&transaction, material)?;
             checkpoint(CommitStage::InvocationMaterial)?;
+            insert_tool_output(&transaction, &commit.record, output)?;
+            checkpoint(CommitStage::ToolOutput)?;
             insert_execution_receipt(&transaction, &commit.record, receipt)?;
             checkpoint(CommitStage::ExecutionReceipt)?;
             write_projection(&transaction, &commit.state)?;
@@ -264,7 +304,14 @@ impl SqliteRunStore {
             .as_mut()
             .expect("successful commit must retain its verified prefix")
             .index
-            .apply_committed(&commit, plan_inputs, material, receipt, receipt_anchor);
+            .apply_committed(
+                &commit,
+                sidecars,
+                CommitAnchors {
+                    output: output_anchor,
+                    receipt: receipt_anchor,
+                },
+            );
         Ok(commit)
     }
 
@@ -275,7 +322,7 @@ impl SqliteRunStore {
         event: RunEvent,
         fault: CommitStage,
     ) -> Result<Commit, StoreError> {
-        self.append_internal(expected, event, None, None, None, |stage| {
+        self.append_internal(expected, event, CommitSidecars::default(), |stage| {
             if stage == fault {
                 Err(StoreError::InjectedFault(stage.label()))
             } else {
@@ -292,13 +339,18 @@ impl SqliteRunStore {
         material: &InvocationMaterialRecord,
         fault: CommitStage,
     ) -> Result<Commit, StoreError> {
-        self.append_internal(expected, event, None, Some(material), None, |stage| {
-            if stage == fault {
-                Err(StoreError::InjectedFault(stage.label()))
-            } else {
-                Ok(())
-            }
-        })
+        self.append_internal(
+            expected,
+            event,
+            CommitSidecars::material(material),
+            |stage| {
+                if stage == fault {
+                    Err(StoreError::InjectedFault(stage.label()))
+                } else {
+                    Ok(())
+                }
+            },
+        )
     }
 
     #[cfg(test)]
@@ -309,13 +361,18 @@ impl SqliteRunStore {
         inputs: &[PlannedInvocationMaterialRecord],
         fault: CommitStage,
     ) -> Result<Commit, StoreError> {
-        self.append_internal(expected, event, Some(inputs), None, None, |stage| {
-            if stage == fault {
-                Err(StoreError::InjectedFault(stage.label()))
-            } else {
-                Ok(())
-            }
-        })
+        self.append_internal(
+            expected,
+            event,
+            CommitSidecars::plan_inputs(inputs),
+            |stage| {
+                if stage == fault {
+                    Err(StoreError::InjectedFault(stage.label()))
+                } else {
+                    Ok(())
+                }
+            },
+        )
     }
 
     #[cfg(test)]
@@ -326,7 +383,24 @@ impl SqliteRunStore {
         receipt: &ExecutionReceiptBody,
         fault: CommitStage,
     ) -> Result<Commit, StoreError> {
-        self.append_internal(expected, event, None, None, Some(receipt), |stage| {
+        self.append_internal(expected, event, CommitSidecars::receipt(receipt), |stage| {
+            if stage == fault {
+                Err(StoreError::InjectedFault(stage.label()))
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn append_tool_output_with_fault(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        output: &ToolOutputRecord,
+        fault: CommitStage,
+    ) -> Result<Commit, StoreError> {
+        self.append_internal(expected, event, CommitSidecars::output(output), |stage| {
             if stage == fault {
                 Err(StoreError::InjectedFault(stage.label()))
             } else {
@@ -343,7 +417,23 @@ impl SqliteRunStore {
         receipt: &ExecutionReceiptBody,
         fault: CommitStage,
     ) -> Result<Commit, StoreError> {
-        self.append_internal(expected, event, None, None, Some(receipt), |stage| {
+        self.append_internal(expected, event, CommitSidecars::receipt(receipt), |stage| {
+            if stage == fault {
+                std::process::exit(86);
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn append_tool_output_and_exit_at(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        output: &ToolOutputRecord,
+        fault: CommitStage,
+    ) -> Result<Commit, StoreError> {
+        self.append_internal(expected, event, CommitSidecars::output(output), |stage| {
             if stage == fault {
                 std::process::exit(86);
             }
@@ -359,12 +449,17 @@ impl SqliteRunStore {
         material: &InvocationMaterialRecord,
         fault: CommitStage,
     ) -> Result<Commit, StoreError> {
-        self.append_internal(expected, event, None, Some(material), None, |stage| {
-            if stage == fault {
-                std::process::exit(86);
-            }
-            Ok(())
-        })
+        self.append_internal(
+            expected,
+            event,
+            CommitSidecars::material(material),
+            |stage| {
+                if stage == fault {
+                    std::process::exit(86);
+                }
+                Ok(())
+            },
+        )
     }
 
     #[cfg(test)]
@@ -410,6 +505,70 @@ impl SqliteRunStore {
     #[cfg(test)]
     pub(crate) fn execution_receipt_count(&self) -> Result<u64, StoreError> {
         table_count(&self.connection, "execution_receipts")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tool_output_count(&self) -> Result<u64, StoreError> {
+        table_count(&self.connection, "tool_outputs")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delete_tool_outputs(&self) -> Result<(), StoreError> {
+        self.connection.execute("DELETE FROM tool_outputs", [])?;
+        self.invalidate_cache();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn corrupt_tool_output_document(&self) -> Result<(), StoreError> {
+        let bytes: Vec<u8> = self.connection.query_row(
+            "SELECT record_json FROM tool_outputs LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        value["output"] = serde_json::json!({"secret": "tampered-output"});
+        self.connection.execute(
+            "UPDATE tool_outputs SET record_json = ?1",
+            [serde_json::to_vec(&value)?],
+        )?;
+        self.invalidate_cache();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn corrupt_tool_output_shape_with_secret(
+        &self,
+        secret: &str,
+    ) -> Result<(), StoreError> {
+        let invalid_record = format!(r#"{{"{secret}":null}}"#).into_bytes();
+        self.connection
+            .execute("UPDATE tool_outputs SET record_json = ?1", [invalid_record])?;
+        self.invalidate_cache();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn corrupt_tool_output_index(&self) -> Result<(), StoreError> {
+        self.connection.execute(
+            "UPDATE tool_outputs SET output_digest = 'sha256:corrupted'",
+            [],
+        )?;
+        self.invalidate_cache();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_orphan_tool_output(&self) -> Result<(), StoreError> {
+        self.connection.pragma_update(None, "foreign_keys", false)?;
+        let result = self.connection.execute(
+            "INSERT INTO tool_outputs (effect_id, event_sequence, step_id, output_id, capability_id, contract_version, definition_digest, canonical_size_bytes, output_digest, record_digest, record_json) SELECT 'orphan-effect', 999999, step_id, output_id || '-orphan', capability_id, contract_version, definition_digest, canonical_size_bytes, output_digest, record_digest || '-orphan', record_json FROM tool_outputs LIMIT 1",
+            [],
+        );
+        self.connection.pragma_update(None, "foreign_keys", true)?;
+        result?;
+        self.invalidate_cache();
+        Ok(())
     }
 
     #[cfg(test)]
@@ -505,6 +664,8 @@ pub(crate) fn write_schema_three_fixture(
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(CREATE_SCHEMA)?;
     transaction.execute("DROP TABLE execution_receipts", [])?;
+    transaction.execute("DROP TABLE tool_outputs", [])?;
+    transaction.execute("DROP TABLE planned_invocations", [])?;
     for record in records {
         insert_event(&transaction, record)?;
         insert_effect_intent_index(&transaction, record)?;
@@ -663,6 +824,7 @@ fn load_verified_store_data(
     let projection = load_projection(connection)?;
     let (snapshot, mut index) = audit_snapshot(records, projection, metrics)?;
     validate_derived_state_without_receipts(connection, &mut index, metrics)?;
+    verify_sqlite_tool_outputs(connection, &mut index, metrics)?;
     let receipts = load_execution_receipts(connection)?;
     verify_receipt_records(&mut index, &receipts, metrics)?;
     Ok((snapshot, receipts, index))
@@ -680,24 +842,19 @@ pub(crate) fn migrate_schema_three(connection: &mut Connection) -> Result<(), St
             let (_, mut index) = audit_snapshot(records, projection, &mut metrics)?;
             validate_derived_state_without_receipts(&transaction, &mut index, &mut metrics)?;
             transaction.execute_batch(CREATE_RECEIPT_SCHEMA)?;
+            transaction.execute_batch(CREATE_TOOL_OUTPUT_SCHEMA)?;
+            verify_sqlite_tool_outputs(&transaction, &mut index, &mut metrics)?;
             verify_receipt_records(&mut index, &[], &mut metrics)?;
             transaction.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())
         }
-        4 => {
+        4..=6 => {
             // Another schema-4 binary may have completed the 3 -> 4 migration after `open`
             // observed version 3 but before this immediate transaction acquired the writer lock.
             // Re-audit the now-current format and converge instead of requiring a process restart.
             transaction.execute_batch(CREATE_PLAN_INPUT_SCHEMA)?;
-            let mut metrics = AuditMetrics::default();
-            let _ = load_verified_store_data(&transaction, &mut metrics)?;
-            transaction.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
-            transaction.commit()?;
-            Ok(())
-        }
-        5 => {
-            transaction.execute_batch(CREATE_PLAN_INPUT_SCHEMA)?;
+            transaction.execute_batch(CREATE_TOOL_OUTPUT_SCHEMA)?;
             let mut metrics = AuditMetrics::default();
             let _ = load_verified_store_data(&transaction, &mut metrics)?;
             transaction.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
@@ -716,8 +873,9 @@ fn migrate_schema_four(connection: &mut Connection) -> Result<(), StoreError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let version: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match version {
-        4 | 5 => {
+        4..=6 => {
             transaction.execute_batch(CREATE_PLAN_INPUT_SCHEMA)?;
+            transaction.execute_batch(CREATE_TOOL_OUTPUT_SCHEMA)?;
             let mut metrics = AuditMetrics::default();
             let _ = load_verified_store_data(&transaction, &mut metrics)?;
             transaction.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
@@ -736,8 +894,29 @@ fn migrate_schema_five(connection: &mut Connection) -> Result<(), StoreError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let version: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match version {
-        5 => {
+        5 | 6 => {
             transaction.execute_batch(CREATE_PLAN_INPUT_SCHEMA)?;
+            transaction.execute_batch(CREATE_TOOL_OUTPUT_SCHEMA)?;
+            let mut metrics = AuditMetrics::default();
+            let _ = load_verified_store_data(&transaction, &mut metrics)?;
+            transaction.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
+            transaction.commit()?;
+            Ok(())
+        }
+        STORE_SCHEMA_VERSION => {
+            transaction.commit()?;
+            Ok(())
+        }
+        unsupported => Err(StoreError::UnsupportedSchemaVersion(unsupported)),
+    }
+}
+
+fn migrate_schema_six(connection: &mut Connection) -> Result<(), StoreError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let version: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    match version {
+        6 => {
+            transaction.execute_batch(CREATE_TOOL_OUTPUT_SCHEMA)?;
             let mut metrics = AuditMetrics::default();
             let _ = load_verified_store_data(&transaction, &mut metrics)?;
             transaction.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
@@ -828,7 +1007,7 @@ fn ensure_verified_cache(
 
 impl RunStore for SqliteRunStore {
     fn append(&mut self, expected: ExpectedHead, event: RunEvent) -> Result<Commit, StoreError> {
-        self.append_internal(expected, event, None, None, None, |_| Ok(()))
+        self.append_internal(expected, event, CommitSidecars::default(), |_| Ok(()))
     }
 
     fn append_with_plan_inputs(
@@ -837,7 +1016,12 @@ impl RunStore for SqliteRunStore {
         event: RunEvent,
         inputs: Vec<PlannedInvocationMaterialRecord>,
     ) -> Result<Commit, StoreError> {
-        self.append_internal(expected, event, Some(&inputs), None, None, |_| Ok(()))
+        self.append_internal(
+            expected,
+            event,
+            CommitSidecars::plan_inputs(&inputs),
+            |_| Ok(()),
+        )
     }
 
     fn append_with_invocation_material(
@@ -846,7 +1030,9 @@ impl RunStore for SqliteRunStore {
         event: RunEvent,
         material: InvocationMaterialRecord,
     ) -> Result<Commit, StoreError> {
-        self.append_internal(expected, event, None, Some(&material), None, |_| Ok(()))
+        self.append_internal(expected, event, CommitSidecars::material(&material), |_| {
+            Ok(())
+        })
     }
 
     fn append_with_execution_receipt(
@@ -855,7 +1041,18 @@ impl RunStore for SqliteRunStore {
         event: RunEvent,
         receipt: ExecutionReceiptBody,
     ) -> Result<Commit, StoreError> {
-        self.append_internal(expected, event, None, None, Some(&receipt), |_| Ok(()))
+        self.append_internal(expected, event, CommitSidecars::receipt(&receipt), |_| {
+            Ok(())
+        })
+    }
+
+    fn append_with_tool_output(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        output: ToolOutputRecord,
+    ) -> Result<Commit, StoreError> {
+        self.append_internal(expected, event, CommitSidecars::output(&output), |_| Ok(()))
     }
 
     fn load(&self) -> Result<Option<RunSnapshot>, StoreError> {
@@ -942,6 +1139,24 @@ impl RunStore for SqliteRunStore {
         Ok(receipts.into_iter().map(|stored| stored.receipt).collect())
     }
 
+    fn load_tool_output(&self, effect_id: &str) -> Result<Option<ToolOutputRecord>, StoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        ensure_verified_cache(&self.cache, &self.metrics, &transaction)?;
+        let output = load_tool_output(&transaction, effect_id)?;
+        verify_tool_output_point(
+            &self
+                .cache
+                .borrow()
+                .as_ref()
+                .expect("cache refresh must install a verified index")
+                .index,
+            effect_id,
+            output.as_ref(),
+        )?;
+        transaction.commit()?;
+        Ok(output.map(|stored| stored.record))
+    }
+
     fn load_with_execution_receipts(
         &self,
     ) -> Result<(Option<RunSnapshot>, Vec<ExecutionReceiptBody>), StoreError> {
@@ -972,13 +1187,34 @@ impl RunStore for SqliteRunStore {
     ) -> Result<Option<RunVerificationSnapshot>, StoreError> {
         let transaction = self.connection.unchecked_transaction()?;
         ensure_verified_cache(&self.cache, &self.metrics, &transaction)?;
-        let snapshot = self
+        let mut snapshot = self
             .cache
             .borrow()
             .as_ref()
             .expect("cache refresh must install a verified index")
             .index
             .verification_snapshot(step_id);
+        if let Some(snapshot) = snapshot.as_mut()
+            && let Some(effect_id) = snapshot
+                .state
+                .steps
+                .get(step_id)
+                .and_then(|step| step.intent.as_ref())
+                .map(|intent| intent.effect_id.as_str())
+        {
+            let output = load_tool_output(&transaction, effect_id)?;
+            verify_tool_output_point(
+                &self
+                    .cache
+                    .borrow()
+                    .as_ref()
+                    .expect("cache refresh must install a verified index")
+                    .index,
+                effect_id,
+                output.as_ref(),
+            )?;
+            snapshot.tool_output = output.map(|stored| stored.record);
+        }
         transaction.commit()?;
         Ok(snapshot)
     }
@@ -991,6 +1227,7 @@ pub(crate) enum CommitStage {
     AuthorizationConsumption,
     PlannedInvocation,
     InvocationMaterial,
+    ToolOutput,
     ExecutionReceipt,
     Projection,
 }
@@ -1004,6 +1241,7 @@ impl CommitStage {
             Self::AuthorizationConsumption => "authorization consumption",
             Self::PlannedInvocation => "planned invocation input",
             Self::InvocationMaterial => "invocation material",
+            Self::ToolOutput => "tool output",
             Self::ExecutionReceipt => "execution receipt",
             Self::Projection => "projection write",
         }
@@ -1106,6 +1344,41 @@ fn insert_invocation_material(
             material.material_digest(),
             material.record_digest(),
             record_json
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_tool_output(
+    transaction: &Transaction<'_>,
+    event: &EventRecord,
+    output: Option<&ToolOutputRecord>,
+) -> Result<(), StoreError> {
+    let Some(output) = output else {
+        return Ok(());
+    };
+    let RunEventBody::EffectSucceeded { step_id, .. } = &event.event.body else {
+        unreachable!("tool-output bundle validation requires a success event")
+    };
+    let event_sequence =
+        i64::try_from(event.sequence).map_err(|_| StoreError::SequenceOutOfRange)?;
+    let canonical_size_bytes =
+        i64::try_from(output.canonical_size_bytes()).map_err(|_| StoreError::SequenceOutOfRange)?;
+    let record_json = serde_json::to_vec(output)?;
+    transaction.execute(
+        "INSERT INTO tool_outputs (effect_id, event_sequence, step_id, output_id, capability_id, contract_version, definition_digest, canonical_size_bytes, output_digest, record_digest, record_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            output.effect_id(),
+            event_sequence,
+            step_id,
+            output.output_id(),
+            output.capability_id(),
+            output.contract_version(),
+            output.definition_digest(),
+            canonical_size_bytes,
+            output.output_digest(),
+            output.record_digest(),
+            record_json,
         ],
     )?;
     Ok(())
@@ -1338,6 +1611,144 @@ fn load_invocation_material(
     .transpose()
 }
 
+fn load_tool_output(
+    connection: &Connection,
+    effect_id: &str,
+) -> Result<Option<StoredToolOutput>, StoreError> {
+    let mut statement = connection.prepare(
+        "SELECT event_sequence, step_id, output_id, capability_id, contract_version, definition_digest, canonical_size_bytes, output_digest, record_digest, length(record_json), record_json FROM tool_outputs WHERE effect_id = ?1",
+    )?;
+    let mut rows = statement.query([effect_id])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    Ok(Some(decode_tool_output_row(effect_id, row)?))
+}
+
+fn decode_tool_output_row(
+    effect_id: &str,
+    row: &rusqlite::Row<'_>,
+) -> Result<StoredToolOutput, StoreError> {
+    let event_sequence =
+        u64::try_from(row.get::<_, i64>(0)?).map_err(|_| StoreError::SequenceOutOfRange)?;
+    let step_id: String = row.get(1)?;
+    let output_id: String = row.get(2)?;
+    let capability_id: String = row.get(3)?;
+    let contract_version: String = row.get(4)?;
+    let definition_digest: String = row.get(5)?;
+    let canonical_size_bytes =
+        u64::try_from(row.get::<_, i64>(6)?).map_err(|_| StoreError::SequenceOutOfRange)?;
+    let output_digest: String = row.get(7)?;
+    let record_digest: String = row.get(8)?;
+    let record_json_size = row.get::<_, i64>(9)?;
+    if !(1..=1_100_000).contains(&record_json_size) {
+        return Err(StoreError::Corrupt(
+            "tool-output record bytes exceed the fixed limit".to_owned(),
+        ));
+    }
+    let record_json: Vec<u8> = row.get(10)?;
+    let record = decode_tool_output_record(&record_json)?;
+    if record.effect_id() != effect_id
+        || record.step_id() != step_id
+        || record.output_id() != output_id
+        || record.capability_id() != capability_id
+        || record.contract_version() != contract_version
+        || record.definition_digest() != definition_digest
+        || record.canonical_size_bytes() != canonical_size_bytes
+        || record.output_digest() != output_digest
+        || record.record_digest() != record_digest
+    {
+        return Err(StoreError::Corrupt(format!(
+            "tool-output index for effect `{effect_id}` differs from its record"
+        )));
+    }
+    Ok(StoredToolOutput {
+        event_sequence,
+        record,
+    })
+}
+
+fn verify_sqlite_tool_outputs(
+    connection: &Connection,
+    index: &mut VerifiedRunIndex,
+    metrics: &mut AuditMetrics,
+) -> Result<(), StoreError> {
+    let mut anchors: Vec<_> = index.tool_output_events.values().cloned().collect();
+    anchors.sort_by_key(|anchor| anchor.event_sequence);
+    let mut statement = connection.prepare(
+        "SELECT effect_id, event_sequence, step_id, output_id, capability_id, contract_version, definition_digest, canonical_size_bytes, output_digest, record_digest, length(record_json), record_json FROM tool_outputs ORDER BY event_sequence, effect_id",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut position = 0_usize;
+    while let Some(row) = rows.next()? {
+        let effect_id: String = row.get(0)?;
+        let anchor = anchors.get(position).ok_or_else(|| {
+            StoreError::Corrupt("tool-output rows outnumber output-bound success events".to_owned())
+        })?;
+        let stored = decode_tool_output_row_offset(&effect_id, row, 1)?;
+        metrics.record_historical_tool_output();
+        verify_stored_tool_output(index, anchor, &stored)?;
+        index_tool_output(index, anchor, &stored.record)?;
+        position = position.saturating_add(1);
+    }
+    if position != anchors.len() {
+        return Err(StoreError::Corrupt(format!(
+            "tool-output count differs from output-bound success events: expected {}, actual {position}",
+            anchors.len()
+        )));
+    }
+    Ok(())
+}
+
+fn decode_tool_output_row_offset(
+    effect_id: &str,
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> Result<StoredToolOutput, StoreError> {
+    let event_sequence =
+        u64::try_from(row.get::<_, i64>(offset)?).map_err(|_| StoreError::SequenceOutOfRange)?;
+    let step_id: String = row.get(offset + 1)?;
+    let output_id: String = row.get(offset + 2)?;
+    let capability_id: String = row.get(offset + 3)?;
+    let contract_version: String = row.get(offset + 4)?;
+    let definition_digest: String = row.get(offset + 5)?;
+    let canonical_size_bytes = u64::try_from(row.get::<_, i64>(offset + 6)?)
+        .map_err(|_| StoreError::SequenceOutOfRange)?;
+    let output_digest: String = row.get(offset + 7)?;
+    let record_digest: String = row.get(offset + 8)?;
+    let record_json_size = row.get::<_, i64>(offset + 9)?;
+    if !(1..=1_100_000).contains(&record_json_size) {
+        return Err(StoreError::Corrupt(
+            "tool-output record bytes exceed the fixed limit".to_owned(),
+        ));
+    }
+    let record_json: Vec<u8> = row.get(offset + 10)?;
+    let record = decode_tool_output_record(&record_json)?;
+    if record.effect_id() != effect_id
+        || record.step_id() != step_id
+        || record.output_id() != output_id
+        || record.capability_id() != capability_id
+        || record.contract_version() != contract_version
+        || record.definition_digest() != definition_digest
+        || record.canonical_size_bytes() != canonical_size_bytes
+        || record.output_digest() != output_digest
+        || record.record_digest() != record_digest
+    {
+        return Err(StoreError::Corrupt(format!(
+            "tool-output index for effect `{effect_id}` differs from its record"
+        )));
+    }
+    Ok(StoredToolOutput {
+        event_sequence,
+        record,
+    })
+}
+
+fn decode_tool_output_record(record_json: &[u8]) -> Result<ToolOutputRecord, StoreError> {
+    serde_json::from_slice(record_json)
+        .map_err(|_| StoreError::Corrupt("tool-output record JSON is invalid".to_owned()))
+}
+
 fn load_execution_receipts(
     connection: &Connection,
 ) -> Result<Vec<StoredExecutionReceipt>, StoreError> {
@@ -1400,6 +1811,7 @@ fn table_count(connection: &Connection, table: &str) -> Result<u64, StoreError> 
         "authorization_consumption" => "SELECT COUNT(*) FROM authorization_consumption",
         "planned_invocations" => "SELECT COUNT(*) FROM planned_invocations",
         "invocation_materials" => "SELECT COUNT(*) FROM invocation_materials",
+        "tool_outputs" => "SELECT COUNT(*) FROM tool_outputs",
         "execution_receipts" => "SELECT COUNT(*) FROM execution_receipts",
         _ => {
             return Err(StoreError::Corrupt(format!(

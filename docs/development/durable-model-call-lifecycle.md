@@ -309,7 +309,7 @@ xgeny-local-store
   model-call-specific active reservation + PlanAccepted sidecar fault rollback
   shared process-exit/two-handle/cache-invalidation regressions remain green
   shared warm append historical scan zero and cold replay event-once
-  schema version 6 and all pre-existing row/blob preservation
+  migration to current schema version 7 and all pre-existing row/blob preservation
 
 xgeny-runtime
   reservation commit before planner invocation

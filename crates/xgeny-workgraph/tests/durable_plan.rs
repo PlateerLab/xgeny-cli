@@ -209,6 +209,7 @@ fn planned_intent(state: &RunState, step_id: &str, effect_id: &str) -> EffectInt
     };
     let provenance = ReceiptProvenance {
         profile_version: "xgeny.core-receipt/v1".to_owned(),
+        tool_output_profile: None,
         invocation_id: "invocation-durable-plan".to_owned(),
         plan_id: planned.plan_id().to_owned(),
         policy_decision_id: "decision-durable-plan".to_owned(),
@@ -747,6 +748,7 @@ fn completion_candidate_seals_legacy_planning() {
             step_id: "step-done".to_owned(),
             effect_id: "effect-done".to_owned(),
             evidence_digest: digest('7'),
+            output_record_digest: None,
         },
     );
     let verified = append(

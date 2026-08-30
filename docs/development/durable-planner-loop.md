@@ -124,7 +124,7 @@ Plan acceptance도 preflight identity로 한 번 정규화한 뒤 semantic propo
 
 Remote lookup이나 credential이 없으면 identity를 만들 수 없는 Capability는 현재 profile에서 plan acceptance할 수 없다. 이런 Capability는 추후 unresolved proposal commitment와 admission-time resolved commitment를 나누는 2단계 binding 계약이 생기기 전까지 fail-closed한다.
 
-## SQLite schema 6
+## SQLite schema 6 planner table과 current schema 7
 
 Schema 6은 다음 table을 추가한다.
 
@@ -149,7 +149,7 @@ SQLite transaction은 event, effect/authorization index, planned input rows, inv
 
 Open과 `load()`는 journal replay만 맞는지 검사하고 끝내지 않는다. `PlanAccepted` anchor와 sidecar 전체를 대조하고 missing/orphan/index-column/serialized-record/digest 차이를 corruption으로 닫는다. `load_planned_invocation(step_id)`도 verified current generation과 point record를 다시 결합한다.
 
-Version 5 → 6 migration은 빈 table을 추가하고 전체 기존 data를 감사한 뒤 `user_version`만 변경한다. 기존 event/projection/effect/authorization/material/Receipt row와 blob은 다시 쓰지 않는다. 감사가 실패하면 새 table과 `user_version` 변경을 같은 transaction에서 모두 rollback해 version 5를 보존한다. Version 1/2와 7 이상은 지원하지 않는다.
+Version 5 → 6 migration은 역사적으로 이 빈 table을 추가했다. Current schema 7 migration은 schema 3/4/5/6의 기존 event/projection/effect/authorization/material/Receipt/plan row와 blob을 다시 쓰지 않고 `tool_outputs` table을 추가한다. 감사가 실패하면 새 table과 `user_version` 변경을 같은 transaction에서 모두 rollback한다. Version 1/2와 8 이상은 지원하지 않는다.
 
 ## Admission 이중 binding
 
@@ -357,11 +357,11 @@ xgeny-local-store
   Memory/SQLite plan bundle parity and reopen
   missing/extra/orphan/tampered sidecar audit
   Event/PlannedInvocation/Projection fault rollback
-  schema 5 -> 6 preservation and failed migration rollback
+  schema 3/4/5/6 -> 7 preservation and failed migration rollback
   model-call-specific Unknown reopen parity
   model-call-specific reservation/Unknown event-projection and active-Plan sidecar fault rollback
   shared process-exit/two-handle/cache regressions remain green
-  schema 6 unchanged and pre-existing durable row/blob preservation
+  schema 7 tool-output addition and pre-existing durable row/blob preservation
 
 xgeny-runtime
   deterministic context/order/round-robin whole-item packing/byte budget/redaction

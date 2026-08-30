@@ -22,6 +22,7 @@ fn step(step_id: &str, depends_on: &[&str], status: StepStatus) -> StepState {
         attempts: 0,
         intent: None,
         effect_evidence_digest: None,
+        output_record_digest: None,
         execution_receipt_id: None,
         execution_receipt_digest: None,
         uncertainty_reason: None,

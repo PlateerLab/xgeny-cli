@@ -24,8 +24,8 @@ use xgeny_workgraph::{
     EffectClass, EffectIntent, EventRecord, InvocationMaterialError, InvocationMaterialRecord,
     InvocationMaterialRetention, PlannedInvocationBinding, PlannedInvocationMaterialRecord,
     PlanningContractError, ReceiptPlacement, ReceiptVerificationStrategy, RecordError, ReplayError,
-    RunEvent, RunEventBody, RunState, TransitionError, VerificationDisposition, apply_record,
-    replay,
+    RunEvent, RunEventBody, RunState, TOOL_OUTPUT_PROFILE_V1, ToolOutputError, ToolOutputRecord,
+    TransitionError, VerificationDisposition, apply_record, replay,
 };
 
 pub use memory::MemoryRunStore;
@@ -68,6 +68,7 @@ pub struct RunVerificationSnapshot {
     pub state: RunState,
     pub effect_started_at: Option<String>,
     pub previous_receipt_digest: Option<String>,
+    pub tool_output: Option<ToolOutputRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -75,6 +76,22 @@ pub(crate) struct StoredExecutionReceipt {
     pub event_sequence: u64,
     pub effect_id: String,
     pub receipt: ExecutionReceiptBody,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct StoredToolOutput {
+    pub event_sequence: u64,
+    pub record: ToolOutputRecord,
+}
+
+impl std::fmt::Debug for StoredToolOutput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StoredToolOutput")
+            .field("event_sequence", &self.event_sequence)
+            .field("record", &self.record)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +106,7 @@ struct EffectStartAnchor {
     event_sequence: u64,
     step_id: String,
     recorded_at: String,
+    execution_attempt: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +128,61 @@ struct ReceiptEventAnchor {
     ended_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolOutputEventAnchor {
+    event_sequence: u64,
+    run_id: String,
+    step_id: String,
+    effect_id: String,
+    evidence_digest: String,
+    record_digest: String,
+    execution_attempt: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct CommitSidecars<'a> {
+    plan_inputs: Option<&'a [PlannedInvocationMaterialRecord]>,
+    material: Option<&'a InvocationMaterialRecord>,
+    output: Option<&'a ToolOutputRecord>,
+    receipt: Option<&'a ExecutionReceiptBody>,
+}
+
+impl<'a> CommitSidecars<'a> {
+    fn plan_inputs(inputs: &'a [PlannedInvocationMaterialRecord]) -> Self {
+        Self {
+            plan_inputs: Some(inputs),
+            ..Self::default()
+        }
+    }
+
+    fn material(material: &'a InvocationMaterialRecord) -> Self {
+        Self {
+            material: Some(material),
+            ..Self::default()
+        }
+    }
+
+    fn output(output: &'a ToolOutputRecord) -> Self {
+        Self {
+            output: Some(output),
+            ..Self::default()
+        }
+    }
+
+    fn receipt(receipt: &'a ExecutionReceiptBody) -> Self {
+        Self {
+            receipt: Some(receipt),
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Default)]
+struct CommitAnchors {
+    output: Option<ToolOutputEventAnchor>,
+    receipt: Option<ReceiptEventAnchor>,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct VerifiedRunIndex {
     state: Option<RunState>,
@@ -120,11 +193,16 @@ struct VerifiedRunIndex {
     intents: BTreeMap<String, EffectIntentAnchor>,
     effect_starts: BTreeMap<String, EffectStartAnchor>,
     receipt_events: Vec<ReceiptEventAnchor>,
+    tool_output_events: BTreeMap<String, ToolOutputEventAnchor>,
     material_effect_ids: BTreeSet<String>,
     receipt_ids: BTreeSet<String>,
     receipt_digests: BTreeSet<String>,
     receipt_effect_ids: BTreeSet<String>,
     receipt_head_digest: Option<String>,
+    tool_output_effect_ids: BTreeSet<String>,
+    tool_output_ids: BTreeSet<String>,
+    tool_output_record_digests: BTreeSet<String>,
+    tool_output_digests: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +218,8 @@ struct AuditMetrics {
     #[cfg(test)]
     historical_receipts: u64,
     #[cfg(test)]
+    historical_tool_outputs: u64,
+    #[cfg(test)]
     candidate_events: u64,
     #[cfg(test)]
     candidate_materials: u64,
@@ -147,6 +227,8 @@ struct AuditMetrics {
     candidate_plan_inputs: u64,
     #[cfg(test)]
     candidate_receipts: u64,
+    #[cfg(test)]
+    candidate_tool_outputs: u64,
     #[cfg(test)]
     receipt_anchor_intent_lookups: u64,
     #[cfg(test)]
@@ -156,6 +238,19 @@ struct AuditMetrics {
 }
 
 impl AuditMetrics {
+    fn record_candidate_sidecars(&mut self, sidecars: CommitSidecars<'_>) {
+        self.record_candidate_plan_inputs(
+            sidecars
+                .plan_inputs
+                .map_or(0, <[PlannedInvocationMaterialRecord]>::len),
+        );
+        self.record_candidate(
+            sidecars.material.is_some(),
+            sidecars.output.is_some(),
+            sidecars.receipt.is_some(),
+        );
+    }
+
     fn record_full_audit(&mut self) {
         #[cfg(test)]
         {
@@ -216,7 +311,7 @@ impl AuditMetrics {
         let _ = self;
     }
 
-    fn record_candidate(&mut self, has_material: bool, has_receipt: bool) {
+    fn record_candidate(&mut self, has_material: bool, has_tool_output: bool, has_receipt: bool) {
         #[cfg(test)]
         {
             self.candidate_events = self.candidate_events.saturating_add(1);
@@ -226,9 +321,21 @@ impl AuditMetrics {
             if has_receipt {
                 self.candidate_receipts = self.candidate_receipts.saturating_add(1);
             }
+            if has_tool_output {
+                self.candidate_tool_outputs = self.candidate_tool_outputs.saturating_add(1);
+            }
         }
         #[cfg(not(test))]
-        let _ = (self, has_material, has_receipt);
+        let _ = (self, has_material, has_tool_output, has_receipt);
+    }
+
+    fn record_historical_tool_output(&mut self) {
+        #[cfg(test)]
+        {
+            self.historical_tool_outputs = self.historical_tool_outputs.saturating_add(1);
+        }
+        #[cfg(not(test))]
+        let _ = self;
     }
 
     fn record_receipt_anchor_intent_lookup(&mut self) {
@@ -259,6 +366,16 @@ impl AuditMetrics {
         #[cfg(not(test))]
         let _ = self;
     }
+}
+
+fn verify_commit_sidecars(
+    event: &RunEvent,
+    sidecars: CommitSidecars<'_>,
+) -> Result<(), StoreError> {
+    verify_plan_input_bundle(event, sidecars.plan_inputs)?;
+    verify_material_bundle(event, sidecars.material)?;
+    verify_receipt_bundle(event, sidecars.receipt)?;
+    verify_tool_output_bundle(event, sidecars.output)
 }
 
 pub trait RunStore {
@@ -323,6 +440,21 @@ pub trait RunStore {
         Err(StoreError::ExecutionReceiptStoreUnsupported)
     }
 
+    /// Atomically append one output-bound successful effect event and its typed JSON sidecar.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported stores, detached or invalid output, stale heads,
+    /// transition failures, serialization, or storage faults.
+    fn append_with_tool_output(
+        &mut self,
+        _expected: ExpectedHead,
+        _event: RunEvent,
+        _output: ToolOutputRecord,
+    ) -> Result<Commit, StoreError> {
+        Err(StoreError::ToolOutputStoreUnsupported)
+    }
+
     /// Load and replay-verify all committed data.
     ///
     /// # Errors
@@ -381,6 +513,15 @@ pub trait RunStore {
         Err(StoreError::ExecutionReceiptStoreUnsupported)
     }
 
+    /// Load one verified typed tool output by exact effect ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when output storage is unsupported or committed data is inconsistent.
+    fn load_tool_output(&self, _effect_id: &str) -> Result<Option<ToolOutputRecord>, StoreError> {
+        Err(StoreError::ToolOutputStoreUnsupported)
+    }
+
     /// Load one replay-verified Run and its complete Receipt chain from one logical snapshot.
     ///
     /// Built-in stores override this method to avoid cross-generation reads. The default is for
@@ -413,8 +554,13 @@ pub trait RunStore {
             .steps
             .get(step_id)
             .and_then(|step| step.intent.as_ref())
-            .map(|intent| intent.effect_id.as_str());
-        let effect_started_at = effect_id.and_then(|effect_id| {
+            .map(|intent| intent.effect_id.clone());
+        let output_required = snapshot
+            .state
+            .steps
+            .get(step_id)
+            .is_some_and(|step| step.output_record_digest.is_some());
+        let effect_started_at = effect_id.as_deref().and_then(|effect_id| {
             snapshot
                 .records
                 .iter()
@@ -429,12 +575,22 @@ pub trait RunStore {
                     _ => None,
                 })
         });
+        let tool_output = if output_required {
+            effect_id
+                .as_deref()
+                .map(|effect_id| self.load_tool_output(effect_id))
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
         Ok(Some(RunVerificationSnapshot {
             state: snapshot.state,
             effect_started_at,
             previous_receipt_digest: receipts
                 .last()
                 .map(|receipt| receipt.receipt_digest.clone()),
+            tool_output,
         }))
     }
 
@@ -630,6 +786,17 @@ fn verify_material_bundle(
         if !profile_matches_effect {
             return Err(StoreError::UnsupportedReceiptProfile);
         }
+        let output_profile_matches_effect = match intent.effect_class {
+            EffectClass::ReadOnly => {
+                provenance.tool_output_profile.as_deref() == Some(TOOL_OUTPUT_PROFILE_V1)
+            }
+            EffectClass::Reversible | EffectClass::Idempotent | EffectClass::NonIdempotent => {
+                provenance.tool_output_profile.is_none()
+            }
+        };
+        if !output_profile_matches_effect {
+            return Err(StoreError::ToolOutputProfileRequired);
+        }
     }
     match (&event.body, material) {
         (RunEventBody::EffectIntentCommitted { step_id, intent }, Some(material)) => material
@@ -713,6 +880,199 @@ fn verify_material_point(
                     ))
                 })
         }
+    }
+}
+
+fn verify_tool_output_bundle(
+    event: &RunEvent,
+    output: Option<&ToolOutputRecord>,
+) -> Result<(), StoreError> {
+    match (&event.body, output) {
+        (
+            RunEventBody::EffectSucceeded {
+                output_record_digest: Some(expected),
+                ..
+            },
+            Some(output),
+        ) if expected == output.record_digest() => Ok(()),
+        (RunEventBody::EffectSucceeded { .. }, Some(_)) => {
+            Err(StoreError::ToolOutputBindingMismatch)
+        }
+        (
+            RunEventBody::EffectSucceeded {
+                output_record_digest: Some(_),
+                ..
+            },
+            None,
+        ) => Err(StoreError::ToolOutputRequired),
+        (_, Some(_)) => Err(StoreError::UnexpectedToolOutput),
+        (_, None) => Ok(()),
+    }
+}
+
+fn verify_tool_output_candidate(
+    index: &VerifiedRunIndex,
+    record: &EventRecord,
+    output: &ToolOutputRecord,
+) -> Result<ToolOutputEventAnchor, StoreError> {
+    let anchor = index.tool_output_anchor_for(record)?;
+    if index.tool_output_effect_ids.contains(&anchor.effect_id)
+        || index.tool_output_ids.contains(output.output_id())
+        || index
+            .tool_output_record_digests
+            .contains(output.record_digest())
+    {
+        return Err(StoreError::Corrupt(
+            "duplicate tool-output identity".to_owned(),
+        ));
+    }
+    let intent = &index
+        .intents
+        .get(&anchor.effect_id)
+        .expect("output anchor verifies its effect intent")
+        .intent;
+    output
+        .verify_for(
+            &anchor.run_id,
+            &anchor.step_id,
+            intent,
+            anchor.execution_attempt,
+            &anchor.evidence_digest,
+        )
+        .map_err(|_| StoreError::ToolOutputBindingMismatch)?;
+    if output.record_digest() != anchor.record_digest {
+        return Err(StoreError::ToolOutputBindingMismatch);
+    }
+    Ok(anchor)
+}
+
+fn verify_tool_output_records(
+    index: &mut VerifiedRunIndex,
+    outputs: &BTreeMap<String, StoredToolOutput>,
+    metrics: &mut AuditMetrics,
+) -> Result<(), StoreError> {
+    if index.tool_output_events.len() != outputs.len() {
+        return Err(StoreError::Corrupt(format!(
+            "tool-output count differs from output-bound success events: expected {}, actual {}",
+            index.tool_output_events.len(),
+            outputs.len()
+        )));
+    }
+    let mut anchors: Vec<_> = index.tool_output_events.values().cloned().collect();
+    anchors.sort_by_key(|anchor| anchor.event_sequence);
+    for anchor in &anchors {
+        metrics.record_historical_tool_output();
+        let stored = outputs.get(&anchor.effect_id).ok_or_else(|| {
+            StoreError::Corrupt(format!(
+                "effect `{}` has no durable tool output",
+                anchor.effect_id
+            ))
+        })?;
+        verify_stored_tool_output(index, anchor, stored)?;
+        index_tool_output(index, anchor, &stored.record)?;
+    }
+    Ok(())
+}
+
+fn verify_stored_tool_output(
+    index: &VerifiedRunIndex,
+    anchor: &ToolOutputEventAnchor,
+    stored: &StoredToolOutput,
+) -> Result<(), StoreError> {
+    if stored.event_sequence != anchor.event_sequence
+        || stored.record.effect_id() != anchor.effect_id
+        || stored.record.record_digest() != anchor.record_digest
+    {
+        return Err(StoreError::Corrupt(
+            "tool output differs from its journal binding".to_owned(),
+        ));
+    }
+    let intent = &index
+        .intents
+        .get(&anchor.effect_id)
+        .ok_or_else(|| StoreError::Corrupt("tool output has no effect intent".to_owned()))?
+        .intent;
+    stored
+        .record
+        .verify_for(
+            &anchor.run_id,
+            &anchor.step_id,
+            intent,
+            anchor.execution_attempt,
+            &anchor.evidence_digest,
+        )
+        .map_err(|_| StoreError::Corrupt("tool output record is invalid".to_owned()))
+}
+
+fn index_tool_output(
+    index: &mut VerifiedRunIndex,
+    anchor: &ToolOutputEventAnchor,
+    output: &ToolOutputRecord,
+) -> Result<(), StoreError> {
+    if !index
+        .tool_output_effect_ids
+        .insert(anchor.effect_id.clone())
+        || !index.tool_output_ids.insert(output.output_id().to_owned())
+        || !index
+            .tool_output_record_digests
+            .insert(output.record_digest().to_owned())
+        || index
+            .tool_output_digests
+            .insert(anchor.effect_id.clone(), output.output_digest().to_owned())
+            .is_some()
+    {
+        return Err(StoreError::Corrupt(
+            "duplicate tool-output identity".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_tool_output_point(
+    index: &VerifiedRunIndex,
+    effect_id: &str,
+    stored: Option<&StoredToolOutput>,
+) -> Result<(), StoreError> {
+    let anchor = index.tool_output_events.get(effect_id);
+    match (anchor, stored) {
+        (None, None) => Ok(()),
+        (None, Some(_)) => Err(StoreError::Corrupt(
+            "tool output has no output-bound success event".to_owned(),
+        )),
+        (Some(_), None) => Err(StoreError::Corrupt(
+            "output-bound success has no durable tool output".to_owned(),
+        )),
+        (Some(anchor), Some(stored)) => verify_stored_tool_output(index, anchor, stored),
+    }
+}
+
+fn verify_receipt_tool_output_binding(
+    index: &VerifiedRunIndex,
+    effect_id: &str,
+    receipt: &ExecutionReceiptBody,
+) -> Result<(), StoreError> {
+    let intent = &index
+        .intents
+        .get(effect_id)
+        .ok_or_else(|| StoreError::Corrupt("Receipt has no effect intent".to_owned()))?
+        .intent;
+    let profile = intent
+        .receipt_provenance
+        .as_ref()
+        .and_then(|provenance| provenance.tool_output_profile.as_deref());
+    match (profile, index.tool_output_digests.get(effect_id)) {
+        (Some(TOOL_OUTPUT_PROFILE_V1), Some(output_digest))
+            if receipt.output_digest == *output_digest =>
+        {
+            Ok(())
+        }
+        (Some(TOOL_OUTPUT_PROFILE_V1), _) => Err(StoreError::Corrupt(
+            "Receipt output digest differs from the durable tool output".to_owned(),
+        )),
+        (None, None) => Ok(()),
+        _ => Err(StoreError::Corrupt(
+            "tool-output profile and durable output differ".to_owned(),
+        )),
     }
 }
 
@@ -810,14 +1170,34 @@ impl VerifiedRunIndex {
                     }
                 }
                 RunEventBody::EffectExecutionStarted { step_id, effect_id } => {
+                    let execution_attempt = index
+                        .effect_starts
+                        .get(effect_id)
+                        .map_or(1, |anchor| anchor.execution_attempt.saturating_add(1));
                     index.effect_starts.insert(
                         effect_id.clone(),
                         EffectStartAnchor {
                             event_sequence: record.sequence,
                             step_id: step_id.clone(),
                             recorded_at: record.event.recorded_at.clone(),
+                            execution_attempt,
                         },
                     );
+                }
+                RunEventBody::EffectSucceeded {
+                    output_record_digest: Some(_),
+                    ..
+                } => {
+                    let anchor = index.tool_output_anchor_for(record)?;
+                    if index
+                        .tool_output_events
+                        .insert(anchor.effect_id.clone(), anchor)
+                        .is_some()
+                    {
+                        return Err(StoreError::Corrupt(
+                            "journal contains duplicate tool-output events".to_owned(),
+                        ));
+                    }
                 }
                 RunEventBody::VerificationRecorded { .. } => {
                     index
@@ -890,6 +1270,56 @@ impl VerifiedRunIndex {
         })
     }
 
+    fn tool_output_anchor_for(
+        &self,
+        record: &EventRecord,
+    ) -> Result<ToolOutputEventAnchor, StoreError> {
+        let RunEventBody::EffectSucceeded {
+            step_id,
+            effect_id,
+            evidence_digest,
+            output_record_digest: Some(record_digest),
+        } = &record.event.body
+        else {
+            return Err(StoreError::UnexpectedToolOutput);
+        };
+        let intent = self.intents.get(effect_id).ok_or_else(|| {
+            StoreError::Corrupt("tool output has no committed effect intent".to_owned())
+        })?;
+        if intent.step_id != *step_id || intent.event_sequence >= record.sequence {
+            return Err(StoreError::Corrupt(
+                "tool output precedes or differs from its effect intent".to_owned(),
+            ));
+        }
+        let profile = intent
+            .intent
+            .receipt_provenance
+            .as_ref()
+            .and_then(|provenance| provenance.tool_output_profile.as_deref());
+        if profile != Some(TOOL_OUTPUT_PROFILE_V1) {
+            return Err(StoreError::Corrupt(
+                "tool output has no supported durable profile".to_owned(),
+            ));
+        }
+        let started = self.effect_starts.get(effect_id).ok_or_else(|| {
+            StoreError::Corrupt("tool output has no effect start event".to_owned())
+        })?;
+        if started.step_id != *step_id || started.event_sequence >= record.sequence {
+            return Err(StoreError::Corrupt(
+                "tool output precedes or differs from its start event".to_owned(),
+            ));
+        }
+        Ok(ToolOutputEventAnchor {
+            event_sequence: record.sequence,
+            run_id: record.event.run_id.clone(),
+            step_id: step_id.clone(),
+            effect_id: effect_id.clone(),
+            evidence_digest: evidence_digest.clone(),
+            record_digest: record_digest.clone(),
+            execution_attempt: started.execution_attempt,
+        })
+    }
+
     fn verification_snapshot(&self, step_id: &str) -> Option<RunVerificationSnapshot> {
         let state = self.state.clone()?;
         let effect_started_at = state
@@ -903,17 +1333,26 @@ impl VerifiedRunIndex {
             state,
             effect_started_at,
             previous_receipt_digest: self.receipt_head_digest.clone(),
+            tool_output: None,
         })
     }
 
     fn apply_committed(
         &mut self,
         commit: &Commit,
-        plan_inputs: Option<&[PlannedInvocationMaterialRecord]>,
-        material: Option<&InvocationMaterialRecord>,
-        receipt: Option<&ExecutionReceiptBody>,
-        receipt_anchor: Option<ReceiptEventAnchor>,
+        sidecars: CommitSidecars<'_>,
+        anchors: CommitAnchors,
     ) {
+        let CommitSidecars {
+            plan_inputs,
+            material,
+            output,
+            receipt,
+        } = sidecars;
+        let CommitAnchors {
+            output: output_anchor,
+            receipt: receipt_anchor,
+        } = anchors;
         self.event_ids.insert(commit.record.event.event_id.clone());
         match &commit.record.event.body {
             RunEventBody::PlanAccepted { steps, .. } => {
@@ -938,14 +1377,28 @@ impl VerifiedRunIndex {
                 );
             }
             RunEventBody::EffectExecutionStarted { step_id, effect_id } => {
+                let execution_attempt = self
+                    .effect_starts
+                    .get(effect_id)
+                    .map_or(1, |anchor| anchor.execution_attempt.saturating_add(1));
                 self.effect_starts.insert(
                     effect_id.clone(),
                     EffectStartAnchor {
                         event_sequence: commit.record.sequence,
                         step_id: step_id.clone(),
                         recorded_at: commit.record.event.recorded_at.clone(),
+                        execution_attempt,
                     },
                 );
+            }
+            RunEventBody::EffectSucceeded {
+                output_record_digest: Some(_),
+                ..
+            } => {
+                let anchor = output_anchor
+                    .expect("verified tool-output commit must retain its event anchor");
+                self.tool_output_events
+                    .insert(anchor.effect_id.clone(), anchor);
             }
             RunEventBody::VerificationRecorded { .. } => self.receipt_events.push(
                 receipt_anchor.expect("verified Receipt commit must retain its event anchor"),
@@ -959,6 +1412,15 @@ impl VerifiedRunIndex {
         if let Some(material) = material {
             self.material_effect_ids
                 .insert(material.effect_id().to_owned());
+        }
+        if let Some(output) = output {
+            let effect_id = output.effect_id().to_owned();
+            self.tool_output_effect_ids.insert(effect_id.clone());
+            self.tool_output_ids.insert(output.output_id().to_owned());
+            self.tool_output_record_digests
+                .insert(output.record_digest().to_owned());
+            self.tool_output_digests
+                .insert(effect_id, output.output_digest().to_owned());
         }
         if let Some(receipt) = receipt {
             self.receipt_ids.insert(receipt.receipt_id.clone());
@@ -1015,6 +1477,7 @@ fn verify_receipt_records(
             StoreError::Corrupt("execution receipt has no durable provenance".to_owned())
         })?;
         verify_receipt_intent_binding(receipt, intent, provenance, anchor.disposition)?;
+        verify_receipt_tool_output_binding(index, &anchor.effect_id, receipt)?;
         verify_receipt_timestamps(anchor, receipt)?;
         if !index.receipt_ids.insert(receipt.receipt_id.clone())
             || !index.receipt_digests.insert(receipt.receipt_digest.clone())
@@ -1064,6 +1527,7 @@ fn verify_receipt_candidate(
         .as_ref()
         .ok_or(StoreError::ReceiptProvenanceRequired)?;
     verify_receipt_intent_binding(receipt, intent, provenance, anchor.disposition)?;
+    verify_receipt_tool_output_binding(index, &anchor.effect_id, receipt)?;
     verify_receipt_timestamps(&anchor, receipt)?;
     Ok(anchor)
 }
@@ -1336,6 +1800,8 @@ pub enum StoreError {
     #[error(transparent)]
     InvocationMaterial(#[from] InvocationMaterialError),
     #[error(transparent)]
+    ToolOutput(#[from] ToolOutputError),
+    #[error(transparent)]
     PlanningContract(#[from] PlanningContractError),
     #[error(transparent)]
     Replay(#[from] ReplayError),
@@ -1391,6 +1857,16 @@ pub enum StoreError {
     LegacyVerificationAppendRejected,
     #[error("this Run store does not support durable ExecutionReceipts")]
     ExecutionReceiptStoreUnsupported,
+    #[error("a tool-output-bound success event requires an atomic ToolOutputRecord")]
+    ToolOutputRequired,
+    #[error("a ToolOutputRecord was supplied for an unrelated event")]
+    UnexpectedToolOutput,
+    #[error("the ToolOutputRecord differs from its success event or effect intent")]
+    ToolOutputBindingMismatch,
+    #[error("a new read-only effect intent requires the supported tool-output profile")]
+    ToolOutputProfileRequired,
+    #[error("this Run store does not support durable tool outputs")]
+    ToolOutputStoreUnsupported,
     #[error("injected append fault after {0}")]
     InjectedFault(&'static str),
 }
@@ -1433,7 +1909,46 @@ mod tests {
     }
 
     type SqliteEventRow = (i64, String, Option<String>, String, Vec<u8>);
+    type SqliteAuthorizationRow = (String, String, String, String, i64);
     type ReceiptMutation = fn(&mut ExecutionReceiptBody);
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct SqliteDurableRows {
+        events: Vec<SqliteEventRow>,
+        projection: Vec<Vec<u8>>,
+        intents: Vec<Vec<u8>>,
+        authorizations: Vec<SqliteAuthorizationRow>,
+        materials: Vec<Vec<u8>>,
+        plans: Vec<Vec<u8>>,
+        receipts: Vec<Vec<u8>>,
+    }
+
+    fn sqlite_durable_rows(connection: &rusqlite::Connection) -> SqliteDurableRows {
+        SqliteDurableRows {
+            events: sqlite_event_rows(connection),
+            projection: sqlite_blob_rows(
+                connection,
+                "SELECT state_json FROM run_projection ORDER BY singleton",
+            ),
+            intents: sqlite_blob_rows(
+                connection,
+                "SELECT intent_json FROM effect_intents ORDER BY effect_id",
+            ),
+            authorizations: sqlite_authorization_rows(connection),
+            materials: sqlite_blob_rows(
+                connection,
+                "SELECT record_json FROM invocation_materials ORDER BY effect_id",
+            ),
+            plans: sqlite_blob_rows(
+                connection,
+                "SELECT record_json FROM planned_invocations ORDER BY event_sequence, step_id",
+            ),
+            receipts: sqlite_blob_rows(
+                connection,
+                "SELECT receipt_json FROM execution_receipts ORDER BY event_sequence",
+            ),
+        }
+    }
 
     fn sqlite_event_rows(connection: &rusqlite::Connection) -> Vec<SqliteEventRow> {
         let mut statement = connection
@@ -1457,9 +1972,7 @@ mod tests {
             .expect("event rows should load")
     }
 
-    fn sqlite_authorization_rows(
-        connection: &rusqlite::Connection,
-    ) -> Vec<(String, String, String, String, i64)> {
+    fn sqlite_authorization_rows(connection: &rusqlite::Connection) -> Vec<SqliteAuthorizationRow> {
         let mut statement = connection
             .prepare(
                 "SELECT grant_id, effect_id, action_digest, grant_digest, max_uses \
@@ -1525,6 +2038,7 @@ mod tests {
         };
         let provenance = ReceiptProvenance {
             profile_version: CORE_RECEIPT_PROFILE_V1.to_owned(),
+            tool_output_profile: None,
             invocation_id: "invocation-base".to_owned(),
             plan_id: "plan-base".to_owned(),
             policy_decision_id: "decision-base".to_owned(),
@@ -1770,6 +2284,7 @@ mod tests {
         };
         let provenance = ReceiptProvenance {
             profile_version: CORE_RECEIPT_PROFILE_V1.to_owned(),
+            tool_output_profile: None,
             invocation_id: "invocation-planned-step".to_owned(),
             plan_id: planned.plan_id().to_owned(),
             policy_decision_id: "decision-planned-step".to_owned(),
@@ -2538,6 +3053,7 @@ mod tests {
             effect.invocation.instance_binding_digest.clone();
         let provenance = ReceiptProvenance {
             profile_version: CORE_RECEIPT_PROFILE_V1.to_owned(),
+            tool_output_profile: None,
             invocation_id: "invocation-1".to_owned(),
             plan_id: "plan-1".to_owned(),
             policy_decision_id: "decision-1".to_owned(),
@@ -2568,6 +3084,7 @@ mod tests {
             .as_mut()
             .expect("Receipt provenance should exist");
         provenance.profile_version = CORE_RECEIPT_PROFILE_V2.to_owned();
+        provenance.tool_output_profile = Some(TOOL_OUTPUT_PROFILE_V1.to_owned());
         effect.authorization.binding.receipt_provenance_digest =
             Some(receipt_provenance_digest(provenance).expect("provenance should canonicalize"));
         effect.authorization.grant_digest = authorization_digest(&effect.authorization.binding, 1)
@@ -2661,6 +3178,7 @@ mod tests {
                         step_id: "step-1".to_owned(),
                         effect_id: effect.effect_id.clone(),
                         evidence_digest: format!("sha256:{}", "d".repeat(64)),
+                        output_record_digest: None,
                     },
                 ),
             )
@@ -2679,6 +3197,74 @@ mod tests {
             "read-only-receipt",
         );
         (validating, effect)
+    }
+
+    fn seed_read_only_executing<S: RunStore>(store: &mut S) -> (Commit, EffectIntent) {
+        let planned = seed(store);
+        let effect = read_only_receipt_intent(&planned.state);
+        let committed = store
+            .append_with_invocation_material(
+                ExpectedHead::from_state(&planned.state),
+                event(
+                    "read-only-output-intent",
+                    RunEventBody::EffectIntentCommitted {
+                        step_id: "step-1".to_owned(),
+                        intent: Box::new(effect.clone()),
+                    },
+                ),
+                material_for(&planned.state, "step-1", &effect),
+            )
+            .expect("read-only intent should commit");
+        let started = store
+            .append(
+                ExpectedHead::from_state(&committed.state),
+                event(
+                    "read-only-output-started",
+                    RunEventBody::EffectExecutionStarted {
+                        step_id: "step-1".to_owned(),
+                        effect_id: effect.effect_id.clone(),
+                    },
+                ),
+            )
+            .expect("read-only effect should start");
+        (started, effect)
+    }
+
+    fn tool_output_success(
+        started: &RunState,
+        effect: &EffectIntent,
+        event_id: &str,
+        output: serde_json::Value,
+    ) -> (RunEvent, ToolOutputRecord) {
+        let evidence_digest = format!("sha256:{}", "d".repeat(64));
+        let record = ToolOutputRecord::new(
+            &started.run_id,
+            "step-1",
+            effect,
+            started.steps["step-1"].attempts,
+            &evidence_digest,
+            output,
+        )
+        .expect("tool output should bind");
+        let candidate = event(
+            event_id,
+            RunEventBody::EffectSucceeded {
+                step_id: "step-1".to_owned(),
+                effect_id: effect.effect_id.clone(),
+                evidence_digest,
+                output_record_digest: Some(record.record_digest().to_owned()),
+            },
+        );
+        (candidate, record)
+    }
+
+    fn assert_secret_absent(secret: &str, exposures: impl IntoIterator<Item = String>) {
+        for exposure in exposures {
+            assert!(
+                !exposure.contains(secret),
+                "raw output must stay outside observable diagnostics"
+            );
+        }
     }
 
     fn append_receipt_effect_to_validating<S: RunStore>(
@@ -2713,19 +3299,54 @@ mod tests {
                 ),
             )
             .expect("effect start should commit");
-        store
-            .append(
-                ExpectedHead::from_state(&started.state),
-                event(
-                    &format!("{event_prefix}-succeeded"),
-                    RunEventBody::EffectSucceeded {
-                        step_id: step_id.to_owned(),
-                        effect_id: effect.effect_id.clone(),
-                        evidence_digest: format!("sha256:{}", "d".repeat(64)),
-                    },
-                ),
+        let evidence_digest = format!("sha256:{}", "d".repeat(64));
+        if effect
+            .receipt_provenance
+            .as_ref()
+            .and_then(|provenance| provenance.tool_output_profile.as_deref())
+            == Some(TOOL_OUTPUT_PROFILE_V1)
+        {
+            let output = ToolOutputRecord::new(
+                &started.state.run_id,
+                step_id,
+                effect,
+                started.state.steps[step_id].attempts,
+                &evidence_digest,
+                serde_json::json!({}),
             )
-            .expect("effect evidence should commit")
+            .expect("test tool output should bind");
+            let output_record_digest = output.record_digest().to_owned();
+            store
+                .append_with_tool_output(
+                    ExpectedHead::from_state(&started.state),
+                    event(
+                        &format!("{event_prefix}-succeeded"),
+                        RunEventBody::EffectSucceeded {
+                            step_id: step_id.to_owned(),
+                            effect_id: effect.effect_id.clone(),
+                            evidence_digest,
+                            output_record_digest: Some(output_record_digest),
+                        },
+                    ),
+                    output,
+                )
+                .expect("effect output should commit")
+        } else {
+            store
+                .append(
+                    ExpectedHead::from_state(&started.state),
+                    event(
+                        &format!("{event_prefix}-succeeded"),
+                        RunEventBody::EffectSucceeded {
+                            step_id: step_id.to_owned(),
+                            effect_id: effect.effect_id.clone(),
+                            evidence_digest,
+                            output_record_digest: None,
+                        },
+                    ),
+                )
+                .expect("effect evidence should commit")
+        }
     }
 
     fn successful_receipt(effect: &EffectIntent) -> ExecutionReceiptBody {
@@ -2794,6 +3415,8 @@ mod tests {
         let mut receipt = successful_receipt(effect);
         receipt.effect.class = ProtocolEffectClass::ReadOnly;
         receipt.effect.idempotency_key = None;
+        receipt.output_digest =
+            "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a".to_owned();
         receipt.artifacts = vec![ArtifactRef {
             artifact_id: "artifact-read-output".to_owned(),
             name: Some("read-output.json".to_owned()),
@@ -3053,6 +3676,7 @@ mod tests {
                         step_id: "step-1".to_owned(),
                         effect_id: effect.effect_id,
                         evidence_digest: format!("sha256:{}", "d".repeat(64)),
+                        output_record_digest: None,
                     },
                 ),
             );
@@ -3095,6 +3719,264 @@ mod tests {
                 .load_invocation_material(&effect_id)
                 .expect("SQLite material should load")
         );
+    }
+
+    #[test]
+    fn memory_and_sqlite_atomically_commit_and_reopen_the_exact_tool_output() {
+        const SECRET_SENTINEL: &str = "tool-output-secret-must-not-reach-journal-or-debug";
+
+        let directory = tempdir().expect("temp directory should exist");
+        let path = directory.path().join("run.db");
+        let mut memory = MemoryRunStore::new();
+        let mut sqlite = SqliteRunStore::open(&path).expect("SQLite should open");
+        let (memory_started, memory_effect) = seed_read_only_executing(&mut memory);
+        let (sqlite_started, sqlite_effect) = seed_read_only_executing(&mut sqlite);
+        let value = serde_json::json!({
+            "content": SECRET_SENTINEL,
+            "metadata": {"encoding": "utf-8"}
+        });
+        let (memory_event, memory_output) = tool_output_success(
+            &memory_started.state,
+            &memory_effect,
+            "read-only-output-succeeded",
+            value.clone(),
+        );
+        let (sqlite_event, sqlite_output) = tool_output_success(
+            &sqlite_started.state,
+            &sqlite_effect,
+            "read-only-output-succeeded",
+            value.clone(),
+        );
+        assert_eq!(memory_output, sqlite_output);
+        assert!(!format!("{memory_output:?}").contains(SECRET_SENTINEL));
+
+        let memory_commit = memory
+            .append_with_tool_output(
+                ExpectedHead::from_state(&memory_started.state),
+                memory_event,
+                memory_output.clone(),
+            )
+            .expect("memory output should commit");
+        let sqlite_commit = sqlite
+            .append_with_tool_output(
+                ExpectedHead::from_state(&sqlite_started.state),
+                sqlite_event,
+                sqlite_output.clone(),
+            )
+            .expect("SQLite output should commit");
+
+        assert_eq!(memory_commit, sqlite_commit);
+        assert_eq!(
+            memory_commit.state.steps["step-1"].status,
+            StepStatus::Validating
+        );
+        assert_eq!(
+            memory
+                .load_tool_output(memory_effect.effect_id.as_str())
+                .expect("memory output should load"),
+            Some(memory_output.clone())
+        );
+        assert_eq!(
+            sqlite
+                .load_tool_output(sqlite_effect.effect_id.as_str())
+                .expect("SQLite output should load"),
+            Some(sqlite_output.clone())
+        );
+        assert_eq!(sqlite.tool_output_count().expect("output count"), 1);
+        sqlite.reset_test_metrics();
+        assert_eq!(
+            sqlite
+                .load_tool_output(sqlite_effect.effect_id.as_str())
+                .expect("warm output should load"),
+            Some(sqlite_output.clone())
+        );
+        let warm_metrics = sqlite.test_metrics();
+        assert_eq!(warm_metrics.full_audits, 0);
+        assert_eq!(warm_metrics.historical_tool_outputs, 0);
+        assert_eq!(
+            sqlite
+                .load_verification_snapshot("step-1")
+                .expect("verification snapshot should load")
+                .expect("verification snapshot should exist")
+                .tool_output,
+            Some(sqlite_output.clone())
+        );
+        assert_secret_absent(
+            SECRET_SENTINEL,
+            [
+                String::from_utf8(memory.export_jsonl().expect("journal should export"))
+                    .expect("journal should be UTF-8"),
+                serde_json::to_string(&memory_commit.state).expect("state should serialize"),
+            ],
+        );
+
+        drop(sqlite);
+        let reopened = SqliteRunStore::open(&path).expect("SQLite should cold-open");
+        let cold_metrics = reopened.test_metrics();
+        assert_eq!(cold_metrics.full_audits, 1);
+        assert_eq!(cold_metrics.historical_tool_outputs, 1);
+        assert_eq!(
+            reopened
+                .load_tool_output(sqlite_effect.effect_id.as_str())
+                .expect("cold output should verify and load"),
+            Some(sqlite_output)
+        );
+        assert_eq!(reopened.test_metrics(), cold_metrics);
+        reopened
+            .load()
+            .expect("cold full audit should pass")
+            .expect("Run should remain");
+    }
+
+    #[test]
+    fn output_bound_success_requires_the_atomic_sidecar_api() {
+        let mut memory = MemoryRunStore::new();
+        let (memory_started, memory_effect) = seed_read_only_executing(&mut memory);
+        let (candidate, output) = tool_output_success(
+            &memory_started.state,
+            &memory_effect,
+            "plain-output-success",
+            serde_json::json!({"content": "must-be-atomic"}),
+        );
+        assert!(matches!(
+            memory.append(
+                ExpectedHead::from_state(&memory_started.state),
+                candidate.clone()
+            ),
+            Err(StoreError::ToolOutputRequired)
+        ));
+        assert_eq!(
+            memory
+                .load_tool_output(memory_effect.effect_id.as_str())
+                .expect("memory output lookup should work"),
+            None
+        );
+
+        let directory = tempdir().expect("temp directory should exist");
+        let mut sqlite =
+            SqliteRunStore::open(directory.path().join("run.db")).expect("SQLite should open");
+        let (sqlite_started, sqlite_effect) = seed_read_only_executing(&mut sqlite);
+        let (candidate, _) = tool_output_success(
+            &sqlite_started.state,
+            &sqlite_effect,
+            "plain-output-success",
+            output.output().clone(),
+        );
+        assert!(matches!(
+            sqlite.append(ExpectedHead::from_state(&sqlite_started.state), candidate),
+            Err(StoreError::ToolOutputRequired)
+        ));
+        assert_eq!(sqlite.tool_output_count().expect("output count"), 0);
+        assert_eq!(
+            sqlite
+                .load_current()
+                .expect("SQLite state should load")
+                .expect("Run should remain"),
+            sqlite_started.state
+        );
+    }
+
+    #[test]
+    fn distinct_effects_may_commit_the_same_canonical_output_digest() {
+        let directory = tempdir().expect("temp directory should exist");
+        let path = directory.path().join("same-output.db");
+        let (first_effect, second_effect, expected_digest) = {
+            let mut store = SqliteRunStore::open(&path).expect("SQLite should open");
+            let planned = seed(&mut store);
+            let graph = store
+                .append(
+                    ExpectedHead::from_state(&planned.state),
+                    event(
+                        "same-output-second-step",
+                        RunEventBody::StepPlanned {
+                            step_id: "step-2".to_owned(),
+                            objective: "observe the same JSON independently".to_owned(),
+                            depends_on: Vec::new(),
+                        },
+                    ),
+                )
+                .expect("second Step should plan");
+            let first_effect = read_only_receipt_intent(&graph.state);
+            let first = append_receipt_effect_to_validating(
+                &mut store,
+                &graph.state,
+                "step-1",
+                &first_effect,
+                "same-output-first",
+            );
+            let mut second_effect = second_receipt_intent(&first.state);
+            second_effect.effect_class = EffectClass::ReadOnly;
+            second_effect.idempotency_key = None;
+            let provenance = second_effect
+                .receipt_provenance
+                .as_mut()
+                .expect("second provenance should exist");
+            provenance.profile_version = CORE_RECEIPT_PROFILE_V2.to_owned();
+            provenance.tool_output_profile = Some(TOOL_OUTPUT_PROFILE_V1.to_owned());
+            second_effect
+                .authorization
+                .binding
+                .receipt_provenance_digest = Some(
+                receipt_provenance_digest(provenance).expect("provenance should canonicalize"),
+            );
+            second_effect.authorization.grant_digest =
+                authorization_digest(&second_effect.authorization.binding, 1)
+                    .expect("authorization should canonicalize");
+            append_receipt_effect_to_validating(
+                &mut store,
+                &first.state,
+                "step-2",
+                &second_effect,
+                "same-output-second",
+            );
+            let first_output = store
+                .load_tool_output(&first_effect.effect_id)
+                .expect("first output should load")
+                .expect("first output should exist");
+            let second_output = store
+                .load_tool_output(&second_effect.effect_id)
+                .expect("second output should load")
+                .expect("second output should exist");
+            assert_eq!(first_output.output_digest(), second_output.output_digest());
+            assert_ne!(first_output.output_id(), second_output.output_id());
+            assert_ne!(first_output.record_digest(), second_output.record_digest());
+            assert_eq!(store.tool_output_count().expect("output count"), 2);
+            (
+                first_effect.effect_id,
+                second_effect.effect_id,
+                first_output.output_digest().to_owned(),
+            )
+        };
+
+        let reopened = SqliteRunStore::open(&path).expect("SQLite should cold-open");
+        for effect_id in [first_effect, second_effect] {
+            assert_eq!(
+                reopened
+                    .load_tool_output(&effect_id)
+                    .expect("cold output should load")
+                    .expect("cold output should exist")
+                    .output_digest(),
+                expected_digest
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_output_digest_must_equal_the_durable_tool_output_digest() {
+        let mut memory = MemoryRunStore::new();
+        let (validating, effect) = seed_read_only_validating(&mut memory);
+        let mut receipt = successful_read_only_receipt(&effect);
+        receipt.output_digest = format!("sha256:{}", "e".repeat(64));
+        seal_receipt(&mut receipt);
+        assert!(matches!(
+            memory.append_with_execution_receipt(
+                ExpectedHead::from_state(&validating.state),
+                receipt_event(&effect, &receipt),
+                receipt,
+            ),
+            Err(StoreError::Corrupt(message))
+                if message == "Receipt output digest differs from the durable tool output"
+        ));
     }
 
     #[test]
@@ -3406,6 +4288,41 @@ mod tests {
     }
 
     #[test]
+    fn new_read_only_intent_without_the_tool_output_profile_is_rejected() {
+        let mut store = MemoryRunStore::new();
+        let planned = seed(&mut store);
+        let mut effect = read_only_receipt_intent(&planned.state);
+        let provenance = effect
+            .receipt_provenance
+            .as_mut()
+            .expect("Receipt provenance should exist");
+        provenance.tool_output_profile = None;
+        effect.authorization.binding.receipt_provenance_digest =
+            Some(receipt_provenance_digest(provenance).expect("provenance should canonicalize"));
+        effect.authorization.grant_digest = authorization_digest(&effect.authorization.binding, 1)
+            .expect("authorization should canonicalize");
+        let material = material(&planned.state, &effect);
+
+        let result = store.append_with_invocation_material(
+            ExpectedHead::from_state(&planned.state),
+            event(
+                "missing-tool-output-profile-intent",
+                RunEventBody::EffectIntentCommitted {
+                    step_id: "step-1".to_owned(),
+                    intent: Box::new(effect),
+                },
+            ),
+            material,
+        );
+
+        assert!(matches!(result, Err(StoreError::ToolOutputProfileRequired)));
+        assert_eq!(
+            store.load().expect("store should load").expect("Run").state,
+            planned.state
+        );
+    }
+
+    #[test]
     fn new_effect_intent_without_receipt_provenance_is_rejected() {
         let mut store = MemoryRunStore::new();
         let planned = seed(&mut store);
@@ -3680,6 +4597,194 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_rolls_back_every_partial_tool_output_commit() {
+        for fault in [
+            AppendFault::Event,
+            AppendFault::ToolOutput,
+            AppendFault::Projection,
+        ] {
+            let directory = tempdir().expect("temp directory should exist");
+            let path = directory.path().join("run.db");
+            let mut store = SqliteRunStore::open(&path).expect("SQLite should open");
+            let (started, effect) = seed_read_only_executing(&mut store);
+            let (candidate, output) = tool_output_success(
+                &started.state,
+                &effect,
+                "faulted-tool-output-success",
+                serde_json::json!({"content": "transactional-output"}),
+            );
+
+            let result = store.append_tool_output_with_fault(
+                ExpectedHead::from_state(&started.state),
+                candidate.clone(),
+                &output,
+                fault,
+            );
+            assert!(matches!(result, Err(StoreError::InjectedFault(_))));
+            let recovered = store
+                .load()
+                .expect("faulted store should remain valid")
+                .expect("Run should remain");
+            assert_eq!(recovered.state, started.state);
+            assert_eq!(store.tool_output_count().expect("output count"), 0);
+            drop(store);
+
+            let mut reopened = SqliteRunStore::open(&path).expect("SQLite should cold-open");
+            assert_eq!(
+                reopened
+                    .load_current()
+                    .expect("cold state should load")
+                    .expect("Run should remain"),
+                started.state
+            );
+            assert_eq!(reopened.tool_output_count().expect("output count"), 0);
+            reopened
+                .append_with_tool_output(
+                    ExpectedHead::from_state(&started.state),
+                    candidate,
+                    output,
+                )
+                .expect("retry after rollback should commit exactly once");
+            assert_eq!(reopened.tool_output_count().expect("output count"), 1);
+        }
+    }
+
+    #[test]
+    fn sqlite_process_exit_after_tool_output_insert_rolls_back_event_row_and_projection() {
+        const CHILD_MARKER: &str = "XGENY_SQLITE_TOOL_OUTPUT_CRASH_CHILD";
+        const DATABASE_PATH: &str = "XGENY_SQLITE_TOOL_OUTPUT_CRASH_DB";
+
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let path = std::env::var_os(DATABASE_PATH).expect("child database path is required");
+            let mut store = SqliteRunStore::open(path).expect("child SQLite should open");
+            let snapshot = store
+                .load()
+                .expect("child load should pass")
+                .expect("executing Run should exist");
+            let effect = snapshot.state.steps["step-1"]
+                .intent
+                .as_ref()
+                .expect("executing Step should retain intent")
+                .clone();
+            let (candidate, output) = tool_output_success(
+                &snapshot.state,
+                &effect,
+                "crashed-tool-output-success",
+                serde_json::json!({"content": "crash-output"}),
+            );
+            let _never_returns = store.append_tool_output_and_exit_at(
+                ExpectedHead::from_state(&snapshot.state),
+                candidate,
+                &output,
+                AppendFault::ToolOutput,
+            );
+            panic!("child should exit after the tool-output row insert");
+        }
+
+        let directory = tempdir().expect("temp directory should exist");
+        let path = directory.path().join("run.db");
+        let (started, effect) = {
+            let mut store = SqliteRunStore::open(&path).expect("SQLite should open");
+            seed_read_only_executing(&mut store)
+        };
+        let status = Command::new(std::env::current_exe().expect("test executable should exist"))
+            .args([
+                "--exact",
+                "tests::sqlite_process_exit_after_tool_output_insert_rolls_back_event_row_and_projection",
+                "--test-threads=1",
+            ])
+            .env(CHILD_MARKER, "1")
+            .env(DATABASE_PATH, &path)
+            .status()
+            .expect("tool-output crash child should start");
+        assert_eq!(status.code(), Some(86));
+
+        let mut reopened = SqliteRunStore::open(&path).expect("SQLite should recover");
+        let recovered = reopened
+            .load()
+            .expect("recovered store should verify")
+            .expect("Run should remain");
+        assert_eq!(recovered.state, started.state);
+        assert_eq!(reopened.tool_output_count().expect("output count"), 0);
+        let (candidate, output) = tool_output_success(
+            &recovered.state,
+            &effect,
+            "crashed-tool-output-success",
+            serde_json::json!({"content": "crash-output"}),
+        );
+        reopened
+            .append_with_tool_output(
+                ExpectedHead::from_state(&recovered.state),
+                candidate,
+                output,
+            )
+            .expect("post-crash retry should commit");
+        assert_eq!(reopened.tool_output_count().expect("output count"), 1);
+    }
+
+    #[test]
+    fn sqlite_cold_audit_rejects_missing_tampered_indexed_and_orphan_tool_outputs() {
+        type Mutation = fn(&SqliteRunStore) -> Result<(), StoreError>;
+        let mutations: [(&str, Mutation); 4] = [
+            ("missing", SqliteRunStore::delete_tool_outputs),
+            (
+                "tampered document",
+                SqliteRunStore::corrupt_tool_output_document,
+            ),
+            ("tampered index", SqliteRunStore::corrupt_tool_output_index),
+            ("orphan", SqliteRunStore::insert_orphan_tool_output),
+        ];
+
+        for (label, mutate) in mutations {
+            let directory = tempdir().expect("temp directory should exist");
+            let path = directory.path().join(format!("{label}.db"));
+            let store = {
+                let mut store = SqliteRunStore::open(&path).expect("SQLite should open");
+                seed_read_only_validating(&mut store);
+                assert_eq!(store.tool_output_count().expect("output count"), 1);
+                store
+            };
+            mutate(&store).expect("corruption fixture should apply");
+            assert!(
+                matches!(store.load(), Err(StoreError::Corrupt(_))),
+                "warm full audit must reject {label} output corruption"
+            );
+            drop(store);
+            assert!(
+                matches!(SqliteRunStore::open(&path), Err(StoreError::Corrupt(_))),
+                "cold open must reject {label} output corruption"
+            );
+        }
+    }
+
+    #[test]
+    fn corrupted_tool_output_json_errors_never_disclose_raw_bytes() {
+        const SECRET_SENTINEL: &str = "ERROR-OUTPUT-SECRET";
+
+        let directory = tempdir().expect("temp directory should exist");
+        let path = directory.path().join("secret-corruption.db");
+        let store = {
+            let mut store = SqliteRunStore::open(&path).expect("SQLite should open");
+            seed_read_only_validating(&mut store);
+            store
+        };
+        store
+            .corrupt_tool_output_shape_with_secret(SECRET_SENTINEL)
+            .expect("corruption fixture should apply");
+        let warm_error = store
+            .load()
+            .expect_err("warm audit must reject invalid JSON");
+        assert!(matches!(warm_error, StoreError::Corrupt(_)));
+        assert!(!format!("{warm_error:?} {warm_error}").contains(SECRET_SENTINEL));
+        drop(store);
+
+        let cold_error =
+            SqliteRunStore::open(&path).expect_err("cold audit must reject invalid JSON");
+        assert!(matches!(cold_error, StoreError::Corrupt(_)));
+        assert!(!format!("{cold_error:?} {cold_error}").contains(SECRET_SENTINEL));
+    }
+
+    #[test]
     fn sqlite_process_exit_after_receipt_insert_rolls_back_the_whole_finalization() {
         const CHILD_MARKER: &str = "XGENY_SQLITE_RECEIPT_CRASH_CHILD";
         const DATABASE_PATH: &str = "XGENY_SQLITE_RECEIPT_CRASH_DB";
@@ -3865,7 +4970,7 @@ mod tests {
         let connection = rusqlite::Connection::open(&path).expect("SQLite file should open");
         drop(connection);
 
-        for version in [1_i64, 2_i64, 7_i64] {
+        for version in [1_i64, 2_i64, 8_i64] {
             let connection = rusqlite::Connection::open(&path).expect("SQLite file should open");
             connection
                 .pragma_update(None, "user_version", version)
@@ -3885,7 +4990,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_sqlite_store_uses_schema_version_six() {
+    fn fresh_sqlite_store_uses_schema_version_seven() {
         let directory = tempdir().expect("temp directory should exist");
         let path = directory.path().join("run.db");
         drop(SqliteRunStore::open(&path).expect("fresh SQLite should open"));
@@ -3893,7 +4998,154 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("schema version should be readable");
+        assert_eq!(version, 7);
+    }
+
+    #[test]
+    fn sqlite_migrates_schema_six_to_seven_without_rewriting_any_durable_bytes() {
+        let directory = tempdir().expect("temp directory should exist");
+        let path = directory.path().join("run.db");
+        {
+            let mut store = SqliteRunStore::open(&path).expect("schema seven store should open");
+            let planned = append_plan_bundle(&mut store);
+            let retention = InvocationMaterialRetention::ReconstructableReference(
+                ReconstructableMaterialReference::new("test-recipes", "recipe-b", "rev-1")
+                    .expect("schema-six recipe should validate"),
+            );
+            let (candidate, material) = planned_effect_bundle(&planned.state, "step-a", retention);
+            store
+                .append_with_invocation_material(
+                    ExpectedHead::from_state(&planned.state),
+                    candidate,
+                    material,
+                )
+                .expect("schema-six planned effect should commit");
+        }
+
+        let connection = rusqlite::Connection::open(&path).expect("raw SQLite should open");
+        let expected_rows = sqlite_durable_rows(&connection);
+        assert!(!expected_rows.intents.is_empty());
+        assert!(!expected_rows.materials.is_empty());
+        assert!(!expected_rows.plans.is_empty());
+        let expected_receipt_exports = {
+            let store = SqliteRunStore::open(&path).expect("store should reopen before downgrade");
+            store
+                .export_execution_receipts_jsonl()
+                .expect("Receipts should export")
+        };
+        connection
+            .execute("DROP TABLE tool_outputs", [])
+            .expect("schema-six fixture should not have tool-output storage");
+        connection
+            .pragma_update(None, "user_version", 6_i64)
+            .expect("fixture should declare schema six");
+        drop(connection);
+
+        let migrated = SqliteRunStore::open(&path).expect("schema six should migrate");
+        assert_eq!(
+            migrated
+                .export_execution_receipts_jsonl()
+                .expect("Receipts should export after migration"),
+            expected_receipt_exports
+        );
+        assert_eq!(migrated.tool_output_count().expect("output count"), 0);
+        drop(migrated);
+
+        let connection = rusqlite::Connection::open(&path).expect("SQLite should reopen");
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("schema version should load");
+        assert_eq!(version, 7);
+        assert_eq!(sqlite_durable_rows(&connection), expected_rows);
+    }
+
+    #[test]
+    fn corrupt_schema_six_migration_does_not_publish_schema_seven() {
+        let directory = tempdir().expect("temp directory should exist");
+        let path = directory.path().join("run.db");
+        {
+            let mut store = SqliteRunStore::open(&path).expect("schema seven store should open");
+            let planned = append_plan_bundle(&mut store);
+            let retention = InvocationMaterialRetention::ReconstructableReference(
+                ReconstructableMaterialReference::new("test-recipes", "recipe-b", "rev-1")
+                    .expect("schema-six recipe should validate"),
+            );
+            let (candidate, material) = planned_effect_bundle(&planned.state, "step-a", retention);
+            store
+                .append_with_invocation_material(
+                    ExpectedHead::from_state(&planned.state),
+                    candidate,
+                    material,
+                )
+                .expect("schema-six planned effect should commit");
+        }
+
+        let connection = rusqlite::Connection::open(&path).expect("raw SQLite should open");
+        connection
+            .execute("DROP TABLE tool_outputs", [])
+            .expect("schema-six fixture should not have tool-output storage");
+        connection
+            .execute(
+                "UPDATE effect_intents SET action_digest = 'sha256:corrupted-schema-six'",
+                [],
+            )
+            .expect("derived index should be corrupted");
+        connection
+            .pragma_update(None, "user_version", 6_i64)
+            .expect("fixture should declare schema six");
+        let expected_events = sqlite_event_rows(&connection);
+        let expected_projection = sqlite_blob_rows(
+            &connection,
+            "SELECT state_json FROM run_projection ORDER BY singleton",
+        );
+        let expected_plans = sqlite_blob_rows(
+            &connection,
+            "SELECT record_json FROM planned_invocations ORDER BY event_sequence, step_id",
+        );
+        assert!(!expected_plans.is_empty());
+        drop(connection);
+
+        assert!(matches!(
+            SqliteRunStore::open(&path),
+            Err(StoreError::Corrupt(_))
+        ));
+
+        let connection = rusqlite::Connection::open(&path).expect("SQLite should reopen");
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("schema version should load");
+        let output_table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'tool_outputs'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("schema should remain inspectable");
+        let action_digest: String = connection
+            .query_row(
+                "SELECT action_digest FROM effect_intents LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("corrupt fixture should remain intact");
         assert_eq!(version, 6);
+        assert_eq!(output_table_count, 0);
+        assert_eq!(action_digest, "sha256:corrupted-schema-six");
+        assert_eq!(sqlite_event_rows(&connection), expected_events);
+        assert_eq!(
+            sqlite_blob_rows(
+                &connection,
+                "SELECT state_json FROM run_projection ORDER BY singleton"
+            ),
+            expected_projection
+        );
+        assert_eq!(
+            sqlite_blob_rows(
+                &connection,
+                "SELECT record_json FROM planned_invocations ORDER BY event_sequence, step_id"
+            ),
+            expected_plans
+        );
     }
 
     #[test]
@@ -3934,6 +5186,9 @@ mod tests {
             .execute("DROP TABLE planned_invocations", [])
             .expect("schema-five fixture should not have plan input storage");
         connection
+            .execute("DROP TABLE tool_outputs", [])
+            .expect("schema-five fixture should not have tool-output storage");
+        connection
             .pragma_update(None, "user_version", 5_i64)
             .expect("fixture should declare schema five");
         drop(connection);
@@ -3955,7 +5210,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("schema version should load");
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         assert_eq!(sqlite_event_rows(&connection), expected_events);
         assert_eq!(
             sqlite_blob_rows(
@@ -4005,6 +5260,9 @@ mod tests {
         connection
             .execute("DROP TABLE planned_invocations", [])
             .expect("schema-five fixture should not have plan input storage");
+        connection
+            .execute("DROP TABLE tool_outputs", [])
+            .expect("schema-five fixture should not have tool-output storage");
         connection
             .execute(
                 "UPDATE effect_intents SET action_digest = 'sha256:corrupted'",
@@ -4074,6 +5332,12 @@ mod tests {
             .execute("DROP TABLE execution_receipts", [])
             .expect("empty schema-four table should drop");
         connection
+            .execute("DROP TABLE tool_outputs", [])
+            .expect("schema-three fixture should not have tool-output storage");
+        connection
+            .execute("DROP TABLE planned_invocations", [])
+            .expect("schema-three fixture should not have plan input storage");
+        connection
             .pragma_update(None, "user_version", 3_i64)
             .expect("schema version should downgrade for the fixture");
         drop(connection);
@@ -4092,7 +5356,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("schema version should load");
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         let mut statement = connection
             .prepare("SELECT event_json FROM run_events ORDER BY sequence")
             .expect("event query should prepare");
@@ -4117,6 +5381,12 @@ mod tests {
             connection
                 .execute("DROP TABLE execution_receipts", [])
                 .expect("hostile schema-three fixture should omit Receipt storage");
+            connection
+                .execute("DROP TABLE tool_outputs", [])
+                .expect("schema-three fixture should omit tool-output storage");
+            connection
+                .execute("DROP TABLE planned_invocations", [])
+                .expect("schema-three fixture should omit plan input storage");
             connection
                 .pragma_update(None, "user_version", 3_i64)
                 .expect("fixture should declare schema three");
@@ -4150,16 +5420,7 @@ mod tests {
     fn sqlite_migrates_schema_four_by_auditing_without_rewriting_run_data() {
         let directory = tempdir().expect("temp directory should exist");
         let path = directory.path().join("run.db");
-        let (
-            journal,
-            receipts,
-            events,
-            projection,
-            intents,
-            authorizations,
-            materials,
-            receipt_rows,
-        ) = {
+        let (journal, receipts, expected_rows) = {
             let mut store = SqliteRunStore::open(&path).expect("schema six store should open");
             commit_two_receipt_chain(&mut store);
             let journal = store.export_jsonl().expect("journal should export");
@@ -4168,37 +5429,17 @@ mod tests {
                 .expect("Receipts should export");
             drop(store);
             let connection = rusqlite::Connection::open(&path).expect("raw SQLite should open");
-            let events = sqlite_event_rows(&connection);
-            let projection = sqlite_blob_rows(
-                &connection,
-                "SELECT state_json FROM run_projection ORDER BY singleton",
-            );
-            let intents = sqlite_blob_rows(
-                &connection,
-                "SELECT intent_json FROM effect_intents ORDER BY effect_id",
-            );
-            let authorizations = sqlite_authorization_rows(&connection);
-            let materials = sqlite_blob_rows(
-                &connection,
-                "SELECT record_json FROM invocation_materials ORDER BY effect_id",
-            );
-            let receipt_rows = sqlite_blob_rows(
-                &connection,
-                "SELECT receipt_json FROM execution_receipts ORDER BY event_sequence",
-            );
+            let expected_rows = sqlite_durable_rows(&connection);
+            connection
+                .execute("DROP TABLE tool_outputs", [])
+                .expect("schema-four fixture should not have tool-output storage");
+            connection
+                .execute("DROP TABLE planned_invocations", [])
+                .expect("schema-four fixture should not have plan input storage");
             connection
                 .pragma_update(None, "user_version", 4_i64)
                 .expect("fixture should declare schema four");
-            (
-                journal,
-                receipts,
-                events,
-                projection,
-                intents,
-                authorizations,
-                materials,
-                receipt_rows,
-            )
+            (journal, receipts, expected_rows)
         };
 
         let migrated = SqliteRunStore::open(&path).expect("schema four should migrate");
@@ -4215,37 +5456,8 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("schema version should load");
-        assert_eq!(version, 6);
-        assert_eq!(sqlite_event_rows(&connection), events);
-        assert_eq!(
-            sqlite_blob_rows(
-                &connection,
-                "SELECT state_json FROM run_projection ORDER BY singleton"
-            ),
-            projection
-        );
-        assert_eq!(
-            sqlite_blob_rows(
-                &connection,
-                "SELECT intent_json FROM effect_intents ORDER BY effect_id"
-            ),
-            intents
-        );
-        assert_eq!(sqlite_authorization_rows(&connection), authorizations);
-        assert_eq!(
-            sqlite_blob_rows(
-                &connection,
-                "SELECT record_json FROM invocation_materials ORDER BY effect_id"
-            ),
-            materials
-        );
-        assert_eq!(
-            sqlite_blob_rows(
-                &connection,
-                "SELECT receipt_json FROM execution_receipts ORDER BY event_sequence"
-            ),
-            receipt_rows
-        );
+        assert_eq!(version, 7);
+        assert_eq!(sqlite_durable_rows(&connection), expected_rows);
     }
 
     #[test]
@@ -4261,6 +5473,12 @@ mod tests {
             .pragma_update(None, "foreign_keys", true)
             .expect("foreign keys should enable");
         connection
+            .execute("DROP TABLE tool_outputs", [])
+            .expect("schema-four fixture should not have tool-output storage");
+        connection
+            .execute("DROP TABLE planned_invocations", [])
+            .expect("schema-four fixture should not have plan input storage");
+        connection
             .pragma_update(None, "user_version", 4_i64)
             .expect("concurrent legacy migration should publish schema four");
 
@@ -4270,7 +5488,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("schema version should load");
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         drop(connection);
         SqliteRunStore::open(&path).expect("converged store should pass full open verification");
     }
@@ -4291,6 +5509,12 @@ mod tests {
                     [],
                 )
                 .expect("fixture event index should be corrupted");
+            connection
+                .execute("DROP TABLE tool_outputs", [])
+                .expect("schema-four fixture should not have tool-output storage");
+            connection
+                .execute("DROP TABLE planned_invocations", [])
+                .expect("schema-four fixture should not have plan input storage");
             connection
                 .pragma_update(None, "user_version", 4_i64)
                 .expect("fixture should declare schema four");
@@ -5056,6 +6280,7 @@ mod tests {
                             step_id: step_id.clone(),
                             effect_id: effect.effect_id.clone(),
                             evidence_digest: format!("sha256:{}", "d".repeat(64)),
+                            output_record_digest: None,
                         },
                     ),
                 )
