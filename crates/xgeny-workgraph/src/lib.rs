@@ -755,6 +755,7 @@ impl ExpectedPlanningTurn {
 #[serde(rename_all = "snake_case")]
 pub enum PlannedExecutionProfile {
     LocalSyncOnceV1,
+    LocalSyncReadOnlyV1,
 }
 
 /// Secret-free semantic facts calculated from normalized transient arguments before plan commit.
@@ -1698,6 +1699,7 @@ impl InvocationMaterialUnavailableReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EffectClass {
+    ReadOnly,
     Reversible,
     Idempotent,
     NonIdempotent,
@@ -3484,6 +3486,13 @@ fn commit_effect_intent(
             effect_id: intent.effect_id.clone(),
         });
     }
+    if intent.effect_class == EffectClass::ReadOnly
+        && (intent.idempotency_key.is_some() || intent.sink_guarantee != SinkGuarantee::None)
+    {
+        return Err(TransitionError::ReadOnlyEffectSemanticsInvalid {
+            effect_id: intent.effect_id.clone(),
+        });
+    }
     if state.steps.values().any(|step| {
         step.intent
             .as_ref()
@@ -3598,28 +3607,63 @@ fn validate_planned_invocation_binding(
             field: "receipt_provenance.plan_id",
         });
     }
+    validate_planned_execution_profile(step, planned, intent, provenance)
+}
+
+fn validate_planned_execution_profile(
+    step: &StepState,
+    planned: &PlannedInvocationBinding,
+    intent: &EffectIntent,
+    provenance: &ReceiptProvenance,
+) -> Result<(), TransitionError> {
     match planned.execution_profile {
         PlannedExecutionProfile::LocalSyncOnceV1 => {
+            if intent.effect_class == EffectClass::ReadOnly {
+                return Err(TransitionError::PlannedInvocationMismatch {
+                    step_id: step.step_id.clone(),
+                    field: "effect_class",
+                });
+            }
             if intent.idempotency_key.as_ref().is_none_or(String::is_empty) {
                 return Err(TransitionError::PlannedInvocationMismatch {
                     step_id: step.step_id.clone(),
                     field: "idempotency_key",
                 });
             }
-            if provenance.executor_placement != ReceiptPlacement::Local {
+        }
+        PlannedExecutionProfile::LocalSyncReadOnlyV1 => {
+            if intent.effect_class != EffectClass::ReadOnly {
                 return Err(TransitionError::PlannedInvocationMismatch {
                     step_id: step.step_id.clone(),
-                    field: "receipt_provenance.executor_placement",
+                    field: "effect_class",
                 });
             }
-            let expected_platform = format!("{}-{}", planned.target_os, planned.target_arch);
-            if provenance.executor_platform != expected_platform {
+            if intent.idempotency_key.is_some() {
                 return Err(TransitionError::PlannedInvocationMismatch {
                     step_id: step.step_id.clone(),
-                    field: "receipt_provenance.executor_platform",
+                    field: "idempotency_key",
+                });
+            }
+            if intent.sink_guarantee != SinkGuarantee::None {
+                return Err(TransitionError::PlannedInvocationMismatch {
+                    step_id: step.step_id.clone(),
+                    field: "sink_guarantee",
                 });
             }
         }
+    }
+    if provenance.executor_placement != ReceiptPlacement::Local {
+        return Err(TransitionError::PlannedInvocationMismatch {
+            step_id: step.step_id.clone(),
+            field: "receipt_provenance.executor_placement",
+        });
+    }
+    let expected_platform = format!("{}-{}", planned.target_os, planned.target_arch);
+    if provenance.executor_platform != expected_platform {
+        return Err(TransitionError::PlannedInvocationMismatch {
+            step_id: step.step_id.clone(),
+            field: "receipt_provenance.executor_platform",
+        });
     }
     Ok(())
 }
@@ -3988,6 +4032,8 @@ pub enum TransitionError {
     AuthorizationBudgetExceeded { grant_id: String, max_uses: u32 },
     #[error("effect `{effect_id}` claims a keyed sink guarantee without an idempotency key")]
     SinkGuaranteeRequiresIdempotencyKey { effect_id: String },
+    #[error("read-only effect `{effect_id}` must not claim keyed or sink effect semantics")]
+    ReadOnlyEffectSemanticsInvalid { effect_id: String },
     #[error("effect `{effect_id}` receipt provenance and authorization binding differ")]
     ReceiptProvenanceBindingMismatch { effect_id: String },
     #[error("effect `{effect_id}` receipt provenance digest is invalid")]
@@ -4025,6 +4071,19 @@ mod tests {
     const AUTHORITY_EPOCH: u64 = 7;
 
     type IntentMutation = Box<dyn Fn(&mut EffectIntent)>;
+
+    #[test]
+    fn read_only_execution_semantics_have_distinct_wire_values() {
+        assert_eq!(
+            serde_json::to_value(EffectClass::ReadOnly).expect("effect class should serialize"),
+            serde_json::json!("read_only")
+        );
+        assert_eq!(
+            serde_json::to_value(PlannedExecutionProfile::LocalSyncReadOnlyV1)
+                .expect("execution profile should serialize"),
+            serde_json::json!("local_sync_read_only_v1")
+        );
+    }
 
     fn event(event_id: &str, body: RunEventBody) -> RunEvent {
         RunEvent {

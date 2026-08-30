@@ -14,8 +14,10 @@ use xgeny_domain::{
     VerificationResult, VerificationStrategy,
 };
 use xgeny_protocol::{
-    CORE_RECEIPT_INPUT_SUMMARY_V1, CORE_RECEIPT_PROFILE_V1, CORE_RECEIPT_REDACTIONS_V1,
-    CoreVerificationOutcome, ProtocolError, core_receipt_id_v1, core_receipt_status_v1,
+    CORE_RECEIPT_INPUT_SUMMARY_V1, CORE_RECEIPT_MAX_ARTIFACT_TOTAL_BYTES_V2,
+    CORE_RECEIPT_MAX_ARTIFACTS_V2, CORE_RECEIPT_PROFILE_V1, CORE_RECEIPT_PROFILE_V2,
+    CORE_RECEIPT_REDACTIONS_V1, CoreVerificationOutcome, ProtocolError,
+    core_artifact_descriptor_v2_is_valid, core_receipt_id_v1, core_receipt_status_v1,
     core_verification_summary_v1, evaluate_core_verification_v1, validate_execution_receipt,
 };
 use xgeny_workgraph::{
@@ -617,7 +619,15 @@ fn verify_material_bundle(
             .receipt_provenance
             .as_ref()
             .ok_or(StoreError::ReceiptProvenanceRequired)?;
-        if provenance.profile_version != CORE_RECEIPT_PROFILE_V1 {
+        let profile_matches_effect = matches!(
+            (provenance.profile_version.as_str(), intent.effect_class),
+            (CORE_RECEIPT_PROFILE_V2, EffectClass::ReadOnly)
+                | (
+                    CORE_RECEIPT_PROFILE_V1,
+                    EffectClass::Reversible | EffectClass::Idempotent | EffectClass::NonIdempotent
+                )
+        );
+        if !profile_matches_effect {
             return Err(StoreError::UnsupportedReceiptProfile);
         }
     }
@@ -1064,12 +1074,11 @@ fn verify_receipt_intent_binding(
     provenance: &xgeny_workgraph::ReceiptProvenance,
     disposition: VerificationDisposition,
 ) -> Result<(), StoreError> {
+    verify_core_receipt_artifacts(receipt, intent, provenance)?;
     if receipt.receipt_id != core_receipt_id_v1(&intent.effect_id)
         || !receipt.extensions.is_empty()
         || !receipt.required_extensions.is_empty()
-        || !receipt.artifacts.is_empty()
         || !has_core_redactions(receipt)
-        || provenance.profile_version != CORE_RECEIPT_PROFILE_V1
         || provenance.input_summary != CORE_RECEIPT_INPUT_SUMMARY_V1
         || receipt.invocation_id != provenance.invocation_id
         || receipt.plan_id != provenance.plan_id
@@ -1128,6 +1137,62 @@ fn verify_receipt_intent_binding(
     Ok(())
 }
 
+fn verify_core_receipt_artifacts(
+    receipt: &ExecutionReceiptBody,
+    intent: &xgeny_workgraph::EffectIntent,
+    provenance: &xgeny_workgraph::ReceiptProvenance,
+) -> Result<(), StoreError> {
+    match provenance.profile_version.as_str() {
+        CORE_RECEIPT_PROFILE_V1 => {
+            if intent.effect_class == EffectClass::ReadOnly || !receipt.artifacts.is_empty() {
+                return Err(StoreError::Corrupt(
+                    "core Receipt v1 artifact semantics differ".to_owned(),
+                ));
+            }
+        }
+        CORE_RECEIPT_PROFILE_V2 => {
+            if intent.effect_class != EffectClass::ReadOnly
+                || receipt.artifacts.is_empty()
+                || receipt.artifacts.len() > CORE_RECEIPT_MAX_ARTIFACTS_V2
+            {
+                return Err(StoreError::Corrupt(
+                    "core Receipt v2 artifact semantics differ".to_owned(),
+                ));
+            }
+            let mut identifiers = BTreeSet::new();
+            let mut total_size = 0_u64;
+            for artifact in &receipt.artifacts {
+                let expected_provenance = artifact.provenance.as_ref().is_some_and(|artifact| {
+                    artifact.run_id == receipt.run_id
+                        && artifact.step_id == receipt.step_id
+                        && artifact.receipt_id.as_deref() == Some(receipt.receipt_id.as_str())
+                });
+                total_size = total_size.checked_add(artifact.size).ok_or_else(|| {
+                    StoreError::Corrupt("core Receipt artifact size overflows".to_owned())
+                })?;
+                if !core_artifact_descriptor_v2_is_valid(
+                    &artifact.artifact_id,
+                    artifact.name.as_deref(),
+                    &artifact.media_type,
+                    artifact.size,
+                    &artifact.digest,
+                ) || total_size > CORE_RECEIPT_MAX_ARTIFACT_TOTAL_BYTES_V2
+                    || !identifiers.insert(artifact.artifact_id.as_str())
+                    || !expected_provenance
+                    || !artifact.extensions.is_empty()
+                    || !artifact.required_extensions.is_empty()
+                {
+                    return Err(StoreError::Corrupt(
+                        "core Receipt artifact binding differs".to_owned(),
+                    ));
+                }
+            }
+        }
+        _ => return Err(StoreError::UnsupportedReceiptProfile),
+    }
+    Ok(())
+}
+
 fn verify_receipt_timestamps(
     anchor: &ReceiptEventAnchor,
     receipt: &ExecutionReceiptBody,
@@ -1164,6 +1229,7 @@ fn has_core_redactions(receipt: &ExecutionReceiptBody) -> bool {
 
 const fn protocol_effect_class(effect_class: EffectClass) -> ProtocolEffectClass {
     match effect_class {
+        EffectClass::ReadOnly => ProtocolEffectClass::ReadOnly,
         EffectClass::Reversible => ProtocolEffectClass::Compensatable,
         EffectClass::Idempotent => ProtocolEffectClass::Idempotent,
         EffectClass::NonIdempotent => ProtocolEffectClass::NonIdempotent,
@@ -1335,10 +1401,13 @@ mod tests {
 
     use tempfile::tempdir;
     use xgeny_domain::{
-        API_VERSION_V1ALPHA1, CapabilityRef, Executor, ProtocolDocument, ReceiptEffect,
-        ReceiptPolicy, ReceiptStatus, VerificationEvidence,
+        API_VERSION_V1ALPHA1, ArtifactProvenance, ArtifactRef, CapabilityRef, Executor,
+        ProtocolDocument, ReceiptEffect, ReceiptPolicy, ReceiptStatus, VerificationEvidence,
     };
-    use xgeny_protocol::canonical_digest_without_field;
+    use xgeny_protocol::{
+        CORE_RECEIPT_MAX_ARTIFACT_SIZE_BYTES_V2, CORE_RECEIPT_PROFILE_V2,
+        canonical_digest_without_field,
+    };
     use xgeny_workgraph::{
         AcceptedPlanStep, AgentLoopBudget, AuthorizationBinding, AuthorizationUse,
         ContinuationAction, EffectClass, EffectIntent, ExpectedPlanningTurn, InvocationBinding,
@@ -1364,6 +1433,7 @@ mod tests {
     }
 
     type SqliteEventRow = (i64, String, Option<String>, String, Vec<u8>);
+    type ReceiptMutation = fn(&mut ExecutionReceiptBody);
 
     fn sqlite_event_rows(connection: &rusqlite::Connection) -> Vec<SqliteEventRow> {
         let mut statement = connection
@@ -2489,6 +2559,22 @@ mod tests {
         effect
     }
 
+    fn read_only_receipt_intent(state: &RunState) -> EffectIntent {
+        let mut effect = receipt_intent(state);
+        effect.effect_class = EffectClass::ReadOnly;
+        effect.idempotency_key = None;
+        let provenance = effect
+            .receipt_provenance
+            .as_mut()
+            .expect("Receipt provenance should exist");
+        provenance.profile_version = CORE_RECEIPT_PROFILE_V2.to_owned();
+        effect.authorization.binding.receipt_provenance_digest =
+            Some(receipt_provenance_digest(provenance).expect("provenance should canonicalize"));
+        effect.authorization.grant_digest = authorization_digest(&effect.authorization.binding, 1)
+            .expect("read-only authorization should canonicalize");
+        effect
+    }
+
     fn second_receipt_intent(state: &RunState) -> EffectIntent {
         let mut effect = receipt_intent(state);
         effect.effect_id = "effect-2".to_owned();
@@ -2580,6 +2666,19 @@ mod tests {
             )
             .expect("effect evidence should commit");
         (succeeded, effect)
+    }
+
+    fn seed_read_only_validating<S: RunStore>(store: &mut S) -> (Commit, EffectIntent) {
+        let planned = seed(store);
+        let effect = read_only_receipt_intent(&planned.state);
+        let validating = append_receipt_effect_to_validating(
+            store,
+            &planned.state,
+            "step-1",
+            &effect,
+            "read-only-receipt",
+        );
+        (validating, effect)
     }
 
     fn append_receipt_effect_to_validating<S: RunStore>(
@@ -2691,6 +2790,28 @@ mod tests {
         receipt
     }
 
+    fn successful_read_only_receipt(effect: &EffectIntent) -> ExecutionReceiptBody {
+        let mut receipt = successful_receipt(effect);
+        receipt.effect.class = ProtocolEffectClass::ReadOnly;
+        receipt.effect.idempotency_key = None;
+        receipt.artifacts = vec![ArtifactRef {
+            artifact_id: "artifact-read-output".to_owned(),
+            name: Some("read-output.json".to_owned()),
+            media_type: "application/json".to_owned(),
+            size: 128,
+            digest: format!("sha256:{}", "a".repeat(64)),
+            provenance: Some(ArtifactProvenance {
+                run_id: receipt.run_id.clone(),
+                step_id: receipt.step_id.clone(),
+                receipt_id: Some(receipt.receipt_id.clone()),
+            }),
+            extensions: BTreeMap::new(),
+            required_extensions: Vec::new(),
+        }];
+        seal_receipt(&mut receipt);
+        receipt
+    }
+
     fn seal_receipt(receipt: &mut ExecutionReceiptBody) {
         let value = serde_json::to_value(ProtocolDocument::ExecutionReceipt(Box::new(
             receipt.clone(),
@@ -2735,6 +2856,42 @@ mod tests {
                 .load_execution_receipts()
                 .expect("Receipts")
                 .is_empty()
+        );
+    }
+
+    fn assert_read_only_receipt_mutation_rejected<S: RunStore>(
+        store: &mut S,
+        validating: &RunState,
+        effect: &EffectIntent,
+        case: &str,
+        mutate: fn(&mut ExecutionReceiptBody),
+    ) {
+        let mut receipt = successful_read_only_receipt(effect);
+        mutate(&mut receipt);
+        seal_receipt(&mut receipt);
+        let candidate = receipt_event(effect, &receipt);
+
+        let error = store
+            .append_with_execution_receipt(ExpectedHead::from_state(validating), candidate, receipt)
+            .expect_err(case);
+        assert!(
+            matches!(
+                error,
+                StoreError::Corrupt(_) | StoreError::ExecutionReceiptInvalid
+            ),
+            "unexpected {case} error: {error:?}"
+        );
+        assert_eq!(
+            store.load_current().expect("store should load"),
+            Some(validating.clone()),
+            "{case} must not mutate durable state"
+        );
+        assert!(
+            store
+                .load_execution_receipts()
+                .expect("Receipts should load")
+                .is_empty(),
+            "{case} must not persist a Receipt"
         );
     }
 
@@ -3210,31 +3367,38 @@ mod tests {
     fn unsupported_receipt_profile_is_rejected_before_intent_commit() {
         let mut store = MemoryRunStore::new();
         let planned = seed(&mut store);
-        let mut effect = receipt_intent(&planned.state);
-        let provenance = effect
-            .receipt_provenance
-            .as_mut()
-            .expect("Receipt provenance should exist");
-        provenance.profile_version = "unsupported-receipt-profile".to_owned();
-        effect.authorization.binding.receipt_provenance_digest =
-            Some(receipt_provenance_digest(provenance).expect("provenance should canonicalize"));
-        effect.authorization.grant_digest = authorization_digest(&effect.authorization.binding, 1)
-            .expect("authorization should canonicalize");
-        let material = material(&planned.state, &effect);
+        for (event_id, profile) in [
+            ("unsupported-profile-intent", "unsupported-receipt-profile"),
+            ("wrong-effect-profile-intent", CORE_RECEIPT_PROFILE_V2),
+        ] {
+            let mut effect = receipt_intent(&planned.state);
+            let provenance = effect
+                .receipt_provenance
+                .as_mut()
+                .expect("Receipt provenance should exist");
+            provenance.profile_version = profile.to_owned();
+            effect.authorization.binding.receipt_provenance_digest = Some(
+                receipt_provenance_digest(provenance).expect("provenance should canonicalize"),
+            );
+            effect.authorization.grant_digest =
+                authorization_digest(&effect.authorization.binding, 1)
+                    .expect("authorization should canonicalize");
+            let material = material(&planned.state, &effect);
 
-        let result = store.append_with_invocation_material(
-            ExpectedHead::from_state(&planned.state),
-            event(
-                "unsupported-profile-intent",
-                RunEventBody::EffectIntentCommitted {
-                    step_id: "step-1".to_owned(),
-                    intent: Box::new(effect),
-                },
-            ),
-            material,
-        );
+            let result = store.append_with_invocation_material(
+                ExpectedHead::from_state(&planned.state),
+                event(
+                    event_id,
+                    RunEventBody::EffectIntentCommitted {
+                        step_id: "step-1".to_owned(),
+                        intent: Box::new(effect),
+                    },
+                ),
+                material,
+            );
 
-        assert!(matches!(result, Err(StoreError::UnsupportedReceiptProfile)));
+            assert!(matches!(result, Err(StoreError::UnsupportedReceiptProfile)));
+        }
         assert_eq!(
             store.load().expect("store should load").expect("Run").state,
             planned.state
@@ -3299,6 +3463,148 @@ mod tests {
         assert_receipt_mutation_rejected(|receipt, _| {
             receipt.previous_receipt_digest = Some(format!("sha256:{}", "f".repeat(64)));
         });
+        assert_receipt_mutation_rejected(|receipt, _| {
+            receipt.artifacts.push(ArtifactRef {
+                artifact_id: "artifact-forged-v1".to_owned(),
+                name: None,
+                media_type: "application/json".to_owned(),
+                size: 0,
+                digest: format!("sha256:{}", "a".repeat(64)),
+                provenance: Some(ArtifactProvenance {
+                    run_id: receipt.run_id.clone(),
+                    step_id: receipt.step_id.clone(),
+                    receipt_id: Some(receipt.receipt_id.clone()),
+                }),
+                extensions: BTreeMap::new(),
+                required_extensions: Vec::new(),
+            });
+        });
+    }
+
+    #[test]
+    fn core_receipt_v2_artifact_provenance_is_exact_and_core_owned() {
+        let mut store = MemoryRunStore::new();
+        let planned = seed(&mut store);
+        let mut effect = receipt_intent(&planned.state);
+        effect.effect_class = EffectClass::ReadOnly;
+        effect.idempotency_key = None;
+        effect
+            .receipt_provenance
+            .as_mut()
+            .expect("provenance should exist")
+            .profile_version = CORE_RECEIPT_PROFILE_V2.to_owned();
+        let mut receipt = successful_receipt(&effect);
+        receipt.effect.class = ProtocolEffectClass::ReadOnly;
+        receipt.artifacts.push(ArtifactRef {
+            artifact_id: "artifact-read-output".to_owned(),
+            name: Some("read-output.json".to_owned()),
+            media_type: "application/json".to_owned(),
+            size: 128,
+            digest: format!("sha256:{}", "a".repeat(64)),
+            provenance: Some(ArtifactProvenance {
+                run_id: receipt.run_id.clone(),
+                step_id: receipt.step_id.clone(),
+                receipt_id: Some(receipt.receipt_id.clone()),
+            }),
+            extensions: BTreeMap::new(),
+            required_extensions: Vec::new(),
+        });
+        let provenance = effect
+            .receipt_provenance
+            .as_ref()
+            .expect("provenance should exist");
+        verify_core_receipt_artifacts(&receipt, &effect, provenance)
+            .expect("exact Core provenance should pass");
+
+        receipt.artifacts[0]
+            .provenance
+            .as_mut()
+            .expect("artifact provenance should exist")
+            .receipt_id = Some("receipt-forged".to_owned());
+        assert!(matches!(
+            verify_core_receipt_artifacts(&receipt, &effect, provenance),
+            Err(StoreError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn core_receipt_v2_artifact_rules_fail_closed_in_memory_and_sqlite_reopen() {
+        let mutations: [(&str, ReceiptMutation); 7] = [
+            ("empty artifact set", |receipt| receipt.artifacts.clear()),
+            ("artifact count overflow", |receipt| {
+                let template = receipt.artifacts[0].clone();
+                receipt.artifacts = (0..=CORE_RECEIPT_MAX_ARTIFACTS_V2)
+                    .map(|index| ArtifactRef {
+                        artifact_id: format!("artifact-count-{index}"),
+                        ..template.clone()
+                    })
+                    .collect();
+            }),
+            ("individual artifact overflow", |receipt| {
+                receipt.artifacts[0].size = CORE_RECEIPT_MAX_ARTIFACT_SIZE_BYTES_V2 + 1;
+            }),
+            ("aggregate artifact overflow", |receipt| {
+                let template = receipt.artifacts[0].clone();
+                receipt.artifacts = (0..5)
+                    .map(|index| ArtifactRef {
+                        artifact_id: format!("artifact-total-{index}"),
+                        size: CORE_RECEIPT_MAX_ARTIFACT_SIZE_BYTES_V2,
+                        ..template.clone()
+                    })
+                    .collect();
+            }),
+            ("duplicate artifact identity", |receipt| {
+                receipt.artifacts.push(receipt.artifacts[0].clone());
+            }),
+            ("missing artifact provenance", |receipt| {
+                receipt.artifacts[0].provenance = None;
+            }),
+            ("artifact extension injection", |receipt| {
+                let extension = "https://example.test/artifact-extension".to_owned();
+                receipt.artifacts[0]
+                    .extensions
+                    .insert(extension.clone(), serde_json::json!(true));
+                receipt.artifacts[0].required_extensions.push(extension);
+            }),
+        ];
+
+        let mut memory = MemoryRunStore::new();
+        let (memory_validating, memory_effect) = seed_read_only_validating(&mut memory);
+        let directory = tempdir().expect("temporary SQLite directory should exist");
+        let database = directory.path().join("run.db");
+        let mut sqlite = SqliteRunStore::open(&database).expect("SQLite store should open");
+        let (sqlite_validating, sqlite_effect) = seed_read_only_validating(&mut sqlite);
+
+        for (case, mutate) in mutations {
+            assert_read_only_receipt_mutation_rejected(
+                &mut memory,
+                &memory_validating.state,
+                &memory_effect,
+                case,
+                mutate,
+            );
+            assert_read_only_receipt_mutation_rejected(
+                &mut sqlite,
+                &sqlite_validating.state,
+                &sqlite_effect,
+                case,
+                mutate,
+            );
+            drop(sqlite);
+            sqlite = SqliteRunStore::open(&database).expect("SQLite store should cold-open");
+            assert_eq!(
+                sqlite.load_current().expect("reopened state should load"),
+                Some(sqlite_validating.state.clone()),
+                "{case} rejection must survive cold-open"
+            );
+            assert!(
+                sqlite
+                    .load_execution_receipts()
+                    .expect("reopened Receipts should load")
+                    .is_empty(),
+                "{case} rejection must not leave a Receipt sidecar"
+            );
+        }
     }
 
     #[test]

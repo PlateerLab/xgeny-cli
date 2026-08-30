@@ -1,15 +1,18 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use thiserror::Error;
 use xgeny_domain::{
-    API_VERSION_V1ALPHA1, CapabilityDefinitionBody, CapabilityInstanceBody, CapabilityRef,
-    EffectClass, ExecutionReceiptBody, Executor, Placement, ProtocolDocument, ReceiptEffect,
-    ReceiptPolicy, VerificationEvidence, VerificationResult, VerificationStrategy,
+    API_VERSION_V1ALPHA1, ArtifactProvenance, ArtifactRef, CapabilityDefinitionBody,
+    CapabilityInstanceBody, CapabilityRef, EffectClass, ExecutionReceiptBody, Executor, Placement,
+    ProtocolDocument, ReceiptEffect, ReceiptPolicy, VerificationEvidence, VerificationResult,
+    VerificationStrategy,
 };
 use xgeny_local_store::{ExpectedHead, RunStore, StoreError};
 use xgeny_protocol::{
-    CORE_RECEIPT_INPUT_SUMMARY_V1, CORE_RECEIPT_PROFILE_V1, CORE_RECEIPT_REDACTIONS_V1,
+    CORE_RECEIPT_INPUT_SUMMARY_V1, CORE_RECEIPT_MAX_ARTIFACT_SIZE_BYTES_V2,
+    CORE_RECEIPT_MAX_ARTIFACT_TOTAL_BYTES_V2, CORE_RECEIPT_MAX_ARTIFACTS_V2,
+    CORE_RECEIPT_PROFILE_V1, CORE_RECEIPT_PROFILE_V2, CORE_RECEIPT_REDACTIONS_V1,
     CoreVerificationOutcome, ProtocolError, canonical_digest_without_field, core_receipt_id_v1,
     core_receipt_status_v1, core_verification_summary_v1, evaluate_core_verification_v1,
     validate_execution_receipt,
@@ -28,6 +31,13 @@ use crate::{
 
 const EMPTY_RECEIPT_DIGEST: &str =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Maximum number of artifact commitments accepted from one verifier report.
+pub const MAX_VERIFIED_ARTIFACTS: usize = CORE_RECEIPT_MAX_ARTIFACTS_V2;
+/// Maximum byte size represented by one artifact descriptor.
+pub const MAX_VERIFIED_ARTIFACT_SIZE_BYTES: u64 = CORE_RECEIPT_MAX_ARTIFACT_SIZE_BYTES_V2;
+/// Maximum aggregate byte size represented by one verifier report.
+pub const MAX_VERIFIED_ARTIFACT_TOTAL_BYTES: u64 = CORE_RECEIPT_MAX_ARTIFACT_TOTAL_BYTES_V2;
 
 /// Canonical digest of a verifier-observed, bounded tool output.
 #[derive(Clone, PartialEq, Eq)]
@@ -112,11 +122,132 @@ impl RuleVerificationObservation {
     }
 }
 
+/// Bounded artifact metadata observed by a trusted verifier.
+///
+/// Run, Step and Receipt provenance is deliberately absent. Core derives those fields only after
+/// verification and attaches them while constructing the durable Receipt. Identifier, name,
+/// media type, size and digest become audit-visible durable Receipt fields; callers must use
+/// host-fixed logical metadata and must not put raw paths, content, credentials, or secrets here.
+/// The digest is an integrity commitment, not a confidentiality boundary.
+#[derive(Clone, PartialEq, Eq)]
+pub struct VerifiedArtifactDescriptor {
+    artifact_id: String,
+    name: Option<String>,
+    media_type: String,
+    size: u64,
+    digest: String,
+}
+
+impl fmt::Debug for VerifiedArtifactDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedArtifactDescriptor")
+            .field("artifact_id", &"<redacted>")
+            .field("name", &"<redacted>")
+            .field("media_type", &"<redacted>")
+            .field("size", &self.size)
+            .field("digest", &self.digest)
+            .finish()
+    }
+}
+
+impl VerifiedArtifactDescriptor {
+    /// Build one schema-compatible, bounded artifact descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fixed error that never includes candidate metadata.
+    pub fn new(
+        artifact_id: impl Into<String>,
+        name: Option<impl Into<String>>,
+        media_type: impl Into<String>,
+        size: u64,
+        digest: impl Into<String>,
+    ) -> Result<Self, VerifiedArtifactDescriptorError> {
+        let artifact_id = artifact_id.into();
+        let name = name.map(Into::into);
+        let media_type = media_type.into();
+        let digest = digest.into();
+        if !valid_artifact_identifier(&artifact_id) {
+            return Err(VerifiedArtifactDescriptorError::InvalidArtifactId);
+        }
+        if name.as_ref().is_some_and(|name| {
+            name.is_empty() || name.len() > 512 || name.chars().any(char::is_control)
+        }) {
+            return Err(VerifiedArtifactDescriptorError::InvalidName);
+        }
+        if !(3..=200).contains(&media_type.len()) || media_type.chars().any(char::is_control) {
+            return Err(VerifiedArtifactDescriptorError::InvalidMediaType);
+        }
+        if size > MAX_VERIFIED_ARTIFACT_SIZE_BYTES {
+            return Err(VerifiedArtifactDescriptorError::ArtifactSizeExceeded);
+        }
+        if !validate_digest(&digest) {
+            return Err(VerifiedArtifactDescriptorError::InvalidDigest);
+        }
+        Ok(Self {
+            artifact_id,
+            name,
+            media_type,
+            size,
+            digest,
+        })
+    }
+
+    #[must_use]
+    pub fn artifact_id(&self) -> &str {
+        &self.artifact_id
+    }
+
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    #[must_use]
+    pub fn media_type(&self) -> &str {
+        &self.media_type
+    }
+
+    #[must_use]
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+
+    #[must_use]
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+}
+
+fn valid_artifact_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 200
+        && value.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphanumeric() || (index > 0 && matches!(byte, b'.' | b'_' | b':' | b'-'))
+        })
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum VerifiedArtifactDescriptorError {
+    #[error("artifact identifier is invalid")]
+    InvalidArtifactId,
+    #[error("artifact name is invalid")]
+    InvalidName,
+    #[error("artifact media type is invalid")]
+    InvalidMediaType,
+    #[error("artifact size exceeds the fixed verifier limit")]
+    ArtifactSizeExceeded,
+    #[error("artifact digest is not canonical SHA-256")]
+    InvalidDigest,
+}
+
 /// Output commitment and positional observations returned by a trusted verifier port.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerificationReport {
     output_digest: VerifierOutputDigest,
     rules: Vec<RuleVerificationObservation>,
+    artifacts: Vec<VerifiedArtifactDescriptor>,
 }
 
 impl VerificationReport {
@@ -128,7 +259,37 @@ impl VerificationReport {
         Self {
             output_digest,
             rules,
+            artifacts: Vec::new(),
         }
+    }
+
+    /// Attach bounded artifact commitments without granting the verifier provenance authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fixed error for excessive counts, duplicate identifiers, or aggregate size.
+    pub fn with_artifacts(
+        mut self,
+        artifacts: Vec<VerifiedArtifactDescriptor>,
+    ) -> Result<Self, VerificationReportError> {
+        if artifacts.len() > MAX_VERIFIED_ARTIFACTS {
+            return Err(VerificationReportError::ArtifactCountExceeded);
+        }
+        let mut identifiers = BTreeSet::new();
+        let mut total = 0_u64;
+        for artifact in &artifacts {
+            if !identifiers.insert(artifact.artifact_id()) {
+                return Err(VerificationReportError::DuplicateArtifactId);
+            }
+            total = total
+                .checked_add(artifact.size())
+                .ok_or(VerificationReportError::ArtifactTotalSizeExceeded)?;
+            if total > MAX_VERIFIED_ARTIFACT_TOTAL_BYTES {
+                return Err(VerificationReportError::ArtifactTotalSizeExceeded);
+            }
+        }
+        self.artifacts = artifacts;
+        Ok(self)
     }
 
     #[must_use]
@@ -140,6 +301,21 @@ impl VerificationReport {
     pub fn rules(&self) -> &[RuleVerificationObservation] {
         &self.rules
     }
+
+    #[must_use]
+    pub fn artifacts(&self) -> &[VerifiedArtifactDescriptor] {
+        &self.artifacts
+    }
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationReportError {
+    #[error("verifier artifact count exceeds the fixed limit")]
+    ArtifactCountExceeded,
+    #[error("verifier artifact identifiers must be unique")]
+    DuplicateArtifactId,
+    #[error("verifier artifact aggregate size exceeds the fixed limit")]
+    ArtifactTotalSizeExceeded,
 }
 
 /// Read-only verification request assembled from durable Core state.
@@ -395,7 +571,19 @@ fn verify_step(
             effect_id: intent.effect_id.clone(),
         }
     })?;
-    if provenance.profile_version != CORE_RECEIPT_PROFILE_V1 {
+    let profile_matches_effect = matches!(
+        (provenance.profile_version.as_str(), intent.effect_class),
+        (
+            CORE_RECEIPT_PROFILE_V2,
+            xgeny_workgraph::EffectClass::ReadOnly
+        ) | (
+            CORE_RECEIPT_PROFILE_V1,
+            xgeny_workgraph::EffectClass::Reversible
+                | xgeny_workgraph::EffectClass::Idempotent
+                | xgeny_workgraph::EffectClass::NonIdempotent
+        )
+    );
+    if !profile_matches_effect {
         return Err(VerificationRunnerError::UnsupportedReceiptProfile);
     }
     if provenance.input_summary != CORE_RECEIPT_INPUT_SUMMARY_V1 {
@@ -436,6 +624,7 @@ fn verify_step(
         instance,
         outcome_evidence_digest: &evidence,
     })?;
+    verify_report_profile(intent, provenance, &report)?;
     let (outcome, verification) = verify_report(provenance, &report)?;
     let disposition = match outcome {
         CoreVerificationOutcome::Passed => VerificationDisposition::Passed,
@@ -462,11 +651,31 @@ fn build_execution_receipt(
 ) -> Result<ExecutionReceiptBody, VerificationRunnerError> {
     let intent = &verified.intent;
     let provenance = &verified.provenance;
+    let receipt_id = core_receipt_id_v1(&intent.effect_id);
+    let artifacts = verified
+        .report
+        .artifacts()
+        .iter()
+        .map(|artifact| ArtifactRef {
+            artifact_id: artifact.artifact_id.clone(),
+            name: artifact.name.clone(),
+            media_type: artifact.media_type.clone(),
+            size: artifact.size,
+            digest: artifact.digest.clone(),
+            provenance: Some(ArtifactProvenance {
+                run_id: state.run_id.clone(),
+                step_id: step_id.to_owned(),
+                receipt_id: Some(receipt_id.clone()),
+            }),
+            extensions: BTreeMap::new(),
+            required_extensions: Vec::new(),
+        })
+        .collect();
     let mut receipt = ExecutionReceiptBody {
         api_version: API_VERSION_V1ALPHA1.to_owned(),
         extensions: BTreeMap::new(),
         required_extensions: Vec::new(),
-        receipt_id: core_receipt_id_v1(&intent.effect_id),
+        receipt_id,
         run_id: state.run_id.clone(),
         step_id: step_id.to_owned(),
         invocation_id: provenance.invocation_id.clone(),
@@ -499,7 +708,7 @@ fn build_execution_receipt(
         started_at,
         ended_at: ended_at.to_owned(),
         output_digest: verified.report.output_digest().as_str().to_owned(),
-        artifacts: Vec::new(),
+        artifacts,
         verification: verified.verification.clone(),
         redactions_applied: CORE_RECEIPT_REDACTIONS_V1
             .iter()
@@ -511,6 +720,24 @@ fn build_execution_receipt(
     receipt.receipt_digest = execution_receipt_digest(&receipt)?;
     validate_execution_receipt(&receipt)?;
     Ok(receipt)
+}
+
+fn verify_report_profile(
+    intent: &EffectIntent,
+    provenance: &ReceiptProvenance,
+    report: &VerificationReport,
+) -> Result<(), VerificationRunnerError> {
+    let valid = match provenance.profile_version.as_str() {
+        CORE_RECEIPT_PROFILE_V1 => report.artifacts().is_empty(),
+        CORE_RECEIPT_PROFILE_V2 => {
+            intent.effect_class == xgeny_workgraph::EffectClass::ReadOnly
+                && !report.artifacts().is_empty()
+        }
+        _ => false,
+    };
+    valid
+        .then_some(())
+        .ok_or(VerificationRunnerError::VerificationReportMismatch)
 }
 
 fn verify_current_definition<'a>(
@@ -619,6 +846,7 @@ fn execution_receipt_digest(
 
 const fn protocol_effect_class(effect_class: xgeny_workgraph::EffectClass) -> EffectClass {
     match effect_class {
+        xgeny_workgraph::EffectClass::ReadOnly => EffectClass::ReadOnly,
         xgeny_workgraph::EffectClass::Reversible => EffectClass::Compensatable,
         xgeny_workgraph::EffectClass::Idempotent => EffectClass::Idempotent,
         xgeny_workgraph::EffectClass::NonIdempotent => EffectClass::NonIdempotent,

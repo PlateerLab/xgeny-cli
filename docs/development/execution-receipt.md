@@ -94,7 +94,7 @@ Verifier 자체의 unavailable/unsupported/evidence-unavailable/unverifiable 오
 
 ## Receipt 생성과 판정
 
-Core는 admission provenance, durable intent, start event, verifier report와 event factory 시각으로 `ExecutionReceiptBody`를 만든다. 현재 profile은 `xgeny.core-receipt/v1`이며 ID·summary·redaction·판정 함수는 `xgeny-protocol`의 한 구현을 runtime과 store가 공유한다. `receiptDigest`는 `kind: ExecutionReceipt`를 포함한 전체 protocol document에서 top-level `receiptDigest`만 제외해 RFC 8785 canonical JSON/SHA-256으로 계산한다.
+Core는 admission provenance, durable intent, start event, verifier report와 event factory 시각으로 `ExecutionReceiptBody`를 만든다. 기존 `xgeny.core-receipt/v1`은 Artifact 0개 의미를 유지한다. ADR-0018의 ReadOnly intent는 `xgeny.core-receipt/v2`를 사용하고 verifier의 bounded artifact descriptor에 Core가 exact Run/Step/Receipt provenance를 붙인다. ID·summary·redaction·판정 함수와 v2 artifact bound는 `xgeny-protocol`의 한 구현을 runtime과 store가 공유한다. `receiptDigest`는 `kind: ExecutionReceipt`를 포함한 전체 protocol document에서 top-level `receiptDigest`만 제외해 RFC 8785 canonical JSON/SHA-256으로 계산한다.
 
 ```text
 required failed                           -> failed / Failed
@@ -120,7 +120,7 @@ Memory와 SQLite store는 같은 bundle 검사를 수행한다.
 4. Receipt가 다른 event, Run, Step, effect 또는 intent에 붙을 수 없다.
 5. Receipt protocol schema와 canonical digest를 cold open, 명시적 full audit 또는 외부 SQLite generation 변경 때 다시 검증한다. 같은 generation의 runtime hot path는 ADR-0013의 verified index를 사용한다.
 6. Capability, Instance, input, policy, executor, effect와 verification plan이 admission provenance와 같아야 한다.
-7. Receipt ID, extensions, Artifact, summary, redaction은 현재 Core builder의 deterministic shape와 같아야 한다.
+7. Receipt ID, extensions, summary와 redaction은 Core builder의 deterministic shape와 같아야 한다. v1 Artifact는 비어 있고, v2 Artifact는 count/size/unique ID와 exact Core provenance를 만족해야 한다.
 8. Receipt started/ended 시각이 journal의 start/final event 시각과 같고 RFC 3339 시간 순서가 역전되지 않아야 한다.
 9. Receipt 수와 finalization event 수가 같고 `previousReceiptDigest`가 journal 순서의 직전 Receipt를 가리켜야 한다.
 10. Persisted projection은 journal replay 결과와 같아야 한다.
@@ -214,7 +214,7 @@ cargo build --workspace --release --locked
 이 기본형은 `EffectSucceeded`와 `ReconciliationResolution::ProvedApplied`가 도달하는 `Validating` 경로를 닫는다. 다음은 별도 수직 slice다.
 
 - Adapter definite failure·effect unknown·cancelled/blocked/not-started Receipt
-- 실제 typed output과 Artifact store
+- 실제 typed output body와 Artifact content store·planning context 주입
 - PolicyDecision/InvocationPlan document 조회와 Receipt signing
 - verifier timeout/backoff/cancellation
 - 제품 filesystem/process/MCP/Connector/XGEN adapter

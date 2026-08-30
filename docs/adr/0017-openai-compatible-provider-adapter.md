@@ -131,7 +131,7 @@ XGENy PlanningContext
   -> PlanAccepted
 ```
 
-이 결과는 engineering connectivity smoke이며 실제 filesystem read/tool execution 검증이 아니다. 현재 Admission 기본형이 `read_only` effect를 아직 지원하지 않으므로 smoke는 별도 synthetic idempotent planning fixture를 사용한다. 기존 연구 평가 문서의 Qwen3.6 preregistration을 Qwen3.8로 조용히 대체하지 않는다. 주 평가 모델 변경은 pilot 전에 별도 amendment로 기록한다.
+이 결과는 engineering connectivity smoke이며 실제 filesystem read/tool execution 검증이 아니다. 당시 Admission 기본형이 `read_only` effect를 지원하지 않아 smoke는 별도 synthetic idempotent planning fixture를 사용했다. ADR-0018 이후 ReadOnly core profile과 bounded driver 기반이 생겼지만 이 live smoke를 실제 tool execution으로 다시 검증한 것은 아니다. 기존 연구 평가 문서의 Qwen3.6 preregistration을 Qwen3.8로 조용히 대체하지 않는다. 주 평가 모델 변경은 pilot 전에 별도 amendment로 기록한다.
 
 ## 비목표
 

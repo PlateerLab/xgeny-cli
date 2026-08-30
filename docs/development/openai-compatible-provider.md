@@ -66,7 +66,7 @@ Test는 health/model-list preflight를 하지 않는다. 한 durable reservation
 - advertised maximum model length: 524,288
 - result: structured proposal decode와 synthetic idempotent planning fixture의 Core `PlanAccepted` 성공
 
-이 smoke는 모델 연결과 계획 수락만 확인하며 실제 filesystem read/tool execution 검증이 아니다. 현재 Admission 기본형은 `read_only` effect를 아직 지원하지 않으므로 별도 synthetic idempotent fixture를 쓴다. Advertised model length는 Run 연속성이나 실제 usable context를 보장하는 값이 아니다. XGENy는 bounded PlanningContext와 WorkGraph/journal resume를 사용하며, 장기 작업 성능은 별도 평가 프로토콜로 검증한다.
+이 smoke는 모델 연결과 계획 수락만 확인하며 실제 filesystem read/tool execution 검증이 아니다. 당시 smoke는 ReadOnly core profile 도입 전이어서 별도 synthetic idempotent fixture를 썼다. 이후 ADR-0018에서 ReadOnly와 bounded CLI driver 기반을 추가했지만 live smoke 자체를 다시 tool execution까지 확장한 것은 아니다. Advertised model length는 Run 연속성이나 실제 usable context를 보장하는 값이 아니다. XGENy는 bounded PlanningContext와 WorkGraph/journal resume를 사용하며, 장기 작업 성능은 별도 평가 프로토콜로 검증한다.
 
 ## 안전 경계
 
@@ -83,6 +83,6 @@ Test는 health/model-list preflight를 하지 않는다. 한 durable reservation
 
 ## 아직 연결하지 않은 것
 
-이번 slice에는 사용자용 `xgeny run`, 실제 filesystem/process Capability, 자동 loop driver와 XGEN Model Gateway가 없다. 현재 rustls trust는 public web PKI 기준이므로 사내 CA/custom trust root가 필요한 HTTPS provider 구성도 후속 설계 범위다. 다음 vertical slice는 fake planner로 CLI driver와 read-only filesystem end-to-end를 먼저 닫은 뒤, 동일 driver의 planner 구성을 이 adapter로 교체하는 순서가 적절하다.
+사용자용 `xgeny run`, 실제 filesystem/process Capability와 XGEN Model Gateway는 아직 없다. ADR-0018에서 generic bounded driver와 ReadOnly/Artifact Receipt 기반은 fake port로 검증했다. 다음 vertical slice는 actual filesystem adapter, typed output sidecar, planning context v2와 completion output을 먼저 닫고, 그 뒤 동일 driver의 planner 구성을 이 adapter로 교체한다. 현재 rustls trust는 public web PKI 기준이므로 사내 CA/custom trust root가 필요한 HTTPS provider 구성도 후속 설계 범위다.
 
 설계 근거와 failure matrix는 [ADR-0017](../adr/0017-openai-compatible-provider-adapter.md)을 따른다.

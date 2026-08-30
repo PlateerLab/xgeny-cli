@@ -72,19 +72,25 @@ semantic action은 의도적으로 Run·Step·Instance와 독립적이다. 같�
 
 ## 현재 허용 범위
 
-기본형은 다음 조건을 모두 만족할 때만 intent를 발행한다.
+기본형은 다음 공통 조건을 모두 만족할 때만 intent를 발행한다.
 
 - local host + user-profile 정책 모드
 - selected Instance placement가 정확히 `Local`
 - `GrantLifetime::Once`, `max_uses = 1`
 - critical action 없음
 - synchronous execution
-- Definition과 route가 idempotency key 지원을 요구
-- effect class가 정확히 `Idempotent` 또는 `NonIdempotent`
 - sink guarantee는 증명되지 않은 `None`
 - Definition/Instance required extension 없음
 
-`ReadOnly`, `Compensatable`, `Unknown`, Device/Remote placement, managed lease, critical approval은 의미를 축약 변환하지 않고 fail-closed한다. 특히 managed policy는 expiry·revocation witness가 없으므로 provisional 평가 결과가 있더라도 권한을 발행하지 않는다. 원격 실행은 실제 executor provenance 계약 없이 local host ID/platform과 섞어 기록하지 않는다.
+실행 의미는 durable plan binding 유무에 따라 닫힌 두 경로로 나뉜다.
+
+| 경로 | 허용 effect/profile | route key feature | 발행 key/Receipt profile |
+|---|---|---:|---|
+| legacy `StepPlanned` 직접 Admission | `Idempotent` 또는 `NonIdempotent` | 필수 | non-empty / `xgeny.core-receipt/v1` |
+| accepted planned invocation | `LocalSyncOnceV1` + `Idempotent`/`NonIdempotent` | 필수 | non-empty / v1 |
+| accepted planned invocation | `LocalSyncReadOnlyV1` + `ReadOnly` | `false`(요구하지 않음) | `None` / `xgeny.core-receipt/v2` |
+
+ReadOnly Definition은 idempotency-key 지원을 선언해도 되지만 planned ReadOnly route와 intent는 그 feature를 사용하지 않는다. `ReadOnly`는 accepted planned-invocation binding이 있을 때만 지원한다. Legacy/unplanned 직접 경로의 ReadOnly는 route feature의 우연한 조합에 맡기지 않고 resolver 호출 전에 `UnplannedReadOnlyUnsupported`로 명시적으로 닫는다. `Compensatable`, `Unknown`, Device/Remote placement, managed lease, critical approval도 의미를 축약 변환하지 않고 fail-closed한다. 특히 managed policy는 expiry·revocation witness가 없으므로 provisional 평가 결과가 있더라도 권한을 발행하지 않는다. 원격 실행은 실제 executor provenance 계약 없이 local host ID/platform과 섞어 기록하지 않는다.
 
 ## durable·runtime 방어
 
@@ -96,7 +102,7 @@ Admission은 `prepare`와 `authorize_and_commit`에서 Step dependency가 모두
 
 ## 검증과 알려진 한계
 
-테스트는 canonical alias와 JSON key 순서, Run/Step 독립 semantic identity, 같은 resource지만 다른 비-selector argument에 대한 policy stack 재사용, 1 MiB 초과, canonicalization 뒤 schema 위반, selector shape와 resolver 실패, ask/deny/critical/managed 차단, stale head·잘못된 lease·Definition drift, durable binding field별 mutation, SQLite 재시작, lost acknowledgement, authorization 예산 중복 방지와 transaction fault matrix를 포함한다. Planned Definition/route drift는 recipe provider와 resolver 호출 0회인지, ordinary prepare는 accepted recipe reference를 고정하고 교체/ephemeral downgrade를 거부하는지도 검사한다. Unreleased 또는 unknown dependency는 resolver 호출 0회·intent/authorization mutation 0회인지도 검사한다. Raw argument와 canonical resource sentinel은 journal serialization과 `PendingInvocation`/`AdmittedEffect`의 `Debug` 출력에 남지 않는지도 검사한다.
+테스트는 canonical alias와 JSON key 순서, Run/Step 독립 semantic identity, 같은 resource지만 다른 비-selector argument에 대한 policy stack 재사용, 1 MiB 초과, canonicalization 뒤 schema 위반, selector shape와 resolver 실패, ask/deny/critical/managed 차단, stale head·잘못된 lease·Definition drift, durable binding field별 mutation, SQLite 재시작, lost acknowledgement, authorization 예산 중복 방지와 transaction fault matrix를 포함한다. Planned Definition/route drift는 recipe provider와 resolver 호출 0회인지, ordinary prepare는 accepted recipe reference를 고정하고 교체/ephemeral downgrade를 거부하는지도 검사한다. Planned ReadOnly는 no-key/v2 intent를 만들고, unplanned ReadOnly는 resolver 호출 0회로 닫히는지도 고정한다. Unreleased 또는 unknown dependency는 resolver 호출 0회·intent/authorization mutation 0회인지도 검사한다. Raw argument와 canonical resource sentinel은 journal serialization과 `PendingInvocation`/`AdmittedEffect`의 `Debug` 출력에 남지 않는지도 검사한다.
 
 Raw/canonical arguments는 durable journal과 SQLite에 저장하지 않는다. 대신 ADR-0010의 `Ephemeral` 또는 secret-free `ReconstructableReference` sidecar를 intent·권한과 원자 commit한다. Planned Step은 accepted plan-input sidecar의 exact reconstructable reference만 사용할 수 있으며 runtime 재검사와 store bundle gate가 다른 reference 또는 Ephemeral final record를 거부한다. Reconstructable material은 재시작 뒤 Definition, Instance, schema, 크기, resource와 semantic action을 다시 검증한 뒤 typed material로 반환한다. Ephemeral material이 영구 유실되면 고정 reason code로 `manual_required`에 전이한다.
 
@@ -108,9 +114,9 @@ semantic action digest에는 canonical argument가 들어간다. 이 값은 암�
 - actual adapter가 canonical argument와 Instance binding을 정직하게 집행한다는 증명
 - public WorkGraph/RunStore 저수준 API를 untrusted extension에서 격리하는 crate/API 경계
 - critical approval, reusable Run grant, expiry·revocation과 cross-run/global budget
-- read-only direct path, compensatable/unknown effect 의미와 async/task 실행
-- raw credential resolver, sealed argument store, adapter failure/unknown Receipt와 Artifact store
-- 동일 Run에서 의도적으로 같은 semantic action을 여러 번 수행할 trusted occurrence identity
+- read-only legacy/direct path, compensatable/unknown effect 의미와 async/task 실행
+- raw credential resolver, sealed argument store, adapter failure/unknown Receipt와 Artifact content store
+- 동일 Run에서 의도적으로 같은 semantic action을 여러 번 수행할 trusted occurrence identity. 현재는 ReadOnly도 같은 Capability+normalized argument면 Run 안에서 한 번만 수락된다.
 - CLI 명령, MCP/Claude/Codex harness, Connector 또는 XGEN wire 연동
 
 따라서 이 구현은 지원된 trusted in-process 경로에서의 misuse-resistant admission 기반이다. 사용자 PC 전체 권한 sandbox나 외부 plugin에 대한 보안 경계의 완성으로 해석하면 안 된다.

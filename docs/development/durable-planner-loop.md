@@ -78,7 +78,7 @@ CompletionCandidateRecorded
 | 한 `PlanAccepted`의 dependency edge | 128 |
 | accepted objective | 5,000 bytes |
 
-Self/duplicate/unknown dependency, cycle, 기존 terminally blocked dependency와 그 전이적 blocked descendant, 같은 Run/batch의 중복 semantic action, total planned-step budget 초과는 거부한다. Semantic action으로 effect/grant ID를 유도하므로 중복 Step을 수락하면 나중에 실행할 수 없기 때문이다. Dependency release는 계속 `Completed + complete Core Receipt ID/digest`만 인정한다. Loop가 configured된 Run의 legacy `StepPlanned`도 같은 total-step budget과 completion-candidate seal을 지킨다.
+Self/duplicate/unknown dependency, cycle, 기존 terminally blocked dependency와 그 전이적 blocked descendant, 같은 Run/batch의 중복 semantic action, total planned-step budget 초과는 거부한다. Semantic action으로 effect/grant ID를 유도하므로 중복 Step을 수락하면 나중에 실행할 수 없기 때문이다. 이 규칙은 현재 ReadOnly에도 동일해서 같은 Capability+normalized argument를 한 Run에서 다시 읽는 시나리오는 지원하지 않는다. 변경 후 재조회에는 trusted occurrence/generation identity가 필요하며 제품 filesystem adapter보다 먼저 별도 결정한다. Dependency release는 계속 `Completed + complete Core Receipt ID/digest`만 인정한다. Loop가 configured된 Run의 legacy `StepPlanned`도 같은 total-step budget과 completion-candidate seal을 지킨다.
 
 Runtime은 이 구조 검사를 recipe materialization 전에 수행하고 reducer는 durable graph 불변식을 append 시 다시 검증한다. 또한 제안 Capability의 exact ID/version은 current `PlanningContext.capabilities()`에, `ExistingStep` dependency ID는 current `PlanningContext.steps()`에 실제 존재해야 한다. Full Registry/RunState에는 있지만 context byte packing에서 생략된 항목을 추측해도 각각 `CapabilityUnavailable`/`UnknownDependency`로 거부한다. 따라서 invalid 또는 hidden-reference graph가 외부 materializer를 호출하지 않는다.
 
@@ -91,7 +91,7 @@ capability_id / contract_version
 definition_digest
 action_digest
 plan_input_digest
-execution_profile = local_sync_once_v1
+execution_profile = local_sync_once_v1 | local_sync_read_only_v1
 target_os = linux | macos | windows
 target_arch = x86_64 | aarch64
 spec_digest
@@ -120,7 +120,7 @@ Planning normalizer의 `ResourceResolver`는 deterministic canonicalization 전�
 
 Plan acceptance도 preflight identity로 한 번 정규화한 뒤 semantic proposal digest와 final Step ID를 만들고, final ID로 같은 normalized argument를 다시 정규화한다. Normalized argument, Definition/action/material digest가 exact match해야만 materializer로 넘어간다. 공개 `ResourceResolver::resolve` 입력은 scope/resource뿐이고 구현은 deterministic/idempotent해야 한다. 이 계약을 어기는 resolver는 `InvocationInvalid`로 fail-closed한다.
 
-현재 `local_sync_once_v1`은 Sync, once/idempotency-key 지원, 지원되는 effect class, critical action 없음 조건을 만족하는 Capability만 plan acceptance한다. Reducer도 final planned intent에 non-empty idempotency key, Local Receipt placement와 exact target executor platform이 있는지 검사한다. Catalog에 보이는 async/unsupported effect/critical-action Capability는 metadata로 모델이 피할 수 있지만, 제안되면 `CapabilityUnsupported`다. Approval UI가 생기기 전까지 critical action을 자동 계획하지 않는다.
+현재 `local_sync_once_v1`은 Sync, once/idempotency-key 지원, `Idempotent` 또는 `NonIdempotent`, critical action 없음 조건을 만족하는 Capability만 plan acceptance한다. `local_sync_read_only_v1`은 Sync `ReadOnly`, idempotency-key feature 비요구, critical action 없음을 요구한다. Definition이 key 지원도 선언할 수는 있지만 route는 그 feature를 요구하지 않고 intent에도 key를 발행하지 않는다. Reducer는 전자에 non-empty key를, 후자에 key 없음을 요구하고 두 profile 모두 Local Receipt placement와 exact target executor platform을 검사한다. Built-in runtime/store 경계가 별도로 ReadOnly intent와 Core Receipt v2 provenance의 결합을 검사한다. Catalog에 보이는 async/unsupported effect/critical-action Capability는 metadata로 모델이 피할 수 있지만, 제안되면 `CapabilityUnsupported`다. Approval UI가 생기기 전까지 critical action을 자동 계획하지 않는다.
 
 Remote lookup이나 credential이 없으면 identity를 만들 수 없는 Capability는 현재 profile에서 plan acceptance할 수 없다. 이런 Capability는 추후 unresolved proposal commitment와 admission-time resolved commitment를 나누는 2단계 binding 계약이 생기기 전까지 fail-closed한다.
 
@@ -169,7 +169,7 @@ verified current Step + planned binding
   -> intent + invocation material atomic commit
 ```
 
-Admission은 dependency, planned route와 current Definition digest를 recipe provider와 resolver 전에 확인하고, current head와 Definition을 policy/routing 뒤 다시 확인한다. Reducer는 intent commit 직전에 Capability ID/version, Definition digest, semantic action, material digest, Receipt provenance plan ID, local placement, exact executor platform과 idempotency key를 Step의 planned binding/profile과 비교한다. Mismatch는 authorization consumption 이전에 실패해야 한다.
+Admission은 dependency, planned route와 current Definition digest를 recipe provider와 resolver 전에 확인하고, current head와 Definition을 policy/routing 뒤 다시 확인한다. Reducer는 intent commit 직전에 Capability ID/version, Definition digest, semantic action, material digest, Receipt provenance plan ID, local placement, exact executor platform과 profile별 idempotency-key 의미를 Step의 planned binding/profile과 비교한다. Mismatch는 authorization consumption 이전에 실패해야 한다. Legacy `StepPlanned` 직접 Admission은 ReadOnly를 지원하지 않고 resolver 전에 명시적으로 거부한다.
 
 이중 gate 때문에 runtime API의 빠른 검증이 빠지더라도 저수준 append가 durable 불변식을 우회할 수 없고, reducer gate만 믿느라 불필요한 resolver나 policy 호출이 발생하는 것도 막는다.
 
