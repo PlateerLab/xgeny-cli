@@ -1,14 +1,11 @@
+use std::fmt;
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io;
 use std::path::{Path, PathBuf};
-
-use thiserror::Error;
 
 pub trait RunLease {
     fn run_id(&self) -> &str;
 }
 
-#[derive(Debug)]
 pub struct LocalRunLease {
     run_id: String,
     path: PathBuf,
@@ -30,23 +27,21 @@ impl LocalRunLease {
         path: impl AsRef<Path>,
     ) -> Result<Self, LeaseError> {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|source| LeaseError::Io {
-                path: path.clone(),
-                source,
-            })?;
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options.open(&path).map_err(|_| LeaseError::Io)?;
         match file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
-                return Err(LeaseError::AlreadyHeld { path });
+                return Err(LeaseError::AlreadyHeld);
             }
-            Err(TryLockError::Error(source)) => {
-                return Err(LeaseError::Io { path, source });
+            Err(TryLockError::Error(_)) => {
+                return Err(LeaseError::Io);
             }
         }
         Ok(Self {
@@ -62,6 +57,16 @@ impl LocalRunLease {
     }
 }
 
+impl fmt::Debug for LocalRunLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocalRunLease")
+            .field("run_id", &self.run_id)
+            .field("path", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
 impl RunLease for LocalRunLease {
     fn run_id(&self) -> &str {
         &self.run_id
@@ -74,14 +79,19 @@ impl Drop for LocalRunLease {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseError {
-    #[error("local Run lease `{path}` is already held", path = .path.display())]
-    AlreadyHeld { path: PathBuf },
-    #[error("local Run lease `{path}` failed: {source}", path = .path.display())]
-    Io {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
+    AlreadyHeld,
+    Io,
 }
+
+impl fmt::Display for LeaseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyHeld => formatter.write_str("local Run lease is already held"),
+            Self::Io => formatter.write_str("local Run lease is unavailable"),
+        }
+    }
+}
+
+impl std::error::Error for LeaseError {}

@@ -2,6 +2,7 @@
 
 mod path;
 mod read_text;
+mod root_identity;
 
 use std::fmt;
 use std::path::Path;
@@ -15,6 +16,7 @@ use xgeny_policy::{ResourceResolutionFailure, ResourceResolver};
 pub use read_text::{
     MAX_READ_TEXT_BYTES, ReadTextAdapter, ReadTextLimits, ReadTextLimitsError, ReadTextVerifier,
 };
+pub use root_identity::{WorkspaceRootIdentity, WorkspaceRootIdentityError};
 
 /// Exact public Capability identifier implemented by this adapter.
 pub const READ_TEXT_CAPABILITY_ID: &str = "xgeny.fs/read-text";
@@ -120,6 +122,20 @@ impl WorkspaceRoot {
         workspace_binding(&self.workspace_id)
     }
 
+    /// Commit the physical directory identity obtained from this exact preopened capability.
+    ///
+    /// Linux and macOS commit the handle's device and inode identifiers. Windows commits its
+    /// volume serial number and file index. The returned value contains only a domain-separated
+    /// SHA-256 digest; neither the ambient path nor raw operating-system identifiers are exposed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fixed error when handle metadata or a required platform identifier is unavailable,
+    /// or when the retained handle is not a directory. Unsupported operating systems fail closed.
+    pub fn physical_identity(&self) -> Result<WorkspaceRootIdentity, WorkspaceRootIdentityError> {
+        root_identity::physical_identity(&self.directory)
+    }
+
     /// Construct a read-text adapter pinned to this exact workspace capability and identity.
     #[must_use]
     pub fn read_text_adapter(&self, limits: ReadTextLimits) -> ReadTextAdapter {
@@ -175,6 +191,8 @@ fn workspace_binding(workspace_id: &WorkspaceId) -> InstanceBinding {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use tempfile::tempdir;
 
     use super::*;
@@ -240,5 +258,123 @@ mod tests {
         .expect_err("missing root should fail");
         let rendered = format!("{error} {error:?}");
         assert!(!rendered.contains("ABSOLUTE-ROOT-SENTINEL"));
+    }
+
+    #[test]
+    fn physical_root_identity_is_stable_for_the_same_preopened_directory() {
+        let directory = tempdir().expect("temporary workspace should exist");
+        let first = WorkspaceRoot::open_ambient(
+            directory.path(),
+            WorkspaceId::new("first-logical-id").expect("workspace ID should validate"),
+        )
+        .expect("workspace should open");
+        let first_observation = first
+            .physical_identity()
+            .expect("physical identity should be available");
+        let repeated_observation = first
+            .physical_identity()
+            .expect("same handle should retain its identity");
+        let second = WorkspaceRoot::open_ambient(
+            directory.path(),
+            WorkspaceId::new("second-logical-id").expect("workspace ID should validate"),
+        )
+        .expect("same workspace should open again");
+        let second_observation = second
+            .physical_identity()
+            .expect("second handle should identify the same directory");
+
+        assert_eq!(first_observation, repeated_observation);
+        assert_eq!(first_observation, second_observation);
+        assert!(first_observation.as_str().starts_with("sha256:"));
+        assert_eq!(first_observation.as_str().len(), 71);
+        assert!(
+            first_observation
+                .as_str()
+                .strip_prefix("sha256:")
+                .expect("identity should use the SHA-256 profile")
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_eq!(
+            format!("{first_observation:?}"),
+            "WorkspaceRootIdentity(<redacted>)"
+        );
+        assert!(
+            !format!("{first_observation:?}").contains(directory.path().to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn different_physical_roots_have_different_identities() {
+        let first_directory = tempdir().expect("first workspace should exist");
+        let second_directory = tempdir().expect("second workspace should exist");
+        let workspace_id =
+            WorkspaceId::new("shared-logical-id").expect("workspace ID should validate");
+        let first = WorkspaceRoot::open_ambient(first_directory.path(), workspace_id.clone())
+            .expect("first workspace should open");
+        let second = WorkspaceRoot::open_ambient(second_directory.path(), workspace_id)
+            .expect("second workspace should open");
+
+        assert_ne!(
+            first
+                .physical_identity()
+                .expect("first identity should be available"),
+            second
+                .physical_identity()
+                .expect("second identity should be available")
+        );
+    }
+
+    #[test]
+    fn physical_root_identity_survives_directory_rename() {
+        let container = tempdir().expect("temporary container should exist");
+        let original = container.path().join("workspace-before-rename");
+        let renamed = container.path().join("workspace-after-rename");
+        fs::create_dir(&original).expect("workspace should create");
+        let before_root = WorkspaceRoot::open_ambient(
+            &original,
+            WorkspaceId::new("before-rename").expect("workspace ID should validate"),
+        )
+        .expect("workspace should open");
+        let before = before_root
+            .physical_identity()
+            .expect("identity before rename should be available");
+
+        // Windows deliberately opens capability directories without FILE_SHARE_DELETE, so close
+        // that handle before the trusted host renames the directory. Both observations still come
+        // from the respective preopened directory handle, never from a path metadata lookup.
+        drop(before_root);
+        fs::rename(&original, &renamed).expect("same directory should rename");
+        let after = WorkspaceRoot::open_ambient(
+            &renamed,
+            WorkspaceId::new("after-rename").expect("workspace ID should validate"),
+        )
+        .expect("renamed workspace should open")
+        .physical_identity()
+        .expect("identity after rename should be available");
+
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn physical_root_identity_fails_closed_without_exposing_handle_details() {
+        let directory = tempdir().expect("temporary container should exist");
+        let sentinel = directory.path().join("RAW-ROOT-IDENTITY-SENTINEL");
+        fs::write(&sentinel, b"not a directory").expect("sentinel file should write");
+        let file = fs::File::open(&sentinel).expect("sentinel file should open");
+        let invalid_root = WorkspaceRoot::from_dir(
+            cap_std::fs::Dir::from_std_file(file),
+            WorkspaceId::new("invalid-handle").expect("workspace ID should validate"),
+        );
+
+        let error = invalid_root
+            .physical_identity()
+            .expect_err("a non-directory handle must fail closed");
+        let rendered = format!("{error} {error:?}");
+        assert_eq!(
+            rendered,
+            "workspace physical identity is unavailable WorkspaceRootIdentityError"
+        );
+        assert!(!rendered.contains("RAW-ROOT-IDENTITY-SENTINEL"));
     }
 }

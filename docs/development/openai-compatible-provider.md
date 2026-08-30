@@ -84,8 +84,13 @@ Test는 health/model-list preflight를 하지 않는다. 한 durable reservation
 - HTTP 4xx의 확정적 거부는 `ProviderRejected` closed settlement다.
 - Model proposal은 permission, selected Instance, tool execution 또는 completion 권위를 얻지 않는다.
 
-## 아직 연결하지 않은 것
+## 이후 연결 범위
 
-사용자용 `xgeny run`, 실제 filesystem/process Capability와 XGEN Model Gateway는 아직 없다. ADR-0018에서 generic bounded driver와 ReadOnly/Artifact Receipt 기반을 fake port로 검증했고, ADR-0019에서 typed output sidecar와 restart-safe verification 입력을 추가했다. ADR-0020은 generation-checked PlanningContext v2와 prompt v2를 추가해 SQLite 재시작 뒤 exact completed output이 다음 model turn 및 loopback OpenAI-compatible HTTP body에 한 번만 전달됨을 검증했다. ADR-0021은 exact completion summary를 schema 8에 원자 저장하고 loopback server가 사라진 뒤에도 HTTP 재호출 없이 복원하는 경계를 닫았다. 다음 vertical slice는 actual filesystem adapter이며, public composition을 연결한 뒤 동일 driver를 go50902 live provider로 실증한다. 현재 rustls trust는 public web PKI 기준이므로 사내 CA/custom trust root가 필요한 HTTPS provider 구성도 후속 설계 범위다.
+ADR-0022/0023에서 사용자용 `xgeny run/resume`, capability-confined filesystem read와 별도
+model-egress/read 동의가 이 adapter에 연결됐다. 기본 CI는 loopback provider를 사용해 첫 model Plan,
+별도 process의 local read, durable ToolOutput의 두 번째 model turn 전달과 offline completion replay를
+검증한다. 실제 go50902/Qwen을 이용한 같은 2-turn public CLI 증명, process/write/network Capability와
+XGEN Model Gateway는 별도 live/후속 slice다. 현재 rustls trust는 public web PKI 기준이므로 사내
+CA/custom trust root가 필요한 HTTPS provider 구성도 후속 설계 범위다.
 
 설계 근거와 failure matrix는 [ADR-0017](../adr/0017-openai-compatible-provider-adapter.md)을 따른다.

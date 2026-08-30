@@ -1,9 +1,14 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::fmt;
+use std::fs::{self, OpenOptions};
+use std::io::{self, ErrorKind};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use xgeny_domain::{ExecutionReceiptBody, ProtocolDocument};
 use xgeny_workgraph::{
     CompletionOutputRecord, EffectIntent, EventRecord, InvocationMaterialRecord,
@@ -181,11 +186,19 @@ CREATE TABLE IF NOT EXISTS completion_outputs (
 ) STRICT;
 ";
 
-#[derive(Debug)]
 pub struct SqliteRunStore {
     connection: Connection,
+    _read_only_snapshot: Option<tempfile::TempDir>,
     cache: RefCell<Option<VerifiedSqliteCache>>,
     metrics: RefCell<AuditMetrics>,
+}
+
+impl fmt::Debug for SqliteRunStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SqliteRunStore")
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,25 +207,162 @@ struct VerifiedSqliteCache {
     index: VerifiedRunIndex,
 }
 
+struct ReadOnlyOpen {
+    // Fields deliberately drop in this order so Windows closes SQLite before removing its files.
+    connection: Connection,
+    snapshot: Option<tempfile::TempDir>,
+}
+
 impl SqliteRunStore {
-    /// Open or initialize one embedded SQLite database for a run.
+    /// Exclusively create and initialize one durable embedded SQLite database for a run.
+    ///
+    /// This operation rejects an existing filesystem entry and never accepts SQLite's in-memory
+    /// path. Call [`Self::open_existing`] when resuming a run.
     ///
     /// The `bundled` rusqlite feature links SQLite into the Rust build; no database server,
     /// daemon, or separately installed SQLite executable is required.
     ///
     /// # Errors
     ///
+    /// Returns an error when the path is not a durable file path, already exists, or the new
+    /// database cannot be opened, configured, initialized, or verified.
+    pub fn create(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let path = path.as_ref();
+        validate_durable_path(path)?;
+        let physical_path =
+            physical_new_database_path(path).map_err(|()| StoreError::DatabaseCreateFailed)?;
+        let mut reservation_options = OpenOptions::new();
+        reservation_options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            reservation_options.mode(0o600);
+        }
+        let reservation = match reservation_options.open(&physical_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                return Err(StoreError::DatabaseAlreadyExists);
+            }
+            Err(_) => return Err(StoreError::DatabaseCreateFailed),
+        };
+
+        let connection = Connection::open_with_flags(&physical_path, durable_file_flags())
+            .map_err(|_| StoreError::DatabaseCreateFailed)?;
+        drop(reservation);
+        Self::finish_open(connection, SchemaOpenMode::Create)
+    }
+
+    /// Open an initialized durable embedded SQLite database without creating one.
+    ///
+    /// A missing path or a database with schema version zero is rejected. This keeps a mistyped
+    /// resume path from silently becoming a new run store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path is not a durable file path, cannot be opened without
+    /// following a symbolic link, has not been initialized, or cannot be migrated or verified.
+    pub fn open_existing(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let path = path.as_ref();
+        validate_durable_path(path)?;
+        let physical_path =
+            physical_existing_database_path(path).map_err(|()| StoreError::DatabaseOpenFailed)?;
+        let connection = Connection::open_with_flags(&physical_path, durable_file_flags())
+            .map_err(|_| StoreError::DatabaseOpenFailed)?;
+        Self::finish_open(connection, SchemaOpenMode::Existing)
+    }
+
+    /// Open a current-schema durable database for verified read-only preflight.
+    ///
+    /// This path never creates, configures, or migrates the database. In particular it does not
+    /// change journal mode or `user_version`. Callers that need to append must close this handle,
+    /// open with [`Self::open_existing`], and revalidate the exact verified state under their lease.
+    /// The caller must also serialize cooperating writers while a WAL snapshot is copied; the
+    /// public CLI satisfies this by acquiring its per-Run lease before preflight.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path is missing, is a symbolic link, is not already schema 8, or
+    /// fails the same complete journal/projection/sidecar audit as a writable open.
+    pub fn open_existing_read_only(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let path = path.as_ref();
+        validate_durable_path(path)?;
+        let physical_path =
+            physical_existing_database_path(path).map_err(|()| StoreError::DatabaseOpenFailed)?;
+        let read_only = open_read_only_preflight(&physical_path)?;
+        read_only.connection.busy_timeout(Duration::from_secs(5))?;
+        let version: i64 =
+            read_only
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version == 0 {
+            return Err(StoreError::DatabaseNotInitialized);
+        }
+        if version != STORE_SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedSchemaVersion(version));
+        }
+        let metrics = RefCell::new(AuditMetrics::default());
+        let cache = build_verified_cache(&read_only.connection, &metrics)?;
+        let ReadOnlyOpen {
+            connection,
+            snapshot,
+        } = read_only;
+        Ok(Self {
+            connection,
+            _read_only_snapshot: snapshot,
+            cache: RefCell::new(Some(cache)),
+            metrics,
+        })
+    }
+
+    /// Open or initialize one embedded SQLite database for a run.
+    ///
+    /// The `bundled` rusqlite feature links SQLite into the Rust build; no database server,
+    /// daemon, or separately installed SQLite executable is required.
+    /// File-backed callers that know whether they are starting or resuming a run should prefer
+    /// [`Self::create`] or [`Self::open_existing`]. This compatibility API retains `:memory:`
+    /// support and create-or-open behavior.
+    ///
+    /// # Errors
+    ///
     /// Returns an error when the file cannot be opened, configured, migrated, or verified.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let mut connection = Connection::open(path)?;
+        let path = path.as_ref();
+        let connection = if path == Path::new(":memory:") {
+            Connection::open_in_memory().map_err(|_| StoreError::DatabaseOpenFailed)?
+        } else if path.as_os_str().is_empty() {
+            Connection::open_with_flags(path, compatibility_file_flags())
+                .map_err(|_| StoreError::DatabaseOpenFailed)?
+        } else {
+            let physical_path = match fs::symlink_metadata(path) {
+                Ok(_) => physical_existing_database_path(path),
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    physical_new_database_path(path)
+                }
+                Err(_) => Err(()),
+            }
+            .map_err(|()| StoreError::DatabaseOpenFailed)?;
+            Connection::open_with_flags(&physical_path, compatibility_file_flags())
+                .map_err(|_| StoreError::DatabaseOpenFailed)?
+        };
+        Self::finish_open(connection, SchemaOpenMode::Compatibility)
+    }
+
+    fn finish_open(
+        mut connection: Connection,
+        open_mode: SchemaOpenMode,
+    ) -> Result<Self, StoreError> {
         connection.busy_timeout(Duration::from_secs(5))?;
 
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         match version {
-            0 => {
+            0 if open_mode != SchemaOpenMode::Existing => {
                 configure_connection(&connection)?;
                 connection.execute_batch(CREATE_SCHEMA)?;
                 connection.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
+            }
+            0 => return Err(StoreError::DatabaseNotInitialized),
+            _ if open_mode == SchemaOpenMode::Create => {
+                return Err(StoreError::DatabaseCreateFailed);
             }
             3 => {
                 configure_connection(&connection)?;
@@ -242,6 +392,7 @@ impl SqliteRunStore {
         let cache = build_verified_cache(&connection, &metrics)?;
         Ok(Self {
             connection,
+            _read_only_snapshot: None,
             cache: RefCell::new(Some(cache)),
             metrics,
         })
@@ -267,6 +418,7 @@ impl SqliteRunStore {
             connection,
             cache,
             metrics,
+            ..
         } = self;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Err(error) = ensure_verified_cache(cache, metrics, &transaction) {
@@ -789,6 +941,199 @@ impl SqliteRunStore {
             .pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
         Ok((journal_mode, synchronous, foreign_keys))
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SchemaOpenMode {
+    Create,
+    Existing,
+    Compatibility,
+}
+
+fn validate_durable_path(path: &Path) -> Result<(), StoreError> {
+    if path.as_os_str().is_empty() || path == Path::new(":memory:") {
+        return Err(StoreError::InvalidDatabasePath);
+    }
+    Ok(())
+}
+
+fn physical_new_database_path(path: &Path) -> Result<PathBuf, ()> {
+    let file_name = path.file_name().ok_or(())?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let physical_parent = fs::canonicalize(parent).map_err(|_| ())?;
+    if !fs::metadata(&physical_parent).map_err(|_| ())?.is_dir() {
+        return Err(());
+    }
+    Ok(physical_parent.join(file_name))
+}
+
+fn physical_existing_database_path(path: &Path) -> Result<PathBuf, ()> {
+    let file_name = path.file_name().ok_or(())?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let physical_parent = fs::canonicalize(parent).map_err(|_| ())?;
+    let physical_path = physical_parent.join(file_name);
+    let metadata = fs::symlink_metadata(&physical_path).map_err(|_| ())?;
+    if !is_regular_non_reparse_file(&metadata) {
+        return Err(());
+    }
+    Ok(physical_path)
+}
+
+fn is_regular_non_reparse_file(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_file() && !is_windows_reparse_point(metadata)
+}
+
+#[cfg(windows)]
+fn is_windows_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+const fn is_windows_reparse_point(_: &fs::Metadata) -> bool {
+    false
+}
+
+fn durable_file_flags() -> OpenFlags {
+    OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW
+}
+
+fn read_only_file_flags() -> OpenFlags {
+    OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW
+}
+
+fn open_read_only_preflight(path: &Path) -> Result<ReadOnlyOpen, StoreError> {
+    let source_wal = sqlite_sidecar_path(path, "-wal");
+    match std::fs::symlink_metadata(&source_wal) {
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            // A clean database has no recovery pages to merge. Immutable URI mode tells SQLite
+            // not to create WAL/SHM files beside the authoritative database. If this platform
+            // cannot represent the path as a file URI, fall back to the private-copy path below.
+            if path.to_str().is_some()
+                && let Ok(mut uri) = url::Url::from_file_path(path)
+            {
+                uri.query_pairs_mut().append_pair("immutable", "1");
+                if let Ok(connection) = Connection::open_with_flags(
+                    uri.as_str(),
+                    read_only_file_flags() | OpenFlags::SQLITE_OPEN_URI,
+                ) {
+                    return Ok(ReadOnlyOpen {
+                        connection,
+                        snapshot: None,
+                    });
+                }
+            }
+        }
+        Ok(metadata) if !is_regular_non_reparse_file(&metadata) => {
+            return Err(StoreError::DatabaseOpenFailed);
+        }
+        Ok(_) => {}
+        Err(_) => return Err(StoreError::DatabaseOpenFailed),
+    }
+
+    // Even a SQLite READ_ONLY connection may create or rewrite `-shm` while attaching a crashed
+    // WAL. Copy the coherent, lease-protected source pair first, then let SQLite perform any WAL
+    // recovery metadata work only inside a private temporary directory. The source database and
+    // all of its sidecars remain byte-for-byte untouched by preflight.
+    let snapshot_parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut snapshot_builder = tempfile::Builder::new();
+    snapshot_builder.prefix(".xgeny-read-only-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        snapshot_builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let snapshot = snapshot_builder
+        .tempdir_in(snapshot_parent)
+        .map_err(|_| StoreError::DatabaseOpenFailed)?;
+    let snapshot_database = snapshot.path().join("run.sqlite3");
+    copy_private_regular_file(path, &snapshot_database)?;
+
+    match std::fs::symlink_metadata(&source_wal) {
+        Ok(metadata) => {
+            if !is_regular_non_reparse_file(&metadata) {
+                return Err(StoreError::DatabaseOpenFailed);
+            }
+            copy_private_regular_file(
+                &source_wal,
+                &sqlite_sidecar_path(&snapshot_database, "-wal"),
+            )?;
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(_) => return Err(StoreError::DatabaseOpenFailed),
+    }
+
+    let connection = Connection::open_with_flags(&snapshot_database, read_only_file_flags())
+        .map_err(|_| StoreError::DatabaseOpenFailed)?;
+    Ok(ReadOnlyOpen {
+        connection,
+        snapshot: Some(snapshot),
+    })
+}
+
+fn copy_private_regular_file(source: &Path, destination: &Path) -> Result<(), StoreError> {
+    let metadata = std::fs::symlink_metadata(source).map_err(|_| StoreError::DatabaseOpenFailed)?;
+    if !is_regular_non_reparse_file(&metadata) {
+        return Err(StoreError::DatabaseOpenFailed);
+    }
+
+    let mut source_options = OpenOptions::new();
+    source_options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        source_options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        source_options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut source_file = source_options
+        .open(source)
+        .map_err(|_| StoreError::DatabaseOpenFailed)?;
+    let mut destination_options = OpenOptions::new();
+    destination_options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        destination_options.mode(0o600);
+    }
+    let mut destination_file = destination_options
+        .open(destination)
+        .map_err(|_| StoreError::DatabaseOpenFailed)?;
+    let copied = io::copy(&mut source_file, &mut destination_file)
+        .map_err(|_| StoreError::DatabaseOpenFailed)?;
+    if copied != metadata.len() {
+        return Err(StoreError::DatabaseOpenFailed);
+    }
+    Ok(())
+}
+
+pub(crate) fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn compatibility_file_flags() -> OpenFlags {
+    durable_file_flags() | OpenFlags::SQLITE_OPEN_CREATE
 }
 
 #[cfg(test)]

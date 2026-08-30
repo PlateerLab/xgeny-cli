@@ -13,8 +13,8 @@ use xgeny_runtime::{
     RouteRequest, RunLease, VerificationRunner, VerificationRunnerError,
 };
 use xgeny_workgraph::{
-    CompletionCandidateState, CompletionOutputRecord, ContinuationAction, ModelCallRejectionReason,
-    ModelCallUnknownReason, RunState, StepStatus,
+    CompletionCandidateState, CompletionOutputRecord, ContinuationAction, FrontierError,
+    ModelCallRejectionReason, ModelCallUnknownReason, RunState, StepStatus, derive_frontier,
 };
 
 /// Host boundary that turns one durable planned Step into an exact deterministic route request.
@@ -107,6 +107,7 @@ pub enum DriverOutcome {
         reason: ModelCallUnknownReason,
     },
     ModelCallRejected(ModelCallRejectionReason),
+    ModelEgressRequired,
     TickBudgetExhausted,
 }
 
@@ -173,7 +174,60 @@ impl RunDriver {
         RP: PlannedRoutePort,
         AP: ApprovalPort,
     {
+        self.drive_until_pause_with_model_egress(
+            store,
+            events,
+            lease,
+            capabilities,
+            resolver,
+            planner,
+            materializer,
+            providers,
+            adapters,
+            verifiers,
+            routes,
+            approvals,
+            true,
+        )
+    }
+
+    /// Drive local frontier actions while stopping before a new model-call reservation when model
+    /// egress is not authorized for this invocation.
+    ///
+    /// # Errors
+    ///
+    /// Has the same fail-closed behavior as [`Self::drive_until_pause`].
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub fn drive_until_pause_with_model_egress<S, F, L, R, P, M, RP, AP>(
+        &self,
+        store: &mut S,
+        events: &mut F,
+        lease: &L,
+        capabilities: &CapabilityRegistry,
+        resolver: &R,
+        planner: &mut P,
+        materializer: &mut M,
+        providers: &mut MaterialProviderRegistry,
+        adapters: &mut EffectAdapterRegistry,
+        verifiers: &mut EffectVerifierRegistry,
+        routes: &mut RP,
+        approvals: &mut AP,
+        model_egress_allowed: bool,
+    ) -> Result<DriverOutcome, RunDriverError>
+    where
+        S: RunStore,
+        F: EventFactory,
+        L: RunLease,
+        R: ResourceResolver,
+        P: PlannerPort,
+        M: PlanMaterializer,
+        RP: PlannedRoutePort,
+        AP: ApprovalPort,
+    {
         for _ in 0..self.max_ticks.get() {
+            if !model_egress_allowed && model_call_may_be_next(store)? {
+                return Ok(DriverOutcome::ModelEgressRequired);
+            }
             let tick = self.agent_loop.tick(
                 store,
                 events,
@@ -314,6 +368,31 @@ impl RunDriver {
     }
 }
 
+fn model_call_may_be_next<S: RunStore>(store: &S) -> Result<bool, RunDriverError> {
+    let Some(state) = store.load_current()? else {
+        return Ok(false);
+    };
+    let Some(agent) = &state.agent_loop else {
+        return Ok(false);
+    };
+    let Some(model_calls) = &agent.model_calls else {
+        return Ok(false);
+    };
+    if model_calls.active_call.is_some() || agent.completion_candidate.is_some() {
+        return Ok(false);
+    }
+    let frontier = derive_frontier(&state)?;
+    if frontier.next_action().is_some()
+        || !frontier.failed_step_ids.is_empty()
+        || !frontier.manual_required_step_ids.is_empty()
+        || agent.accepted_model_turns >= agent.budget.max_model_turns
+        || model_calls.reserved_calls >= model_calls.budget.max_model_calls()
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 #[derive(Debug, Error)]
 pub enum RunDriverError {
     #[error(transparent)]
@@ -328,6 +407,8 @@ pub enum RunDriverError {
     Executor(#[from] DirectExecutorError),
     #[error(transparent)]
     Verification(#[from] VerificationRunnerError),
+    #[error(transparent)]
+    Frontier(#[from] FrontierError),
     #[error(transparent)]
     Route(#[from] PlannedRouteFailure),
     #[error(transparent)]

@@ -1053,10 +1053,10 @@ fn local_run_lease_is_exclusive_and_released_on_drop() {
     let path = directory.path().join("run.lock");
     let first = LocalRunLease::try_acquire(RUN_ID, &path).expect("first lease should succeed");
 
-    assert!(matches!(
-        LocalRunLease::try_acquire(RUN_ID, &path),
-        Err(LeaseError::AlreadyHeld { .. })
-    ));
+    let error =
+        LocalRunLease::try_acquire(RUN_ID, &path).expect_err("a second lease must be rejected");
+    assert_eq!(error, LeaseError::AlreadyHeld);
+    assert!(!format!("{first:?} {error:?} {error}").contains(&*path.to_string_lossy()));
     drop(first);
     LocalRunLease::try_acquire(RUN_ID, &path).expect("lease should be released after drop");
 }
