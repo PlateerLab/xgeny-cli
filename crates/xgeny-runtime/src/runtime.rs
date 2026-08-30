@@ -5,7 +5,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use xgeny_local_store::{Commit, ExpectedHead, RunStore, StoreError};
 use xgeny_workgraph::{
     EffectIntent, InvocationMaterialRecord, ReconciliationResolution, RunEvent, RunEventBody,
-    RunState, SinkGuarantee, StepState, StepStatus,
+    RunState, SinkGuarantee, StepState, StepStatus, TOOL_OUTPUT_PROFILE_V1, ToolOutputRecord,
 };
 
 use crate::RunLease;
@@ -129,11 +129,40 @@ pub(crate) trait PreparedEffect {
     fn binding(&self) -> &PreparedEffectBinding;
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ToolOutputCandidate(serde_json::Value);
+
+impl ToolOutputCandidate {
+    pub(crate) const fn new(value: serde_json::Value) -> Self {
+        Self(value)
+    }
+
+    fn into_value(self) -> serde_json::Value {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for ToolOutputCandidate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ToolOutputCandidate(<redacted>)")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ExecutionObservation {
-    Succeeded { evidence_digest: String },
-    Failed { evidence_digest: String },
-    Unknown { reason: String },
+    Succeeded {
+        evidence_digest: String,
+    },
+    SucceededWithOutput {
+        evidence_digest: String,
+        output: ToolOutputCandidate,
+    },
+    Failed {
+        evidence_digest: String,
+    },
+    Unknown {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -312,50 +341,23 @@ where
             },
         )?;
         let observation = self.sink.execute(&intent, prepared);
-        let (body, action) = match observation {
-            ExecutionObservation::Succeeded { evidence_digest } => {
-                let evidence_digest = require_observation_value(
-                    "execution_succeeded",
-                    "evidence_digest",
-                    evidence_digest,
-                )?;
-                (
-                    RunEventBody::EffectSucceeded {
-                        step_id: step.step_id.clone(),
-                        effect_id: intent.effect_id,
-                        evidence_digest,
-                    },
-                    DriveAction::EffectSucceeded,
-                )
-            }
-            ExecutionObservation::Failed { evidence_digest } => {
-                let evidence_digest = require_observation_value(
-                    "execution_failed",
-                    "evidence_digest",
-                    evidence_digest,
-                )?;
-                (
-                    RunEventBody::EffectFailed {
-                        step_id: step.step_id.clone(),
-                        effect_id: intent.effect_id,
-                        evidence_digest,
-                    },
-                    DriveAction::EffectFailed,
-                )
-            }
-            ExecutionObservation::Unknown { reason } => {
-                let reason = require_observation_value("execution_unknown", "reason", reason)?;
-                (
-                    RunEventBody::EffectBecameUnknown {
-                        step_id: step.step_id.clone(),
-                        effect_id: intent.effect_id,
-                        reason,
-                    },
-                    DriveAction::EffectUnknown,
-                )
-            }
-        };
-        self.commit_report(&started.state, body, action)
+        let output_required = intent
+            .receipt_provenance
+            .as_ref()
+            .and_then(|provenance| provenance.tool_output_profile.as_deref())
+            == Some(TOOL_OUTPUT_PROFILE_V1);
+        let pending = classify_execution_observation(
+            &started.state,
+            step,
+            &intent,
+            output_required,
+            observation,
+        )?;
+        if let Some(output) = pending.output {
+            self.commit_tool_output_report(&started.state, pending.body, pending.action, output)
+        } else {
+            self.commit_report(&started.state, pending.body, pending.action)
+        }
     }
 
     fn mark_recovered_execution_unknown(
@@ -524,6 +526,185 @@ where
             action,
             state: commit.state,
         })
+    }
+
+    fn commit_tool_output_report(
+        &mut self,
+        state: &RunState,
+        body: RunEventBody,
+        action: DriveAction,
+        output: ToolOutputRecord,
+    ) -> Result<DriveReport, RuntimeError> {
+        let metadata = self.events.create_metadata(state)?;
+        metadata.validate()?;
+        let event = RunEvent {
+            event_id: metadata.event_id,
+            run_id: state.run_id.clone(),
+            authority: state.authority.clone(),
+            authority_epoch: state.authority_epoch,
+            recorded_at: metadata.recorded_at,
+            body,
+        };
+        let commit =
+            self.store
+                .append_with_tool_output(ExpectedHead::from_state(state), event, output)?;
+        Ok(DriveReport {
+            action,
+            state: commit.state,
+        })
+    }
+}
+
+struct PendingExecutionCommit {
+    body: RunEventBody,
+    action: DriveAction,
+    output: Option<ToolOutputRecord>,
+}
+
+impl PendingExecutionCommit {
+    fn succeeded(
+        step: &StepState,
+        intent: &EffectIntent,
+        evidence_digest: String,
+        output: Option<ToolOutputRecord>,
+    ) -> Self {
+        let output_record_digest = output
+            .as_ref()
+            .map(|record| record.record_digest().to_owned());
+        Self {
+            body: RunEventBody::EffectSucceeded {
+                step_id: step.step_id.clone(),
+                effect_id: intent.effect_id.clone(),
+                evidence_digest,
+                output_record_digest,
+            },
+            action: DriveAction::EffectSucceeded,
+            output,
+        }
+    }
+
+    fn failed(step: &StepState, intent: &EffectIntent, evidence_digest: String) -> Self {
+        Self {
+            body: RunEventBody::EffectFailed {
+                step_id: step.step_id.clone(),
+                effect_id: intent.effect_id.clone(),
+                evidence_digest,
+            },
+            action: DriveAction::EffectFailed,
+            output: None,
+        }
+    }
+
+    fn unknown(step: &StepState, intent: &EffectIntent, reason: impl Into<String>) -> Self {
+        Self {
+            body: RunEventBody::EffectBecameUnknown {
+                step_id: step.step_id.clone(),
+                effect_id: intent.effect_id.clone(),
+                reason: reason.into(),
+            },
+            action: DriveAction::EffectUnknown,
+            output: None,
+        }
+    }
+}
+
+fn classify_execution_observation(
+    started: &RunState,
+    step: &StepState,
+    intent: &EffectIntent,
+    output_required: bool,
+    observation: ExecutionObservation,
+) -> Result<PendingExecutionCommit, RuntimeError> {
+    match observation {
+        ExecutionObservation::Succeeded { evidence_digest } => {
+            let evidence_digest = require_observation_value(
+                "execution_succeeded",
+                "evidence_digest",
+                evidence_digest,
+            )?;
+            if output_required {
+                Ok(PendingExecutionCommit::unknown(
+                    step,
+                    intent,
+                    "adapter returned no durable tool output",
+                ))
+            } else {
+                Ok(PendingExecutionCommit::succeeded(
+                    step,
+                    intent,
+                    evidence_digest,
+                    None,
+                ))
+            }
+        }
+        ExecutionObservation::SucceededWithOutput {
+            evidence_digest,
+            output,
+        } => classify_output_success(
+            started,
+            step,
+            intent,
+            output_required,
+            evidence_digest,
+            output,
+        ),
+        ExecutionObservation::Failed { evidence_digest } => {
+            let evidence_digest =
+                require_observation_value("execution_failed", "evidence_digest", evidence_digest)?;
+            Ok(PendingExecutionCommit::failed(
+                step,
+                intent,
+                evidence_digest,
+            ))
+        }
+        ExecutionObservation::Unknown { reason } => {
+            let reason = require_observation_value("execution_unknown", "reason", reason)?;
+            Ok(PendingExecutionCommit::unknown(step, intent, reason))
+        }
+    }
+}
+
+fn classify_output_success(
+    started: &RunState,
+    step: &StepState,
+    intent: &EffectIntent,
+    output_required: bool,
+    evidence_digest: String,
+    output: ToolOutputCandidate,
+) -> Result<PendingExecutionCommit, RuntimeError> {
+    let evidence_digest =
+        require_observation_value("execution_succeeded", "evidence_digest", evidence_digest)?;
+    let execution_attempt = started
+        .steps
+        .get(&step.step_id)
+        .map(|step| step.attempts)
+        .ok_or_else(|| RuntimeError::StepNotFound(step.step_id.clone()))?;
+    if !output_required {
+        return Ok(PendingExecutionCommit::unknown(
+            step,
+            intent,
+            "adapter returned an unexpected tool output",
+        ));
+    }
+    match ToolOutputRecord::new(
+        &started.run_id,
+        &step.step_id,
+        intent,
+        execution_attempt,
+        &evidence_digest,
+        output.into_value(),
+    ) {
+        Ok(record) => Ok(PendingExecutionCommit::succeeded(
+            step,
+            intent,
+            evidence_digest,
+            Some(record),
+        )),
+        Err(_) => Ok(PendingExecutionCommit::unknown(
+            step,
+            intent,
+            "adapter tool output is invalid",
+        )),
     }
 }
 

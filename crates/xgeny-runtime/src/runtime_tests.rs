@@ -296,6 +296,7 @@ fn effect_intent(state: &RunState, guarantee: SinkGuarantee) -> EffectIntent {
     };
     let provenance = ReceiptProvenance {
         profile_version: CORE_RECEIPT_PROFILE_V1.to_owned(),
+        tool_output_profile: None,
         invocation_id: "invocation-runtime-test".to_owned(),
         plan_id: "plan-runtime-test".to_owned(),
         policy_decision_id: "decision-runtime-test".to_owned(),

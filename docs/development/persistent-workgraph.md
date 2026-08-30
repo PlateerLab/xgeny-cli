@@ -85,11 +85,11 @@ Action 순서는 `Executing recovery → EffectUnknown → Reconciling → Valid
 
 `all_steps_receipt_completed()`는 현재 graph의 모든 Step이 Receipt-bound completion인지 확인할 뿐 사용자 goal이나 Run의 완료를 선언하지 않는다.
 
-## SQLite schema 5 dependency fence와 current schema 6
+## SQLite schema 5 dependency fence와 current schema 7
 
 새 table이나 column은 없다. Dependency는 event와 projection JSON에 이미 포함된다. Schema bump는 schema 4 binary가 새 dependency를 모른 채 child를 독립 실행하는 downgrade를 막기 위한 의미 fence다.
 
-Schema 5는 이 dependency 의미를 도입한 역사적 fence다. ADR-0015의 current schema 6은 같은 `BEGIN IMMEDIATE` 안에서 기존 event JSON/index, projection, effect intent, authorization, invocation material과 Receipt 전체를 감사하고 빈 `planned_invocations` table을 추가한다. Schema 3/4/5는 기존 durable blob을 다시 쓰지 않고 바로 6으로 수렴하며, 감사나 commit이 실패하면 원래 version과 모든 row가 그대로 남는다.
+Schema 5는 이 dependency 의미를 도입한 역사적 fence다. ADR-0015의 schema 6은 `planned_invocations` table을 추가했고, ADR-0019의 current schema 7은 event-anchored `tool_outputs` table을 추가한다. Schema 3/4/5/6은 같은 `BEGIN IMMEDIATE` 안에서 해당 legacy topology를 전부 감사하고 기존 durable blob을 다시 쓰지 않은 채 7로 수렴한다. 감사나 commit이 실패하면 원래 version과 모든 row가 그대로 남는다.
 
 ## 검증 명령
 

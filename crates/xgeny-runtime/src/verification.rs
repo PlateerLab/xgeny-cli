@@ -19,8 +19,8 @@ use xgeny_protocol::{
 };
 use xgeny_workgraph::{
     EffectIntent, ReceiptPlacement, ReceiptProvenance, ReceiptVerificationStrategy, RunEvent,
-    RunEventBody, RunState, StepState, StepStatus, VerificationDisposition,
-    receipt_provenance_digest,
+    RunEventBody, RunState, StepState, StepStatus, TOOL_OUTPUT_PROFILE_V1, ToolOutputRecord,
+    VerificationDisposition, receipt_provenance_digest,
 };
 
 use crate::admission::{AdmissionError, definition_contract_digest, executable_binding_digest};
@@ -324,6 +324,7 @@ pub struct VerificationRequest<'a> {
     definition: &'a CapabilityDefinitionBody,
     instance: &'a CapabilityInstanceBody,
     outcome_evidence_digest: &'a AdapterEvidenceDigest,
+    tool_output: Option<&'a ToolOutputRecord>,
 }
 
 impl VerificationRequest<'_> {
@@ -345,6 +346,11 @@ impl VerificationRequest<'_> {
     #[must_use]
     pub const fn outcome_evidence_digest(&self) -> &AdapterEvidenceDigest {
         self.outcome_evidence_digest
+    }
+
+    #[must_use]
+    pub const fn tool_output(&self) -> Option<&ToolOutputRecord> {
+        self.tool_output
     }
 }
 
@@ -502,7 +508,7 @@ impl VerificationRunner {
                 actual: step.status,
             });
         }
-        let verified = verify_step(step, capabilities, verifiers)?;
+        let verified = verify_step(step, snapshot.tool_output.as_ref(), capabilities, verifiers)?;
         let metadata = events.create_metadata(&snapshot.state)?;
         metadata.validate()?;
         let started_at = snapshot.effect_started_at.ok_or_else(|| {
@@ -559,6 +565,7 @@ struct VerifiedStep {
 
 fn verify_step(
     step: &StepState,
+    tool_output: Option<&ToolOutputRecord>,
     capabilities: &CapabilityRegistry,
     verifiers: &mut EffectVerifierRegistry,
 ) -> Result<VerifiedStep, VerificationRunnerError> {
@@ -585,6 +592,17 @@ fn verify_step(
     );
     if !profile_matches_effect {
         return Err(VerificationRunnerError::UnsupportedReceiptProfile);
+    }
+    let output_profile_matches_effect = match intent.effect_class {
+        xgeny_workgraph::EffectClass::ReadOnly => {
+            provenance.tool_output_profile.as_deref() == Some(TOOL_OUTPUT_PROFILE_V1)
+        }
+        xgeny_workgraph::EffectClass::Reversible
+        | xgeny_workgraph::EffectClass::Idempotent
+        | xgeny_workgraph::EffectClass::NonIdempotent => provenance.tool_output_profile.is_none(),
+    };
+    if !output_profile_matches_effect {
+        return Err(VerificationRunnerError::UnsupportedToolOutputProfile);
     }
     if provenance.input_summary != CORE_RECEIPT_INPUT_SUMMARY_V1 {
         return Err(VerificationRunnerError::ReceiptProvenanceBindingMismatch);
@@ -623,8 +641,18 @@ fn verify_step(
         definition,
         instance,
         outcome_evidence_digest: &evidence,
+        tool_output,
     })?;
     verify_report_profile(intent, provenance, &report)?;
+    match (provenance.tool_output_profile.as_deref(), tool_output) {
+        (Some(TOOL_OUTPUT_PROFILE_V1), Some(output))
+            if report.output_digest().as_str() == output.output_digest() => {}
+        (Some(TOOL_OUTPUT_PROFILE_V1), _) => {
+            return Err(VerificationRunnerError::ToolOutputMismatch);
+        }
+        (None, None) => {}
+        _ => return Err(VerificationRunnerError::ToolOutputMismatch),
+    }
     let (outcome, verification) = verify_report(provenance, &report)?;
     let disposition = match outcome {
         CoreVerificationOutcome::Passed => VerificationDisposition::Passed,
@@ -913,6 +941,8 @@ pub enum VerificationRunnerError {
     ReceiptProvenanceMissing { effect_id: String },
     #[error("the durable Receipt profile is unsupported")]
     UnsupportedReceiptProfile,
+    #[error("the durable tool-output profile is unsupported for this effect")]
+    UnsupportedToolOutputProfile,
     #[error("durable Receipt provenance does not match its authorization binding")]
     ReceiptProvenanceBindingMismatch,
     #[error("effect `{effect_id}` has no durable adapter evidence")]
@@ -936,6 +966,8 @@ pub enum VerificationRunnerError {
     VerificationPlanChanged,
     #[error("the verifier report does not cover the durable plan exactly")]
     VerificationReportMismatch,
+    #[error("the verifier output digest differs from the durable tool output")]
+    ToolOutputMismatch,
     #[error("effect `{effect_id}` has no durable execution start timestamp")]
     EffectStartMissing { effect_id: String },
     #[error("lease is for Run `{lease_run_id}`, but durable state is `{state_run_id}`")]

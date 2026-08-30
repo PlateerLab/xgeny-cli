@@ -2752,6 +2752,7 @@ mod tests {
             attempts: 0,
             intent: None,
             effect_evidence_digest: None,
+            output_record_digest: None,
             execution_receipt_id: released.then(|| "receipt-released".to_owned()),
             execution_receipt_digest: released.then(|| format!("sha256:{}", "b".repeat(64))),
             uncertainty_reason: None,

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use jsonschema::Draft;
 use serde_json::Value;
 use thiserror::Error;
 use xgeny_domain::{
@@ -12,14 +13,15 @@ use xgeny_protocol::{
 };
 use xgeny_workgraph::{
     EffectIntent, InvocationMaterialError, InvocationMaterialRecord, ReceiptPlacement, RunState,
-    SinkGuarantee, StepStatus, invocation_material_digest, receipt_provenance_digest,
+    SinkGuarantee, StepStatus, TOOL_OUTPUT_PROFILE_V1, invocation_material_digest,
+    receipt_provenance_digest, validate_tool_output_candidate,
 };
 
 use crate::admission::{AdmissionError, definition_contract_digest, executable_binding_digest};
 use crate::material::InvocationMaterial;
 use crate::runtime::{
     DurableEffectRuntime, EffectSink, ExecutionObservation, PreparedEffect, PreparedEffectBinding,
-    ReconciliationObservation, RuntimeError,
+    ReconciliationObservation, RuntimeError, ToolOutputCandidate,
 };
 use crate::verification::receipt_verification_plan_matches;
 use crate::{
@@ -141,6 +143,27 @@ impl fmt::Debug for AdapterEvidenceDigest {
 #[error("adapter evidence digest is not canonical SHA-256")]
 pub struct AdapterEvidenceDigestError;
 
+/// Raw typed JSON returned by an adapter without granting it durable identity authority.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AdapterToolOutput(Value);
+
+impl AdapterToolOutput {
+    #[must_use]
+    pub const fn new(value: Value) -> Self {
+        Self(value)
+    }
+
+    fn into_value(self) -> Value {
+        self.0
+    }
+}
+
+impl fmt::Debug for AdapterToolOutput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AdapterToolOutput(<redacted>)")
+    }
+}
+
 /// Fixed, non-sensitive failure classes for side-effect-free adapter preparation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdapterPrepareFailure {
@@ -172,6 +195,10 @@ impl AdapterExecutionUnknownReason {
 pub enum AdapterExecutionObservation {
     Succeeded {
         evidence_digest: AdapterEvidenceDigest,
+    },
+    SucceededWithOutput {
+        evidence_digest: AdapterEvidenceDigest,
+        output: AdapterToolOutput,
     },
     Failed {
         evidence_digest: AdapterEvidenceDigest,
@@ -400,6 +427,7 @@ impl fmt::Debug for CorePreparedEffect {
 struct DirectSink<'a> {
     adapter: Option<&'a mut dyn EffectAdapter>,
     reconciliation_instance: Option<CapabilityInstanceBody>,
+    output_validator: Option<jsonschema::Validator>,
 }
 
 impl EffectSink for DirectSink<'_> {
@@ -412,8 +440,39 @@ impl EffectSink for DirectSink<'_> {
     ) -> ExecutionObservation {
         match prepared.invocation.execute() {
             AdapterExecutionObservation::Succeeded { evidence_digest } => {
-                ExecutionObservation::Succeeded {
-                    evidence_digest: evidence_digest.into_string(),
+                if self.output_validator.is_some() {
+                    ExecutionObservation::Unknown {
+                        reason: AdapterExecutionUnknownReason::ResponseUnverifiable
+                            .code()
+                            .to_owned(),
+                    }
+                } else {
+                    ExecutionObservation::Succeeded {
+                        evidence_digest: evidence_digest.into_string(),
+                    }
+                }
+            }
+            AdapterExecutionObservation::SucceededWithOutput {
+                evidence_digest,
+                output,
+            } => {
+                let output = output.into_value();
+                if validate_tool_output_candidate(&output).is_ok()
+                    && self
+                        .output_validator
+                        .as_ref()
+                        .is_some_and(|validator| validator.is_valid(&output))
+                {
+                    ExecutionObservation::SucceededWithOutput {
+                        evidence_digest: evidence_digest.into_string(),
+                        output: ToolOutputCandidate::new(output),
+                    }
+                } else {
+                    ExecutionObservation::Unknown {
+                        reason: AdapterExecutionUnknownReason::ResponseUnverifiable
+                            .code()
+                            .to_owned(),
+                    }
                 }
             }
             AdapterExecutionObservation::Failed { evidence_digest } => {
@@ -508,9 +567,7 @@ impl DirectExecutor {
         F: EventFactory,
         L: RunLease,
     {
-        let state = store
-            .load_current()?
-            .ok_or(DirectExecutorError::RunNotInitialized)?;
+        let state = require_current_state(store)?;
         verify_lease(lease, &state)?;
         let step = state
             .steps
@@ -540,6 +597,7 @@ impl DirectExecutor {
                 verify_material(store, &state, step_id, intent, record, arguments)?;
                 let instance = verify_current_instance(capabilities, intent)?;
                 verify_dynamic_execution_gate(instance)?;
+                let output_validator = build_tool_output_validator(capabilities, intent)?;
                 let adapter_key = AdapterBindingKey::from_binding(&instance.binding)?;
                 let adapter = adapters.adapter_mut(&adapter_key).ok_or_else(|| {
                     DirectExecutorError::AdapterNotRegistered {
@@ -566,6 +624,7 @@ impl DirectExecutor {
                 let mut sink = DirectSink {
                     adapter: None,
                     reconciliation_instance: None,
+                    output_validator,
                 };
                 DurableEffectRuntime::new(store, &mut sink, events, lease)
                     .with_policy(self.policy)
@@ -592,6 +651,7 @@ impl DirectExecutor {
                 let mut sink = DirectSink {
                     adapter: Some(adapter),
                     reconciliation_instance: Some(instance),
+                    output_validator: None,
                 };
                 DurableEffectRuntime::new(store, &mut sink, events, lease)
                     .with_policy(self.policy)
@@ -616,6 +676,12 @@ impl Default for DirectExecutor {
     }
 }
 
+fn require_current_state<S: RunStore>(store: &S) -> Result<RunState, DirectExecutorError> {
+    store
+        .load_current()?
+        .ok_or(DirectExecutorError::RunNotInitialized)
+}
+
 fn drive_without_adapter<S, F, L>(
     policy: RuntimePolicy,
     store: &mut S,
@@ -631,6 +697,7 @@ where
     let mut sink = DirectSink {
         adapter: None,
         reconciliation_instance: None,
+        output_validator: None,
     };
     DurableEffectRuntime::new(store, &mut sink, events, lease)
         .with_policy(policy)
@@ -739,6 +806,17 @@ fn verify_receipt_provenance(intent: &EffectIntent) -> Result<(), DirectExecutor
     if !profile_matches_effect {
         return Err(DirectExecutorError::UnsupportedReceiptProfile);
     }
+    let output_profile_matches_effect = match intent.effect_class {
+        xgeny_workgraph::EffectClass::ReadOnly => {
+            provenance.tool_output_profile.as_deref() == Some(TOOL_OUTPUT_PROFILE_V1)
+        }
+        xgeny_workgraph::EffectClass::Reversible
+        | xgeny_workgraph::EffectClass::Idempotent
+        | xgeny_workgraph::EffectClass::NonIdempotent => provenance.tool_output_profile.is_none(),
+    };
+    if !output_profile_matches_effect {
+        return Err(DirectExecutorError::UnsupportedToolOutputProfile);
+    }
     if provenance.input_summary != CORE_RECEIPT_INPUT_SUMMARY_V1 {
         return Err(DirectExecutorError::ReceiptProvenanceBindingMismatch);
     }
@@ -760,6 +838,35 @@ fn verify_receipt_provenance(intent: &EffectIntent) -> Result<(), DirectExecutor
         return Err(DirectExecutorError::ReceiptProvenanceBindingMismatch);
     }
     Ok(())
+}
+
+fn build_tool_output_validator(
+    registry: &CapabilityRegistry,
+    intent: &EffectIntent,
+) -> Result<Option<jsonschema::Validator>, DirectExecutorError> {
+    let Some(provenance) = intent.receipt_provenance.as_ref() else {
+        return Ok(None);
+    };
+    if provenance.tool_output_profile.as_deref() != Some(TOOL_OUTPUT_PROFILE_V1) {
+        return Ok(None);
+    }
+    let capability = CapabilityRef {
+        capability_id: intent.invocation.capability_id.clone(),
+        contract_version: intent.invocation.contract_version.clone(),
+    };
+    let definition = registry.definition(&capability).ok_or_else(|| {
+        DirectExecutorError::DefinitionNotFound {
+            capability_id: capability.capability_id.clone(),
+            contract_version: capability.contract_version.clone(),
+        }
+    })?;
+    let validator = jsonschema::options()
+        .with_draft(Draft::Draft202012)
+        .offline()
+        .should_validate_formats(true)
+        .build(&definition.spec.output_schema)
+        .map_err(|_| DirectExecutorError::ToolOutputSchemaInvalid)?;
+    Ok(Some(validator))
 }
 
 fn verify_lease<L: RunLease>(lease: &L, state: &RunState) -> Result<(), DirectExecutorError> {
@@ -809,6 +916,10 @@ pub enum DirectExecutorError {
     ReceiptProvenanceUnavailable { effect_id: String },
     #[error("the durable Receipt profile is unsupported")]
     UnsupportedReceiptProfile,
+    #[error("the durable tool-output profile is unsupported")]
+    UnsupportedToolOutputProfile,
+    #[error("the committed Capability output schema is invalid")]
+    ToolOutputSchemaInvalid,
     #[error("durable Receipt provenance does not match its authorization binding")]
     ReceiptProvenanceBindingMismatch,
     #[error("the durable Receipt verification plan differs from the current Definition")]

@@ -799,6 +799,7 @@ fn manual_step(step_id: &str, status: StepStatus, attempts: u32) -> StepState {
         attempts,
         intent: None,
         effect_evidence_digest: None,
+        output_record_digest: None,
         execution_receipt_id: completed.then(|| format!("receipt-{step_id}")),
         execution_receipt_digest: completed.then(|| format!("sha256:{}", "c".repeat(64))),
         uncertainty_reason: None,

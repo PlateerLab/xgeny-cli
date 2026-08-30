@@ -1,12 +1,15 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::fs;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 
+use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tempfile::{TempDir, tempdir};
 use xgeny_domain::{
     Architecture, AuthState, CapabilityDefinitionBody, CapabilityInstanceBody, CapabilityRef,
@@ -19,25 +22,28 @@ use xgeny_local_store::{
     SqliteRunStore, StoreError,
 };
 use xgeny_policy::{
-    PolicyAllowance, PolicyContribution, PolicyInputs, ResolvedPermissionRequest,
-    ResourceResolutionFailure, ResourceResolver,
+    PermissionRequestResolver, PolicyAllowance, PolicyContribution, PolicyInputs,
+    ResolvedPermissionRequest, ResourceResolutionFailure, ResourceResolver,
 };
 use xgeny_runtime::{
     AdapterEvidenceDigest, AdapterExecutionObservation, AdapterPrepareFailure,
     AdapterPrepareRequest, AdapterReconcileRequest, AdapterReconciliationInconclusiveReason,
-    AdapterReconciliationObservation, AdapterRegistryError, AdmissionOutcome, AdmissionRequest,
-    CapabilityRegistry, DirectExecutor, DirectExecutorError, DriveAction, EffectAdapter,
-    EffectAdapterRegistry, EffectVerifier, EffectVerifierRegistry, EventFactory, EventFactoryError,
-    EventMetadata, InvocationAdmission, InvocationMaterial, InvocationMaterialProvider,
-    InvocationMaterialRecovery, LocalRunLease, MaterialProviderFailure, MaterialProviderRegistry,
-    MaterialProviderRegistryError, PreparedAdapterInvocation, RequiredRouteFeatures, RouteRequest,
-    RuleVerificationObservation, RuntimePolicy, VerificationPortFailure, VerificationRegistryError,
-    VerificationReport, VerificationRequest, VerificationRunner, VerifierOutputDigest,
+    AdapterReconciliationObservation, AdapterRegistryError, AdapterToolOutput, AdmissionOutcome,
+    AdmissionRequest, CapabilityRegistry, DirectExecutor, DirectExecutorError, DriveAction,
+    EffectAdapter, EffectAdapterRegistry, EffectVerifier, EffectVerifierRegistry, EventFactory,
+    EventFactoryError, EventMetadata, InvocationAdmission, InvocationMaterial,
+    InvocationMaterialProvider, InvocationMaterialRecovery, LocalRunLease, MaterialProviderFailure,
+    MaterialProviderRegistry, MaterialProviderRegistryError, PreparedAdapterInvocation,
+    RequiredRouteFeatures, RouteRequest, RuleVerificationObservation, RuntimePolicy,
+    VerificationPortFailure, VerificationRegistryError, VerificationReport, VerificationRequest,
+    VerificationRunner, VerifierOutputDigest,
 };
 use xgeny_workgraph::{
-    EventRecord, InvocationMaterialRecord, InvocationMaterialRetention,
-    ReconstructableMaterialReference, RunEvent, RunEventBody, RunState, SinkGuarantee, StepStatus,
-    apply_record, authorization_digest, receipt_provenance_digest,
+    AcceptedPlanStep, AgentLoopBudget, EventRecord, ExpectedPlanningTurn, InvocationMaterialRecord,
+    InvocationMaterialRetention, PlannedExecutionProfile, PlannedInvocationMaterialRecord,
+    PlannedInvocationSpec, ReconstructableMaterialReference, RunEvent, RunEventBody, RunState,
+    SinkGuarantee, StepStatus, ToolOutputRecord, apply_record, authorization_digest,
+    invocation_material_digest, receipt_provenance_digest,
 };
 
 const RUN_ID: &str = "run-direct-1";
@@ -161,6 +167,23 @@ impl RunStore for RecordingStore {
         self.inner.load()
     }
 
+    fn append_with_plan_inputs(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        inputs: Vec<PlannedInvocationMaterialRecord>,
+    ) -> Result<Commit, StoreError> {
+        self.record(&event.body)?;
+        self.inner.append_with_plan_inputs(expected, event, inputs)
+    }
+
+    fn load_planned_invocation(
+        &self,
+        step_id: &str,
+    ) -> Result<Option<PlannedInvocationMaterialRecord>, StoreError> {
+        self.inner.load_planned_invocation(step_id)
+    }
+
     fn append_with_invocation_material(
         &mut self,
         expected: ExpectedHead,
@@ -200,14 +223,40 @@ impl RunStore for RecordingStore {
         Ok(commit)
     }
 
+    fn append_with_tool_output(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        output: ToolOutputRecord,
+    ) -> Result<Commit, StoreError> {
+        self.record(&event.body)?;
+        self.inner.append_with_tool_output(expected, event, output)
+    }
+
     fn load_execution_receipts(
         &self,
     ) -> Result<Vec<xgeny_domain::ExecutionReceiptBody>, StoreError> {
         self.inner.load_execution_receipts()
     }
+
+    fn load_tool_output(&self, effect_id: &str) -> Result<Option<ToolOutputRecord>, StoreError> {
+        self.inner.load_tool_output(effect_id)
+    }
+
+    fn load_verification_snapshot(
+        &self,
+        step_id: &str,
+    ) -> Result<Option<RunVerificationSnapshot>, StoreError> {
+        self.inner.load_verification_snapshot(step_id)
+    }
 }
 
 struct LostReceiptAckStore<S> {
+    inner: S,
+    lose_once: bool,
+}
+
+struct LostOutputAckStore<S> {
     inner: S,
     lose_once: bool,
 }
@@ -324,6 +373,98 @@ impl<S: RunStore> RunStore for LostReceiptAckStore<S> {
         &self,
     ) -> Result<Vec<xgeny_domain::ExecutionReceiptBody>, StoreError> {
         self.inner.load_execution_receipts()
+    }
+}
+
+impl<S: RunStore> RunStore for LostOutputAckStore<S> {
+    fn append(&mut self, expected: ExpectedHead, event: RunEvent) -> Result<Commit, StoreError> {
+        self.inner.append(expected, event)
+    }
+
+    fn load(&self) -> Result<Option<RunSnapshot>, StoreError> {
+        self.inner.load()
+    }
+
+    fn load_current(&self) -> Result<Option<RunState>, StoreError> {
+        self.inner.load_current()
+    }
+
+    fn append_with_plan_inputs(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        inputs: Vec<PlannedInvocationMaterialRecord>,
+    ) -> Result<Commit, StoreError> {
+        self.inner.append_with_plan_inputs(expected, event, inputs)
+    }
+
+    fn load_planned_invocation(
+        &self,
+        step_id: &str,
+    ) -> Result<Option<PlannedInvocationMaterialRecord>, StoreError> {
+        self.inner.load_planned_invocation(step_id)
+    }
+
+    fn append_with_invocation_material(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        material: InvocationMaterialRecord,
+    ) -> Result<Commit, StoreError> {
+        self.inner
+            .append_with_invocation_material(expected, event, material)
+    }
+
+    fn load_invocation_material(
+        &self,
+        effect_id: &str,
+    ) -> Result<Option<InvocationMaterialRecord>, StoreError> {
+        self.inner.load_invocation_material(effect_id)
+    }
+
+    fn append_with_tool_output(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        output: ToolOutputRecord,
+    ) -> Result<Commit, StoreError> {
+        let commit = self
+            .inner
+            .append_with_tool_output(expected, event, output)?;
+        if self.lose_once {
+            self.lose_once = false;
+            return Err(StoreError::InjectedFault(
+                "lost SQLite tool-output commit acknowledgement",
+            ));
+        }
+        Ok(commit)
+    }
+
+    fn load_tool_output(&self, effect_id: &str) -> Result<Option<ToolOutputRecord>, StoreError> {
+        self.inner.load_tool_output(effect_id)
+    }
+
+    fn append_with_execution_receipt(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        receipt: xgeny_domain::ExecutionReceiptBody,
+    ) -> Result<Commit, StoreError> {
+        self.inner
+            .append_with_execution_receipt(expected, event, receipt)
+    }
+
+    fn load_execution_receipts(
+        &self,
+    ) -> Result<Vec<xgeny_domain::ExecutionReceiptBody>, StoreError> {
+        self.inner.load_execution_receipts()
+    }
+
+    fn load_verification_snapshot(
+        &self,
+        step_id: &str,
+    ) -> Result<Option<RunVerificationSnapshot>, StoreError> {
+        self.inner.load_verification_snapshot(step_id)
     }
 }
 
@@ -668,6 +809,38 @@ fn definition_fixture() -> CapabilityDefinitionBody {
     *definition
 }
 
+fn read_only_definition_fixture() -> CapabilityDefinitionBody {
+    let document: ProtocolDocument = serde_json::from_str(include_str!(
+        "../../../protocol/fixtures/v1alpha1/valid/capability-definition.fs-read-text.json"
+    ))
+    .expect("definition fixture should deserialize");
+    let ProtocolDocument::CapabilityDefinition(mut definition) = document else {
+        panic!("expected CapabilityDefinition fixture")
+    };
+    definition.spec.input_schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["path", "marker"],
+        "properties": {
+            "path": {"type": "string", "minLength": 1},
+            "marker": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false
+    });
+    definition.spec.output_schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["content"],
+        "properties": {
+            "content": {"type": "string"}
+        },
+        "additionalProperties": false
+    });
+    definition.spec.execution.idempotency_key_supported = false;
+    assert_eq!(definition.spec.effect.class, EffectClass::ReadOnly);
+    *definition
+}
+
 fn capability(definition: &CapabilityDefinitionBody) -> CapabilityRef {
     CapabilityRef {
         capability_id: definition.metadata.id.clone(),
@@ -715,7 +888,7 @@ fn route_request(definition: &CapabilityDefinitionBody) -> RouteRequest {
         required_features: RequiredRouteFeatures {
             execution_style: ExecutionStyle::Sync,
             cancellation: false,
-            idempotency_key: true,
+            idempotency_key: definition.spec.execution.idempotency_key_supported,
             idempotency_query: false,
         },
         allowed_trust_levels: vec![TrustLevel::Verified],
@@ -733,6 +906,194 @@ fn arguments() -> Value {
 
 fn canonical_arguments() -> Value {
     json!({"path": CANONICAL_PATH, "marker": SECRET_SENTINEL})
+}
+
+fn canonical_digest(value: &impl Serialize) -> String {
+    let bytes = serde_jcs::to_vec(value).expect("test digest input should canonicalize");
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    format!("sha256:{encoded}")
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TestDefinitionContractDigestInput<'a> {
+    domain: &'static str,
+    capability_id: &'a str,
+    contract_version: &'a str,
+    spec: &'a xgeny_domain::CapabilitySpec,
+    required_extensions: &'a [String],
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TestCanonicalResourceDigestInput<'a> {
+    scope: &'a str,
+    resource: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TestSemanticActionDigestInput<'a> {
+    domain: &'static str,
+    capability: &'a CapabilityRef,
+    definition_digest: &'a str,
+    effect_class: EffectClass,
+    arguments: &'a Value,
+    resources: Vec<TestCanonicalResourceDigestInput<'a>>,
+}
+
+fn planned_read_only_facts(definition: &CapabilityDefinitionBody) -> (String, String, String) {
+    let capability = capability(definition);
+    let definition_digest = canonical_digest(&TestDefinitionContractDigestInput {
+        domain: "xgeny.capability-contract/v1",
+        capability_id: &definition.metadata.id,
+        contract_version: &definition.metadata.contract_version,
+        spec: &definition.spec,
+        required_extensions: &definition.required_extensions,
+    });
+    let resolved = PermissionRequestResolver::new(CanonicalResolver)
+        .resolve_invocation(
+            "permission-planned-read-only",
+            RUN_ID,
+            STEP_ID,
+            definition,
+            &arguments(),
+            GrantLifetime::Once,
+        )
+        .expect("planned read-only request should resolve");
+    let resources = resolved
+        .permission_request()
+        .resources()
+        .iter()
+        .map(|resource| TestCanonicalResourceDigestInput {
+            scope: resource.scope(),
+            resource: resource.canonical_resource(),
+        })
+        .collect();
+    let action_digest = canonical_digest(&TestSemanticActionDigestInput {
+        domain: "xgeny.semantic-action/v1",
+        capability: &capability,
+        definition_digest: &definition_digest,
+        effect_class: definition.spec.effect.class,
+        arguments: resolved.normalized_arguments(),
+        resources,
+    });
+    let material_digest = invocation_material_digest(resolved.normalized_arguments())
+        .expect("planned material should canonicalize");
+    (definition_digest, action_digest, material_digest)
+}
+
+fn seed_planned_read_only<S: RunStore>(store: &mut S, definition: &CapabilityDefinitionBody) {
+    let created = store
+        .append(
+            ExpectedHead::Empty,
+            RunEvent {
+                event_id: "seed-planned-read-only-run".to_owned(),
+                run_id: RUN_ID.to_owned(),
+                authority: AUTHORITY.to_owned(),
+                authority_epoch: AUTHORITY_EPOCH,
+                recorded_at: "2026-08-29T15:00:00Z".to_owned(),
+                body: RunEventBody::RunCreated {
+                    goal: "read one planned local value".to_owned(),
+                },
+            },
+        )
+        .expect("Run should seed");
+    let configured = store
+        .append(
+            ExpectedHead::from_state(&created.state),
+            RunEvent {
+                event_id: "seed-planned-read-only-loop".to_owned(),
+                run_id: RUN_ID.to_owned(),
+                authority: AUTHORITY.to_owned(),
+                authority_epoch: AUTHORITY_EPOCH,
+                recorded_at: "2026-08-29T15:00:00Z".to_owned(),
+                body: RunEventBody::AgentLoopConfigured {
+                    budget: AgentLoopBudget::new(2, 2, 1, 16_384)
+                        .expect("planning budget should validate"),
+                },
+            },
+        )
+        .expect("agent loop should configure");
+    let proposal_digest = format!("sha256:{}", "b".repeat(64));
+    let (definition_digest, action_digest, material_digest) = planned_read_only_facts(definition);
+    let spec = PlannedInvocationSpec::new(
+        definition.metadata.id.clone(),
+        definition.metadata.contract_version.clone(),
+        definition_digest,
+        action_digest,
+        material_digest,
+        PlannedExecutionProfile::LocalSyncReadOnlyV1,
+        "linux",
+        "x86_64",
+    )
+    .expect("planned invocation should validate");
+    let reference = ReconstructableMaterialReference::new("run-recipe", "recipe-1", "rev-1")
+        .expect("planned recipe should validate");
+    let (binding, input) =
+        PlannedInvocationMaterialRecord::bind(RUN_ID, STEP_ID, &proposal_digest, spec, reference)
+            .expect("planned input should bind");
+    store
+        .append_with_plan_inputs(
+            ExpectedHead::from_state(&configured.state),
+            RunEvent {
+                event_id: "seed-planned-read-only-accepted".to_owned(),
+                run_id: RUN_ID.to_owned(),
+                authority: AUTHORITY.to_owned(),
+                authority_epoch: AUTHORITY_EPOCH,
+                recorded_at: "2026-08-29T15:00:00Z".to_owned(),
+                body: RunEventBody::PlanAccepted {
+                    decision: ExpectedPlanningTurn::new(
+                        1,
+                        format!("sha256:{}", "d".repeat(64)),
+                        proposal_digest,
+                    )
+                    .expect("planning turn should validate"),
+                    steps: vec![AcceptedPlanStep {
+                        step_id: STEP_ID.to_owned(),
+                        objective: "read one planned local value".to_owned(),
+                        depends_on: Vec::new(),
+                        invocation: binding,
+                    }],
+                },
+            },
+            vec![input],
+        )
+        .expect("planned read-only Step should commit");
+}
+
+fn admit_and_recover_planned_read_only<S: RunStore>(
+    store: &mut S,
+    lease: &LocalRunLease,
+    registry: &CapabilityRegistry,
+    definition: &CapabilityDefinitionBody,
+) -> InvocationMaterial {
+    let admitted = admit(store, lease, registry, definition, true);
+    drop(admitted);
+    let mut providers = MaterialProviderRegistry::new();
+    providers
+        .register(
+            "run-recipe",
+            FixedProvider {
+                calls: Rc::new(Cell::new(0)),
+                material: canonical_arguments(),
+            },
+        )
+        .expect("planned provider should register");
+    InvocationMaterialRecovery::new()
+        .recover(
+            store,
+            lease,
+            registry,
+            &CanonicalResolver,
+            &mut providers,
+            STEP_ID,
+        )
+        .expect("planned material should recover")
 }
 
 fn seed<S: RunStore>(store: &mut S) {
@@ -873,6 +1234,7 @@ fn legacy_replay_store(
     intent: &xgeny_workgraph::EffectIntent,
     material_digest: &str,
     validating: bool,
+    retention: InvocationMaterialRetention,
 ) -> LegacyReplayStore {
     let mut events = vec![
         RunEvent {
@@ -932,6 +1294,7 @@ fn legacy_replay_store(
                     step_id: STEP_ID.to_owned(),
                     effect_id: intent.effect_id.clone(),
                     evidence_digest: format!("sha256:{}", "a".repeat(64)),
+                    output_record_digest: None,
                 },
             },
         ]);
@@ -943,14 +1306,75 @@ fn legacy_replay_store(
         state = Some(apply_record(state.as_ref(), &record).expect("legacy event should replay"));
         records.push(record);
     }
-    let material = InvocationMaterialRecord::new(
-        RUN_ID,
-        STEP_ID,
-        intent,
-        material_digest,
-        InvocationMaterialRetention::Ephemeral,
-    )
-    .expect("legacy material should bind");
+    let material =
+        InvocationMaterialRecord::new(RUN_ID, STEP_ID, intent, material_digest, retention)
+            .expect("legacy material should bind");
+    LegacyReplayStore {
+        snapshot: RunSnapshot {
+            records,
+            state: state.expect("legacy Run should have state"),
+        },
+        material,
+    }
+}
+
+fn legacy_replay_from_snapshot(
+    snapshot: RunSnapshot,
+    intent: &xgeny_workgraph::EffectIntent,
+    material: InvocationMaterialRecord,
+    validating: bool,
+) -> LegacyReplayStore {
+    let mut events: Vec<_> = snapshot
+        .records
+        .into_iter()
+        .map(|record| {
+            let mut event = record.event;
+            if let RunEventBody::EffectIntentCommitted {
+                step_id,
+                intent: committed,
+            } = &mut event.body
+                && step_id == STEP_ID
+            {
+                **committed = intent.clone();
+            }
+            event
+        })
+        .collect();
+    if validating {
+        events.extend([
+            RunEvent {
+                event_id: "legacy-read-only-replay-started".to_owned(),
+                run_id: RUN_ID.to_owned(),
+                authority: AUTHORITY.to_owned(),
+                authority_epoch: AUTHORITY_EPOCH,
+                recorded_at: "2026-08-29T15:00:00Z".to_owned(),
+                body: RunEventBody::EffectExecutionStarted {
+                    step_id: STEP_ID.to_owned(),
+                    effect_id: intent.effect_id.clone(),
+                },
+            },
+            RunEvent {
+                event_id: "legacy-read-only-replay-succeeded".to_owned(),
+                run_id: RUN_ID.to_owned(),
+                authority: AUTHORITY.to_owned(),
+                authority_epoch: AUTHORITY_EPOCH,
+                recorded_at: "2026-08-29T15:00:00Z".to_owned(),
+                body: RunEventBody::EffectSucceeded {
+                    step_id: STEP_ID.to_owned(),
+                    effect_id: intent.effect_id.clone(),
+                    evidence_digest: format!("sha256:{}", "a".repeat(64)),
+                    output_record_digest: None,
+                },
+            },
+        ]);
+    }
+    let mut records = Vec::new();
+    let mut state = None;
+    for event in events {
+        let record = EventRecord::next(records.last(), event).expect("legacy event should record");
+        state = Some(apply_record(state.as_ref(), &record).expect("legacy event should replay"));
+        records.push(record);
+    }
     LegacyReplayStore {
         snapshot: RunSnapshot {
             records,
@@ -1164,6 +1588,176 @@ fn exact_adapter_executes_once_only_after_the_durable_start_marker() {
             .uses,
         1
     );
+}
+
+#[test]
+fn read_only_outputless_schema_mismatched_and_excessively_deep_results_fail_closed() {
+    let mut deeply_nested = json!(null);
+    for _ in 0..=xgeny_workgraph::MAX_TOOL_OUTPUT_DEPTH {
+        deeply_nested = json!([deeply_nested]);
+    }
+    let cases = [
+        (
+            "outputless",
+            AdapterExecutionObservation::Succeeded {
+                evidence_digest: digest('a'),
+            },
+        ),
+        (
+            "schema-mismatched",
+            AdapterExecutionObservation::SucceededWithOutput {
+                evidence_digest: digest('a'),
+                output: AdapterToolOutput::new(json!({"unexpected": true})),
+            },
+        ),
+        (
+            "excessively-deep",
+            AdapterExecutionObservation::SucceededWithOutput {
+                evidence_digest: digest('a'),
+                output: AdapterToolOutput::new(deeply_nested),
+            },
+        ),
+    ];
+
+    for (label, observation) in cases {
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let counters = Rc::new(AdapterCounters::default());
+        let mut store = RecordingStore::new(Rc::clone(&trace));
+        let definition = read_only_definition_fixture();
+        let instance = instance_fixture(&definition);
+        let registry = registry_with(&definition, instance.clone());
+        seed_planned_read_only(&mut store, &definition);
+        let (_lease_directory, lease) = acquire_lease();
+        let material =
+            admit_and_recover_planned_read_only(&mut store, &lease, &registry, &definition);
+        trace.borrow_mut().clear();
+        let mut adapter = FakeAdapter::succeeding(Rc::clone(&counters), Rc::clone(&trace));
+        adapter.executions = VecDeque::from([observation]);
+        let mut adapters = EffectAdapterRegistry::new();
+        register_fake(&mut adapters, &instance, adapter);
+        let mut events = DeterministicEvents;
+
+        let report = DirectExecutor::new()
+            .drive_step(
+                &mut store,
+                &mut events,
+                &lease,
+                &registry,
+                &mut adapters,
+                STEP_ID,
+                Some(&material),
+            )
+            .unwrap_or_else(|error| {
+                panic!("{label} result should become durable Unknown: {error}")
+            });
+
+        assert_eq!(report.action, DriveAction::EffectUnknown, "case: {label}");
+        assert_eq!(
+            report.state.steps[STEP_ID].status,
+            StepStatus::EffectUnknown,
+            "case: {label}"
+        );
+        assert_eq!(
+            report.state.steps[STEP_ID].uncertainty_reason.as_deref(),
+            Some("adapter_response_unverifiable"),
+            "case: {label}"
+        );
+        let effect_id = report.state.steps[STEP_ID]
+            .intent
+            .as_ref()
+            .expect("intent should remain")
+            .effect_id
+            .clone();
+        assert_eq!(
+            store
+                .load_tool_output(&effect_id)
+                .expect("output lookup should work"),
+            None,
+            "case: {label}"
+        );
+        assert_eq!(counters.prepares.get(), 1, "case: {label}");
+        assert_eq!(counters.executes.get(), 1, "case: {label}");
+    }
+}
+
+#[test]
+fn lost_tool_output_commit_ack_reopens_as_validating_without_duplicate_adapter_execution() {
+    let directory = tempdir().expect("temporary Run directory should exist");
+    let database = directory.path().join("run.db");
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let counters = Rc::new(AdapterCounters::default());
+    let definition = read_only_definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, instance.clone());
+    let (_lease_directory, lease) = acquire_lease();
+    let mut store = LostOutputAckStore {
+        inner: SqliteRunStore::open(&database).expect("SQLite should open"),
+        lose_once: true,
+    };
+    seed_planned_read_only(&mut store, &definition);
+    let material = admit_and_recover_planned_read_only(&mut store, &lease, &registry, &definition);
+    let mut adapter = FakeAdapter::succeeding(Rc::clone(&counters), Rc::clone(&trace));
+    adapter.executions = VecDeque::from([AdapterExecutionObservation::SucceededWithOutput {
+        evidence_digest: digest('a'),
+        output: AdapterToolOutput::new(json!({"content": "durable read result"})),
+    }]);
+    let mut adapters = EffectAdapterRegistry::new();
+    register_fake(&mut adapters, &instance, adapter);
+    let mut events = DeterministicEvents;
+
+    let first = DirectExecutor::new().drive_step(
+        &mut store,
+        &mut events,
+        &lease,
+        &registry,
+        &mut adapters,
+        STEP_ID,
+        Some(&material),
+    );
+    assert!(matches!(first, Err(DirectExecutorError::Runtime(_))));
+    assert_eq!(counters.prepares.get(), 1);
+    assert_eq!(counters.executes.get(), 1);
+    let state = store
+        .load_current()
+        .expect("committed state should load")
+        .expect("Run should exist");
+    assert_eq!(state.steps[STEP_ID].status, StepStatus::Validating);
+    let effect_id = state.steps[STEP_ID]
+        .intent
+        .as_ref()
+        .expect("intent should remain")
+        .effect_id
+        .clone();
+    assert!(
+        store
+            .load_tool_output(&effect_id)
+            .expect("committed output should load")
+            .is_some()
+    );
+    drop(store);
+
+    let mut reopened = SqliteRunStore::open(&database).expect("SQLite should cold-open");
+    assert!(
+        reopened
+            .load_tool_output(&effect_id)
+            .expect("cold output should verify")
+            .is_some()
+    );
+    let resumed = DirectExecutor::new()
+        .drive_step(
+            &mut reopened,
+            &mut events,
+            &lease,
+            &CapabilityRegistry::new(),
+            &mut EffectAdapterRegistry::new(),
+            STEP_ID,
+            None,
+        )
+        .expect("Validating should resume without an adapter");
+    assert_eq!(resumed.action, DriveAction::NoAction);
+    assert_eq!(resumed.state.steps[STEP_ID].status, StepStatus::Validating);
+    assert_eq!(counters.prepares.get(), 1);
+    assert_eq!(counters.executes.get(), 1);
 }
 
 #[test]
@@ -2131,7 +2725,12 @@ fn legacy_intent_without_receipt_provenance_cannot_start_after_upgrade() {
 
     let trace = Rc::new(RefCell::new(Vec::new()));
     let counters = Rc::new(AdapterCounters::default());
-    let mut store = legacy_replay_store(&legacy_intent, material.record().material_digest(), false);
+    let mut store = legacy_replay_store(
+        &legacy_intent,
+        material.record().material_digest(),
+        false,
+        InvocationMaterialRetention::Ephemeral,
+    );
     let mut adapters = EffectAdapterRegistry::new();
     register_fake(
         &mut adapters,
@@ -2541,7 +3140,12 @@ fn legacy_validating_step_stays_closed_without_invoking_a_verifier() {
     )
     .expect("legacy authorization should canonicalize");
 
-    let mut store = legacy_replay_store(&legacy_intent, material.record().material_digest(), true);
+    let mut store = legacy_replay_store(
+        &legacy_intent,
+        material.record().material_digest(),
+        true,
+        InvocationMaterialRetention::Ephemeral,
+    );
     assert_eq!(
         store.snapshot.state.steps[STEP_ID].status,
         StepStatus::Validating
@@ -2579,6 +3183,134 @@ fn legacy_validating_step_stays_closed_without_invoking_a_verifier() {
             .state
             .steps[STEP_ID]
             .status,
+        StepStatus::Validating
+    );
+}
+
+#[test]
+fn legacy_read_only_v2_pending_without_output_profile_never_prepares_or_executes() {
+    let definition = read_only_definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, instance.clone());
+    let (_lease_directory, lease) = acquire_lease();
+    let mut source = MemoryRunStore::new();
+    seed_planned_read_only(&mut source, &definition);
+    let admitted = admit(&mut source, &lease, &registry, &definition, true);
+    let source_snapshot = source.load().unwrap().unwrap();
+    let material = admitted.material_record().clone();
+    let mut legacy_intent = admitted.commit().state.steps[STEP_ID]
+        .intent
+        .as_ref()
+        .expect("planned admission should commit intent")
+        .clone();
+    let provenance = legacy_intent
+        .receipt_provenance
+        .as_mut()
+        .expect("ReadOnly intent should have Receipt provenance");
+    provenance.tool_output_profile = None;
+    legacy_intent
+        .authorization
+        .binding
+        .receipt_provenance_digest =
+        Some(receipt_provenance_digest(provenance).expect("provenance should canonicalize"));
+    legacy_intent.authorization.grant_digest = authorization_digest(
+        &legacy_intent.authorization.binding,
+        legacy_intent.authorization.max_uses,
+    )
+    .expect("legacy authorization should canonicalize");
+    let mut store = legacy_replay_from_snapshot(source_snapshot, &legacy_intent, material, false);
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let counters = Rc::new(AdapterCounters::default());
+    let mut adapters = EffectAdapterRegistry::new();
+    register_fake(
+        &mut adapters,
+        &instance,
+        FakeAdapter::succeeding(Rc::clone(&counters), trace),
+    );
+
+    let result = DirectExecutor::new().drive_step(
+        &mut store,
+        &mut DeterministicEvents,
+        &lease,
+        &registry,
+        &mut adapters,
+        STEP_ID,
+        None,
+    );
+
+    assert!(matches!(
+        result,
+        Err(DirectExecutorError::UnsupportedToolOutputProfile)
+    ));
+    assert_eq!(counters.prepares.get(), 0);
+    assert_eq!(counters.executes.get(), 0);
+    assert_eq!(
+        store.load().unwrap().unwrap().state.steps[STEP_ID].status,
+        StepStatus::IntentCommitted
+    );
+}
+
+#[test]
+fn legacy_read_only_v2_validating_without_output_profile_never_invokes_a_verifier() {
+    let definition = read_only_definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, instance.clone());
+    let (_lease_directory, lease) = acquire_lease();
+    let mut source = MemoryRunStore::new();
+    seed_planned_read_only(&mut source, &definition);
+    let admitted = admit(&mut source, &lease, &registry, &definition, true);
+    let source_snapshot = source.load().unwrap().unwrap();
+    let material = admitted.material_record().clone();
+    let mut legacy_intent = admitted.commit().state.steps[STEP_ID]
+        .intent
+        .as_ref()
+        .expect("planned admission should commit intent")
+        .clone();
+    let provenance = legacy_intent
+        .receipt_provenance
+        .as_mut()
+        .expect("ReadOnly intent should have Receipt provenance");
+    provenance.tool_output_profile = None;
+    legacy_intent
+        .authorization
+        .binding
+        .receipt_provenance_digest =
+        Some(receipt_provenance_digest(provenance).expect("provenance should canonicalize"));
+    legacy_intent.authorization.grant_digest = authorization_digest(
+        &legacy_intent.authorization.binding,
+        legacy_intent.authorization.max_uses,
+    )
+    .expect("legacy authorization should canonicalize");
+
+    let mut store = legacy_replay_from_snapshot(source_snapshot, &legacy_intent, material, true);
+    let verifier_calls = Rc::new(Cell::new(0));
+    let mut verifiers = EffectVerifierRegistry::new();
+    verifiers
+        .register(
+            &instance.binding,
+            PassingVerifier {
+                calls: Rc::clone(&verifier_calls),
+            },
+        )
+        .expect("exact verifier should register");
+
+    let result = VerificationRunner::new().drive_step(
+        &mut store,
+        &mut DeterministicEvents,
+        &lease,
+        &registry,
+        &mut verifiers,
+        STEP_ID,
+    );
+
+    assert!(matches!(
+        result,
+        Err(xgeny_runtime::VerificationRunnerError::UnsupportedToolOutputProfile)
+    ));
+    assert_eq!(verifier_calls.get(), 0);
+    assert!(store.load_execution_receipts().unwrap().is_empty());
+    assert_eq!(
+        store.load().unwrap().unwrap().state.steps[STEP_ID].status,
         StepStatus::Validating
     );
 }

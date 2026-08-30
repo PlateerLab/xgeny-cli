@@ -3,7 +3,7 @@
 - 기준일: 2026-08-29
 - 상태: ADR-0012 연구 gate용 기본형
 - 공개 protocol v0.1 변경: 없음
-- Receipt 도입 schema: 4; current local store schema: 6
+- Receipt 도입 schema: 4; current local store schema: 7
 
 ## 구현된 사용자 시나리오
 
@@ -94,7 +94,7 @@ Verifier 자체의 unavailable/unsupported/evidence-unavailable/unverifiable 오
 
 ## Receipt 생성과 판정
 
-Core는 admission provenance, durable intent, start event, verifier report와 event factory 시각으로 `ExecutionReceiptBody`를 만든다. 기존 `xgeny.core-receipt/v1`은 Artifact 0개 의미를 유지한다. ADR-0018의 ReadOnly intent는 `xgeny.core-receipt/v2`를 사용하고 verifier의 bounded artifact descriptor에 Core가 exact Run/Step/Receipt provenance를 붙인다. ID·summary·redaction·판정 함수와 v2 artifact bound는 `xgeny-protocol`의 한 구현을 runtime과 store가 공유한다. `receiptDigest`는 `kind: ExecutionReceipt`를 포함한 전체 protocol document에서 top-level `receiptDigest`만 제외해 RFC 8785 canonical JSON/SHA-256으로 계산한다.
+Core는 admission provenance, durable intent, start event, verifier report와 event factory 시각으로 `ExecutionReceiptBody`를 만든다. 기존 `xgeny.core-receipt/v1`은 Artifact 0개 의미를 유지한다. ADR-0018의 ReadOnly intent는 `xgeny.core-receipt/v2`를 사용하고 verifier의 bounded artifact descriptor에 Core가 exact Run/Step/Receipt provenance를 붙인다. ADR-0019의 output profile에서는 verifier report와 Receipt `outputDigest`가 같은-generation durable `ToolOutputRecord.outputDigest`와 정확히 같아야 하며, verifier는 외부 파일을 다시 여는 대신 이 bounded snapshot을 검증한다. ID·summary·redaction·판정 함수와 v2 artifact bound는 `xgeny-protocol`의 한 구현을 runtime과 store가 공유한다. `receiptDigest`는 `kind: ExecutionReceipt`를 포함한 전체 protocol document에서 top-level `receiptDigest`만 제외해 RFC 8785 canonical JSON/SHA-256으로 계산한다.
 
 ```text
 required failed                           -> failed / Failed
@@ -129,7 +129,7 @@ Admission은 Receipt가 참조하는 transient `PolicyDecisionBody`를 bundled s
 
 `RunStore::export_jsonl`은 기존 journal-only canonical stream이다. Complete Receipt는 `export_execution_receipts_jsonl`에서 `kind: ExecutionReceipt`를 포함한 protocol document로 chain 순서에 export한다. 현재 두 export는 하나의 atomic archive/import format이 아니며, SQLite built-in의 `load_with_execution_receipts`만 한 read transaction에서 Run과 Receipt chain을 읽는다. Runtime의 Receipt finalization은 전체 vector 대신 같은 verified generation에서 state, start 시각과 이전 Receipt digest만 반환하는 `load_verification_snapshot`을 사용한다.
 
-Schema 4에서 도입되어 current schema 6에도 유지되는 Receipt transaction은 다음 순서로 수행한다.
+Schema 4에서 도입되어 current schema 7에도 유지되는 Receipt transaction은 다음 순서로 수행한다.
 
 ```text
 BEGIN IMMEDIATE
@@ -147,7 +147,7 @@ Receipt insert 또는 projection write에서 실패하면 event를 포함한 전
 
 과거 journal event의 Rust 필드명은 evidence 의미로 정리했지만 serialized JSON key `receiptDigest`는 유지한다. Optional provenance와 execution Receipt projection field는 없는 경우 serialize하지 않아 schema 3 event의 canonical bytes와 digest를 바꾸지 않는다.
 
-Schema 3 open은 기존 journal과 sidecar를 검증한 뒤 빈 `execution_receipts`와 `planned_invocations` table을 원자적으로 추가하고 current schema 6으로 올린다. 과거 terminal event에 Receipt나 계획 입력을 조작해 backfill하지 않는다. 실제 provenance 없는 pending/Validating schema 3 fixture로 migration과 journal byte 보존을 검증한다. Legacy Run은 그대로 replay할 수 있지만 current store에서 provenance 없는 intent를 새 append하는 것은 금지한다. Schema 4/5도 full audit과 byte 보존 뒤 current schema 6으로 이동한다.
+Schema 3 open은 기존 journal과 sidecar를 검증한 뒤 빈 `execution_receipts`, `planned_invocations`, `tool_outputs` table을 원자적으로 추가하고 current schema 7로 올린다. 과거 terminal event에 Receipt, 계획 입력이나 output을 조작해 backfill하지 않는다. 실제 provenance 없는 pending/Validating schema 3 fixture로 migration과 journal byte 보존을 검증한다. Legacy Run은 그대로 replay할 수 있지만 current store에서 provenance 없는 intent를 새 append하는 것은 금지한다. Schema 4/5/6도 full audit과 byte 보존 뒤 current schema 7로 이동한다.
 
 Schema 3의 `IntentCommitted`, `EffectUnknown` 또는 `Reconciling` intent에는 provenance가 없으므로 자동 실행·reconciliation을 금지한다. Direct Executor는 material/adapter 접근과 Started event 전에 `ReceiptProvenanceUnavailable`로 닫는다. Schema 3의 `Validating`도 profile과 verification plan을 추측하지 않아 `ReceiptProvenanceMissing`으로 닫고 verifier 0회·상태 보존을 보장한다. 사용자가 legacy effect를 새 schema 4 의미로 재승인·대체하거나 종결하는 workflow는 후속 migration 정책이다.
 

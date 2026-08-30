@@ -78,6 +78,8 @@ pub enum RunEventBody {
         effect_id: String,
         #[serde(rename = "receiptDigest")]
         evidence_digest: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_record_digest: Option<String>,
     },
     EffectFailed {
         step_id: String,
@@ -169,6 +171,8 @@ pub struct EffectIntent {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReceiptProvenance {
     pub profile_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_output_profile: Option<String>,
     pub invocation_id: String,
     pub plan_id: String,
     pub policy_decision_id: String,
@@ -239,6 +243,500 @@ pub struct InvocationBinding {
     pub definition_digest: String,
     pub instance_id: String,
     pub instance_binding_digest: String,
+}
+
+/// Durable profile for bounded RFC 8785 canonical JSON tool outputs.
+pub const TOOL_OUTPUT_PROFILE_V1: &str = "xgeny.tool-output/v1";
+/// Current self-verifying tool-output sidecar format.
+pub const TOOL_OUTPUT_FORMAT_VERSION: u32 = 1;
+/// Maximum canonical JSON bytes retained for one tool observation.
+pub const MAX_TOOL_OUTPUT_CANONICAL_BYTES: usize = 1_048_576;
+/// Maximum JSON nesting depth accepted before canonicalization.
+pub const MAX_TOOL_OUTPUT_DEPTH: usize = 64;
+/// Maximum JSON values and object members accepted in one output.
+pub const MAX_TOOL_OUTPUT_NODES: usize = 32_768;
+const MAX_TOOL_OUTPUT_TEXT_BYTES: usize = MAX_TOOL_OUTPUT_CANONICAL_BYTES;
+
+/// Self-verifying local sidecar for one exact, bounded tool observation.
+///
+/// The raw value is intentionally stored in the local output sidecar, but never in the journal
+/// event or `RunState` projection. Its custom `Debug` implementation does not reveal that value.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ToolOutputRecord {
+    format_version: u32,
+    output_id: String,
+    run_id: String,
+    step_id: String,
+    effect_id: String,
+    action_digest: String,
+    invocation: InvocationBinding,
+    plan_id: String,
+    execution_attempt: u32,
+    evidence_digest: String,
+    canonical_size_bytes: u64,
+    output_digest: String,
+    output: serde_json::Value,
+    record_digest: String,
+}
+
+impl ToolOutputRecord {
+    /// Bind a bounded JSON value to the exact durable effect observation that produced it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fixed error for unsupported profiles, malformed identity, excessive structure,
+    /// canonicalization, or a non-canonical evidence digest.
+    pub fn new(
+        run_id: impl Into<String>,
+        step_id: impl Into<String>,
+        intent: &EffectIntent,
+        execution_attempt: u32,
+        evidence_digest: &str,
+        output: serde_json::Value,
+    ) -> Result<Self, ToolOutputError> {
+        let run_id = run_id.into();
+        let step_id = step_id.into();
+        let provenance = required_tool_output_provenance(intent)?;
+        validate_tool_output_identity(&run_id, &step_id, intent, execution_attempt)?;
+        if !is_canonical_sha256(evidence_digest) {
+            return Err(ToolOutputError::InvalidEvidenceDigest);
+        }
+        let validated = validate_tool_output(&output)?;
+        let mut record = Self {
+            format_version: TOOL_OUTPUT_FORMAT_VERSION,
+            output_id: String::new(),
+            run_id,
+            step_id,
+            effect_id: intent.effect_id.clone(),
+            action_digest: intent.action_digest.clone(),
+            invocation: intent.invocation.clone(),
+            plan_id: provenance.plan_id.clone(),
+            execution_attempt,
+            evidence_digest: evidence_digest.to_owned(),
+            canonical_size_bytes: validated.canonical_size_bytes,
+            output_digest: validated.output_digest,
+            output,
+            record_digest: String::new(),
+        };
+        record.output_id = tool_output_id(&record)?;
+        record.record_digest = tool_output_record_digest(&record)?;
+        record.verify_for(
+            &record.run_id,
+            &record.step_id,
+            intent,
+            execution_attempt,
+            evidence_digest,
+        )?;
+        Ok(record)
+    }
+
+    /// Recompute every content and identity binding for this record.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fixed error for tampering, cross-effect reuse, excessive content, or unsupported
+    /// format/profile semantics.
+    pub fn verify_for(
+        &self,
+        run_id: &str,
+        step_id: &str,
+        intent: &EffectIntent,
+        execution_attempt: u32,
+        evidence_digest: &str,
+    ) -> Result<(), ToolOutputError> {
+        if self.format_version != TOOL_OUTPUT_FORMAT_VERSION {
+            return Err(ToolOutputError::UnsupportedFormatVersion(
+                self.format_version,
+            ));
+        }
+        let provenance = required_tool_output_provenance(intent)?;
+        validate_tool_output_identity(run_id, step_id, intent, execution_attempt)?;
+        for (field, matches) in [
+            ("run_id", self.run_id == run_id),
+            ("step_id", self.step_id == step_id),
+            ("effect_id", self.effect_id == intent.effect_id),
+            ("action_digest", self.action_digest == intent.action_digest),
+            ("invocation", self.invocation == intent.invocation),
+            ("plan_id", self.plan_id == provenance.plan_id),
+            (
+                "execution_attempt",
+                self.execution_attempt == execution_attempt,
+            ),
+            ("evidence_digest", self.evidence_digest == evidence_digest),
+        ] {
+            if !matches {
+                return Err(ToolOutputError::BindingMismatch(field));
+            }
+        }
+        if !is_canonical_sha256(&self.evidence_digest) {
+            return Err(ToolOutputError::InvalidEvidenceDigest);
+        }
+        let validated = validate_tool_output(&self.output)?;
+        if self.canonical_size_bytes != validated.canonical_size_bytes {
+            return Err(ToolOutputError::CanonicalSizeMismatch);
+        }
+        if self.output_digest != validated.output_digest {
+            return Err(ToolOutputError::OutputDigestMismatch);
+        }
+        if self.output_id != tool_output_id(self)? {
+            return Err(ToolOutputError::OutputIdMismatch);
+        }
+        if self.record_digest != tool_output_record_digest(self)? {
+            return Err(ToolOutputError::RecordDigestMismatch);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn output_id(&self) -> &str {
+        &self.output_id
+    }
+
+    #[must_use]
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    #[must_use]
+    pub fn step_id(&self) -> &str {
+        &self.step_id
+    }
+
+    #[must_use]
+    pub fn effect_id(&self) -> &str {
+        &self.effect_id
+    }
+
+    #[must_use]
+    pub fn capability_id(&self) -> &str {
+        &self.invocation.capability_id
+    }
+
+    #[must_use]
+    pub fn contract_version(&self) -> &str {
+        &self.invocation.contract_version
+    }
+
+    #[must_use]
+    pub fn definition_digest(&self) -> &str {
+        &self.invocation.definition_digest
+    }
+
+    #[must_use]
+    pub fn plan_id(&self) -> &str {
+        &self.plan_id
+    }
+
+    #[must_use]
+    pub const fn execution_attempt(&self) -> u32 {
+        self.execution_attempt
+    }
+
+    #[must_use]
+    pub fn evidence_digest(&self) -> &str {
+        &self.evidence_digest
+    }
+
+    #[must_use]
+    pub const fn canonical_size_bytes(&self) -> u64 {
+        self.canonical_size_bytes
+    }
+
+    #[must_use]
+    pub fn output_digest(&self) -> &str {
+        &self.output_digest
+    }
+
+    #[must_use]
+    pub const fn output(&self) -> &serde_json::Value {
+        &self.output
+    }
+
+    #[must_use]
+    pub fn record_digest(&self) -> &str {
+        &self.record_digest
+    }
+}
+
+impl std::fmt::Debug for ToolOutputRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ToolOutputRecord")
+            .field("format_version", &self.format_version)
+            .field("output_id", &self.output_id)
+            .field("run_id", &self.run_id)
+            .field("step_id", &self.step_id)
+            .field("effect_id", &self.effect_id)
+            .field("action_digest", &self.action_digest)
+            .field("invocation", &self.invocation)
+            .field("plan_id", &self.plan_id)
+            .field("execution_attempt", &self.execution_attempt)
+            .field("evidence_digest", &self.evidence_digest)
+            .field("canonical_size_bytes", &self.canonical_size_bytes)
+            .field("output_digest", &self.output_digest)
+            .field("output", &"<redacted>")
+            .field("record_digest", &self.record_digest)
+            .finish()
+    }
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ToolOutputError {
+    #[error("tool output format version {0} is unsupported")]
+    UnsupportedFormatVersion(u32),
+    #[error("tool output profile is missing or unsupported")]
+    UnsupportedProfile,
+    #[error("tool output is only supported for read-only effects")]
+    UnsupportedEffectClass,
+    #[error("tool output identity field `{0}` is invalid")]
+    InvalidIdentity(&'static str),
+    #[error("tool output execution attempt must be non-zero")]
+    InvalidExecutionAttempt,
+    #[error("tool output evidence digest is invalid")]
+    InvalidEvidenceDigest,
+    #[error("tool output JSON nesting depth exceeds the fixed limit")]
+    DepthExceeded,
+    #[error("tool output JSON node count exceeds the fixed limit")]
+    NodeCountExceeded,
+    #[error("tool output JSON text bytes exceed the fixed limit")]
+    TextBytesExceeded,
+    #[error("tool output canonical bytes exceed the fixed limit")]
+    CanonicalSizeExceeded,
+    #[error("tool output canonicalization failed")]
+    Canonicalization,
+    #[error("tool output differs from its `{0}` binding")]
+    BindingMismatch(&'static str),
+    #[error("tool output canonical size differs from its value")]
+    CanonicalSizeMismatch,
+    #[error("tool output digest differs from its value")]
+    OutputDigestMismatch,
+    #[error("tool output identifier is invalid")]
+    OutputIdMismatch,
+    #[error("tool output record digest is invalid")]
+    RecordDigestMismatch,
+}
+
+struct ValidatedToolOutput {
+    canonical_size_bytes: u64,
+    output_digest: String,
+}
+
+/// Reject a raw adapter output that exceeds the fixed structural or canonical byte limits.
+///
+/// This preflight is intentionally independent of an effect identity so callers can bound an
+/// untrusted JSON value before passing it to a potentially recursive JSON Schema validator.
+/// `ToolOutputRecord::new` repeats the same validation while binding the durable identity.
+///
+/// # Errors
+///
+/// Returns a fixed [`ToolOutputError`] when the value exceeds a depth, node, text, or canonical
+/// size limit, or cannot be canonicalized.
+pub fn validate_tool_output_candidate(output: &serde_json::Value) -> Result<(), ToolOutputError> {
+    validate_tool_output(output).map(|_| ())
+}
+
+fn validate_tool_output(
+    output: &serde_json::Value,
+) -> Result<ValidatedToolOutput, ToolOutputError> {
+    let mut pending = vec![(output, 0_usize)];
+    let mut nodes = 0_usize;
+    let mut text_bytes = 0_usize;
+    while let Some((value, depth)) = pending.pop() {
+        if depth > MAX_TOOL_OUTPUT_DEPTH {
+            return Err(ToolOutputError::DepthExceeded);
+        }
+        nodes = nodes
+            .checked_add(1)
+            .filter(|count| *count <= MAX_TOOL_OUTPUT_NODES)
+            .ok_or(ToolOutputError::NodeCountExceeded)?;
+        match value {
+            serde_json::Value::String(value) => {
+                text_bytes = bounded_tool_output_text_add(text_bytes, value.len())?;
+            }
+            serde_json::Value::Array(values) => {
+                ensure_tool_output_pending_bound(nodes, pending.len(), values.len())?;
+                let child_depth = depth.checked_add(1).ok_or(ToolOutputError::DepthExceeded)?;
+                for value in values.iter().rev() {
+                    pending.push((value, child_depth));
+                }
+            }
+            serde_json::Value::Object(values) => {
+                ensure_tool_output_pending_bound(nodes, pending.len(), values.len())?;
+                let child_depth = depth.checked_add(1).ok_or(ToolOutputError::DepthExceeded)?;
+                for (key, value) in values.iter().rev() {
+                    text_bytes = bounded_tool_output_text_add(text_bytes, key.len())?;
+                    pending.push((value, child_depth));
+                }
+            }
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            }
+        }
+    }
+    let canonical = serde_jcs::to_vec(output).map_err(|_| ToolOutputError::Canonicalization)?;
+    if canonical.len() > MAX_TOOL_OUTPUT_CANONICAL_BYTES {
+        return Err(ToolOutputError::CanonicalSizeExceeded);
+    }
+    Ok(ValidatedToolOutput {
+        canonical_size_bytes: u64::try_from(canonical.len())
+            .map_err(|_| ToolOutputError::CanonicalSizeExceeded)?,
+        output_digest: sha256_digest(&canonical),
+    })
+}
+
+fn ensure_tool_output_pending_bound(
+    visited: usize,
+    pending: usize,
+    children: usize,
+) -> Result<(), ToolOutputError> {
+    visited
+        .checked_add(pending)
+        .and_then(|scheduled| scheduled.checked_add(children))
+        .filter(|scheduled| *scheduled <= MAX_TOOL_OUTPUT_NODES)
+        .map(|_| ())
+        .ok_or(ToolOutputError::NodeCountExceeded)
+}
+
+fn bounded_tool_output_text_add(current: usize, added: usize) -> Result<usize, ToolOutputError> {
+    current
+        .checked_add(added)
+        .filter(|total| *total <= MAX_TOOL_OUTPUT_TEXT_BYTES)
+        .ok_or(ToolOutputError::TextBytesExceeded)
+}
+
+fn required_tool_output_provenance(
+    intent: &EffectIntent,
+) -> Result<&ReceiptProvenance, ToolOutputError> {
+    if intent.effect_class != EffectClass::ReadOnly {
+        return Err(ToolOutputError::UnsupportedEffectClass);
+    }
+    let provenance = intent
+        .receipt_provenance
+        .as_ref()
+        .ok_or(ToolOutputError::UnsupportedProfile)?;
+    if provenance.profile_version != "xgeny.core-receipt/v2"
+        || provenance.tool_output_profile.as_deref() != Some(TOOL_OUTPUT_PROFILE_V1)
+    {
+        return Err(ToolOutputError::UnsupportedProfile);
+    }
+    if provenance.plan_id.is_empty()
+        || provenance.plan_id.len() > 512
+        || provenance.plan_id.chars().any(char::is_control)
+    {
+        return Err(ToolOutputError::InvalidIdentity("plan_id"));
+    }
+    Ok(provenance)
+}
+
+fn validate_tool_output_identity(
+    run_id: &str,
+    step_id: &str,
+    intent: &EffectIntent,
+    execution_attempt: u32,
+) -> Result<(), ToolOutputError> {
+    for (field, value) in [
+        ("run_id", run_id),
+        ("step_id", step_id),
+        ("effect_id", intent.effect_id.as_str()),
+        ("action_digest", intent.action_digest.as_str()),
+        ("capability_id", intent.invocation.capability_id.as_str()),
+        (
+            "contract_version",
+            intent.invocation.contract_version.as_str(),
+        ),
+        (
+            "definition_digest",
+            intent.invocation.definition_digest.as_str(),
+        ),
+        ("instance_id", intent.invocation.instance_id.as_str()),
+        (
+            "instance_binding_digest",
+            intent.invocation.instance_binding_digest.as_str(),
+        ),
+    ] {
+        if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
+            return Err(ToolOutputError::InvalidIdentity(field));
+        }
+    }
+    if execution_attempt == 0 {
+        return Err(ToolOutputError::InvalidExecutionAttempt);
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolOutputIdInput<'a> {
+    domain: &'static str,
+    run_id: &'a str,
+    step_id: &'a str,
+    effect_id: &'a str,
+    execution_attempt: u32,
+    output_digest: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolOutputRecordDigestInput<'a> {
+    domain: &'static str,
+    format_version: u32,
+    output_id: &'a str,
+    run_id: &'a str,
+    step_id: &'a str,
+    effect_id: &'a str,
+    action_digest: &'a str,
+    invocation: &'a InvocationBinding,
+    plan_id: &'a str,
+    execution_attempt: u32,
+    evidence_digest: &'a str,
+    canonical_size_bytes: u64,
+    output_digest: &'a str,
+}
+
+fn tool_output_id(record: &ToolOutputRecord) -> Result<String, ToolOutputError> {
+    let canonical = serde_jcs::to_vec(&ToolOutputIdInput {
+        domain: "xgeny.tool-output.id/v1",
+        run_id: &record.run_id,
+        step_id: &record.step_id,
+        effect_id: &record.effect_id,
+        execution_attempt: record.execution_attempt,
+        output_digest: &record.output_digest,
+    })
+    .map_err(|_| ToolOutputError::Canonicalization)?;
+    let digest = sha256_digest(&canonical);
+    Ok(format!(
+        "output-{}",
+        digest.strip_prefix("sha256:").unwrap_or(&digest)
+    ))
+}
+
+fn tool_output_record_digest(record: &ToolOutputRecord) -> Result<String, ToolOutputError> {
+    let canonical = serde_jcs::to_vec(&ToolOutputRecordDigestInput {
+        domain: "xgeny.tool-output.record/v1",
+        format_version: record.format_version,
+        output_id: &record.output_id,
+        run_id: &record.run_id,
+        step_id: &record.step_id,
+        effect_id: &record.effect_id,
+        action_digest: &record.action_digest,
+        invocation: &record.invocation,
+        plan_id: &record.plan_id,
+        execution_attempt: record.execution_attempt,
+        evidence_digest: &record.evidence_digest,
+        canonical_size_bytes: record.canonical_size_bytes,
+        output_digest: &record.output_digest,
+    })
+    .map_err(|_| ToolOutputError::Canonicalization)?;
+    Ok(sha256_digest(&canonical))
+}
+
+fn is_canonical_sha256(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|encoded| {
+        encoded.len() == 64
+            && encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    })
 }
 
 pub const INVOCATION_MATERIAL_FORMAT_VERSION: u32 = 1;
@@ -1927,6 +2425,8 @@ pub struct StepState {
     #[serde(rename = "receiptDigest")]
     pub effect_evidence_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_record_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_receipt_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_receipt_digest: Option<String>,
@@ -3045,6 +3545,7 @@ fn build_accepted_plan_candidate(
                 attempts: 0,
                 intent: None,
                 effect_evidence_digest: None,
+                output_record_digest: None,
                 execution_receipt_id: None,
                 execution_receipt_digest: None,
                 uncertainty_reason: None,
@@ -3195,6 +3696,7 @@ fn plan_step(
             attempts: 0,
             intent: None,
             effect_evidence_digest: None,
+            output_record_digest: None,
             execution_receipt_id: None,
             execution_receipt_digest: None,
             uncertainty_reason: None,
@@ -3233,11 +3735,13 @@ fn apply_effect_lifecycle(
             step_id,
             effect_id,
             evidence_digest,
+            output_record_digest,
         } => record_effect_observation(
             state,
             step_id,
             effect_id,
             evidence_digest,
+            output_record_digest.as_deref(),
             StepStatus::Validating,
             body,
         )?,
@@ -3250,6 +3754,7 @@ fn apply_effect_lifecycle(
             step_id,
             effect_id,
             evidence_digest,
+            None,
             StepStatus::Failed,
             body,
         )?,
@@ -3282,14 +3787,10 @@ fn apply_effect_lifecycle(
             reason,
         } => record_manual_required(state, step_id, effect_id, reason, body)?,
         RunEventBody::VerificationPassed { step_id } => {
-            let step = step_mut(state, step_id)?;
-            require_status(step, StepStatus::Validating, body)?;
-            step.status = StepStatus::Completed;
+            record_legacy_verification(state, step_id, StepStatus::Completed, body)?;
         }
         RunEventBody::VerificationFailed { step_id, .. } => {
-            let step = step_mut(state, step_id)?;
-            require_status(step, StepStatus::Validating, body)?;
-            step.status = StepStatus::Failed;
+            record_legacy_verification(state, step_id, StepStatus::Failed, body)?;
         }
         RunEventBody::VerificationRecorded {
             step_id,
@@ -3307,6 +3808,18 @@ fn apply_effect_lifecycle(
             body,
         )?,
     }
+    Ok(())
+}
+
+fn record_legacy_verification(
+    state: &mut RunState,
+    step_id: &str,
+    next_status: StepStatus,
+    body: &RunEventBody,
+) -> Result<(), TransitionError> {
+    let step = step_mut(state, step_id)?;
+    require_status(step, StepStatus::Validating, body)?;
+    step.status = next_status;
     Ok(())
 }
 
@@ -3362,6 +3875,18 @@ fn record_reconciliation(
 ) -> Result<(), TransitionError> {
     let step = matching_step_mut(state, step_id, effect_id)?;
     require_status(step, StepStatus::Reconciling, body)?;
+    if resolution == ReconciliationResolution::ProvedApplied
+        && step
+            .intent
+            .as_ref()
+            .and_then(|intent| intent.receipt_provenance.as_ref())
+            .and_then(|provenance| provenance.tool_output_profile.as_deref())
+            == Some(TOOL_OUTPUT_PROFILE_V1)
+    {
+        return Err(TransitionError::ToolOutputRecordRequired {
+            effect_id: effect_id.to_owned(),
+        });
+    }
     step.reconciliation_evidence_digest = Some(evidence_digest.to_owned());
     step.uncertainty_reason = None;
     step.status = match resolution {
@@ -3396,13 +3921,43 @@ fn record_effect_observation(
     step_id: &str,
     effect_id: &str,
     evidence_digest: &str,
+    output_record_digest: Option<&str>,
     next_status: StepStatus,
     body: &RunEventBody,
 ) -> Result<(), TransitionError> {
     let step = matching_step_mut(state, step_id, effect_id)?;
     require_status(step, StepStatus::Executing, body)?;
+    if let Some(output_record_digest) = output_record_digest {
+        let profile = step
+            .intent
+            .as_ref()
+            .and_then(|intent| intent.receipt_provenance.as_ref())
+            .and_then(|provenance| provenance.tool_output_profile.as_deref());
+        if profile != Some(TOOL_OUTPUT_PROFILE_V1) {
+            return Err(TransitionError::UnexpectedToolOutputRecord {
+                effect_id: effect_id.to_owned(),
+            });
+        }
+        if !is_canonical_sha256(output_record_digest) {
+            return Err(TransitionError::InvalidToolOutputRecordDigest {
+                effect_id: effect_id.to_owned(),
+            });
+        }
+    } else if step
+        .intent
+        .as_ref()
+        .and_then(|intent| intent.receipt_provenance.as_ref())
+        .and_then(|provenance| provenance.tool_output_profile.as_deref())
+        == Some(TOOL_OUTPUT_PROFILE_V1)
+        && next_status == StepStatus::Validating
+    {
+        return Err(TransitionError::ToolOutputRecordRequired {
+            effect_id: effect_id.to_owned(),
+        });
+    }
     step.status = next_status;
     step.effect_evidence_digest = Some(evidence_digest.to_owned());
+    step.output_record_digest = output_record_digest.map(ToOwned::to_owned);
     Ok(())
 }
 
@@ -3455,6 +4010,7 @@ fn commit_effect_intent(
     step_id: &str,
     intent: &EffectIntent,
 ) -> Result<(), TransitionError> {
+    validate_tool_output_profile(intent)?;
     match (
         &intent.receipt_provenance,
         &intent.authorization.binding.receipt_provenance_digest,
@@ -3555,6 +4111,20 @@ fn commit_effect_intent(
         .expect("step was checked before authorization mutation");
     step.intent = Some(intent.clone());
     step.status = StepStatus::IntentCommitted;
+    Ok(())
+}
+
+fn validate_tool_output_profile(intent: &EffectIntent) -> Result<(), TransitionError> {
+    if let Some(profile) = intent
+        .receipt_provenance
+        .as_ref()
+        .and_then(|provenance| provenance.tool_output_profile.as_deref())
+        && (profile != TOOL_OUTPUT_PROFILE_V1 || intent.effect_class != EffectClass::ReadOnly)
+    {
+        return Err(TransitionError::UnsupportedToolOutputProfile {
+            effect_id: intent.effect_id.clone(),
+        });
+    }
     Ok(())
 }
 
@@ -4038,6 +4608,14 @@ pub enum TransitionError {
     ReceiptProvenanceBindingMismatch { effect_id: String },
     #[error("effect `{effect_id}` receipt provenance digest is invalid")]
     ReceiptProvenanceDigestMismatch { effect_id: String },
+    #[error("effect `{effect_id}` uses an unsupported tool-output profile")]
+    UnsupportedToolOutputProfile { effect_id: String },
+    #[error("effect `{effect_id}` requires a durable tool-output record")]
+    ToolOutputRecordRequired { effect_id: String },
+    #[error("effect `{effect_id}` supplied an unexpected tool-output record")]
+    UnexpectedToolOutputRecord { effect_id: String },
+    #[error("effect `{effect_id}` supplied an invalid tool-output record digest")]
+    InvalidToolOutputRecordDigest { effect_id: String },
     #[error("step `{step_id}` attempt counter overflowed")]
     AttemptOverflow { step_id: String },
 }
@@ -4191,6 +4769,38 @@ mod tests {
         )
     }
 
+    fn read_only_receipt_intent(
+        state: &RunState,
+        tool_output_profile: Option<&str>,
+    ) -> EffectIntent {
+        let RunEventBody::EffectIntentCommitted { mut intent, .. } =
+            intent(state, "step-material", "effect-material", 1)
+        else {
+            panic!("helper must create an intent")
+        };
+        intent.effect_class = EffectClass::ReadOnly;
+        let provenance = ReceiptProvenance {
+            profile_version: "xgeny.core-receipt/v2".to_owned(),
+            tool_output_profile: tool_output_profile.map(ToOwned::to_owned),
+            invocation_id: "invocation-output".to_owned(),
+            plan_id: "plan-output".to_owned(),
+            policy_decision_id: "decision-output".to_owned(),
+            policy_decision_digest: format!("sha256:{}", "c".repeat(64)),
+            executor_id: "xgeny-local".to_owned(),
+            executor_placement: ReceiptPlacement::Local,
+            executor_platform: "linux-x86_64".to_owned(),
+            input_summary: "canonical invocation summary intentionally omitted".to_owned(),
+            verification_plan: Vec::new(),
+        };
+        intent.authorization.binding.receipt_provenance_digest =
+            Some(receipt_provenance_digest(&provenance).expect("provenance should canonicalize"));
+        intent.receipt_provenance = Some(provenance);
+        intent.authorization.grant_digest =
+            authorization_digest(&intent.authorization.binding, intent.authorization.max_uses)
+                .expect("authorization should canonicalize");
+        *intent
+    }
+
     #[test]
     fn invocation_material_record_detects_cross_effect_and_content_tampering() {
         let mut records = Vec::new();
@@ -4243,6 +4853,350 @@ mod tests {
                 | InvocationMaterialError::RecordDigestMismatch)
         ));
         assert!(!format!("{record:?}").contains("recipe-1"));
+    }
+
+    #[test]
+    fn tool_output_record_binds_typed_value_without_debug_disclosure() {
+        let mut records = Vec::new();
+        let state = planned_state(&mut records);
+        let intent = read_only_receipt_intent(&state, Some(TOOL_OUTPUT_PROFILE_V1));
+        let evidence_digest = format!("sha256:{}", "e".repeat(64));
+        let output = serde_json::json!({"content": "private-output", "digest": format!("sha256:{}", "f".repeat(64))});
+        let record = ToolOutputRecord::new(
+            RUN_ID,
+            "step-material",
+            &intent,
+            1,
+            &evidence_digest,
+            output,
+        )
+        .expect("bounded output should bind");
+
+        record
+            .verify_for(RUN_ID, "step-material", &intent, 1, &evidence_digest)
+            .expect("original output should verify");
+        assert_eq!(record.plan_id(), "plan-output");
+        assert_eq!(record.execution_attempt(), 1);
+        assert!(!format!("{record:?}").contains("private-output"));
+        assert!(matches!(
+            record.verify_for("run-other", "step-material", &intent, 1, &evidence_digest),
+            Err(ToolOutputError::BindingMismatch("run_id"))
+        ));
+        assert!(matches!(
+            record.verify_for(RUN_ID, "step-other", &intent, 1, &evidence_digest),
+            Err(ToolOutputError::BindingMismatch("step_id"))
+        ));
+        let mut swapped_effect = intent.clone();
+        swapped_effect.effect_id = "effect-swapped".to_owned();
+        assert!(matches!(
+            record.verify_for(
+                RUN_ID,
+                "step-material",
+                &swapped_effect,
+                1,
+                &evidence_digest
+            ),
+            Err(ToolOutputError::BindingMismatch("effect_id"))
+        ));
+
+        let mut tampered_json = serde_json::to_value(&record).expect("record should serialize");
+        tampered_json["output"]["content"] = serde_json::json!("changed-output");
+        let tampered: ToolOutputRecord =
+            serde_json::from_value(tampered_json).expect("shape should deserialize");
+        assert!(matches!(
+            tampered.verify_for(RUN_ID, "step-material", &intent, 1, &evidence_digest),
+            Err(ToolOutputError::OutputDigestMismatch | ToolOutputError::RecordDigestMismatch)
+        ));
+
+        let mut swapped = intent.clone();
+        swapped.action_digest = "sha256:swapped-action".to_owned();
+        assert!(matches!(
+            record.verify_for(RUN_ID, "step-material", &swapped, 1, &evidence_digest),
+            Err(ToolOutputError::BindingMismatch("action_digest"))
+        ));
+        let mut swapped = intent.clone();
+        swapped.invocation.definition_digest = "sha256:swapped-definition".to_owned();
+        assert!(matches!(
+            record.verify_for(RUN_ID, "step-material", &swapped, 1, &evidence_digest),
+            Err(ToolOutputError::BindingMismatch("invocation"))
+        ));
+        let mut swapped = intent.clone();
+        swapped
+            .receipt_provenance
+            .as_mut()
+            .expect("provenance should exist")
+            .plan_id = "plan-swapped".to_owned();
+        assert!(matches!(
+            record.verify_for(RUN_ID, "step-material", &swapped, 1, &evidence_digest),
+            Err(ToolOutputError::BindingMismatch("plan_id"))
+        ));
+        assert!(matches!(
+            record.verify_for(RUN_ID, "step-material", &intent, 2, &evidence_digest),
+            Err(ToolOutputError::BindingMismatch("execution_attempt"))
+        ));
+        let other_evidence = format!("sha256:{}", "a".repeat(64));
+        assert!(matches!(
+            record.verify_for(RUN_ID, "step-material", &intent, 1, &other_evidence),
+            Err(ToolOutputError::BindingMismatch("evidence_digest"))
+        ));
+    }
+
+    #[test]
+    fn tool_output_record_rejects_excessive_depth_and_canonical_size() {
+        let mut exact_depth = serde_json::json!(null);
+        for _ in 0..MAX_TOOL_OUTPUT_DEPTH {
+            exact_depth = serde_json::json!([exact_depth]);
+        }
+        validate_tool_output(&exact_depth).expect("exact depth limit should pass");
+
+        let mut nested = serde_json::json!(null);
+        for _ in 0..=MAX_TOOL_OUTPUT_DEPTH {
+            nested = serde_json::json!([nested]);
+        }
+        assert!(matches!(
+            validate_tool_output(&nested),
+            Err(ToolOutputError::DepthExceeded)
+        ));
+
+        let oversized = serde_json::json!({
+            "content": "x".repeat(MAX_TOOL_OUTPUT_CANONICAL_BYTES + 1)
+        });
+        assert!(matches!(
+            validate_tool_output(&oversized),
+            Err(ToolOutputError::TextBytesExceeded | ToolOutputError::CanonicalSizeExceeded)
+        ));
+        let secret = "ERROR-OUTPUT-SECRET";
+        let disclosure_probe = serde_json::json!({
+            "secret": secret,
+            "content": "x".repeat(MAX_TOOL_OUTPUT_CANONICAL_BYTES + 1)
+        });
+        let Err(error) = validate_tool_output(&disclosure_probe) else {
+            panic!("oversized output should be rejected with a fixed error");
+        };
+        assert!(!format!("{error:?} {error}").contains(secret));
+
+        let exact = serde_json::Value::String("x".repeat(MAX_TOOL_OUTPUT_CANONICAL_BYTES - 2));
+        let exact = validate_tool_output(&exact).expect("exact canonical byte limit should pass");
+        assert_eq!(
+            exact.canonical_size_bytes,
+            u64::try_from(MAX_TOOL_OUTPUT_CANONICAL_BYTES).expect("limit should fit u64")
+        );
+        let one_byte_over =
+            serde_json::Value::String("x".repeat(MAX_TOOL_OUTPUT_CANONICAL_BYTES - 1));
+        assert!(matches!(
+            validate_tool_output(&one_byte_over),
+            Err(ToolOutputError::CanonicalSizeExceeded)
+        ));
+
+        let exact_nodes = serde_json::Value::Array(
+            (0..MAX_TOOL_OUTPUT_NODES - 1)
+                .map(|_| serde_json::Value::Null)
+                .collect(),
+        );
+        validate_tool_output(&exact_nodes).expect("exact node limit should pass");
+        let one_node_over = serde_json::Value::Array(
+            (0..MAX_TOOL_OUTPUT_NODES)
+                .map(|_| serde_json::Value::Null)
+                .collect(),
+        );
+        assert!(matches!(
+            validate_tool_output(&one_node_over),
+            Err(ToolOutputError::NodeCountExceeded)
+        ));
+        let far_over_node_limit = serde_json::Value::Array(
+            (0..MAX_TOOL_OUTPUT_NODES * 4)
+                .map(|_| serde_json::Value::Null)
+                .collect(),
+        );
+        assert!(matches!(
+            validate_tool_output(&far_over_node_limit),
+            Err(ToolOutputError::NodeCountExceeded)
+        ));
+
+        let left: serde_json::Value =
+            serde_json::from_str(r#"{"a":1,"b":2}"#).expect("left JSON should parse");
+        let right: serde_json::Value =
+            serde_json::from_str(r#"{"b":2,"a":1}"#).expect("right JSON should parse");
+        assert_eq!(
+            validate_tool_output(&left)
+                .expect("left JSON should validate")
+                .output_digest,
+            validate_tool_output(&right)
+                .expect("right JSON should validate")
+                .output_digest
+        );
+    }
+
+    #[test]
+    fn output_profile_requires_a_success_record_while_legacy_v2_replay_remains_compatible() {
+        let mut records = Vec::new();
+        let planned = planned_state(&mut records);
+        let output_intent = read_only_receipt_intent(&planned, Some(TOOL_OUTPUT_PROFILE_V1));
+        let committed = append(
+            &mut records,
+            Some(&planned),
+            event(
+                "output-profile-intent",
+                RunEventBody::EffectIntentCommitted {
+                    step_id: "step-material".to_owned(),
+                    intent: Box::new(output_intent.clone()),
+                },
+            ),
+        );
+        let started = append(
+            &mut records,
+            Some(&committed),
+            event(
+                "output-profile-started",
+                RunEventBody::EffectExecutionStarted {
+                    step_id: "step-material".to_owned(),
+                    effect_id: output_intent.effect_id.clone(),
+                },
+            ),
+        );
+        let outputless = EventRecord::next(
+            records.last(),
+            event(
+                "output-profile-outputless-success",
+                RunEventBody::EffectSucceeded {
+                    step_id: "step-material".to_owned(),
+                    effect_id: output_intent.effect_id.clone(),
+                    evidence_digest: format!("sha256:{}", "e".repeat(64)),
+                    output_record_digest: None,
+                },
+            ),
+        )
+        .expect("candidate should canonicalize");
+        assert!(matches!(
+            apply_record(Some(&started), &outputless),
+            Err(TransitionError::ToolOutputRecordRequired { effect_id })
+                if effect_id == output_intent.effect_id
+        ));
+
+        let mut legacy_records = Vec::new();
+        let legacy_planned = planned_state(&mut legacy_records);
+        let legacy_intent = read_only_receipt_intent(&legacy_planned, None);
+        let provenance_json = serde_json::to_value(
+            legacy_intent
+                .receipt_provenance
+                .as_ref()
+                .expect("legacy provenance should exist"),
+        )
+        .expect("legacy provenance should serialize");
+        assert!(provenance_json.get("toolOutputProfile").is_none());
+        let legacy_committed = append(
+            &mut legacy_records,
+            Some(&legacy_planned),
+            event(
+                "legacy-outputless-intent",
+                RunEventBody::EffectIntentCommitted {
+                    step_id: "step-material".to_owned(),
+                    intent: Box::new(legacy_intent.clone()),
+                },
+            ),
+        );
+        let legacy_started = append(
+            &mut legacy_records,
+            Some(&legacy_committed),
+            event(
+                "legacy-outputless-started",
+                RunEventBody::EffectExecutionStarted {
+                    step_id: "step-material".to_owned(),
+                    effect_id: legacy_intent.effect_id.clone(),
+                },
+            ),
+        );
+        let legacy_succeeded = append(
+            &mut legacy_records,
+            Some(&legacy_started),
+            event(
+                "legacy-outputless-succeeded",
+                RunEventBody::EffectSucceeded {
+                    step_id: "step-material".to_owned(),
+                    effect_id: legacy_intent.effect_id,
+                    evidence_digest: format!("sha256:{}", "e".repeat(64)),
+                    output_record_digest: None,
+                },
+            ),
+        );
+        assert_eq!(
+            legacy_succeeded.steps["step-material"].status,
+            StepStatus::Validating
+        );
+        assert_eq!(
+            legacy_succeeded.steps["step-material"].output_record_digest,
+            None
+        );
+    }
+
+    #[test]
+    fn reconciliation_cannot_prove_applied_when_the_required_output_is_unrecoverable() {
+        let mut records = Vec::new();
+        let planned = planned_state(&mut records);
+        let output_intent = read_only_receipt_intent(&planned, Some(TOOL_OUTPUT_PROFILE_V1));
+        let committed = append(
+            &mut records,
+            Some(&planned),
+            event(
+                "output-reconcile-intent",
+                RunEventBody::EffectIntentCommitted {
+                    step_id: "step-material".to_owned(),
+                    intent: Box::new(output_intent.clone()),
+                },
+            ),
+        );
+        let started = append(
+            &mut records,
+            Some(&committed),
+            event(
+                "output-reconcile-started",
+                RunEventBody::EffectExecutionStarted {
+                    step_id: "step-material".to_owned(),
+                    effect_id: output_intent.effect_id.clone(),
+                },
+            ),
+        );
+        let unknown = append(
+            &mut records,
+            Some(&started),
+            event(
+                "output-reconcile-unknown",
+                RunEventBody::EffectBecameUnknown {
+                    step_id: "step-material".to_owned(),
+                    effect_id: output_intent.effect_id.clone(),
+                    reason: "tool_output_commit_unknown".to_owned(),
+                },
+            ),
+        );
+        let reconciling = append(
+            &mut records,
+            Some(&unknown),
+            event(
+                "output-reconcile-start",
+                RunEventBody::ReconciliationStarted {
+                    step_id: "step-material".to_owned(),
+                    effect_id: output_intent.effect_id.clone(),
+                },
+            ),
+        );
+        let proved_applied = EventRecord::next(
+            records.last(),
+            event(
+                "output-reconcile-proved-applied",
+                RunEventBody::ReconciliationResolved {
+                    step_id: "step-material".to_owned(),
+                    effect_id: output_intent.effect_id.clone(),
+                    resolution: ReconciliationResolution::ProvedApplied,
+                    evidence_digest: format!("sha256:{}", "f".repeat(64)),
+                },
+            ),
+        )
+        .expect("candidate should canonicalize");
+        assert!(matches!(
+            apply_record(Some(&reconciling), &proved_applied),
+            Err(TransitionError::ToolOutputRecordRequired { effect_id })
+                if effect_id == output_intent.effect_id
+        ));
     }
 
     #[test]
@@ -4369,6 +5323,7 @@ mod tests {
                     step_id: "step-1".to_owned(),
                     effect_id: "effect-1".to_owned(),
                     evidence_digest: "sha256:receipt-1".to_owned(),
+                    output_record_digest: None,
                 },
             ),
         );
@@ -4808,6 +5763,7 @@ mod tests {
             step_id: "step-1".to_owned(),
             effect_id: "effect-1".to_owned(),
             evidence_digest: format!("sha256:{}", "a".repeat(64)),
+            output_record_digest: None,
         };
         let value = serde_json::to_value(&body).expect("event body should serialize");
         assert_eq!(
@@ -4844,6 +5800,7 @@ mod tests {
             attempts: 0,
             intent: None,
             effect_evidence_digest: None,
+            output_record_digest: None,
             execution_receipt_id: None,
             execution_receipt_digest: None,
             uncertainty_reason: None,
@@ -4877,6 +5834,7 @@ mod tests {
                 attempts: 1,
                 intent: None,
                 effect_evidence_digest: None,
+                output_record_digest: None,
                 execution_receipt_id: Some(format!("receipt-{index:04}")),
                 execution_receipt_digest: Some(format!("sha256:{}", "a".repeat(64))),
                 uncertainty_reason: None,

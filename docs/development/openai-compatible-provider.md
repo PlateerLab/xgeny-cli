@@ -14,7 +14,7 @@
 - credential, endpoint와 raw content Debug redaction
 - Core model-call reservation 및 Plan settlement 통합 테스트
 
-Core, public protocol v0.1과 SQLite schema 6은 OpenAI/vLLM/Qwen에 의존하지 않는다.
+Core, public protocol v0.1과 SQLite schema 7은 OpenAI/vLLM/Qwen에 의존하지 않는다.
 Configured model은 provider response의 `model`과 exact match해야 한다. Alias가 다른 문자열을 반환하는 provider는 현재 별도 response identity 설정이 없으므로 fail-closed한다.
 
 ## 기본 검증
@@ -83,6 +83,6 @@ Test는 health/model-list preflight를 하지 않는다. 한 durable reservation
 
 ## 아직 연결하지 않은 것
 
-사용자용 `xgeny run`, 실제 filesystem/process Capability와 XGEN Model Gateway는 아직 없다. ADR-0018에서 generic bounded driver와 ReadOnly/Artifact Receipt 기반은 fake port로 검증했다. 다음 vertical slice는 actual filesystem adapter, typed output sidecar, planning context v2와 completion output을 먼저 닫고, 그 뒤 동일 driver의 planner 구성을 이 adapter로 교체한다. 현재 rustls trust는 public web PKI 기준이므로 사내 CA/custom trust root가 필요한 HTTPS provider 구성도 후속 설계 범위다.
+사용자용 `xgeny run`, 실제 filesystem/process Capability와 XGEN Model Gateway는 아직 없다. ADR-0018에서 generic bounded driver와 ReadOnly/Artifact Receipt 기반을 fake port로 검증했고, ADR-0019에서 typed output sidecar와 restart-safe verification 입력을 추가했다. 다음 vertical slice는 planning context v2와 completion output을 닫고 actual filesystem adapter를 연결한 뒤, 동일 driver의 planner 구성을 live provider로 교체한다. 현재 rustls trust는 public web PKI 기준이므로 사내 CA/custom trust root가 필요한 HTTPS provider 구성도 후속 설계 범위다.
 
 설계 근거와 failure matrix는 [ADR-0017](../adr/0017-openai-compatible-provider-adapter.md)을 따른다.

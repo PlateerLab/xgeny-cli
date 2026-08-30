@@ -2,7 +2,7 @@
 
 Local-first general-purpose agent CLI and harness.
 
-> 현재 상태: 프로토콜 v0.1 검증, dependency DAG와 Receipt-gated 재개 frontier를 갖춘 model-free WorkGraph, embedded SQLite schema 6 store, effect 실행·복구 조정기, 결정론적 Capability Registry·Router, I/O 없는 Permission Broker, secret-free invocation material 복구, Direct Executor와 Core-owned Execution Receipt 검증 경계, 장기 Run용 VerifiedRunIndex를 실행할 수 있습니다. Provider-neutral bounded AgentLoop는 비신뢰 `PlanProposal`을 검증해 다중 Step DAG와 reconstructable input sidecar를 원자 commit하고 재시작 뒤 한 frontier action씩 이어갑니다. Model call은 provider 호출 전에 보수적인 possible-send slot을 journal에 예약하며 accepted/rejected/Unknown을 재시작 뒤 복원하고, 불확정 호출을 자동 재시도하지 않습니다. 별도 `xgeny-provider-openai` leaf adapter는 OpenAI-compatible Chat Completions의 단일 요청과 strict structured proposal을 이 lifecycle에 연결하며, `go50902`의 Qwen3.8-27B engineering smoke로 Plan 수락까지 검증했습니다. 내부 WorkGraph는 이제 planned `ReadOnly`를 별도 profile로 보존하고 Core Receipt v2의 bounded Artifact commitment를 지원하며, `xgeny-cli` library의 bounded driver가 계획·승인·실행·검증을 조합합니다. Legacy/unplanned direct ReadOnly, 실제 filesystem/process 제품 adapter, typed output의 다음 모델 turn 전달, 승인 UI와 사용자용 CLI `run` 연결은 아직 구현하지 않았습니다.
+> 현재 상태: 프로토콜 v0.1 검증, dependency DAG와 Receipt-gated 재개 frontier를 갖춘 model-free WorkGraph, embedded SQLite schema 7 store, effect 실행·복구 조정기, 결정론적 Capability Registry·Router, I/O 없는 Permission Broker, secret-free invocation material 복구, Direct Executor와 Core-owned Execution Receipt 검증 경계, 장기 Run용 VerifiedRunIndex를 실행할 수 있습니다. Provider-neutral bounded AgentLoop는 비신뢰 `PlanProposal`을 검증해 다중 Step DAG와 reconstructable input sidecar를 원자 commit하고 재시작 뒤 한 frontier action씩 이어갑니다. Model call은 provider 호출 전에 보수적인 possible-send slot을 journal에 예약하며 accepted/rejected/Unknown을 재시작 뒤 복원하고, 불확정 호출을 자동 재시도하지 않습니다. 별도 `xgeny-provider-openai` leaf adapter는 OpenAI-compatible Chat Completions의 단일 요청과 strict structured proposal을 이 lifecycle에 연결하며, `go50902`의 Qwen3.8-27B engineering smoke로 Plan 수락까지 검증했습니다. 내부 WorkGraph는 planned `ReadOnly`, Core Receipt v2의 bounded Artifact commitment와 event-anchored typed `ToolOutputRecord`를 지원하며, `xgeny-cli` library의 bounded driver가 계획·승인·실행·검증을 조합합니다. Legacy/unplanned direct ReadOnly, 실제 filesystem/process 제품 adapter, durable output의 다음 모델 turn 전달, 승인 UI와 사용자용 CLI `run` 연결은 아직 구현하지 않았습니다.
 
 ## 제품 원칙
 
@@ -38,6 +38,7 @@ Local-first general-purpose agent CLI and harness.
 - [ADR-0016: Durable model-call lifecycle와 possible-send budget](docs/adr/0016-durable-model-call-lifecycle.md)
 - [ADR-0017: OpenAI-compatible 단일 요청 Provider 경계](docs/adr/0017-openai-compatible-provider-adapter.md)
 - [ADR-0018: ReadOnly 의미, Artifact Receipt와 bounded CLI driver 기반](docs/adr/0018-read-only-artifact-and-cli-driver-foundation.md)
+- [ADR-0019: Durable ToolOutputRecord와 local store schema 7](docs/adr/0019-durable-tool-output-and-schema-7.md)
 
 ## 개발 및 검증
 

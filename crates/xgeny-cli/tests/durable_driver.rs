@@ -23,14 +23,14 @@ use xgeny_policy::{
 use xgeny_runtime::{
     AdapterEvidenceDigest, AdapterExecutionObservation, AdapterPrepareFailure,
     AdapterPrepareRequest, AdapterReconcileRequest, AdapterReconciliationInconclusiveReason,
-    AdapterReconciliationObservation, AgentLoop, CapabilityRegistry, EffectAdapter,
-    EffectAdapterRegistry, EffectVerifier, EffectVerifierRegistry, EventFactory, EventFactoryError,
-    EventMetadata, InvocationMaterialProvider, LocalRunLease, MaterialProviderFailure,
-    MaterialProviderRegistry, PlanMaterializationRequest, PlanMaterializer,
-    PlanMaterializerFailure, PlanProposal, PlannerCallRequest, PlannerPort, PlannerPortFailure,
-    PreparedAdapterInvocation, ProposedPlanStep, RequiredRouteFeatures, RouteRequest,
-    RuleVerificationObservation, VerificationPortFailure, VerificationReport, VerificationRequest,
-    VerifiedArtifactDescriptor, VerifierOutputDigest,
+    AdapterReconciliationObservation, AdapterToolOutput, AgentLoop, CapabilityRegistry,
+    EffectAdapter, EffectAdapterRegistry, EffectVerifier, EffectVerifierRegistry, EventFactory,
+    EventFactoryError, EventMetadata, InvocationMaterialProvider, LocalRunLease,
+    MaterialProviderFailure, MaterialProviderRegistry, PlanMaterializationRequest,
+    PlanMaterializer, PlanMaterializerFailure, PlanProposal, PlannerCallRequest, PlannerPort,
+    PlannerPortFailure, PreparedAdapterInvocation, ProposedPlanStep, RequiredRouteFeatures,
+    RouteRequest, RuleVerificationObservation, VerificationPortFailure, VerificationReport,
+    VerificationRequest, VerifiedArtifactDescriptor, VerifierOutputDigest,
 };
 use xgeny_workgraph::{
     AgentLoopBudget, PlannedExecutionProfile, ReconstructableMaterialReference, RunEvent,
@@ -41,7 +41,7 @@ const RUN_ID: &str = "run-cli-driver-read-only";
 const RAW_PATH: &str = "RAW-DRIVER-PATH/../README.md";
 const CANONICAL_PATH: &str = "workspace:fixture/README.md";
 const OUTPUT_DIGEST: &str =
-    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    "sha256:6428eca423933898d1191c9687288aaf33b29cc2e3809bd30452630a3816527e";
 const EVIDENCE_DIGEST: &str =
     "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const ARTIFACT_DIGEST: &str =
@@ -245,9 +245,13 @@ struct ReadSession {
 impl PreparedAdapterInvocation for ReadSession {
     fn execute(self: Box<Self>) -> AdapterExecutionObservation {
         self.calls.set(self.calls.get() + 1);
-        AdapterExecutionObservation::Succeeded {
+        AdapterExecutionObservation::SucceededWithOutput {
             evidence_digest: AdapterEvidenceDigest::new(EVIDENCE_DIGEST)
                 .expect("evidence digest should validate"),
+            output: AdapterToolOutput::new(json!({
+                "content": "fixture-content",
+                "digest": ARTIFACT_DIGEST,
+            })),
         }
     }
 }
@@ -294,6 +298,13 @@ impl EffectVerifier for ArtifactVerifier {
         request: VerificationRequest<'_>,
     ) -> Result<VerificationReport, VerificationPortFailure> {
         self.calls.set(self.calls.get() + 1);
+        assert_eq!(
+            request
+                .tool_output()
+                .expect("read-only verification must receive the durable output")
+                .output()["content"],
+            "fixture-content"
+        );
         let rules = request
             .definition()
             .spec
@@ -588,6 +599,25 @@ fn sqlite_driver_completes_read_only_plan_with_core_bound_artifact_and_replays()
         provenance.receipt_id.as_deref(),
         Some(receipt.receipt_id.as_str())
     );
+    for public_surface in [
+        String::from_utf8(reopened.export_jsonl().expect("journal should export"))
+            .expect("journal should be UTF-8"),
+        String::from_utf8(
+            reopened
+                .export_execution_receipts_jsonl()
+                .expect("Receipts should export"),
+        )
+        .expect("Receipt export should be UTF-8"),
+        serde_json::to_string(&state).expect("projection should serialize"),
+        format!(
+            "{:?}",
+            reopened
+                .load_verification_snapshot(&receipt.step_id)
+                .expect("verification snapshot should load")
+        ),
+    ] {
+        assert!(!public_surface.contains("fixture-content"));
+    }
     drop(reopened);
 
     let mut reopened = SqliteRunStore::open(&database).expect("SQLite should reopen after Receipt");
