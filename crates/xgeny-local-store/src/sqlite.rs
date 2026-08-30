@@ -269,6 +269,22 @@ impl SqliteRunStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn append_plain_with_fault(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        fault: CommitStage,
+    ) -> Result<Commit, StoreError> {
+        self.append_internal(expected, event, None, None, None, |stage| {
+            if stage == fault {
+                Err(StoreError::InjectedFault(stage.label()))
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn append_with_fault(
         &mut self,
         expected: ExpectedHead,
