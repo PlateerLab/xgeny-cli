@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/xgeny-adapter-filesystem",
     "crates/xgeny-adapter-reference",
     "crates/xgeny-cli",
     "crates/xgeny-domain",
@@ -20,6 +21,8 @@ license = "Apache-2.0"
 repository = "https://github.com/PlateerLab/xgeny-cli"
 
 [workspace.dependencies]
+cap-fs-ext = "4.0.3"
+cap-std = "4.0.3"
 clap = { version = "4.6.6", features = ["derive"] }
 jsonschema = { version = "0.52.0", default-features = false }
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
