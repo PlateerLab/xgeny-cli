@@ -211,9 +211,30 @@ fn instance_fixture(definition: &CapabilityDefinitionBody) -> CapabilityInstance
     };
     "local.fs.writer.v1".clone_into(&mut instance.instance_id);
     instance.definition = capability(definition);
+    instance.platform = current_platform();
     "builtin://test/filesystem-writer".clone_into(&mut instance.binding.binding_ref);
     instance.binding.operation_ref = Some("writeMarker".to_owned());
     *instance
+}
+
+fn current_platform() -> Platform {
+    let os = if cfg!(target_os = "linux") {
+        OperatingSystem::Linux
+    } else if cfg!(target_os = "macos") {
+        OperatingSystem::Macos
+    } else if cfg!(target_os = "windows") {
+        OperatingSystem::Windows
+    } else {
+        panic!("unsupported admission test OS")
+    };
+    let arch = if cfg!(target_arch = "x86_64") {
+        Architecture::X86_64
+    } else if cfg!(target_arch = "aarch64") {
+        Architecture::Aarch64
+    } else {
+        panic!("unsupported admission test architecture")
+    };
+    Platform { os, arch }
 }
 
 fn registry_with(
@@ -235,10 +256,7 @@ fn registry_with(
 fn route_request(definition: &CapabilityDefinitionBody) -> RouteRequest {
     RouteRequest {
         capability: capability(definition),
-        target_platform: Platform {
-            os: OperatingSystem::Linux,
-            arch: Architecture::X86_64,
-        },
+        target_platform: current_platform(),
         required_features: RequiredRouteFeatures {
             execution_style: ExecutionStyle::Sync,
             cancellation: false,
@@ -366,8 +384,8 @@ fn seed_accepted_plan<S: RunStore>(
         action_digest,
         material_digest,
         PlannedExecutionProfile::LocalSyncOnceV1,
-        "linux",
-        "x86_64",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
     )
     .expect("planned invocation facts should validate");
     let reference = ReconstructableMaterialReference::new("run-recipe", "recipe-1", "rev-1")
@@ -835,8 +853,8 @@ fn unreleased_planned_dependency_is_rejected_before_material_provider_access() {
         second_facts.1,
         second_facts.2,
         PlannedExecutionProfile::LocalSyncOnceV1,
-        "linux",
-        "x86_64",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
     )
     .expect("planned invocation facts should validate");
     let (binding, input) = PlannedInvocationMaterialRecord::bind(
