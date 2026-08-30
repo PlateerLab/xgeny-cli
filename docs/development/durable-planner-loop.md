@@ -9,21 +9,29 @@
 
 한 Run의 model-owned 작업 부분에 host-selected budget을 고정하고, 한 planning decision이 만든 여러 Step과 각 Step의 secret-free reconstructable input reference를 Memory 또는 embedded SQLite에 원자 저장할 수 있다. Embedded SQLite에서는 process 재시작 뒤에도 accepted Capability/input commitment와 dependency DAG를 검증해 같은 frontier를 복원한다.
 
-현재 구현은 injected provider-neutral planner fake/port를 한 tick에 한 번 호출할 수 있지만 실제 model API에는 연결하지 않고 tool을 자동 실행하지 않는다. Runtime coordinator가 제공하는 것은 bounded context/decision과 한 번에 하나의 continuation 경계다. Product model adapter, dispatcher와 사용자 interaction이 붙기 전까지 이것을 완전한 autonomous CLI로 설명하지 않는다.
+현재 구현은 injected provider-neutral planner fake/port를 호출하기 전에 durable possible-send slot을 예약하고 accepted/rejected/Unknown 상태를 재시작 뒤 복원한다. 실제 model API에는 연결하지 않고 tool도 자동 실행하지 않는다. Runtime coordinator가 제공하는 것은 bounded context/decision, 한 번에 하나의 continuation 경계와 provider-free model-call lifecycle이다. Product model adapter, dispatcher와 사용자 interaction이 붙기 전까지 이것을 완전한 autonomous CLI로 설명하지 않는다.
 
 ```mermaid
 flowchart TB
   State[Verified RunState + WorkFrontier]
   Context[Deterministic PlanningContext]
+  Reserve[Durable model-call reservation]
+  Port[PlannerPort\nat most one invocation]
   Proposal[PlanProposal\nuntrusted/transient]
   Accept[Core validation + AcceptedPlan]
-  Bundle[PlanAccepted + all input sidecars\natomic commit]
+  Bundle[PlanAccepted + all input sidecars\natomic success settlement]
+  Closed[Closed rejection]
+  Unknown[Unknown / explicit recovery\nno automatic retry]
   Tick[Next tick]
   Action[one FrontierAction]
   Admission[Admission + Router + Policy]
   Intent[EffectIntent]
 
-  State --> Context --> Proposal --> Accept --> Bundle --> Tick
+  State --> Context --> Reserve --> Port --> Proposal --> Accept --> Bundle --> Tick
+  Reserve -. restart before invocation .-> Unknown
+  Port --> Closed --> Tick
+  Port --> Unknown --> Tick
+  Accept --> Closed
   Tick --> Action --> Admission --> Intent --> State
 ```
 
@@ -39,7 +47,7 @@ flowchart TB
 
 ## Durable event와 projection
 
-Agent loop 관련 durable event는 세 가지다.
+계획 수락과 completion에 관한 durable event는 세 가지다. ADR-0016의 model-call lifecycle event는 provider 호출 전에 reservation을 만들고 closed rejection, Unknown과 explicit recovery를 별도로 기록한다.
 
 ```text
 AgentLoopConfigured
@@ -52,10 +60,13 @@ PlanAccepted
        └─ PlannedInvocationBinding
 
 CompletionCandidateRecorded
+  ├─ exact active modelCallId의 성공 settlement
   └─ Receipt-completed graph에 대한 비종결 완료 후보
 ```
 
-`RunState.agent_loop`는 configured budget, accepted model decision 수와 optional completion candidate를 보존한다. `StepState.planned_invocation`은 `PlanAccepted`로 만든 Step에만 존재한다. 기존 `StepPlanned`는 legacy/model-free 경로라 이 필드가 `None`이다.
+`PlanAccepted`의 `ExpectedPlanningTurn`도 lifecycle이 configured된 Run에서는 exact active `modelCallId`를 요구하고 성공 settlement를 겸한다. 별도 success event와 Plan을 두 단계로 기록하지 않으므로 crash 사이에 settled-without-Plan 상태가 생기지 않는다.
+
+`RunState.agent_loop`는 configured budget, accepted model decision 수, model-call lifecycle의 bounded counter/current state와 optional completion candidate를 보존한다. `StepState.planned_invocation`은 `PlanAccepted`로 만든 Step에만 존재한다. 기존 `StepPlanned`는 legacy/model-free 경로라 이 필드가 `None`이다. Model-call field의 optional legacy shape는 schema 6 과거 journal replay를 위한 것이며, lifecycle configuration 이후 missing call ID append를 허용하는 우회로가 아니다.
 
 `PlanAccepted` reducer는 Step vector 순서와 무관하게 전체 ID 집합을 먼저 확인하므로 같은 proposal 내부 forward dependency를 표현할 수 있다. Candidate projection에 모든 새 Step을 넣은 뒤 기존 `derive_frontier()`로 union graph를 검증하며, 오류 시 이전 state는 바뀌지 않는다.
 
@@ -200,21 +211,29 @@ Context membership 목록 자체는 durable event에 저장하지 않으므로 r
 
 이 allowlist는 content DLP가 아니다. 허용 필드인 goal, 기존 Step objective, Capability summary/schema 안에 secret이 있으면 Core가 자동 탐지·삭제하지 않는다. 실제 외부 provider adapter를 붙이는 composition root가 secret-free 입력과 sensitivity/egress policy를 보장해야 한다.
 
+Model-call identifier도 같은 경계다. `planner_id` validator는 길이와 ASCII `[A-Za-z0-9._-]`만 검사하고 secret/token-like content는 판별하지 않는다. Trusted composition root가 registry의 stable non-secret ID를 공급해야 하며 raw prompt/response/error/credential을 identifier 또는 ad-hoc digest field로 우회 저장하면 안 된다. `request_profile_digest`의 SHA-256 shape 검증 역시 입력 provenance나 confidentiality 검증이 아니다.
+
 `max_context_bytes`는 최종 serialized payload만 제한한다. 전체 catalog/schema와 Step 후보를 모으는 CPU·peak memory·scan 시간은 아직 별도 상한이 없고, `Debug` redaction도 `PlanningContext`의 명시적 serialization이나 adapter logging을 차단하지 않는다. Production adapter 전에 catalog input bound/streaming packer와 raw proposal/request/response log 금지 검증이 필요하다.
 
 Artifact/Memory reference, raw Receipt evidence/tool output와 사용자 conversation excerpt는 아직 context에 넣지 않는다. 이를 추가할 때는 provenance/sensitivity, stable priority와 section별 budget을 먼저 정의해야 한다.
 
 ## One-frontier-action tick
 
-`AgentLoop::new(AgentLoopBudget)`로 coordinator를 만들고 `tick(store, events, lease, registry, resolver, planner, materializer)`를 호출한다. 한 tick은 다음 순서로만 판단한다.
+`AgentLoop` coordinator는 durable planning budget과 별도 model-call budget/request profile을 함께 검사한다. 한 coordination cycle은 다음 순서로만 판단한다.
 
 ```text
 load_current()
   -> derive_frontier()
   -> next_action()이 있으면 정확히 하나 반환
+  -> unresolved model call이 있으면 provider를 호출하지 않고 recovery 요구
   -> completion candidate가 있으면 pause
   -> waiting/blocked가 있으면 pause
+  -> accepted-turn/model-call/planned-step budget 검사
   -> empty 또는 모든 Step Receipt-complete면 planning turn 필요
+  -> bounded context/request identity 생성
+  -> reservation을 먼저 commit
+  -> exact reservation으로 PlannerPort를 최대 한 번 호출
+  -> accepted | closed rejection | Unknown 정산
   -> 그 밖의 non-progress terminal 상태는 pause
 ```
 
@@ -231,22 +250,30 @@ Executing recovery
 
 Model planning은 위 action을 추월하지 않는다. 특히 unknown effect나 검증 대기 상태에서 새 Step을 만들지 않는다. Caller는 한 action이 durable commit 또는 명시적 pause로 끝난 뒤 새 head에서 다시 tick한다.
 
+반대로 model call이 Reserved/Unknown이라는 이유로 effect lifecycle을 전역 freeze하지 않는다. 이미 시작된 effect의 recovery/reconciliation, Core verification과 manual safety transition은 계속 진행할 수 있다. 이 event가 head를 전진시키면 기존 model response는 새 head로 rebase하지 않고 `StaleHead` rejection으로 call만 정산한다.
+
 Tick 결과는 실행 command가 아니라 coordination decision이다. 현재 slice에는 tool dispatcher, async task runner, timeout/backoff, approval UI와 provider network 호출이 없다.
 
 현재 outcome은 다음을 구분한다.
 
 | outcome | 의미 |
 |---|---|
-| `Configured` | budget 설정 event 하나를 commit했으므로 새 head에서 다시 tick |
+| `Configured` | `AgentLoopConfigured`를 commit했으므로 새 head에서 다시 판단 |
+| `ModelCallLifecycleConfigured` | model-call budget과 historical floor를 commit했으므로 새 head에서 다시 판단 |
 | `ActionRequired` | 기존 frontier의 첫 action 하나를 caller가 수행해야 함 |
-| `PlanAccepted` | Proposal 하나와 모든 input sidecar가 commit됨 |
-| `CompletionCandidate` | 새 candidate를 commit했거나 기존 candidate가 있어 pause |
+| `PlanAccepted` | exact active call의 성공 settlement와 모든 input sidecar가 commit됨 |
+| `CompletionCandidate` | exact active call로 새 candidate를 commit했거나 기존 candidate가 있어 pause |
 | `Quiescent` | waiting/blocked/non-progress 상태로 model 호출 없이 pause |
-| `PlannerUnavailable` | planner가 고정 failure를 반환해 mutation 없이 pause |
-| `ProposalRejected` | proposal validation/normalization 실패, plan mutation 없음 |
-| `MaterializerUnavailable` | durable recipe를 만들 수 없어 plan mutation 없음 |
+| `PlannerUnavailable` | timeout/unavailable은 Unknown, invalid/provider limit은 closed rejection으로 먼저 commit한 뒤 pause |
+| `ProposalRejected` | Core rejection을 closed `ProposalRejected` settlement로 commit, Plan/sidecar는 만들지 않음 |
+| `MaterializerUnavailable` | materializer 실패를 closed `MaterializationFailed` settlement로 commit, Plan은 만들지 않음 |
+| `ModelCallRecoveryRequired` | restart 또는 이미 Unknown인 call을 자동 재호출하지 않고 explicit recovery까지 pause |
+| `ModelCallRejected` | concurrent head advance로 response를 적용하지 않고 `StaleHead`로 정산 |
+| `ModelCallAbandoned` | `abandon_model_call`이 exact unresolved call을 explicit discard로 정산 |
 
-## Budget과 현재 한계
+Reservation은 별도 tick으로 노출되지 않는다. Planning tick 내부에서 먼저 `ModelCallReserved`를 commit하고, 그 commit이 성공한 경우에만 `PlannerPort`를 한 번 호출한 뒤 위 결과 중 하나로 돌아온다.
+
+## Planning budget과 model-call budget
 
 ```rust
 AgentLoopBudget {
@@ -264,16 +291,27 @@ AgentLoopBudget {
 - `max_context_bytes`는 context assembly가 planner 호출 전에 canonical bytes로 검사한다.
 - `max_tool_calls`는 durable `StepState.attempts` 합계로 `IntentCommitted`에서 새 effect를 시작하는 `DriveEffect`와 새 Plan acceptance를 차단한다. Admission, 이미 시작된 recovery/reconciliation과 Core verification은 막지 않는다.
 
-중요한 현재 한계는 provider-call reservation이 없다는 점이다. 요청 전에 model-turn slot을 durable하게 소비하지 않으므로 timeout, invalid JSON, stale response, process crash 또는 lost response 뒤 재호출은 `accepted_model_turns`에 잡히지 않는다. 실제 provider를 붙이기 전에 아래 계약이 필요하다.
+별도 `ModelCallBudget`은 possible-send reservation 상한을 고정한다. Reservation은 provider 호출 전에 commit되며 closed rejection, Unknown과 explicit discard 뒤에도 slot을 돌려주지 않는다.
 
 ```text
-ModelTurnReserved(request_id, expected_head, context_digest)
-  -> provider call
-  -> accepted | rejected | expired settlement
-  -> restart 시 unresolved reservation 조회/정리
+accepted_model_turns
+  = commit된 Plan/Completion decision 수
+
+reserved/possible-send model calls
+  = provider 호출 전에 영구 소비한 reservation 수
+
+historical accepted floor + post-configuration outbound calls
+  <= durable reserved_calls
+  <= configured model-call budget
 ```
 
-이 계약 전에는 `max_model_turns`를 provider quota, 비용 또는 호출 횟수 제한이라고 부르면 안 된다. Token, 비용, wall-clock deadline과 rate-limit budget도 아직 없다. Tool budget이 소진돼도 Receipt-complete graph에 completion candidate를 제안할 model turn은 허용하므로 `max_tool_calls` 역시 model-call quota가 아니다. Tick의 durable-attempt gate는 구현 범위지만 실제 dispatcher가 effect start마다 attempt를 정확히 기록한다는 end-to-end 보장은 dispatcher slice의 failure test가 완료돼야 한다.
+마지막 부등식은 port invocation 하나가 outbound request를 최대 한 번만 보내고 hidden retry를 하지 않는다는 adapter 계약에 의존한다. Reservation 직후 send 전에 crash할 수 있으므로 reserved counter는 실제 outbound 또는 provider 청구 건수의 정확한 계측값이 아니다. Provider 내부 retry·과금 정책도 Core가 증명하지 않는다. Token, 금액, wall-clock deadline과 rate limit 역시 아직 durable budget이 아니다.
+
+Legacy schema 6 Run의 historical floor는 lifecycle 이전 accepted decision만 복원한다. 이전 invalid/timeout/failure 호출은 알 수 없으므로 위 possible-send 상한은 `ModelCallLifecycleConfigured` 이후 reservation부터 적용되며, Run 전체 과거 outbound/청구 수의 exact count나 upper bound가 아니다.
+
+Timeout, ambiguous unavailable, process crash와 lost acknowledgement는 Unknown 또는 unresolved reservation으로 남고 자동 재호출하지 않는다. Explicit recovery discard 뒤에만 새 reservation을 만들 수 있으며 기존 slot은 계속 소비된 상태다. 자세한 상태·실패 표는 [Durable model-call lifecycle](durable-model-call-lifecycle.md)을 따른다.
+
+Tool budget이 소진돼도 Receipt-complete graph에 completion candidate를 제안할 accepted turn은 남을 수 있으므로 `max_tool_calls`은 model-call quota가 아니다. Tick의 durable-attempt gate는 구현 범위지만 실제 dispatcher가 effect start마다 attempt를 정확히 기록한다는 end-to-end 보장은 dispatcher slice의 failure test가 완료돼야 한다.
 
 ## Strict completion candidate
 
@@ -291,7 +329,7 @@ Candidate가 생기면 현재 기본형은 추가 plan을 받지 않고 pause한
 
 ## XGEN과 외부 harness
 
-Core planning 타입과 store에는 XGEN, Connector, PostgreSQL, MinIO identifier나 client가 없다. 향후 XGEN Model Gateway adapter는 같은 provider-neutral planning request를 XGEN dialect로 보내고 Proposal을 Core 계약으로 변환한다. 조직 DB/RAG/workflow는 XGEN Capability로 호출되며 local Parent WorkGraph와 별도 bounded child Run을 가진다.
+Core planning/model-call 타입과 store에는 XGEN, Connector, PostgreSQL, MinIO identifier나 client가 없다. 향후 XGEN Model Gateway adapter는 같은 provider-neutral reserved request를 XGEN dialect로 보내고 reservation 하나당 outbound request를 최대 한 번만 수행한 뒤 Proposal을 Core 계약으로 변환한다. XGEN request/interaction ID는 adapter correlation이지 XGENy call identity의 권위가 아니다. 조직 DB/RAG/workflow는 XGEN Capability로 호출되며 local Parent WorkGraph와 별도 bounded child Run을 가진다.
 
 Claude Code, Codex, OpenClaw가 Parent orchestrator인 observer mode에서는 이 agent loop를 호출하지 않는다.
 
@@ -312,22 +350,35 @@ xgeny-workgraph
   accepted multi-step DAG / forward reference / cycle atomic rejection
   turn, plan, input, capability와 completion invariant
   planned binding과 EffectIntent mismatch before authorization consumption
+  model-call reservation/rejection/unknown/discard lifecycle and budget counters
+  configured lifecycle missing/wrong/stale modelCallId rejection
 
 xgeny-local-store
   Memory/SQLite plan bundle parity and reopen
   missing/extra/orphan/tampered sidecar audit
   Event/PlannedInvocation/Projection fault rollback
   schema 5 -> 6 preservation and failed migration rollback
+  model-call-specific Unknown reopen parity
+  model-call-specific reservation/Unknown event-projection and active-Plan sidecar fault rollback
+  shared process-exit/two-handle/cache regressions remain green
+  schema 6 unchanged and pre-existing durable row/blob preservation
 
 xgeny-runtime
   deterministic context/order/round-robin whole-item packing/byte budget/redaction
   omitted Capability/Step guess rejection before materialization
   one-tick/one-action and recovery-first ordering
+  reservation commit before PlannerPort invocation and at-most-one call
+  timeout/unavailable/restart no automatic retry and explicit discard recovery
+  SQLite reopen simulation after committed Plan or interrupted reservation calls planner zero times
+  CommitAckLossStore simulates reservation/accepted-Plan commit acknowledgement loss
   normalized semantic proposal digest and preflight/final normalization exact match
-  stale planning response mutation zero
+  stale planning response new-head rebase zero
   planned-input reconstruction and admission double binding
+  raw prompt/response/error/credential durable/log exposure zero
   observer-mode provider/store mutation zero
 ```
+
+Shared store의 process-exit/two-handle/cache 항목은 기존 transaction/cache 회귀를 재사용한다. 이번 model-call slice는 runtime `CommitAckLossStore`로 reservation과 accepted-Plan commit acknowledgement loss를 전용 simulation한다. Model-call 전용 process-kill/two-handle/cache injector는 추가하지 않았으며 restart와 stale response는 runtime reopen/race simulation으로 보완한다.
 
 현재 저장소에서 merge 전에 실행할 전체 gate:
 
@@ -344,16 +395,19 @@ Public protocol schema를 바꾸지 않았으므로 기존 protocol fixture coun
 ## 아직 할 수 없는 것
 
 - 실제 모델 provider를 호출해 Proposal을 받기
-- provider 요청을 durable하게 예약하고 token/비용을 정산하기
+- provider request-status/idempotency를 조회해 Unknown을 자동 reconciliation하기
+- 실제 outbound/청구/token/금액/rate-limit/wall-clock을 정확히 정산하기
 - provider별 tokenizer와 prompt/structured-output adapter
 - context assembly CPU/peak-memory/catalog-scan 상한과 streaming packer
-- tick 결과를 자동 실행하는 dispatcher와 취소/timeout/backoff
+- tick 결과를 자동 실행하는 dispatcher와 취소/backoff/fallback
+- provider 또는 port 내부의 hidden retry
 - 사용자 승인, 질문, 인증과 critical-action UI
 - 제품 filesystem/process/network/MCP/Connector/XGEN adapter
+- raw prompt/response/error, transcript와 chain-of-thought 저장
 - raw/secret argument sealed storage와 external recipe garbage collection
 - Artifact output을 downstream argument에 동적으로 binding하기
 - failed/manual branch의 자동 replan과 graph rewiring
 - completion candidate를 검증해 Run을 terminal completed로 전이하기
 - public `PlanProposal`, WorkGraph delta와 full `InvocationPlan` document 조회
 
-설계 근거와 비보장은 [ADR-0015](../adr/0015-durable-planner-contract-and-bounded-agent-loop.md)를 따른다.
+계획·context·WorkGraph 설계는 [ADR-0015](../adr/0015-durable-planner-contract-and-bounded-agent-loop.md), provider 호출 전 reservation과 불확정 복구는 [ADR-0016](../adr/0016-durable-model-call-lifecycle.md)을 따른다.

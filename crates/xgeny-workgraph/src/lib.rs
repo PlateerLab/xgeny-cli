@@ -31,6 +31,20 @@ pub enum RunEventBody {
     AgentLoopConfigured {
         budget: AgentLoopBudget,
     },
+    ModelCallLifecycleConfigured {
+        budget: ModelCallBudget,
+    },
+    ModelCallReserved {
+        reservation: ModelCallReservation,
+    },
+    ModelCallBecameUnknown {
+        call_id: String,
+        reason: ModelCallUnknownReason,
+    },
+    ModelCallSettled {
+        call_id: String,
+        settlement: ModelCallSettlement,
+    },
     PlanAccepted {
         decision: ExpectedPlanningTurn,
         steps: Vec<AcceptedPlanStep>,
@@ -112,6 +126,10 @@ impl RunEventBody {
         match self {
             Self::RunCreated { .. } => "run_created",
             Self::AgentLoopConfigured { .. } => "agent_loop_configured",
+            Self::ModelCallLifecycleConfigured { .. } => "model_call_lifecycle_configured",
+            Self::ModelCallReserved { .. } => "model_call_reserved",
+            Self::ModelCallBecameUnknown { .. } => "model_call_became_unknown",
+            Self::ModelCallSettled { .. } => "model_call_settled",
             Self::PlanAccepted { .. } => "plan_accepted",
             Self::CompletionCandidateRecorded { .. } => "completion_candidate_recorded",
             Self::StepPlanned { .. } => "step_planned",
@@ -323,6 +341,271 @@ pub const PLANNED_INVOCATION_FORMAT_VERSION: u32 = 1;
 pub const MAX_ACCEPTED_PLAN_STEPS: usize = 32;
 pub const MAX_ACCEPTED_PLAN_EDGES: usize = 128;
 pub const MAX_ACCEPTED_OBJECTIVE_BYTES: usize = 5_000;
+pub const MODEL_CALL_FORMAT_VERSION: u32 = 1;
+
+/// Durable upper bound for conservative model-call reservations.
+///
+/// A reservation consumes one slot even if the process exits before the provider observes the
+/// request. This deliberately avoids undercounting possible sends after an ambiguous crash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelCallBudget {
+    max_model_calls: u32,
+}
+
+impl ModelCallBudget {
+    /// Build a non-zero model-call reservation budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `max_model_calls` is zero.
+    pub fn new(max_model_calls: u32) -> Result<Self, PlanningContractError> {
+        let budget = Self { max_model_calls };
+        budget.validate()?;
+        Ok(budget)
+    }
+
+    #[must_use]
+    pub const fn max_model_calls(&self) -> u32 {
+        self.max_model_calls
+    }
+
+    fn validate(&self) -> Result<(), PlanningContractError> {
+        if self.max_model_calls == 0 {
+            return Err(PlanningContractError::ZeroBudget("max_model_calls"));
+        }
+        Ok(())
+    }
+}
+
+/// Immutable Core-owned binding for one possible outbound planner request.
+///
+/// The record shape contains only bounded identifiers and commitments. A trusted host must supply
+/// non-secret registry identifiers and commitments; the syntactic validators are not secret
+/// detectors. Prompt text, response content, credentials, and provider error bodies must never be
+/// placed in these fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelCallReservation {
+    format_version: u32,
+    call_id: String,
+    planner_id: String,
+    call_index: u32,
+    turn_index: u32,
+    base_sequence: u64,
+    base_head_digest: String,
+    context_digest: String,
+    request_digest: String,
+}
+
+impl ModelCallReservation {
+    /// Bind a planner request to one exact Run head and accepted-turn position.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a syntactically invalid planner ID, zero indexes, malformed digests, or
+    /// canonical encoding failure. Planner-ID validation checks only length and allowed ASCII; the
+    /// caller remains responsible for supplying a non-secret registry identifier.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        run_id: impl Into<String>,
+        authority_epoch: u64,
+        planner_id: impl Into<String>,
+        call_index: u32,
+        turn_index: u32,
+        base_sequence: u64,
+        base_head_digest: impl Into<String>,
+        context_digest: impl Into<String>,
+        request_digest: impl Into<String>,
+    ) -> Result<Self, PlanningContractError> {
+        let run_id = run_id.into();
+        let planner_id = planner_id.into();
+        let base_head_digest = base_head_digest.into();
+        let context_digest = context_digest.into();
+        let request_digest = request_digest.into();
+        require_planning_identifier("run_id", &run_id)?;
+        require_model_call_identifier("planner_id", &planner_id)?;
+        if call_index == 0 {
+            return Err(PlanningContractError::ModelCallIndexZero);
+        }
+        if turn_index == 0 {
+            return Err(PlanningContractError::TurnIndexZero);
+        }
+        require_planning_digest("base_head_digest", &base_head_digest)?;
+        require_planning_digest("context_digest", &context_digest)?;
+        require_planning_digest("request_digest", &request_digest)?;
+        let call_id = model_call_id(
+            &run_id,
+            authority_epoch,
+            &planner_id,
+            call_index,
+            turn_index,
+            base_sequence,
+            &base_head_digest,
+            &context_digest,
+            &request_digest,
+        )?;
+        Ok(Self {
+            format_version: MODEL_CALL_FORMAT_VERSION,
+            call_id,
+            planner_id,
+            call_index,
+            turn_index,
+            base_sequence,
+            base_head_digest,
+            context_digest,
+            request_digest,
+        })
+    }
+
+    #[must_use]
+    pub const fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    #[must_use]
+    pub fn call_id(&self) -> &str {
+        &self.call_id
+    }
+
+    #[must_use]
+    pub fn planner_id(&self) -> &str {
+        &self.planner_id
+    }
+
+    #[must_use]
+    pub const fn call_index(&self) -> u32 {
+        self.call_index
+    }
+
+    #[must_use]
+    pub const fn turn_index(&self) -> u32 {
+        self.turn_index
+    }
+
+    #[must_use]
+    pub const fn base_sequence(&self) -> u64 {
+        self.base_sequence
+    }
+
+    #[must_use]
+    pub fn base_head_digest(&self) -> &str {
+        &self.base_head_digest
+    }
+
+    #[must_use]
+    pub fn context_digest(&self) -> &str {
+        &self.context_digest
+    }
+
+    #[must_use]
+    pub fn request_digest(&self) -> &str {
+        &self.request_digest
+    }
+
+    fn validate_for(
+        &self,
+        run_id: &str,
+        authority_epoch: u64,
+    ) -> Result<(), PlanningContractError> {
+        if self.format_version != MODEL_CALL_FORMAT_VERSION {
+            return Err(PlanningContractError::UnsupportedModelCallFormatVersion(
+                self.format_version,
+            ));
+        }
+        require_planning_identifier("run_id", run_id)?;
+        require_model_call_id("call_id", &self.call_id)?;
+        require_model_call_identifier("planner_id", &self.planner_id)?;
+        if self.call_index == 0 {
+            return Err(PlanningContractError::ModelCallIndexZero);
+        }
+        if self.turn_index == 0 {
+            return Err(PlanningContractError::TurnIndexZero);
+        }
+        require_planning_digest("base_head_digest", &self.base_head_digest)?;
+        require_planning_digest("context_digest", &self.context_digest)?;
+        require_planning_digest("request_digest", &self.request_digest)?;
+        let expected = model_call_id(
+            run_id,
+            authority_epoch,
+            &self.planner_id,
+            self.call_index,
+            self.turn_index,
+            self.base_sequence,
+            &self.base_head_digest,
+            &self.context_digest,
+            &self.request_digest,
+        )?;
+        if self.call_id != expected {
+            return Err(PlanningContractError::ModelCallIdMismatch);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCallUnknownReason {
+    Timeout,
+    TransportUnavailable,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCallRejectionReason {
+    PlannerInvalidResponse,
+    ProviderLimit,
+    ProposalRejected,
+    MaterializationFailed,
+    StaleHead,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCallAbandonmentReason {
+    RecoveryDiscarded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "status",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum ModelCallStatus {
+    Reserved,
+    Unknown { reason: ModelCallUnknownReason },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "disposition",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum ModelCallSettlement {
+    Rejected { reason: ModelCallRejectionReason },
+    Abandoned { reason: ModelCallAbandonmentReason },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelCallState {
+    pub reservation: ModelCallReservation,
+    pub status: ModelCallStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelCallLifecycleState {
+    pub budget: ModelCallBudget,
+    pub reserved_calls: u32,
+    pub settled_calls: u32,
+    pub unknown_calls: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_call: Option<ModelCallState>,
+}
 
 /// Durable limits for the model-owned portion of one local Runtime-mode Run.
 ///
@@ -383,6 +666,8 @@ impl AgentLoopBudget {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExpectedPlanningTurn {
     turn_index: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_call_id: Option<String>,
     context_digest: String,
     proposal_digest: String,
 }
@@ -400,6 +685,28 @@ impl ExpectedPlanningTurn {
     ) -> Result<Self, PlanningContractError> {
         let turn = Self {
             turn_index,
+            model_call_id: None,
+            context_digest: context_digest.into(),
+            proposal_digest: proposal_digest.into(),
+        };
+        turn.validate()?;
+        Ok(turn)
+    }
+
+    /// Build an accepted decision bound to one durable model-call reservation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for turn zero, a malformed call ID, or malformed digests.
+    pub fn for_model_call(
+        turn_index: u32,
+        call_id: impl Into<String>,
+        context_digest: impl Into<String>,
+        proposal_digest: impl Into<String>,
+    ) -> Result<Self, PlanningContractError> {
+        let turn = Self {
+            turn_index,
+            model_call_id: Some(call_id.into()),
             context_digest: context_digest.into(),
             proposal_digest: proposal_digest.into(),
         };
@@ -410,6 +717,11 @@ impl ExpectedPlanningTurn {
     #[must_use]
     pub const fn turn_index(&self) -> u32 {
         self.turn_index
+    }
+
+    #[must_use]
+    pub fn model_call_id(&self) -> Option<&str> {
+        self.model_call_id.as_deref()
     }
 
     #[must_use]
@@ -425,6 +737,9 @@ impl ExpectedPlanningTurn {
     fn validate(&self) -> Result<(), PlanningContractError> {
         if self.turn_index == 0 {
             return Err(PlanningContractError::TurnIndexZero);
+        }
+        if let Some(call_id) = &self.model_call_id {
+            require_model_call_id("model_call_id", call_id)?;
         }
         require_planning_digest("context_digest", &self.context_digest)?;
         require_planning_digest("proposal_digest", &self.proposal_digest)
@@ -792,7 +1107,25 @@ pub struct AgentLoopState {
     pub budget: AgentLoopBudget,
     pub accepted_model_turns: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_calls: Option<ModelCallLifecycleState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_candidate: Option<CompletionCandidateState>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelCallIdDigestInput<'a> {
+    domain: &'static str,
+    format_version: u32,
+    run_id: &'a str,
+    authority_epoch: u64,
+    planner_id: &'a str,
+    call_index: u32,
+    turn_index: u32,
+    base_sequence: u64,
+    base_head_digest: &'a str,
+    context_digest: &'a str,
+    request_digest: &'a str,
 }
 
 #[derive(Serialize)]
@@ -869,6 +1202,37 @@ fn planned_invocation_id(
     Ok(format!("plan-{encoded}"))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn model_call_id(
+    run_id: &str,
+    authority_epoch: u64,
+    planner_id: &str,
+    call_index: u32,
+    turn_index: u32,
+    base_sequence: u64,
+    base_head_digest: &str,
+    context_digest: &str,
+    request_digest: &str,
+) -> Result<String, PlanningContractError> {
+    let canonical = serde_jcs::to_vec(&ModelCallIdDigestInput {
+        domain: "xgeny.model-call.id/v1",
+        format_version: MODEL_CALL_FORMAT_VERSION,
+        run_id,
+        authority_epoch,
+        planner_id,
+        call_index,
+        turn_index,
+        base_sequence,
+        base_head_digest,
+        context_digest,
+        request_digest,
+    })
+    .map_err(|error| PlanningContractError::Canonicalization(error.to_string()))?;
+    let digest = sha256_digest(&canonical);
+    let encoded = digest.strip_prefix("sha256:").unwrap_or(&digest);
+    Ok(format!("model-call-{encoded}"))
+}
+
 fn planned_invocation_material_record_digest(
     record: &PlannedInvocationMaterialRecord,
 ) -> Result<String, PlanningContractError> {
@@ -898,6 +1262,41 @@ fn require_planning_identifier(
     Ok(())
 }
 
+/// Validate bounded identifier wire syntax only.
+///
+/// This is intentionally not a credential, token, or sensitive-content detector. Callers must
+/// source non-secret identifiers from a trusted registry instead of treating this check as DLP.
+fn require_model_call_identifier(
+    field: &'static str,
+    value: &str,
+) -> Result<(), PlanningContractError> {
+    const MAX_IDENTIFIER_BYTES: usize = 256;
+    if value.is_empty()
+        || value.len() > MAX_IDENTIFIER_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(PlanningContractError::InvalidIdentifier(field));
+    }
+    Ok(())
+}
+
+fn require_model_call_id(field: &'static str, value: &str) -> Result<(), PlanningContractError> {
+    require_model_call_identifier(field, value)?;
+    let encoded = value
+        .strip_prefix("model-call-")
+        .ok_or(PlanningContractError::InvalidIdentifier(field))?;
+    if encoded.len() != 64
+        || !encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(PlanningContractError::InvalidIdentifier(field));
+    }
+    Ok(())
+}
+
 fn require_planning_digest(field: &'static str, value: &str) -> Result<(), PlanningContractError> {
     if !is_sha256_digest(value) {
         return Err(PlanningContractError::InvalidDigest(field));
@@ -911,6 +1310,8 @@ pub enum PlanningContractError {
     ZeroBudget(&'static str),
     #[error("planning turn index must be greater than zero")]
     TurnIndexZero,
+    #[error("model-call index must be greater than zero")]
+    ModelCallIndexZero,
     #[error("planning identifier `{0}` is invalid")]
     InvalidIdentifier(&'static str),
     #[error("planned invocation target `{0}` is unsupported")]
@@ -919,6 +1320,10 @@ pub enum PlanningContractError {
     InvalidDigest(&'static str),
     #[error("planned invocation format version {0} is unsupported")]
     UnsupportedFormatVersion(u32),
+    #[error("model-call format version {0} is unsupported")]
+    UnsupportedModelCallFormatVersion(u32),
+    #[error("model-call ID differs from its durable bindings")]
+    ModelCallIdMismatch,
     #[error("planned invocation spec digest differs from its fields")]
     SpecDigestMismatch,
     #[error("planned invocation material binding differs at `{0}`")]
@@ -2139,6 +2544,19 @@ fn apply_body(state: &mut RunState, body: &RunEventBody) -> Result<(), Transitio
     match body {
         RunEventBody::RunCreated { .. } => unreachable!("handled by apply_record"),
         RunEventBody::AgentLoopConfigured { budget } => configure_agent_loop(state, budget)?,
+        RunEventBody::ModelCallLifecycleConfigured { budget } => {
+            configure_model_call_lifecycle(state, budget)?;
+        }
+        RunEventBody::ModelCallReserved { reservation } => {
+            reserve_model_call(state, reservation)?;
+        }
+        RunEventBody::ModelCallBecameUnknown { call_id, reason } => {
+            mark_model_call_unknown(state, call_id, *reason)?;
+        }
+        RunEventBody::ModelCallSettled {
+            call_id,
+            settlement,
+        } => settle_model_call(state, call_id, *settlement)?,
         RunEventBody::PlanAccepted { decision, steps } => {
             accept_plan(state, decision, steps)?;
         }
@@ -2184,8 +2602,188 @@ fn configure_agent_loop(
     state.agent_loop = Some(AgentLoopState {
         budget: budget.clone(),
         accepted_model_turns: 0,
+        model_calls: None,
         completion_candidate: None,
     });
+    Ok(())
+}
+
+fn configure_model_call_lifecycle(
+    state: &mut RunState,
+    budget: &ModelCallBudget,
+) -> Result<(), TransitionError> {
+    budget.validate()?;
+    let loop_state = state
+        .agent_loop
+        .as_mut()
+        .ok_or(TransitionError::AgentLoopNotConfigured)?;
+    if loop_state.model_calls.is_some() {
+        return Err(TransitionError::ModelCallLifecycleAlreadyConfigured);
+    }
+    if budget.max_model_calls < loop_state.accepted_model_turns {
+        return Err(
+            TransitionError::ModelCallBudgetBelowHistoricalAcceptedTurns {
+                max_model_calls: budget.max_model_calls,
+                accepted_model_turns: loop_state.accepted_model_turns,
+            },
+        );
+    }
+    loop_state.model_calls = Some(ModelCallLifecycleState {
+        budget: budget.clone(),
+        reserved_calls: loop_state.accepted_model_turns,
+        settled_calls: loop_state.accepted_model_turns,
+        unknown_calls: 0,
+        active_call: None,
+    });
+    validate_model_call_counters(loop_state)
+}
+
+fn reserve_model_call(
+    state: &mut RunState,
+    reservation: &ModelCallReservation,
+) -> Result<(), TransitionError> {
+    reservation.validate_for(&state.run_id, state.authority_epoch)?;
+    let loop_state = state
+        .agent_loop
+        .as_mut()
+        .ok_or(TransitionError::AgentLoopNotConfigured)?;
+    if loop_state.completion_candidate.is_some() {
+        return Err(TransitionError::CompletionCandidateAlreadyRecorded);
+    }
+    if loop_state.accepted_model_turns >= loop_state.budget.max_model_turns {
+        return Err(TransitionError::ModelTurnBudgetExceeded);
+    }
+    let calls = loop_state
+        .model_calls
+        .as_mut()
+        .ok_or(TransitionError::ModelCallLifecycleNotConfigured)?;
+    if calls.active_call.is_some() {
+        return Err(TransitionError::ModelCallActive);
+    }
+    if calls.reserved_calls >= calls.budget.max_model_calls {
+        return Err(TransitionError::ModelCallBudgetExceeded);
+    }
+    let expected_call_index = calls
+        .reserved_calls
+        .checked_add(1)
+        .ok_or(TransitionError::ModelCallBudgetExceeded)?;
+    if reservation.call_index != expected_call_index {
+        return Err(TransitionError::UnexpectedModelCallIndex {
+            expected: expected_call_index,
+            actual: reservation.call_index,
+        });
+    }
+    let expected_turn_index = loop_state
+        .accepted_model_turns
+        .checked_add(1)
+        .ok_or(TransitionError::ModelTurnBudgetExceeded)?;
+    if reservation.turn_index != expected_turn_index {
+        return Err(TransitionError::UnexpectedModelCallTurn {
+            expected: expected_turn_index,
+            actual: reservation.turn_index,
+        });
+    }
+    if reservation.base_sequence != state.journal_sequence
+        || reservation.base_head_digest != state.journal_head_digest
+    {
+        return Err(TransitionError::ModelCallBaseHeadMismatch);
+    }
+    calls.reserved_calls = expected_call_index;
+    calls.active_call = Some(ModelCallState {
+        reservation: reservation.clone(),
+        status: ModelCallStatus::Reserved,
+    });
+    validate_model_call_counters(loop_state)
+}
+
+fn mark_model_call_unknown(
+    state: &mut RunState,
+    call_id: &str,
+    reason: ModelCallUnknownReason,
+) -> Result<(), TransitionError> {
+    require_model_call_id("call_id", call_id)?;
+    let loop_state = state
+        .agent_loop
+        .as_mut()
+        .ok_or(TransitionError::AgentLoopNotConfigured)?;
+    let calls = loop_state
+        .model_calls
+        .as_mut()
+        .ok_or(TransitionError::ModelCallLifecycleNotConfigured)?;
+    let active = calls
+        .active_call
+        .as_mut()
+        .ok_or(TransitionError::ModelCallNotReserved)?;
+    if active.reservation.call_id != call_id {
+        return Err(TransitionError::ModelCallIdMismatch);
+    }
+    if active.status != ModelCallStatus::Reserved {
+        return Err(TransitionError::ModelCallNotReserved);
+    }
+    calls.unknown_calls = calls
+        .unknown_calls
+        .checked_add(1)
+        .ok_or(TransitionError::ModelCallCounterOverflow)?;
+    active.status = ModelCallStatus::Unknown { reason };
+    validate_model_call_counters(loop_state)
+}
+
+fn settle_model_call(
+    state: &mut RunState,
+    call_id: &str,
+    settlement: ModelCallSettlement,
+) -> Result<(), TransitionError> {
+    require_model_call_id("call_id", call_id)?;
+    let loop_state = state
+        .agent_loop
+        .as_mut()
+        .ok_or(TransitionError::AgentLoopNotConfigured)?;
+    let calls = loop_state
+        .model_calls
+        .as_mut()
+        .ok_or(TransitionError::ModelCallLifecycleNotConfigured)?;
+    let active = calls
+        .active_call
+        .as_ref()
+        .ok_or(TransitionError::ModelCallNotReserved)?;
+    if active.reservation.call_id != call_id {
+        return Err(TransitionError::ModelCallIdMismatch);
+    }
+    match settlement {
+        ModelCallSettlement::Rejected { reason } => {
+            if active.status != ModelCallStatus::Reserved {
+                return Err(TransitionError::ModelCallNotReserved);
+            }
+            let immediate_sequence = active
+                .reservation
+                .base_sequence
+                .checked_add(1)
+                .ok_or(TransitionError::ModelCallCounterOverflow)?;
+            let is_immediate = state.journal_sequence == immediate_sequence;
+            if is_immediate != (reason != ModelCallRejectionReason::StaleHead) {
+                return Err(TransitionError::ModelCallSettlementHeadMismatch);
+            }
+        }
+        ModelCallSettlement::Abandoned { .. } => {}
+    }
+    calls.settled_calls = calls
+        .settled_calls
+        .checked_add(1)
+        .ok_or(TransitionError::ModelCallCounterOverflow)?;
+    calls.active_call = None;
+    validate_model_call_counters(loop_state)
+}
+
+fn validate_model_call_counters(loop_state: &AgentLoopState) -> Result<(), TransitionError> {
+    let Some(calls) = &loop_state.model_calls else {
+        return Ok(());
+    };
+    if loop_state.accepted_model_turns > calls.settled_calls
+        || calls.settled_calls > calls.reserved_calls
+        || calls.unknown_calls > calls.reserved_calls
+    {
+        return Err(TransitionError::ModelCallCounterInvariant);
+    }
     Ok(())
 }
 
@@ -2195,6 +2793,7 @@ fn accept_plan(
     steps: &[AcceptedPlanStep],
 ) -> Result<(), TransitionError> {
     decision.validate()?;
+    validate_model_call_success(state, decision)?;
     let loop_state = state
         .agent_loop
         .as_ref()
@@ -2233,13 +2832,78 @@ fn accept_plan(
     let proposed_ids = validate_accepted_plan_headers(state, decision, steps)?;
     let mut candidate = build_accepted_plan_candidate(state, steps, &proposed_ids)?;
     derive_frontier(&candidate).map_err(map_plan_frontier_error)?;
-    candidate
+    let candidate_loop = candidate
         .agent_loop
         .as_mut()
-        .expect("candidate retains configured loop")
-        .accepted_model_turns = expected_turn;
+        .expect("candidate retains configured loop");
+    candidate_loop.accepted_model_turns = expected_turn;
+    settle_successful_model_call(candidate_loop)?;
     *state = candidate;
     Ok(())
+}
+
+fn validate_model_call_success(
+    state: &RunState,
+    decision: &ExpectedPlanningTurn,
+) -> Result<(), TransitionError> {
+    let loop_state = state
+        .agent_loop
+        .as_ref()
+        .ok_or(TransitionError::AgentLoopNotConfigured)?;
+    match (&loop_state.model_calls, decision.model_call_id()) {
+        (None, None) => Ok(()),
+        (None, Some(_)) => Err(TransitionError::ModelCallLifecycleNotConfigured),
+        (Some(_), None) => Err(TransitionError::ModelCallDecisionRequired),
+        (Some(calls), Some(call_id)) => {
+            let active = calls
+                .active_call
+                .as_ref()
+                .ok_or(TransitionError::ModelCallNotReserved)?;
+            if active.reservation.call_id != call_id {
+                return Err(TransitionError::ModelCallIdMismatch);
+            }
+            if active.status != ModelCallStatus::Reserved {
+                return Err(TransitionError::ModelCallNotReserved);
+            }
+            if active.reservation.turn_index != decision.turn_index {
+                return Err(TransitionError::UnexpectedModelCallTurn {
+                    expected: active.reservation.turn_index,
+                    actual: decision.turn_index,
+                });
+            }
+            if active.reservation.context_digest != decision.context_digest {
+                return Err(TransitionError::ModelCallContextMismatch);
+            }
+            let immediate_sequence = active
+                .reservation
+                .base_sequence
+                .checked_add(1)
+                .ok_or(TransitionError::ModelCallCounterOverflow)?;
+            if state.journal_sequence != immediate_sequence {
+                return Err(TransitionError::StaleModelCallResponse);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn settle_successful_model_call(loop_state: &mut AgentLoopState) -> Result<(), TransitionError> {
+    let Some(calls) = loop_state.model_calls.as_mut() else {
+        return Ok(());
+    };
+    let active = calls
+        .active_call
+        .as_ref()
+        .ok_or(TransitionError::ModelCallNotReserved)?;
+    if active.status != ModelCallStatus::Reserved {
+        return Err(TransitionError::ModelCallNotReserved);
+    }
+    calls.settled_calls = calls
+        .settled_calls
+        .checked_add(1)
+        .ok_or(TransitionError::ModelCallCounterOverflow)?;
+    calls.active_call = None;
+    validate_model_call_counters(loop_state)
 }
 
 fn validate_accepted_plan_headers(
@@ -2435,6 +3099,7 @@ fn record_completion_candidate(
     summary_digest: &str,
 ) -> Result<(), TransitionError> {
     decision.validate()?;
+    validate_model_call_success(state, decision)?;
     require_planning_identifier("candidate_id", candidate_id)?;
     require_planning_digest("summary_digest", summary_digest)?;
     let frontier = derive_frontier(state).map_err(map_plan_frontier_error)?;
@@ -2468,7 +3133,7 @@ fn record_completion_candidate(
         proposal_digest: decision.proposal_digest.clone(),
         summary_digest: summary_digest.to_owned(),
     });
-    Ok(())
+    settle_successful_model_call(loop_state)
 }
 
 fn plan_step(
@@ -2543,6 +3208,10 @@ fn apply_effect_lifecycle(
     match body {
         RunEventBody::RunCreated { .. }
         | RunEventBody::AgentLoopConfigured { .. }
+        | RunEventBody::ModelCallLifecycleConfigured { .. }
+        | RunEventBody::ModelCallReserved { .. }
+        | RunEventBody::ModelCallBecameUnknown { .. }
+        | RunEventBody::ModelCallSettled { .. }
         | RunEventBody::PlanAccepted { .. }
         | RunEventBody::CompletionCandidateRecorded { .. }
         | RunEventBody::StepPlanned { .. }
@@ -3161,6 +3830,43 @@ pub enum TransitionError {
     AgentLoopAlreadyConfigured,
     #[error("agent loop is not configured")]
     AgentLoopNotConfigured,
+    #[error("model-call lifecycle is already configured")]
+    ModelCallLifecycleAlreadyConfigured,
+    #[error("model-call lifecycle is not configured")]
+    ModelCallLifecycleNotConfigured,
+    #[error(
+        "model-call budget {max_model_calls} is below {accepted_model_turns} historical accepted turns"
+    )]
+    ModelCallBudgetBelowHistoricalAcceptedTurns {
+        max_model_calls: u32,
+        accepted_model_turns: u32,
+    },
+    #[error("model-call reservation budget is exhausted")]
+    ModelCallBudgetExceeded,
+    #[error("a model call is already reserved or unresolved")]
+    ModelCallActive,
+    #[error("model-call index mismatch: expected {expected}, got {actual}")]
+    UnexpectedModelCallIndex { expected: u32, actual: u32 },
+    #[error("model-call turn mismatch: expected {expected}, got {actual}")]
+    UnexpectedModelCallTurn { expected: u32, actual: u32 },
+    #[error("model-call reservation is bound to another Run head")]
+    ModelCallBaseHeadMismatch,
+    #[error("model-call ID differs from the active reservation")]
+    ModelCallIdMismatch,
+    #[error("model-call context differs from the active reservation")]
+    ModelCallContextMismatch,
+    #[error("a lifecycle-enabled planning decision requires an active model-call ID")]
+    ModelCallDecisionRequired,
+    #[error("the model call is absent or no longer reserved")]
+    ModelCallNotReserved,
+    #[error("a successful model response was produced against a stale Run head")]
+    StaleModelCallResponse,
+    #[error("model-call settlement reason does not match reservation head freshness")]
+    ModelCallSettlementHeadMismatch,
+    #[error("model-call counter overflowed")]
+    ModelCallCounterOverflow,
+    #[error("model-call projection counters violate their durable ordering")]
+    ModelCallCounterInvariant,
     #[error("planning turn mismatch: expected {expected}, got {actual}")]
     UnexpectedPlanningTurn { expected: u32, actual: u32 },
     #[error("accepted model-turn budget is exhausted")]

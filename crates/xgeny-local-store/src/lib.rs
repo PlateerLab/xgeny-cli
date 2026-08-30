@@ -1342,13 +1342,14 @@ mod tests {
     use xgeny_workgraph::{
         AcceptedPlanStep, AgentLoopBudget, AuthorizationBinding, AuthorizationUse,
         ContinuationAction, EffectClass, EffectIntent, ExpectedPlanningTurn, InvocationBinding,
-        InvocationMaterialRecord, InvocationMaterialRetention, PlannedExecutionProfile,
-        PlannedInvocationMaterialRecord, PlannedInvocationSpec, ReceiptPlacement,
-        ReceiptProvenance, ReceiptVerificationRule, ReceiptVerificationStrategy,
-        ReconciliationResolution, ReconstructableMaterialReference, RunEvent, RunEventBody,
-        RunState, SinkGuarantee, StepStatus, VerificationDisposition, authorization_digest,
-        derive_frontier, invocation_material_digest, invocation_material_retention_digest,
-        once_authorization_id, receipt_provenance_digest,
+        InvocationMaterialRecord, InvocationMaterialRetention, ModelCallAbandonmentReason,
+        ModelCallBudget, ModelCallReservation, ModelCallSettlement, ModelCallStatus,
+        ModelCallUnknownReason, PlannedExecutionProfile, PlannedInvocationMaterialRecord,
+        PlannedInvocationSpec, ReceiptPlacement, ReceiptProvenance, ReceiptVerificationRule,
+        ReceiptVerificationStrategy, ReconciliationResolution, ReconstructableMaterialReference,
+        RunEvent, RunEventBody, RunState, SinkGuarantee, StepStatus, VerificationDisposition,
+        authorization_digest, derive_frontier, invocation_material_digest,
+        invocation_material_retention_digest, once_authorization_id, receipt_provenance_digest,
     };
 
     use super::*;
@@ -1581,6 +1582,36 @@ mod tests {
                 ),
             )
             .expect("loop should configure")
+    }
+
+    fn seed_model_call_lifecycle<S: RunStore>(store: &mut S) -> Commit {
+        let configured = seed_planning_context(store);
+        store
+            .append(
+                ExpectedHead::from_state(&configured.state),
+                event(
+                    "model-call-lifecycle-configured",
+                    RunEventBody::ModelCallLifecycleConfigured {
+                        budget: ModelCallBudget::new(3).expect("model-call budget should validate"),
+                    },
+                ),
+            )
+            .expect("model-call lifecycle should configure")
+    }
+
+    fn model_call_reservation(state: &RunState) -> ModelCallReservation {
+        ModelCallReservation::new(
+            &state.run_id,
+            state.authority_epoch,
+            "xgeny.test.store-planner",
+            1,
+            1,
+            state.journal_sequence,
+            &state.journal_head_digest,
+            format!("sha256:{}", "c".repeat(64)),
+            format!("sha256:{}", "d".repeat(64)),
+        )
+        .expect("model-call reservation should validate")
     }
 
     fn accepted_plan_event(
@@ -1974,6 +2005,336 @@ mod tests {
                     .expect("planned invocation count"),
                 2
             );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keeps the complete Memory/SQLite reopen parity chain visible.
+    fn memory_and_sqlite_reopen_preserve_unknown_model_call_without_retry_state() {
+        let directory = tempdir().expect("temp directory should exist");
+        let database = directory.path().join("model-call.db");
+        let mut memory = MemoryRunStore::new();
+        let memory_lifecycle = seed_model_call_lifecycle(&mut memory);
+        let mut sqlite = SqliteRunStore::open(&database).expect("SQLite should open");
+        let sqlite_lifecycle = seed_model_call_lifecycle(&mut sqlite);
+        assert_eq!(memory_lifecycle.state, sqlite_lifecycle.state);
+
+        let reservation = model_call_reservation(&memory_lifecycle.state);
+        let reserved_event = event(
+            "model-call-reserved",
+            RunEventBody::ModelCallReserved {
+                reservation: reservation.clone(),
+            },
+        );
+        let memory_reserved = memory
+            .append(
+                ExpectedHead::from_state(&memory_lifecycle.state),
+                reserved_event.clone(),
+            )
+            .expect("memory reservation should commit");
+        let sqlite_reserved = sqlite
+            .append(
+                ExpectedHead::from_state(&sqlite_lifecycle.state),
+                reserved_event,
+            )
+            .expect("SQLite reservation should commit");
+        assert_eq!(memory_reserved.state, sqlite_reserved.state);
+
+        let unknown_event = event(
+            "model-call-unknown",
+            RunEventBody::ModelCallBecameUnknown {
+                call_id: reservation.call_id().to_owned(),
+                reason: ModelCallUnknownReason::Timeout,
+            },
+        );
+        let memory_unknown = memory
+            .append(
+                ExpectedHead::from_state(&memory_reserved.state),
+                unknown_event.clone(),
+            )
+            .expect("memory Unknown transition should commit");
+        let sqlite_unknown = sqlite
+            .append(
+                ExpectedHead::from_state(&sqlite_reserved.state),
+                unknown_event,
+            )
+            .expect("SQLite Unknown transition should commit");
+        assert_eq!(memory_unknown.state, sqlite_unknown.state);
+        drop(sqlite);
+
+        let mut reopened = SqliteRunStore::open(&database).expect("SQLite should reopen");
+        let reopened_unknown = reopened
+            .load_current()
+            .expect("reopened state should verify")
+            .expect("Run should exist");
+        assert_eq!(reopened_unknown, memory_unknown.state);
+        let calls = reopened_unknown
+            .agent_loop
+            .as_ref()
+            .and_then(|loop_state| loop_state.model_calls.as_ref())
+            .expect("model-call lifecycle should project");
+        assert_eq!(
+            (
+                calls.reserved_calls,
+                calls.settled_calls,
+                calls.unknown_calls
+            ),
+            (1, 0, 1)
+        );
+        assert!(matches!(
+            calls.active_call.as_ref().map(|call| call.status),
+            Some(ModelCallStatus::Unknown {
+                reason: ModelCallUnknownReason::Timeout
+            })
+        ));
+
+        let abandoned_event = event(
+            "model-call-abandoned",
+            RunEventBody::ModelCallSettled {
+                call_id: reservation.call_id().to_owned(),
+                settlement: ModelCallSettlement::Abandoned {
+                    reason: ModelCallAbandonmentReason::RecoveryDiscarded,
+                },
+            },
+        );
+        let memory_abandoned = memory
+            .append(
+                ExpectedHead::from_state(&memory_unknown.state),
+                abandoned_event.clone(),
+            )
+            .expect("memory abandonment should commit");
+        let sqlite_abandoned = reopened
+            .append(ExpectedHead::from_state(&reopened_unknown), abandoned_event)
+            .expect("SQLite abandonment should commit");
+        assert_eq!(memory_abandoned.state, sqlite_abandoned.state);
+        let calls = sqlite_abandoned
+            .state
+            .agent_loop
+            .as_ref()
+            .and_then(|loop_state| loop_state.model_calls.as_ref())
+            .expect("settled model-call lifecycle should project");
+        assert_eq!(
+            (
+                calls.reserved_calls,
+                calls.settled_calls,
+                calls.unknown_calls
+            ),
+            (1, 1, 1)
+        );
+        assert!(calls.active_call.is_none());
+    }
+
+    #[test]
+    fn sqlite_rolls_back_model_call_reservation_event_and_projection_together() {
+        for fault in [AppendFault::Event, AppendFault::Projection] {
+            let directory = tempdir().expect("temp directory should exist");
+            let database = directory.path().join("model-call-fault.db");
+            let mut store = SqliteRunStore::open(&database).expect("SQLite should open");
+            let lifecycle = seed_model_call_lifecycle(&mut store);
+            let before = store
+                .load()
+                .expect("seeded store should verify")
+                .expect("seeded Run should exist");
+            let reservation = model_call_reservation(&lifecycle.state);
+            let candidate = event(
+                "faulted-model-call-reservation",
+                RunEventBody::ModelCallReserved {
+                    reservation: reservation.clone(),
+                },
+            );
+
+            let result = store.append_plain_with_fault(
+                ExpectedHead::from_state(&lifecycle.state),
+                candidate.clone(),
+                fault,
+            );
+            assert!(matches!(result, Err(StoreError::InjectedFault(_))));
+            assert_eq!(
+                store.load().expect("rolled-back store should verify"),
+                Some(before.clone())
+            );
+            assert_eq!(store.run_event_count().expect("event count"), 3);
+            drop(store);
+
+            let mut reopened = SqliteRunStore::open(&database).expect("SQLite should reopen");
+            assert_eq!(
+                reopened.load().expect("reopened store should verify"),
+                Some(before)
+            );
+            let committed = reopened
+                .append(ExpectedHead::from_state(&lifecycle.state), candidate)
+                .expect("reservation should commit after rollback");
+            assert_eq!(committed.record.sequence, 4);
+            let calls = committed
+                .state
+                .agent_loop
+                .as_ref()
+                .and_then(|loop_state| loop_state.model_calls.as_ref())
+                .expect("reservation should project");
+            assert_eq!(
+                (
+                    calls.reserved_calls,
+                    calls.settled_calls,
+                    calls.unknown_calls
+                ),
+                (1, 0, 0)
+            );
+            assert!(matches!(
+                calls.active_call.as_ref().map(|call| call.status),
+                Some(ModelCallStatus::Reserved)
+            ));
+        }
+    }
+
+    #[test]
+    fn sqlite_rolls_back_model_call_success_plan_sidecars_and_settlement_together() {
+        for fault in [
+            AppendFault::Event,
+            AppendFault::PlannedInvocation,
+            AppendFault::Projection,
+        ] {
+            let directory = tempdir().expect("temp directory should exist");
+            let database = directory.path().join("model-call-plan-fault.db");
+            let mut store = SqliteRunStore::open(&database).expect("SQLite should open");
+            let lifecycle = seed_model_call_lifecycle(&mut store);
+            let reservation = model_call_reservation(&lifecycle.state);
+            let reserved = store
+                .append(
+                    ExpectedHead::from_state(&lifecycle.state),
+                    event(
+                        "model-call-plan-reserved",
+                        RunEventBody::ModelCallReserved {
+                            reservation: reservation.clone(),
+                        },
+                    ),
+                )
+                .expect("reservation should commit");
+            let before = store
+                .load()
+                .expect("reserved store should verify")
+                .expect("reserved Run should exist");
+            let proposal_digest = format!("sha256:{}", "f".repeat(64));
+            let (step, input) = plan_input("model-call-step", &proposal_digest, 'a');
+            let candidate = event(
+                "faulted-model-call-plan",
+                RunEventBody::PlanAccepted {
+                    decision: ExpectedPlanningTurn::for_model_call(
+                        reservation.turn_index(),
+                        reservation.call_id(),
+                        reservation.context_digest(),
+                        &proposal_digest,
+                    )
+                    .expect("model-call decision should bind"),
+                    steps: vec![step],
+                },
+            );
+
+            let result = store.append_plan_with_fault(
+                ExpectedHead::from_state(&reserved.state),
+                candidate,
+                &[input],
+                fault,
+            );
+            assert!(matches!(result, Err(StoreError::InjectedFault(_))));
+            assert_eq!(
+                store.load().expect("rolled-back store should verify"),
+                Some(before.clone())
+            );
+            assert_eq!(store.run_event_count().expect("event count"), 4);
+            assert_eq!(
+                store
+                    .planned_invocation_count()
+                    .expect("planned invocation count"),
+                0
+            );
+            drop(store);
+
+            let reopened = SqliteRunStore::open(&database).expect("SQLite should reopen");
+            let reopened_state = reopened
+                .load_current()
+                .expect("reopened state should verify")
+                .expect("Run should exist");
+            assert_eq!(reopened_state, before.state);
+            assert!(reopened_state.steps.is_empty());
+            let calls = reopened_state
+                .agent_loop
+                .as_ref()
+                .and_then(|loop_state| loop_state.model_calls.as_ref())
+                .expect("reservation should remain projected");
+            assert_eq!((calls.reserved_calls, calls.settled_calls), (1, 0));
+            assert!(matches!(
+                calls.active_call.as_ref().map(|call| call.status),
+                Some(ModelCallStatus::Reserved)
+            ));
+        }
+    }
+
+    #[test]
+    fn sqlite_rolls_back_model_call_unknown_settlement_and_projection_together() {
+        for fault in [AppendFault::Event, AppendFault::Projection] {
+            let directory = tempdir().expect("temp directory should exist");
+            let database = directory.path().join("model-call-unknown-fault.db");
+            let mut store = SqliteRunStore::open(&database).expect("SQLite should open");
+            let lifecycle = seed_model_call_lifecycle(&mut store);
+            let reservation = model_call_reservation(&lifecycle.state);
+            let reserved = store
+                .append(
+                    ExpectedHead::from_state(&lifecycle.state),
+                    event(
+                        "model-call-unknown-reserved",
+                        RunEventBody::ModelCallReserved {
+                            reservation: reservation.clone(),
+                        },
+                    ),
+                )
+                .expect("reservation should commit");
+            let before = store
+                .load()
+                .expect("reserved store should verify")
+                .expect("reserved Run should exist");
+            let candidate = event(
+                "faulted-model-call-unknown",
+                RunEventBody::ModelCallBecameUnknown {
+                    call_id: reservation.call_id().to_owned(),
+                    reason: ModelCallUnknownReason::TransportUnavailable,
+                },
+            );
+
+            let result = store.append_plain_with_fault(
+                ExpectedHead::from_state(&reserved.state),
+                candidate,
+                fault,
+            );
+            assert!(matches!(result, Err(StoreError::InjectedFault(_))));
+            assert_eq!(
+                store.load().expect("rolled-back store should verify"),
+                Some(before.clone())
+            );
+            drop(store);
+
+            let reopened = SqliteRunStore::open(&database).expect("SQLite should reopen");
+            let reopened_state = reopened
+                .load_current()
+                .expect("reopened state should verify")
+                .expect("Run should exist");
+            assert_eq!(reopened_state, before.state);
+            let calls = reopened_state
+                .agent_loop
+                .as_ref()
+                .and_then(|loop_state| loop_state.model_calls.as_ref())
+                .expect("reservation should remain projected");
+            assert_eq!(
+                (
+                    calls.reserved_calls,
+                    calls.settled_calls,
+                    calls.unknown_calls
+                ),
+                (1, 0, 0)
+            );
+            assert!(matches!(
+                calls.active_call.as_ref().map(|call| call.status),
+                Some(ModelCallStatus::Reserved)
+            ));
         }
     }
 

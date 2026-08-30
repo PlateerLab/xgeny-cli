@@ -11,10 +11,12 @@ use xgeny_policy::ResourceResolver;
 use xgeny_workgraph::{
     AcceptedPlanStep, AgentLoopBudget, CompletionCandidateState, ContinuationAction,
     DependencyBlockReason, ExpectedPlanningTurn, FrontierAction, MAX_ACCEPTED_OBJECTIVE_BYTES,
-    MAX_ACCEPTED_PLAN_EDGES, MAX_ACCEPTED_PLAN_STEPS, PlannedExecutionProfile,
-    PlannedInvocationMaterialRecord, PlannedInvocationSpec, PlanningContractError,
-    ReconstructableMaterialReference, RunEvent, RunEventBody, RunState, StepStatus, WorkFrontier,
-    dependency_release_block_reason, derive_frontier, receipt_releases_dependency,
+    MAX_ACCEPTED_PLAN_EDGES, MAX_ACCEPTED_PLAN_STEPS, ModelCallAbandonmentReason, ModelCallBudget,
+    ModelCallRejectionReason, ModelCallReservation, ModelCallSettlement, ModelCallStatus,
+    ModelCallUnknownReason, PlannedExecutionProfile, PlannedInvocationMaterialRecord,
+    PlannedInvocationSpec, PlanningContractError, ReconstructableMaterialReference, RunEvent,
+    RunEventBody, RunState, StepStatus, WorkFrontier, dependency_release_block_reason,
+    derive_frontier, receipt_releases_dependency,
 };
 
 use crate::admission::{definition_contract_digest, prepare_invocation_facts};
@@ -502,15 +504,70 @@ pub enum PlannerPortFailure {
     ProviderLimit,
 }
 
+/// Core-owned envelope for exactly one durably reserved planner call.
+///
+/// This value is intentionally not serializable. The context may contain arbitrary provider-bound
+/// text and schemas; only the reservation identifiers and digests belong in the Run journal.
+pub struct PlannerCallRequest<'a> {
+    call_id: &'a str,
+    request_digest: &'a str,
+    context: &'a PlanningContext,
+}
+
+impl<'a> PlannerCallRequest<'a> {
+    #[must_use]
+    pub const fn call_id(&self) -> &'a str {
+        self.call_id
+    }
+
+    #[must_use]
+    pub const fn request_digest(&self) -> &'a str {
+        self.request_digest
+    }
+
+    #[must_use]
+    pub const fn context(&self) -> &'a PlanningContext {
+        self.context
+    }
+}
+
+impl fmt::Debug for PlannerCallRequest<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PlannerCallRequest")
+            .field("call_id", &self.call_id)
+            .field("request_digest", &self.request_digest)
+            .field("context_digest", &self.context.context_digest())
+            .field("context", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Provider-neutral boundary for one bounded planning decision.
 pub trait PlannerPort {
+    /// Stable, non-secret registry identifier supplied by the trusted host.
+    ///
+    /// Syntactic validation does not detect secrets. Credentials and raw provider content must
+    /// never be placed in this identifier.
+    fn planner_id(&self) -> &str;
+
+    /// Digest of an approved, non-secret, versioned request profile owned by the trusted host.
+    ///
+    /// SHA-256 shape validation does not establish provenance or confidentiality. Raw prompts,
+    /// responses, errors, and credentials must never be embedded or ad hoc hashed into this value.
+    fn request_profile_digest(&self) -> &str;
+
     /// Return one proposal without executing tools or changing the Run store.
     ///
     /// # Errors
     ///
-    /// Returns only a fixed failure class. Raw provider response bodies must remain behind this
-    /// boundary.
-    fn plan(&mut self, context: &PlanningContext) -> Result<PlanProposal, PlannerPortFailure>;
+    /// Returns only a fixed failure class. One invocation may issue at most one provider request;
+    /// hidden SDK retries would bypass the durable call budget. Raw response bodies must remain
+    /// behind this boundary.
+    fn plan(
+        &mut self,
+        request: &PlannerCallRequest<'_>,
+    ) -> Result<PlanProposal, PlannerPortFailure>;
 }
 
 /// Exact normalized material that a trusted host materializer must durably retain before commit.
@@ -603,6 +660,7 @@ pub enum AgentLoopQuiescence {
     BlockedDependencies,
     WaitingDependencies,
     ModelTurnBudgetExhausted,
+    ModelCallBudgetExhausted,
     PlannedStepBudgetExhausted,
     ToolCallBudgetExhausted,
     ContextBudgetExceeded,
@@ -641,6 +699,9 @@ pub enum AgentLoopTick {
     Configured {
         head: AgentLoopHead,
     },
+    ModelCallLifecycleConfigured {
+        head: AgentLoopHead,
+    },
     ActionRequired {
         action: FrontierAction,
         head: AgentLoopHead,
@@ -670,23 +731,65 @@ pub enum AgentLoopTick {
         failure: PlanMaterializerFailure,
         head: AgentLoopHead,
     },
+    ModelCallRecoveryRequired {
+        call_id: String,
+        reason: ModelCallUnknownReason,
+        newly_recorded: bool,
+        head: AgentLoopHead,
+    },
+    ModelCallRejected {
+        reason: ModelCallRejectionReason,
+        head: AgentLoopHead,
+    },
+    ModelCallAbandoned {
+        call_id: String,
+        head: AgentLoopHead,
+    },
 }
 
 /// Single-orchestrator, model-provider-neutral coordinator for a durable Run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentLoop {
     budget: AgentLoopBudget,
+    model_call_budget: ModelCallBudget,
 }
 
 impl AgentLoop {
+    /// Build a loop whose conservative call budget equals its accepted-turn budget.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `budget` was constructed directly with a zero `max_model_turns` instead of
+    /// through [`AgentLoopBudget::new`].
     #[must_use]
-    pub const fn new(budget: AgentLoopBudget) -> Self {
-        Self { budget }
+    pub fn new(budget: AgentLoopBudget) -> Self {
+        let model_call_budget = ModelCallBudget::new(budget.max_model_turns)
+            .expect("a validated AgentLoop budget has a non-zero model-turn limit");
+        Self {
+            budget,
+            model_call_budget,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_model_call_budget(
+        budget: AgentLoopBudget,
+        model_call_budget: ModelCallBudget,
+    ) -> Self {
+        Self {
+            budget,
+            model_call_budget,
+        }
     }
 
     #[must_use]
     pub const fn budget(&self) -> &AgentLoopBudget {
         &self.budget
+    }
+
+    #[must_use]
+    pub const fn model_call_budget(&self) -> &ModelCallBudget {
+        &self.model_call_budget
     }
 
     /// Select at most one current frontier action, or make at most one planner decision.
@@ -696,8 +799,9 @@ impl AgentLoop {
     /// an Executor, verifier, policy UI, or admission path automatically.
     ///
     /// A plan result and all of its secret-free material-reference sidecars are committed in one
-    /// store transaction. Planner rejection, timeout, and materialization failure leave the Run
-    /// journal unchanged.
+    /// store transaction. Every possible provider call is first reserved durably. Typed provider,
+    /// proposal, and materialization failures therefore leave the `WorkGraph` unchanged but append a
+    /// closed lifecycle outcome to the Run journal.
     ///
     /// `resolver` is a planning-time canonicalizer and must be deterministic and side-effect-free.
     /// Core recomputes its result against final Step IDs and rejects any mismatch before calling
@@ -707,7 +811,7 @@ impl AgentLoop {
     ///
     /// Returns an error for missing/corrupt state, wrong lease, changed durable configuration,
     /// event creation, canonicalization, or store failure.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn tick<S, F, L, R, P, M>(
         &self,
         store: &mut S,
@@ -740,6 +844,16 @@ impl AgentLoop {
         if loop_state.budget != self.budget {
             return Err(AgentLoopError::BudgetMismatch);
         }
+        if loop_state.model_calls.is_none() {
+            return self.configure_model_call_lifecycle(store, events, &state);
+        }
+        let model_calls = loop_state
+            .model_calls
+            .as_ref()
+            .ok_or(AgentLoopError::ModelCallLifecycleNotConfigured)?;
+        if model_calls.budget != self.model_call_budget {
+            return Err(AgentLoopError::ModelCallBudgetMismatch);
+        }
         let frontier = derive_frontier(&state)?;
         let tool_calls = total_tool_calls(&state)?;
         if let Some(action) = frontier.next_action() {
@@ -755,6 +869,26 @@ impl AgentLoop {
                 action: action.clone(),
                 head: AgentLoopHead::from_state(&state),
             });
+        }
+
+        if let Some(active) = &model_calls.active_call {
+            return match active.status {
+                ModelCallStatus::Reserved => Self::mark_model_call_unknown(
+                    store,
+                    events,
+                    &state,
+                    active.reservation.call_id(),
+                    ModelCallUnknownReason::Interrupted,
+                ),
+                ModelCallStatus::Unknown { reason } => {
+                    Ok(AgentLoopTick::ModelCallRecoveryRequired {
+                        call_id: active.reservation.call_id().to_owned(),
+                        reason,
+                        newly_recorded: false,
+                        head: AgentLoopHead::from_state(&state),
+                    })
+                }
+            };
         }
 
         if let Some(candidate) = &loop_state.completion_candidate {
@@ -773,6 +907,12 @@ impl AgentLoop {
         if loop_state.accepted_model_turns >= loop_state.budget.max_model_turns {
             return Ok(AgentLoopTick::Quiescent {
                 reason: AgentLoopQuiescence::ModelTurnBudgetExhausted,
+                head: AgentLoopHead::from_state(&state),
+            });
+        }
+        if model_calls.reserved_calls >= model_calls.budget.max_model_calls() {
+            return Ok(AgentLoopTick::Quiescent {
+                reason: AgentLoopQuiescence::ModelCallBudgetExhausted,
                 head: AgentLoopHead::from_state(&state),
             });
         }
@@ -799,13 +939,57 @@ impl AgentLoop {
             }
             Err(ContextBuildError::Catalog) => return Err(AgentLoopError::CapabilityCatalog),
         };
-        let proposal = match planner.plan(&context) {
+        let planner_id = planner.planner_id().to_owned();
+        let request_profile_digest = planner.request_profile_digest().to_owned();
+        if !valid_sha256_digest(&request_profile_digest) {
+            return Err(AgentLoopError::InvalidPlannerRequestProfileDigest);
+        }
+        let request_digest = planner_request_digest(
+            &planner_id,
+            &request_profile_digest,
+            context.context_digest(),
+        )?;
+        let call_index = model_calls
+            .reserved_calls
+            .checked_add(1)
+            .ok_or(AgentLoopError::BudgetCounterOverflow)?;
+        let turn_index = next_turn_index(&state)?;
+        let reservation = ModelCallReservation::new(
+            &state.run_id,
+            state.authority_epoch,
+            planner_id,
+            call_index,
+            turn_index,
+            state.journal_sequence,
+            &state.journal_head_digest,
+            context.context_digest(),
+            request_digest,
+        )?;
+        let reservation_event = create_event(
+            events,
+            &state,
+            RunEventBody::ModelCallReserved {
+                reservation: reservation.clone(),
+            },
+        )?;
+        let reservation_commit =
+            store.append(ExpectedHead::from_state(&state), reservation_event)?;
+        let reserved_state = reservation_commit.state;
+        let request = PlannerCallRequest {
+            call_id: reservation.call_id(),
+            request_digest: reservation.request_digest(),
+            context: &context,
+        };
+        let proposal = match planner.plan(&request) {
             Ok(proposal) => proposal,
             Err(failure) => {
-                return Ok(AgentLoopTick::PlannerUnavailable {
+                return Self::record_planner_failure(
+                    store,
+                    events,
+                    &reserved_state,
+                    reservation.call_id(),
                     failure,
-                    head: AgentLoopHead::from_state(&state),
-                });
+                );
             }
         };
         self.handle_proposal(
@@ -815,11 +999,73 @@ impl AgentLoop {
             resolver,
             materializer,
             &state,
+            &reserved_state,
             &frontier,
             &context,
+            reservation.call_id(),
             proposal,
             tool_calls,
         )
+    }
+
+    /// Explicitly discard one unresolved model call. No call-budget slot is refunded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing state, a wrong lease, changed durable configuration, or when
+    /// the named call is not the active unresolved call.
+    pub fn abandon_model_call<S, F, L>(
+        &self,
+        store: &mut S,
+        events: &mut F,
+        lease: &L,
+        call_id: &str,
+    ) -> Result<AgentLoopTick, AgentLoopError>
+    where
+        S: RunStore,
+        F: EventFactory,
+        L: RunLease,
+    {
+        let state = store
+            .load_current()?
+            .ok_or(AgentLoopError::RunNotInitialized)?;
+        verify_lease(lease, &state)?;
+        let loop_state = state
+            .agent_loop
+            .as_ref()
+            .ok_or(AgentLoopError::AgentLoopNotConfigured)?;
+        if loop_state.budget != self.budget {
+            return Err(AgentLoopError::BudgetMismatch);
+        }
+        let lifecycle = loop_state
+            .model_calls
+            .as_ref()
+            .ok_or(AgentLoopError::ModelCallLifecycleNotConfigured)?;
+        if lifecycle.budget != self.model_call_budget {
+            return Err(AgentLoopError::ModelCallBudgetMismatch);
+        }
+        let active = lifecycle
+            .active_call
+            .as_ref()
+            .ok_or(AgentLoopError::ModelCallNotActive)?;
+        if active.reservation.call_id() != call_id {
+            return Err(AgentLoopError::ModelCallIdMismatch);
+        }
+        let event = create_event(
+            events,
+            &state,
+            RunEventBody::ModelCallSettled {
+                call_id: call_id.to_owned(),
+                settlement: ModelCallSettlement::Abandoned {
+                    reason: ModelCallAbandonmentReason::RecoveryDiscarded,
+                },
+            },
+        )?;
+        let commit = store.append(ExpectedHead::from_state(&state), event)?;
+        Ok(AgentLoopTick::ModelCallAbandoned {
+            call_id: call_id.to_owned(),
+            head: AgentLoopHead::from_state(&commit.state),
+        })
     }
 
     fn configure<S, F>(
@@ -845,7 +1091,30 @@ impl AgentLoop {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
+    fn configure_model_call_lifecycle<S, F>(
+        &self,
+        store: &mut S,
+        events: &mut F,
+        state: &RunState,
+    ) -> Result<AgentLoopTick, AgentLoopError>
+    where
+        S: RunStore,
+        F: EventFactory,
+    {
+        let event = create_event(
+            events,
+            state,
+            RunEventBody::ModelCallLifecycleConfigured {
+                budget: self.model_call_budget.clone(),
+            },
+        )?;
+        let commit = store.append(ExpectedHead::from_state(state), event)?;
+        Ok(AgentLoopTick::ModelCallLifecycleConfigured {
+            head: AgentLoopHead::from_state(&commit.state),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn handle_proposal<S, F, R, M>(
         &self,
         store: &mut S,
@@ -853,9 +1122,11 @@ impl AgentLoop {
         capabilities: &CapabilityRegistry,
         resolver: &R,
         materializer: &mut M,
-        state: &RunState,
+        base_state: &RunState,
+        reserved_state: &RunState,
         frontier: &WorkFrontier,
         context: &PlanningContext,
+        call_id: &str,
         proposal: PlanProposal,
         tool_calls: u32,
     ) -> Result<AgentLoopTick, AgentLoopError>
@@ -866,18 +1137,28 @@ impl AgentLoop {
         M: PlanMaterializer,
     {
         match proposal {
-            PlanProposal::CompletionCandidate { summary } => {
-                Self::record_completion_candidate(store, events, state, frontier, context, &summary)
-            }
+            PlanProposal::CompletionCandidate { summary } => Self::record_completion_candidate(
+                store,
+                events,
+                base_state,
+                reserved_state,
+                frontier,
+                context,
+                call_id,
+                &summary,
+            ),
             PlanProposal::Plan { steps } => {
                 if tool_calls >= self.budget.max_tool_calls {
-                    return Ok(AgentLoopTick::ProposalRejected {
-                        reason: ProposalRejection::ToolCallBudgetExhausted,
-                        head: AgentLoopHead::from_state(state),
-                    });
+                    return Self::record_proposal_rejection(
+                        store,
+                        events,
+                        reserved_state,
+                        call_id,
+                        ProposalRejection::ToolCallBudgetExhausted,
+                    );
                 }
                 let prepared = match prepare_plan(
-                    state,
+                    base_state,
                     frontier,
                     context,
                     capabilities,
@@ -887,28 +1168,50 @@ impl AgentLoop {
                 ) {
                     Ok(prepared) => prepared,
                     Err(reason) => {
-                        return Ok(AgentLoopTick::ProposalRejected {
+                        return Self::record_proposal_rejection(
+                            store,
+                            events,
+                            reserved_state,
+                            call_id,
                             reason,
-                            head: AgentLoopHead::from_state(state),
-                        });
+                        );
                     }
                 };
                 let (accepted_steps, inputs) = match materialize_plan(
                     materializer,
-                    state,
+                    base_state,
                     &prepared.proposal_digest,
                     prepared.steps,
                 ) {
                     Ok(values) => values,
                     Err(failure) => {
+                        let commit = match append_model_call_rejection(
+                            store,
+                            events,
+                            reserved_state,
+                            call_id,
+                            ModelCallRejectionReason::MaterializationFailed,
+                        ) {
+                            Ok(commit) => commit,
+                            Err(AgentLoopError::Store(StoreError::HeadConflict { .. })) => {
+                                return Self::resolve_model_call_conflict(
+                                    store,
+                                    events,
+                                    call_id,
+                                    ModelCallConflictIntent::RejectStale,
+                                );
+                            }
+                            Err(error) => return Err(error),
+                        };
                         return Ok(AgentLoopTick::MaterializerUnavailable {
                             failure,
-                            head: AgentLoopHead::from_state(state),
+                            head: AgentLoopHead::from_state(&commit.state),
                         });
                     }
                 };
-                let decision = ExpectedPlanningTurn::new(
-                    next_turn_index(state)?,
+                let decision = ExpectedPlanningTurn::for_model_call(
+                    next_turn_index(base_state)?,
+                    call_id,
                     context.context_digest(),
                     &prepared.proposal_digest,
                 )?;
@@ -918,17 +1221,23 @@ impl AgentLoop {
                     .collect();
                 let event = create_event(
                     events,
-                    state,
+                    reserved_state,
                     RunEventBody::PlanAccepted {
                         decision,
                         steps: accepted_steps,
                     },
                 )?;
-                let commit = store.append_with_plan_inputs(
-                    ExpectedHead::from_state(state),
+                let commit = match store.append_with_plan_inputs(
+                    ExpectedHead::from_state(reserved_state),
                     event,
                     inputs,
-                )?;
+                ) {
+                    Ok(commit) => commit,
+                    Err(StoreError::HeadConflict { .. }) => {
+                        return Self::record_stale_model_call(store, events, call_id);
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 Ok(AgentLoopTick::PlanAccepted {
                     step_ids,
                     head: AgentLoopHead::from_state(&commit.state),
@@ -937,12 +1246,15 @@ impl AgentLoop {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_completion_candidate<S, F>(
         store: &mut S,
         events: &mut F,
-        state: &RunState,
+        base_state: &RunState,
+        reserved_state: &RunState,
         frontier: &WorkFrontier,
         context: &PlanningContext,
+        call_id: &str,
         summary: &str,
     ) -> Result<AgentLoopTick, AgentLoopError>
     where
@@ -950,16 +1262,22 @@ impl AgentLoop {
         F: EventFactory,
     {
         if !frontier.all_steps_receipt_completed() {
-            return Ok(AgentLoopTick::ProposalRejected {
-                reason: ProposalRejection::CompletionWithoutReceiptCompletedPlan,
-                head: AgentLoopHead::from_state(state),
-            });
+            return Self::record_proposal_rejection(
+                store,
+                events,
+                reserved_state,
+                call_id,
+                ProposalRejection::CompletionWithoutReceiptCompletedPlan,
+            );
         }
         if !valid_bounded_text(summary, MAX_COMPLETION_SUMMARY_BYTES) {
-            return Ok(AgentLoopTick::ProposalRejected {
-                reason: ProposalRejection::InvalidCompletionSummary,
-                head: AgentLoopHead::from_state(state),
-            });
+            return Self::record_proposal_rejection(
+                store,
+                events,
+                reserved_state,
+                call_id,
+                ProposalRejection::InvalidCompletionSummary,
+            );
         }
         let proposal_digest = digest_serializable(&CompletionProposalDigestInput {
             domain: "xgeny.completion-proposal/v1",
@@ -972,10 +1290,13 @@ impl AgentLoop {
             summary,
         })? > MAX_PROPOSAL_BYTES
         {
-            return Ok(AgentLoopTick::ProposalRejected {
-                reason: ProposalRejection::ProposalTooLarge,
-                head: AgentLoopHead::from_state(state),
-            });
+            return Self::record_proposal_rejection(
+                store,
+                events,
+                reserved_state,
+                call_id,
+                ProposalRejection::ProposalTooLarge,
+            );
         }
         let summary_digest = digest_serializable(&CompletionSummaryDigestInput {
             domain: "xgeny.completion-summary/v1",
@@ -985,26 +1306,33 @@ impl AgentLoop {
             "completion",
             &digest_serializable(&CompletionCandidateIdInput {
                 domain: "xgeny.completion-candidate-id/v1",
-                run_id: &state.run_id,
+                run_id: &base_state.run_id,
                 context_digest: context.context_digest(),
                 proposal_digest: &proposal_digest,
             })?,
         );
-        let decision = ExpectedPlanningTurn::new(
-            next_turn_index(state)?,
+        let decision = ExpectedPlanningTurn::for_model_call(
+            next_turn_index(base_state)?,
+            call_id,
             context.context_digest(),
             &proposal_digest,
         )?;
         let event = create_event(
             events,
-            state,
+            reserved_state,
             RunEventBody::CompletionCandidateRecorded {
                 decision,
                 candidate_id: candidate_id.clone(),
                 summary_digest: summary_digest.clone(),
             },
         )?;
-        let commit = store.append(ExpectedHead::from_state(state), event)?;
+        let commit = match store.append(ExpectedHead::from_state(reserved_state), event) {
+            Ok(commit) => commit,
+            Err(StoreError::HeadConflict { .. }) => {
+                return Self::record_stale_model_call(store, events, call_id);
+            }
+            Err(error) => return Err(error.into()),
+        };
         let candidate = commit
             .state
             .agent_loop
@@ -1017,6 +1345,266 @@ impl AgentLoop {
             head: AgentLoopHead::from_state(&commit.state),
         })
     }
+
+    fn record_proposal_rejection<S, F>(
+        store: &mut S,
+        events: &mut F,
+        reserved_state: &RunState,
+        call_id: &str,
+        reason: ProposalRejection,
+    ) -> Result<AgentLoopTick, AgentLoopError>
+    where
+        S: RunStore,
+        F: EventFactory,
+    {
+        let commit = match append_model_call_rejection(
+            store,
+            events,
+            reserved_state,
+            call_id,
+            ModelCallRejectionReason::ProposalRejected,
+        ) {
+            Ok(commit) => commit,
+            Err(AgentLoopError::Store(StoreError::HeadConflict { .. })) => {
+                return Self::resolve_model_call_conflict(
+                    store,
+                    events,
+                    call_id,
+                    ModelCallConflictIntent::RejectStale,
+                );
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(AgentLoopTick::ProposalRejected {
+            reason,
+            head: AgentLoopHead::from_state(&commit.state),
+        })
+    }
+
+    fn record_planner_failure<S, F>(
+        store: &mut S,
+        events: &mut F,
+        reserved_state: &RunState,
+        call_id: &str,
+        failure: PlannerPortFailure,
+    ) -> Result<AgentLoopTick, AgentLoopError>
+    where
+        S: RunStore,
+        F: EventFactory,
+    {
+        let (commit, conflict_intent) = match failure {
+            PlannerPortFailure::Timeout => (
+                append_model_call_unknown(
+                    store,
+                    events,
+                    reserved_state,
+                    call_id,
+                    ModelCallUnknownReason::Timeout,
+                ),
+                ModelCallConflictIntent::MarkUnknown(ModelCallUnknownReason::Timeout),
+            ),
+            PlannerPortFailure::Unavailable => (
+                append_model_call_unknown(
+                    store,
+                    events,
+                    reserved_state,
+                    call_id,
+                    ModelCallUnknownReason::TransportUnavailable,
+                ),
+                ModelCallConflictIntent::MarkUnknown(ModelCallUnknownReason::TransportUnavailable),
+            ),
+            PlannerPortFailure::InvalidResponse => (
+                append_model_call_rejection(
+                    store,
+                    events,
+                    reserved_state,
+                    call_id,
+                    ModelCallRejectionReason::PlannerInvalidResponse,
+                ),
+                ModelCallConflictIntent::RejectStale,
+            ),
+            PlannerPortFailure::ProviderLimit => (
+                append_model_call_rejection(
+                    store,
+                    events,
+                    reserved_state,
+                    call_id,
+                    ModelCallRejectionReason::ProviderLimit,
+                ),
+                ModelCallConflictIntent::RejectStale,
+            ),
+        };
+        let commit = match commit {
+            Ok(commit) => commit,
+            Err(AgentLoopError::Store(StoreError::HeadConflict { .. })) => {
+                return Self::resolve_model_call_conflict(store, events, call_id, conflict_intent);
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(AgentLoopTick::PlannerUnavailable {
+            failure,
+            head: AgentLoopHead::from_state(&commit.state),
+        })
+    }
+
+    fn mark_model_call_unknown<S, F>(
+        store: &mut S,
+        events: &mut F,
+        state: &RunState,
+        call_id: &str,
+        reason: ModelCallUnknownReason,
+    ) -> Result<AgentLoopTick, AgentLoopError>
+    where
+        S: RunStore,
+        F: EventFactory,
+    {
+        let commit = match append_model_call_unknown(store, events, state, call_id, reason) {
+            Ok(commit) => commit,
+            Err(AgentLoopError::Store(StoreError::HeadConflict { .. })) => {
+                return Self::resolve_model_call_conflict(
+                    store,
+                    events,
+                    call_id,
+                    ModelCallConflictIntent::MarkUnknown(reason),
+                );
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(AgentLoopTick::ModelCallRecoveryRequired {
+            call_id: call_id.to_owned(),
+            reason,
+            newly_recorded: true,
+            head: AgentLoopHead::from_state(&commit.state),
+        })
+    }
+
+    fn record_stale_model_call<S, F>(
+        store: &mut S,
+        events: &mut F,
+        call_id: &str,
+    ) -> Result<AgentLoopTick, AgentLoopError>
+    where
+        S: RunStore,
+        F: EventFactory,
+    {
+        Self::resolve_model_call_conflict(
+            store,
+            events,
+            call_id,
+            ModelCallConflictIntent::RejectStale,
+        )
+    }
+
+    fn resolve_model_call_conflict<S, F>(
+        store: &mut S,
+        events: &mut F,
+        call_id: &str,
+        intent: ModelCallConflictIntent,
+    ) -> Result<AgentLoopTick, AgentLoopError>
+    where
+        S: RunStore,
+        F: EventFactory,
+    {
+        let current = store
+            .load_current()?
+            .ok_or(AgentLoopError::RunNotInitialized)?;
+        let active = current
+            .agent_loop
+            .as_ref()
+            .ok_or(AgentLoopError::AgentLoopNotConfigured)?
+            .model_calls
+            .as_ref()
+            .ok_or(AgentLoopError::ModelCallLifecycleNotConfigured)?
+            .active_call
+            .as_ref()
+            .ok_or(AgentLoopError::ModelCallNoLongerActive)?;
+        if active.reservation.call_id() != call_id {
+            return Err(AgentLoopError::ModelCallNoLongerActive);
+        }
+        match active.status {
+            ModelCallStatus::Unknown { reason } => Ok(AgentLoopTick::ModelCallRecoveryRequired {
+                call_id: call_id.to_owned(),
+                reason,
+                newly_recorded: false,
+                head: AgentLoopHead::from_state(&current),
+            }),
+            ModelCallStatus::Reserved => match intent {
+                ModelCallConflictIntent::MarkUnknown(reason) => {
+                    let commit =
+                        append_model_call_unknown(store, events, &current, call_id, reason)?;
+                    Ok(AgentLoopTick::ModelCallRecoveryRequired {
+                        call_id: call_id.to_owned(),
+                        reason,
+                        newly_recorded: true,
+                        head: AgentLoopHead::from_state(&commit.state),
+                    })
+                }
+                ModelCallConflictIntent::RejectStale => {
+                    let commit = append_model_call_rejection(
+                        store,
+                        events,
+                        &current,
+                        call_id,
+                        ModelCallRejectionReason::StaleHead,
+                    )?;
+                    Ok(AgentLoopTick::ModelCallRejected {
+                        reason: ModelCallRejectionReason::StaleHead,
+                        head: AgentLoopHead::from_state(&commit.state),
+                    })
+                }
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelCallConflictIntent {
+    MarkUnknown(ModelCallUnknownReason),
+    RejectStale,
+}
+
+fn append_model_call_unknown<S, F>(
+    store: &mut S,
+    events: &mut F,
+    state: &RunState,
+    call_id: &str,
+    reason: ModelCallUnknownReason,
+) -> Result<xgeny_local_store::Commit, AgentLoopError>
+where
+    S: RunStore,
+    F: EventFactory,
+{
+    let event = create_event(
+        events,
+        state,
+        RunEventBody::ModelCallBecameUnknown {
+            call_id: call_id.to_owned(),
+            reason,
+        },
+    )?;
+    Ok(store.append(ExpectedHead::from_state(state), event)?)
+}
+
+fn append_model_call_rejection<S, F>(
+    store: &mut S,
+    events: &mut F,
+    state: &RunState,
+    call_id: &str,
+    reason: ModelCallRejectionReason,
+) -> Result<xgeny_local_store::Commit, AgentLoopError>
+where
+    S: RunStore,
+    F: EventFactory,
+{
+    let event = create_event(
+        events,
+        state,
+        RunEventBody::ModelCallSettled {
+            call_id: call_id.to_owned(),
+            settlement: ModelCallSettlement::Rejected { reason },
+        },
+    )?;
+    Ok(store.append(ExpectedHead::from_state(state), event)?)
 }
 
 fn verify_lease<L: RunLease>(lease: &L, state: &RunState) -> Result<(), AgentLoopError> {
@@ -1082,6 +1670,37 @@ struct CatalogDigestInput<'a> {
 struct ContextDigestInput<'a> {
     domain: &'static str,
     payload: &'a PlanningContextPayload,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlannerRequestDigestInput<'a> {
+    domain: &'static str,
+    planner_id: &'a str,
+    request_profile_digest: &'a str,
+    context_digest: &'a str,
+}
+
+fn planner_request_digest(
+    planner_id: &str,
+    request_profile_digest: &str,
+    context_digest: &str,
+) -> Result<String, AgentLoopError> {
+    digest_serializable(&PlannerRequestDigestInput {
+        domain: "xgeny.model-call-request/v1",
+        planner_id,
+        request_profile_digest,
+        context_digest,
+    })
+}
+
+fn valid_sha256_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|encoded| {
+        encoded.len() == 64
+            && encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 #[derive(Debug)]
@@ -1830,10 +2449,22 @@ pub enum AgentLoopError {
     LeaseRunMismatch,
     #[error("AgentLoop durable budget differs from this runtime configuration")]
     BudgetMismatch,
+    #[error("durable model-call budget differs from this runtime configuration")]
+    ModelCallBudgetMismatch,
     #[error("AgentLoop is not durably configured")]
     AgentLoopNotConfigured,
+    #[error("durable model-call lifecycle is not configured")]
+    ModelCallLifecycleNotConfigured,
+    #[error("no unresolved model call is active")]
+    ModelCallNotActive,
+    #[error("the requested model call is not the active call")]
+    ModelCallIdMismatch,
+    #[error("the model call was settled or superseded during concurrent outcome recording")]
+    ModelCallNoLongerActive,
     #[error("AgentLoop budget counter overflowed")]
     BudgetCounterOverflow,
+    #[error("planner request profile digest is not canonical lowercase SHA-256")]
+    InvalidPlannerRequestProfileDigest,
     #[error("planning canonicalization failed")]
     Canonicalization,
     #[error("Capability catalog could not be committed to planning context")]
@@ -1862,46 +2493,6 @@ mod tests {
         ) -> Result<String, ResourceResolutionFailure> {
             self.0.set(self.0.get() + 1);
             Ok(resource.to_owned())
-        }
-    }
-
-    struct NoAppendStore;
-
-    impl RunStore for NoAppendStore {
-        fn append(
-            &mut self,
-            _expected: ExpectedHead,
-            _event: RunEvent,
-        ) -> Result<xgeny_local_store::Commit, StoreError> {
-            panic!("blocked proposal must not append")
-        }
-
-        fn load(&self) -> Result<Option<xgeny_local_store::RunSnapshot>, StoreError> {
-            Ok(None)
-        }
-    }
-
-    struct NoEvents;
-
-    impl EventFactory for NoEvents {
-        fn create_metadata(
-            &mut self,
-            _state: &RunState,
-        ) -> Result<crate::EventMetadata, EventFactoryError> {
-            panic!("blocked proposal must not create an event")
-        }
-    }
-
-    #[derive(Default)]
-    struct CountingMaterializer(Cell<usize>);
-
-    impl PlanMaterializer for CountingMaterializer {
-        fn materialize(
-            &mut self,
-            _request: PlanMaterializationRequest<'_>,
-        ) -> Result<ReconstructableMaterialReference, PlanMaterializerFailure> {
-            self.0.set(self.0.get() + 1);
-            Err(PlanMaterializerFailure::Rejected)
         }
     }
 
@@ -1948,6 +2539,7 @@ mod tests {
             agent_loop: Some(AgentLoopState {
                 budget: test_budget(),
                 accepted_model_turns: 0,
+                model_calls: None,
                 completion_candidate: None,
             }),
         }
@@ -1971,30 +2563,20 @@ mod tests {
         let context = build_context(state, &frontier, &CapabilityRegistry::new(), &test_budget())
             .expect("context should fit");
         let resolver = CountingResolver::default();
-        let mut materializer = CountingMaterializer::default();
-        let outcome = AgentLoop::new(test_budget())
-            .handle_proposal(
-                &mut NoAppendStore,
-                &mut NoEvents,
-                &CapabilityRegistry::new(),
-                &resolver,
-                &mut materializer,
-                state,
-                &frontier,
-                &context,
-                PlanProposal::plan(proposal(dependency)),
-                0,
-            )
-            .expect("blocked proposal should be classified");
+        let outcome = prepare_plan(
+            state,
+            &frontier,
+            &context,
+            &CapabilityRegistry::new(),
+            &resolver,
+            &test_budget(),
+            proposal(dependency),
+        );
         assert!(matches!(
             outcome,
-            AgentLoopTick::ProposalRejected {
-                reason: ProposalRejection::BlockedExistingDependency,
-                ..
-            }
+            Err(ProposalRejection::BlockedExistingDependency)
         ));
         assert_eq!(resolver.0.get(), 0);
-        assert_eq!(materializer.0.get(), 0);
     }
 
     #[test]
