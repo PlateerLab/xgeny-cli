@@ -12,8 +12,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use xgeny_domain::{
-    API_VERSION_V1ALPHA1, ExecutionReceiptBody, PolicyDecisionBody, ProtocolDocument,
-    ReceiptStatus, VerificationEvidence, VerificationResult,
+    API_VERSION_V1ALPHA1, ExecutionMode, ExecutionReceiptBody, PolicyDecisionBody,
+    ProtocolDocument, ReceiptStatus, VerificationEvidence, VerificationResult, VerificationState,
+    WorkGraphBody, WorkStepStatus,
 };
 
 const SCHEMA_BASE_URI: &str = "https://schemas.xgeny.dev/v1alpha1/";
@@ -27,6 +28,7 @@ static EXECUTION_RECEIPT_VALIDATOR: OnceLock<Result<BundledDocumentValidator, St
     OnceLock::new();
 static POLICY_DECISION_VALIDATOR: OnceLock<Result<BundledDocumentValidator, String>> =
     OnceLock::new();
+static WORK_GRAPH_VALIDATOR: OnceLock<Result<BundledDocumentValidator, String>> = OnceLock::new();
 
 /// Stable identifier for the first Core-owned Receipt construction and verification profile.
 pub const CORE_RECEIPT_PROFILE_V1: &str = "xgeny.core-receipt/v1";
@@ -361,6 +363,31 @@ pub fn validate_policy_decision(decision: &PolicyDecisionBody) -> Result<(), Pro
     Ok(())
 }
 
+/// Validate one typed `WorkGraph` snapshot against its bundled wire and DAG semantics.
+///
+/// # Errors
+///
+/// Returns an error for schema violations, duplicate/unknown/self/cyclic dependencies, or a Step
+/// lifecycle that claims readiness or progress before every dependency completed.
+pub fn validate_work_graph(graph: &WorkGraphBody) -> Result<(), ProtocolError> {
+    let context = cached_document_validator(&WORK_GRAPH_VALIDATOR, "work-graph.schema.json")?;
+    let document = ProtocolDocument::WorkGraph(Box::new(graph.clone()));
+    let value = serde_json::to_value(&document).map_err(|source| ProtocolError::Json {
+        asset: "runtime WorkGraph".to_owned(),
+        source,
+    })?;
+    context.validator.validate(&value).map_err(|error| {
+        ProtocolError::Fixture(format!(
+            "runtime WorkGraph violates the schema at {}: {}",
+            error.instance_path(),
+            error
+        ))
+    })?;
+    validate_required_extensions(&document, &BTreeSet::new())?;
+    validate_document_semantics("runtime WorkGraph", &value, &document, &context.registry)?;
+    Ok(())
+}
+
 fn cached_document_validator(
     cell: &'static OnceLock<Result<BundledDocumentValidator, String>>,
     schema_name: &'static str,
@@ -535,6 +562,7 @@ fn validate_document_semantics(
             }
             Ok(1)
         }
+        ProtocolDocument::WorkGraph(body) => validate_work_graph_semantics(name, body),
         ProtocolDocument::RunJournalEvent(body) => {
             verify_derived_digest(name, original, "eventDigest", &body.event_digest)?;
             Ok(1)
@@ -545,6 +573,107 @@ fn validate_document_semantics(
         }
         _ => Ok(0),
     }
+}
+
+fn validate_work_graph_semantics(
+    name: &str,
+    graph: &WorkGraphBody,
+) -> Result<usize, ProtocolError> {
+    let mut steps = BTreeMap::new();
+    for step in &graph.steps {
+        if steps.insert(step.step_id.as_str(), step).is_some() {
+            return Err(ProtocolError::Fixture(format!(
+                "`{name}` repeats WorkGraph stepId `{}`",
+                step.step_id
+            )));
+        }
+    }
+
+    let mut remaining_dependencies = BTreeMap::new();
+    let mut dependents: BTreeMap<&str, Vec<&str>> = steps
+        .keys()
+        .copied()
+        .map(|step_id| (step_id, Vec::new()))
+        .collect();
+    let mut semantic_checks = 1_usize;
+    for (step_id, step) in &steps {
+        let mut unique = BTreeSet::new();
+        for dependency_id in &step.depends_on {
+            semantic_checks = semantic_checks.saturating_add(1);
+            if dependency_id == step_id {
+                return Err(ProtocolError::Fixture(format!(
+                    "`{name}` WorkGraph step `{step_id}` depends on itself"
+                )));
+            }
+            if !unique.insert(dependency_id.as_str()) {
+                return Err(ProtocolError::Fixture(format!(
+                    "`{name}` WorkGraph step `{step_id}` repeats dependency `{dependency_id}`"
+                )));
+            }
+            let Some(children) = dependents.get_mut(dependency_id.as_str()) else {
+                return Err(ProtocolError::Fixture(format!(
+                    "`{name}` WorkGraph step `{step_id}` refers to unknown dependency `{dependency_id}`"
+                )));
+            };
+            children.push(step_id);
+        }
+        if graph.execution_mode == ExecutionMode::Direct && !step.depends_on.is_empty() {
+            return Err(ProtocolError::Fixture(format!(
+                "`{name}` Direct WorkGraph step cannot declare dependencies"
+            )));
+        }
+        if matches!(
+            step.status,
+            WorkStepStatus::Ready
+                | WorkStepStatus::Running
+                | WorkStepStatus::WaitingInput
+                | WorkStepStatus::Validating
+                | WorkStepStatus::Completed
+        ) {
+            for dependency_id in &step.depends_on {
+                if steps[dependency_id.as_str()].status != WorkStepStatus::Completed {
+                    return Err(ProtocolError::Fixture(format!(
+                        "`{name}` WorkGraph step `{step_id}` advanced before dependency `{dependency_id}` completed"
+                    )));
+                }
+            }
+        }
+        if step.status == WorkStepStatus::Completed
+            && step.verification_status != VerificationState::Passed
+        {
+            return Err(ProtocolError::Fixture(format!(
+                "`{name}` completed WorkGraph step `{step_id}` is not verification-passed"
+            )));
+        }
+        remaining_dependencies.insert(*step_id, step.depends_on.len());
+    }
+
+    let mut zero_indegree: BTreeSet<&str> = remaining_dependencies
+        .iter()
+        .filter_map(|(step_id, count)| (*count == 0).then_some(*step_id))
+        .collect();
+    let mut processed = 0_usize;
+    while let Some(step_id) = zero_indegree.pop_first() {
+        processed = processed.saturating_add(1);
+        for child in &dependents[step_id] {
+            let remaining = remaining_dependencies
+                .get_mut(child)
+                .expect("validated dependent should be indexed");
+            *remaining = remaining
+                .checked_sub(1)
+                .expect("dependency count cannot underflow");
+            if *remaining == 0 {
+                zero_indegree.insert(child);
+            }
+        }
+    }
+    if processed != steps.len() {
+        return Err(ProtocolError::Fixture(format!(
+            "`{name}` WorkGraph contains a dependency cycle"
+        )));
+    }
+
+    Ok(semantic_checks)
 }
 
 fn validate_embedded_schema(
@@ -730,6 +859,57 @@ mod tests {
         let mut tampered = (*receipt).clone();
         tampered.output_digest = format!("sha256:{}", "e".repeat(64));
         assert!(validate_execution_receipt(&tampered).is_err());
+    }
+
+    #[test]
+    fn runtime_work_graph_validation_enforces_dag_semantics() {
+        let document: ProtocolDocument = serde_json::from_str(
+            assets::FIXTURES
+                .iter()
+                .find(|asset| asset.name == "valid/work-graph.direct-completed.json")
+                .expect("WorkGraph fixture should be bundled")
+                .contents,
+        )
+        .expect("WorkGraph fixture should deserialize");
+        let ProtocolDocument::WorkGraph(graph) = document else {
+            panic!("expected WorkGraph")
+        };
+        let mut graph = *graph;
+        graph.execution_mode = ExecutionMode::Persistent;
+        graph.status = xgeny_domain::WorkGraphStatus::Running;
+        let mut root = graph.steps[0].clone();
+        root.step_id = "step-a".to_owned();
+        root.depends_on.clear();
+        let mut child = root.clone();
+        child.step_id = "step-b".to_owned();
+        child.depends_on = vec![root.step_id.clone()];
+        child.status = WorkStepStatus::Ready;
+        child.verification_status = VerificationState::NotStarted;
+        child.output_digest = None;
+        graph.steps = vec![root.clone(), child.clone()];
+        validate_work_graph(&graph).expect("valid dependency DAG should pass");
+
+        let mut unknown = graph.clone();
+        unknown.steps[1].depends_on = vec!["step-missing".to_owned()];
+        assert!(validate_work_graph(&unknown).is_err());
+
+        let mut cycle = graph.clone();
+        cycle.steps[0].status = WorkStepStatus::Pending;
+        cycle.steps[0].verification_status = VerificationState::NotStarted;
+        cycle.steps[0].depends_on = vec!["step-b".to_owned()];
+        cycle.steps[1].status = WorkStepStatus::Pending;
+        cycle.steps[1].depends_on = vec!["step-a".to_owned()];
+        assert!(validate_work_graph(&cycle).is_err());
+
+        let mut early_ready = graph.clone();
+        early_ready.steps[0].status = WorkStepStatus::Pending;
+        early_ready.steps[0].verification_status = VerificationState::NotStarted;
+        assert!(validate_work_graph(&early_ready).is_err());
+
+        let mut duplicate = graph;
+        duplicate.steps[1].step_id = duplicate.steps[0].step_id.clone();
+        duplicate.steps[1].depends_on.clear();
+        assert!(validate_work_graph(&duplicate).is_err());
     }
 
     #[test]

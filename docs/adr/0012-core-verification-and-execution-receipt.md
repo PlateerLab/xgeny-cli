@@ -6,7 +6,7 @@
 - 공개 protocol v0.1 변경: 없음
 - local store schema: 3 → 4
 
-> 후속 상태: ADR-0013이 schema와 wire를 바꾸지 않고 one-pass Receipt anchor 검증, connection-local VerifiedRunIndex와 runtime 최소 view를 추가했다. 아래 장기 Run index 비목표는 ADR-0012 결정 당시의 범위를 기록한다.
+> 후속 상태: ADR-0013이 schema와 wire를 바꾸지 않고 one-pass Receipt anchor 검증, connection-local VerifiedRunIndex와 runtime 최소 view를 추가했다. ADR-0014는 Receipt-bound completion만 dependency를 해제하는 Persistent WorkGraph frontier를 추가하고 semantic downgrade 방지를 위해 local store schema를 5로 올렸다. 아래 schema 4와 후속 범위 설명은 ADR-0012 결정 당시의 기록이다.
 
 ## 문맥
 

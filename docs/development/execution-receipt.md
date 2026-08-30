@@ -3,7 +3,7 @@
 - 기준일: 2026-08-29
 - 상태: ADR-0012 연구 gate용 기본형
 - 공개 protocol v0.1 변경: 없음
-- local store schema: 4
+- Receipt 도입 schema: 4; current local store schema: 5
 
 ## 구현된 사용자 시나리오
 
@@ -129,7 +129,7 @@ Admission은 Receipt가 참조하는 transient `PolicyDecisionBody`를 bundled s
 
 `RunStore::export_jsonl`은 기존 journal-only canonical stream이다. Complete Receipt는 `export_execution_receipts_jsonl`에서 `kind: ExecutionReceipt`를 포함한 protocol document로 chain 순서에 export한다. 현재 두 export는 하나의 atomic archive/import format이 아니며, SQLite built-in의 `load_with_execution_receipts`만 한 read transaction에서 Run과 Receipt chain을 읽는다. Runtime의 Receipt finalization은 전체 vector 대신 같은 verified generation에서 state, start 시각과 이전 Receipt digest만 반환하는 `load_verification_snapshot`을 사용한다.
 
-SQLite schema 4 transaction은 다음 순서로 수행한다.
+Schema 4에서 도입되어 current schema 5에도 유지되는 Receipt transaction은 다음 순서로 수행한다.
 
 ```text
 BEGIN IMMEDIATE
@@ -147,7 +147,7 @@ Receipt insert 또는 projection write에서 실패하면 event를 포함한 전
 
 과거 journal event의 Rust 필드명은 evidence 의미로 정리했지만 serialized JSON key `receiptDigest`는 유지한다. Optional provenance와 execution Receipt projection field는 없는 경우 serialize하지 않아 schema 3 event의 canonical bytes와 digest를 바꾸지 않는다.
 
-Schema 3 open은 기존 journal과 sidecar를 검증한 뒤 빈 `execution_receipts` table을 원자적으로 추가한다. 과거 terminal event에 Receipt를 조작해 backfill하지 않는다. 실제 provenance 없는 pending/Validating schema 3 fixture로 migration과 journal byte 보존을 검증한다. Legacy Run은 그대로 replay할 수 있지만 schema 4에서 provenance 없는 intent를 새 append하는 것은 금지한다.
+Schema 3 open은 기존 journal과 sidecar를 검증한 뒤 빈 `execution_receipts` table을 원자적으로 추가하고 current schema 5로 올린다. 과거 terminal event에 Receipt를 조작해 backfill하지 않는다. 실제 provenance 없는 pending/Validating schema 3 fixture로 migration과 journal byte 보존을 검증한다. Legacy Run은 그대로 replay할 수 있지만 current store에서 provenance 없는 intent를 새 append하는 것은 금지한다. Schema 4는 full audit과 byte 보존 뒤 dependency downgrade fence인 schema 5로 이동한다.
 
 Schema 3의 `IntentCommitted`, `EffectUnknown` 또는 `Reconciling` intent에는 provenance가 없으므로 자동 실행·reconciliation을 금지한다. Direct Executor는 material/adapter 접근과 Started event 전에 `ReceiptProvenanceUnavailable`로 닫는다. Schema 3의 `Validating`도 profile과 verification plan을 추측하지 않아 `ReceiptProvenanceMissing`으로 닫고 verifier 0회·상태 보존을 보장한다. 사용자가 legacy effect를 새 schema 4 의미로 재승인·대체하거나 종결하는 workflow는 후속 migration 정책이다.
 
@@ -155,7 +155,7 @@ Schema 3의 `IntentCommitted`, `EffectUnknown` 또는 `Reconciling` intent에는
 
 | durable 상태 | VerificationRunner 동작 | effect adapter 호출 |
 |---|---|---|
-| schema 4 provenance가 있는 `Validating` | exact verifier로 read-only 검증 후 Receipt commit | 0 |
+| supported provenance가 있는 `Validating` | exact verifier로 read-only 검증 후 Receipt commit | 0 |
 | provenance가 없는 legacy `Validating` | fixed error, 상태 보존 | 0 |
 | `Completed`, `Failed`, `ManualRequired` | no-op, store integrity만 load에서 검증 | 0 |
 | 그 외 | 잘못된 호출로 거부 | 0 |
@@ -197,7 +197,7 @@ cargo build --workspace --release --locked
 - Receipt transaction 단계별 rollback
 - Receipt row insert 직후 child-process exit rollback
 - missing/tampered Receipt 탐지
-- schema 3 → 4 journal byte 보존 migration
+- schema 3 → 5 journal byte 보존 migration과 schema 4 → 5 full-audit migration
 - Receipt acknowledgement 유실 뒤 verifier·effect 중복 0회
 - 실제 SQLite reopen 뒤 lost-ack terminal no-op
 - legacy pending intent의 Started/prepare/execute 0회
@@ -218,10 +218,9 @@ cargo build --workspace --release --locked
 - PolicyDecision/InvocationPlan document 조회와 Receipt signing
 - verifier timeout/backoff/cancellation
 - 제품 filesystem/process/MCP/Connector/XGEN adapter
-- Tracked/Persistent WorkGraph dependency와 runnable frontier
 - atomic Run archive/import manifest
-- 장기 Run의 incremental Receipt 검증 index와 성능 budget
+- failure/unknown Receipt까지 일반화된 dependency outcome
 
-현재 load/append는 tamper 탐지를 우선해 committed Receipt chain을 다시 검증한다. Schema validator compile은 process-wide cache하지만 Receipt와 event가 큰 장기 Run에서는 검증 비용이 누적된다. 따라서 이 기본형을 unbounded production workload에 적합하다고 주장하지 않으며 Tracked/Persistent 단계 전에 one-pass index와 reopen/append 성능 budget을 별도 gate로 둔다.
+후속 ADR-0013은 connection-local VerifiedRunIndex로 warm append의 history rescan을 제거했고 ADR-0014는 Receipt-bound terminal gate를 Persistent WorkGraph dependency release에 연결했다. 그래도 projection clone/rewrite와 unbounded index memory를 해결한 것은 아니므로 장기 workload의 별도 characterization이 필요하다.
 
 설계 결정은 [ADR-0012](../adr/0012-core-verification-and-execution-receipt.md)를 따른다.

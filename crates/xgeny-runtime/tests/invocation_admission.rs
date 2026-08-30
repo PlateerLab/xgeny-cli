@@ -24,7 +24,7 @@ use xgeny_runtime::{
     MaterialRecoveryError, RequiredRouteFeatures, RouteOutcome, RouteRequest,
 };
 use xgeny_workgraph::{
-    InvocationMaterialRecord, InvocationMaterialUnavailableReason,
+    DependencyBlockReason, InvocationMaterialRecord, InvocationMaterialUnavailableReason,
     ReconstructableMaterialReference, RunEvent, RunEventBody, RunState, StepStatus,
     invocation_material_digest,
 };
@@ -289,6 +289,7 @@ fn seed<S: RunStore>(store: &mut S, run_id: &str, step_id: &str) -> RunState {
                 RunEventBody::StepPlanned {
                     step_id: step_id.to_owned(),
                     objective: "write one marker".to_owned(),
+                    depends_on: Vec::new(),
                 },
             ),
         )
@@ -519,6 +520,109 @@ fn exact_arguments_are_resolved_authorized_and_atomically_committed() {
     );
     assert!(!format!("{material:?}").contains(SECRET_SENTINEL));
     assert!(!format!("{material:?}").contains(CANONICAL_PATH));
+}
+
+#[test]
+fn dependency_must_be_receipt_released_before_admission_preparation() {
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, [instance]);
+    let resolver = CanonicalResolver::default();
+    let mut store = MemoryRunStore::new();
+    let root = seed(&mut store, RUN_ID, STEP_ID);
+    store
+        .append(
+            ExpectedHead::from_state(&root),
+            seed_event(
+                "seed-dependent-step",
+                RUN_ID,
+                RunEventBody::StepPlanned {
+                    step_id: OTHER_STEP_ID.to_owned(),
+                    objective: "run only after the verified parent".to_owned(),
+                    depends_on: vec![STEP_ID.to_owned()],
+                },
+            ),
+        )
+        .expect("dependent Step should plan in topological order");
+    let (_directory, lease) = acquire_lease(RUN_ID);
+
+    let result = prepare_for_step(
+        &store,
+        &lease,
+        &registry,
+        &resolver,
+        &definition,
+        OTHER_STEP_ID,
+        arguments(RAW_ALIAS, SECRET_SENTINEL),
+    );
+
+    assert!(matches!(
+        result,
+        Err(AdmissionError::StepDependencyNotReleased {
+            step_id,
+            dependency_id,
+            reason: DependencyBlockReason::NotCompleted,
+        }) if step_id == OTHER_STEP_ID && dependency_id == STEP_ID
+    ));
+    assert_eq!(
+        resolver.calls.get(),
+        0,
+        "dependency gating must precede argument/resource resolution"
+    );
+    assert!(store.load().expect("store should load").is_some());
+}
+
+struct CurrentOnlyStore {
+    state: RunState,
+}
+
+impl RunStore for CurrentOnlyStore {
+    fn append(&mut self, _expected: ExpectedHead, _event: RunEvent) -> Result<Commit, StoreError> {
+        Err(StoreError::InjectedFault("append must not be called"))
+    }
+
+    fn load(&self) -> Result<Option<RunSnapshot>, StoreError> {
+        Err(StoreError::InjectedFault("full load must not be called"))
+    }
+
+    fn load_current(&self) -> Result<Option<RunState>, StoreError> {
+        Ok(Some(self.state.clone()))
+    }
+}
+
+#[test]
+fn corrupt_unknown_dependency_is_rejected_before_resource_resolution_without_panicking() {
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, [instance]);
+    let resolver = CanonicalResolver::default();
+    let mut source = MemoryRunStore::new();
+    let mut state = seed(&mut source, RUN_ID, STEP_ID);
+    state
+        .steps
+        .get_mut(STEP_ID)
+        .expect("Step should exist")
+        .depends_on = vec!["missing-step".to_owned()];
+    let store = CurrentOnlyStore { state };
+    let (_directory, lease) = acquire_lease(RUN_ID);
+
+    let result = prepare(
+        &store,
+        &lease,
+        &registry,
+        &resolver,
+        &definition,
+        arguments(RAW_ALIAS, SECRET_SENTINEL),
+    );
+
+    assert!(matches!(
+        result,
+        Err(AdmissionError::StepDependencyUnknown {
+            step_id,
+            dependency_id,
+        }) if step_id == STEP_ID && dependency_id == "missing-step"
+    ));
+    assert_eq!(resolver.calls.get(), 0);
 }
 
 #[test]
@@ -1052,6 +1156,7 @@ fn stale_run_head_and_wrong_lease_cannot_consume_prepared_policy() {
                 RunEventBody::StepPlanned {
                     step_id: "unrelated-step".to_owned(),
                     objective: "advance the head".to_owned(),
+                    depends_on: Vec::new(),
                 },
             ),
         )

@@ -21,13 +21,13 @@ use xgeny_protocol::{
     validate_policy_decision,
 };
 use xgeny_workgraph::{
-    AuthorizationBinding, AuthorizationDigestError, AuthorizationUse,
+    AuthorizationBinding, AuthorizationDigestError, AuthorizationUse, DependencyBlockReason,
     EffectClass as WorkGraphEffectClass, EffectIntent, InvocationBinding, InvocationMaterialError,
     InvocationMaterialRecord, InvocationMaterialRetention, ReceiptPlacement, ReceiptProvenance,
     ReceiptVerificationRule, ReceiptVerificationStrategy, ReconstructableMaterialReference,
     RunEvent, RunEventBody, RunState, SinkGuarantee, StepStatus, authorization_digest,
-    invocation_material_digest, invocation_material_retention_digest, once_authorization_id,
-    receipt_provenance_digest,
+    dependency_release_block_reason, invocation_material_digest,
+    invocation_material_retention_digest, once_authorization_id, receipt_provenance_digest,
 };
 
 use crate::{
@@ -265,7 +265,7 @@ impl InvocationAdmission {
             .load_current()?
             .ok_or(AdmissionError::RunNotInitialized)?;
         verify_lease(lease, &state)?;
-        require_planned_step(&state, &request.step_id)?;
+        require_admission_ready_step(&state, &request.step_id)?;
         if request.route.required_features.execution_style != ExecutionStyle::Sync {
             return Err(AdmissionError::UnsupportedExecutionStyle);
         }
@@ -357,7 +357,7 @@ impl InvocationAdmission {
         if !pending.run_binding.matches(&state) {
             return Err(AdmissionError::RunHeadChanged);
         }
-        require_planned_step(&state, pending.permission_request.step_id())?;
+        require_admission_ready_step(&state, pending.permission_request.step_id())?;
 
         let definition = registry
             .definition(&pending.route.capability)
@@ -654,7 +654,7 @@ fn verify_lease<L: RunLease>(lease: &L, state: &RunState) -> Result<(), Admissio
     Ok(())
 }
 
-fn require_planned_step(state: &RunState, step_id: &str) -> Result<(), AdmissionError> {
+fn require_admission_ready_step(state: &RunState, step_id: &str) -> Result<(), AdmissionError> {
     let step = state
         .steps
         .get(step_id)
@@ -663,6 +663,31 @@ fn require_planned_step(state: &RunState, step_id: &str) -> Result<(), Admission
         return Err(AdmissionError::StepNotPlanned {
             step_id: step_id.to_owned(),
             actual: step.status,
+        });
+    }
+    let mut first_blocker: Option<(&str, DependencyBlockReason)> = None;
+    for dependency_id in &step.depends_on {
+        let dependency = state.steps.get(dependency_id).ok_or_else(|| {
+            AdmissionError::StepDependencyUnknown {
+                step_id: step_id.to_owned(),
+                dependency_id: dependency_id.clone(),
+            }
+        })?;
+        if let Some(reason) = dependency_release_block_reason(dependency) {
+            let candidate = (dependency_id.as_str(), reason);
+            if first_blocker
+                .as_ref()
+                .is_none_or(|current| candidate.0 < current.0)
+            {
+                first_blocker = Some(candidate);
+            }
+        }
+    }
+    if let Some((dependency_id, reason)) = first_blocker {
+        return Err(AdmissionError::StepDependencyNotReleased {
+            step_id: step_id.to_owned(),
+            dependency_id: dependency_id.to_owned(),
+            reason,
         });
     }
     Ok(())
@@ -929,6 +954,17 @@ pub enum AdmissionError {
     StepNotFound(String),
     #[error("step `{step_id}` must be Planned before admission, got {actual:?}")]
     StepNotPlanned { step_id: String, actual: StepStatus },
+    #[error("step `{step_id}` refers to unknown dependency `{dependency_id}`")]
+    StepDependencyUnknown {
+        step_id: String,
+        dependency_id: String,
+    },
+    #[error("step `{step_id}` dependency `{dependency_id}` is not released ({reason:?})")]
+    StepDependencyNotReleased {
+        step_id: String,
+        dependency_id: String,
+        reason: xgeny_workgraph::DependencyBlockReason,
+    },
     #[error("Run head or authority changed while the invocation awaited policy evaluation")]
     RunHeadChanged,
     #[error(

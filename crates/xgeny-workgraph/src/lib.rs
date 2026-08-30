@@ -31,6 +31,8 @@ pub enum RunEventBody {
     StepPlanned {
         step_id: String,
         objective: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        depends_on: Vec<String>,
     },
     EffectIntentCommitted {
         step_id: String,
@@ -876,6 +878,8 @@ pub struct RunState {
 pub struct StepState {
     pub step_id: String,
     pub objective: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
     pub status: StepStatus,
     pub attempts: u32,
     pub intent: Option<EffectIntent>,
@@ -901,6 +905,514 @@ pub enum StepStatus {
     Completed,
     Failed,
     ManualRequired,
+}
+
+/// Existing Core operation that can advance one member of the derived frontier.
+///
+/// This is deliberately smaller than the internal Step lifecycle. [`DriveEffect`](Self::DriveEffect)
+/// delegates `IntentCommitted`, `Executing`, `EffectUnknown`, and `Reconciling` to the existing
+/// effect runtime, which retains the conservative recovery rules for each state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationAction {
+    DriveEffect,
+    Verify,
+    Admit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrontierAction {
+    pub step_id: String,
+    pub action: ContinuationAction,
+}
+
+/// Why one dependency cannot release a downstream Step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DependencyBlockReason {
+    NotCompleted,
+    Failed,
+    ManualRequired,
+    ReceiptMissing,
+    DependencyBlocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DependencyBlocker {
+    pub step_id: String,
+    pub reason: DependencyBlockReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitingStep {
+    pub step_id: String,
+    pub pending_dependencies: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockedStep {
+    pub step_id: String,
+    pub blockers: Vec<DependencyBlocker>,
+}
+
+/// Deterministic, non-durable coordination view derived from one verified [`RunState`].
+///
+/// `actionable` is ordered conservatively: uncertain effects, reconciliation, verification,
+/// unstarted committed intents, then newly admissible Steps. Equal lifecycle states are ordered
+/// by byte-exact Step ID. A caller should commit at most one action and derive the frontier again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkFrontier {
+    pub run_id: String,
+    pub revision: u64,
+    pub journal_sequence: u64,
+    pub journal_head_digest: String,
+    pub total_steps: usize,
+    pub actionable: Vec<FrontierAction>,
+    pub waiting: Vec<WaitingStep>,
+    pub blocked: Vec<BlockedStep>,
+    pub verified_completed_step_ids: Vec<String>,
+    pub unverified_completed_step_ids: Vec<String>,
+    pub failed_step_ids: Vec<String>,
+    pub manual_required_step_ids: Vec<String>,
+}
+
+impl WorkFrontier {
+    /// Return the first conservative single-orchestrator action, if any.
+    #[must_use]
+    pub fn next_action(&self) -> Option<&FrontierAction> {
+        self.actionable.first()
+    }
+
+    /// Report whether every currently planned Step has a Receipt-bound completion.
+    ///
+    /// This does not assert that the user's goal or Run is complete. Run-level completion needs
+    /// an explicit lifecycle contract and is intentionally outside this derived view.
+    #[must_use]
+    pub fn all_steps_receipt_completed(&self) -> bool {
+        self.total_steps > 0 && self.verified_completed_step_ids.len() == self.total_steps
+    }
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum FrontierError {
+    #[error("step `{step_id}` depends on itself")]
+    SelfDependency { step_id: String },
+    #[error("step `{step_id}` repeats dependency `{dependency_id}`")]
+    DuplicateDependency {
+        step_id: String,
+        dependency_id: String,
+    },
+    #[error("step `{step_id}` refers to unknown dependency `{dependency_id}`")]
+    UnknownDependency {
+        step_id: String,
+        dependency_id: String,
+    },
+    #[error("WorkGraph dependency cycle detected")]
+    DependencyCycle,
+    #[error(
+        "active step `{step_id}` has dependency `{dependency_id}` that is not Receipt-released"
+    )]
+    ActiveDependencyNotReleased {
+        step_id: String,
+        dependency_id: String,
+        reason: DependencyBlockReason,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DependencyOutcome {
+    Satisfied,
+    Pending,
+    Blocked,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct FrontierMetrics {
+    #[cfg(test)]
+    validation_steps: u64,
+    #[cfg(test)]
+    validation_dependencies: u64,
+    #[cfg(test)]
+    classification_steps: u64,
+    #[cfg(test)]
+    classification_dependencies: u64,
+}
+
+impl FrontierMetrics {
+    fn record_validation_step(&mut self) {
+        #[cfg(test)]
+        {
+            self.validation_steps = self.validation_steps.saturating_add(1);
+        }
+        #[cfg(not(test))]
+        let _ = self;
+    }
+
+    fn record_validation_dependency(&mut self) {
+        #[cfg(test)]
+        {
+            self.validation_dependencies = self.validation_dependencies.saturating_add(1);
+        }
+        #[cfg(not(test))]
+        let _ = self;
+    }
+
+    fn record_classification_step(&mut self) {
+        #[cfg(test)]
+        {
+            self.classification_steps = self.classification_steps.saturating_add(1);
+        }
+        #[cfg(not(test))]
+        let _ = self;
+    }
+
+    fn record_classification_dependency(&mut self) {
+        #[cfg(test)]
+        {
+            self.classification_dependencies = self.classification_dependencies.saturating_add(1);
+        }
+        #[cfg(not(test))]
+        let _ = self;
+    }
+}
+
+struct ValidatedFrontierGraph<'a> {
+    remaining_dependencies: BTreeMap<&'a str, usize>,
+    dependents: BTreeMap<&'a str, Vec<&'a str>>,
+    zero_indegree: BTreeSet<&'a str>,
+}
+
+#[derive(Default)]
+struct FrontierAssembly<'a> {
+    outcomes: BTreeMap<&'a str, DependencyOutcome>,
+    ranked_actions: Vec<(u8, &'a str, ContinuationAction)>,
+    waiting: Vec<WaitingStep>,
+    blocked: Vec<BlockedStep>,
+    verified_completed_step_ids: Vec<String>,
+    unverified_completed_step_ids: Vec<String>,
+    failed_step_ids: Vec<String>,
+    manual_required_step_ids: Vec<String>,
+    processed: usize,
+}
+
+impl<'a> FrontierAssembly<'a> {
+    fn record_step(
+        &mut self,
+        state: &'a RunState,
+        step_id: &'a str,
+        metrics: &mut FrontierMetrics,
+    ) -> Result<(), FrontierError> {
+        self.processed = self.processed.saturating_add(1);
+        metrics.record_classification_step();
+        let step = &state.steps[step_id];
+        let (pending_dependencies, blockers) = self.partition_dependencies(state, step, metrics);
+        let dependencies_released = blockers.is_empty() && pending_dependencies.is_empty();
+        if step.status != StepStatus::Planned && !dependencies_released {
+            let (dependency_id, reason) = blockers.first().map_or_else(
+                || {
+                    (
+                        pending_dependencies
+                            .first()
+                            .expect("unreleased dependency must be classified")
+                            .clone(),
+                        DependencyBlockReason::NotCompleted,
+                    )
+                },
+                |blocker| (blocker.step_id.clone(), blocker.reason),
+            );
+            return Err(FrontierError::ActiveDependencyNotReleased {
+                step_id: step_id.to_owned(),
+                dependency_id,
+                reason,
+            });
+        }
+
+        let outcome = self.record_status(step_id, step, pending_dependencies, blockers);
+        self.outcomes.insert(step_id, outcome);
+        Ok(())
+    }
+
+    fn partition_dependencies(
+        &self,
+        state: &RunState,
+        step: &StepState,
+        metrics: &mut FrontierMetrics,
+    ) -> (Vec<String>, Vec<DependencyBlocker>) {
+        let mut pending = Vec::new();
+        let mut blockers = Vec::new();
+        for dependency_id in &step.depends_on {
+            metrics.record_classification_dependency();
+            match self
+                .outcomes
+                .get(dependency_id.as_str())
+                .copied()
+                .expect("topological traversal processes dependencies first")
+            {
+                DependencyOutcome::Satisfied => {}
+                DependencyOutcome::Pending => pending.push(dependency_id.clone()),
+                DependencyOutcome::Blocked => blockers.push(DependencyBlocker {
+                    step_id: dependency_id.clone(),
+                    reason: blocker_reason(&state.steps[dependency_id]),
+                }),
+            }
+        }
+        pending.sort();
+        blockers.sort();
+        blockers.dedup();
+        (pending, blockers)
+    }
+
+    fn record_status(
+        &mut self,
+        step_id: &'a str,
+        step: &StepState,
+        pending_dependencies: Vec<String>,
+        blockers: Vec<DependencyBlocker>,
+    ) -> DependencyOutcome {
+        match step.status {
+            StepStatus::Planned if !blockers.is_empty() => {
+                self.blocked.push(BlockedStep {
+                    step_id: step_id.to_owned(),
+                    blockers,
+                });
+                DependencyOutcome::Blocked
+            }
+            StepStatus::Planned if !pending_dependencies.is_empty() => {
+                self.waiting.push(WaitingStep {
+                    step_id: step_id.to_owned(),
+                    pending_dependencies,
+                });
+                DependencyOutcome::Pending
+            }
+            StepStatus::Planned => {
+                self.ranked_actions
+                    .push((5, step_id, ContinuationAction::Admit));
+                DependencyOutcome::Pending
+            }
+            StepStatus::IntentCommitted => {
+                self.ranked_actions
+                    .push((4, step_id, ContinuationAction::DriveEffect));
+                DependencyOutcome::Pending
+            }
+            StepStatus::Executing => {
+                self.ranked_actions
+                    .push((0, step_id, ContinuationAction::DriveEffect));
+                DependencyOutcome::Pending
+            }
+            StepStatus::EffectUnknown => {
+                self.ranked_actions
+                    .push((1, step_id, ContinuationAction::DriveEffect));
+                DependencyOutcome::Pending
+            }
+            StepStatus::Reconciling => {
+                self.ranked_actions
+                    .push((2, step_id, ContinuationAction::DriveEffect));
+                DependencyOutcome::Pending
+            }
+            StepStatus::Validating => {
+                self.ranked_actions
+                    .push((3, step_id, ContinuationAction::Verify));
+                DependencyOutcome::Pending
+            }
+            StepStatus::Completed if receipt_releases_dependency(step) => {
+                self.verified_completed_step_ids.push(step_id.to_owned());
+                DependencyOutcome::Satisfied
+            }
+            StepStatus::Completed => {
+                self.unverified_completed_step_ids.push(step_id.to_owned());
+                DependencyOutcome::Blocked
+            }
+            StepStatus::Failed => {
+                self.failed_step_ids.push(step_id.to_owned());
+                DependencyOutcome::Blocked
+            }
+            StepStatus::ManualRequired => {
+                self.manual_required_step_ids.push(step_id.to_owned());
+                DependencyOutcome::Blocked
+            }
+        }
+    }
+
+    fn finish(mut self, state: &RunState) -> WorkFrontier {
+        self.ranked_actions
+            .sort_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
+        let actionable = self
+            .ranked_actions
+            .into_iter()
+            .map(|(_, step_id, action)| FrontierAction {
+                step_id: step_id.to_owned(),
+                action,
+            })
+            .collect();
+        self.waiting
+            .sort_by(|left, right| left.step_id.cmp(&right.step_id));
+        self.blocked
+            .sort_by(|left, right| left.step_id.cmp(&right.step_id));
+        self.verified_completed_step_ids.sort();
+        self.unverified_completed_step_ids.sort();
+        self.failed_step_ids.sort();
+        self.manual_required_step_ids.sort();
+
+        WorkFrontier {
+            run_id: state.run_id.clone(),
+            revision: state.revision,
+            journal_sequence: state.journal_sequence,
+            journal_head_digest: state.journal_head_digest.clone(),
+            total_steps: state.steps.len(),
+            actionable,
+            waiting: self.waiting,
+            blocked: self.blocked,
+            verified_completed_step_ids: self.verified_completed_step_ids,
+            unverified_completed_step_ids: self.unverified_completed_step_ids,
+            failed_step_ids: self.failed_step_ids,
+            manual_required_step_ids: self.manual_required_step_ids,
+        }
+    }
+}
+
+fn validate_frontier_graph<'a>(
+    state: &'a RunState,
+    metrics: &mut FrontierMetrics,
+) -> Result<ValidatedFrontierGraph<'a>, FrontierError> {
+    let mut remaining_dependencies = BTreeMap::new();
+    let mut dependents: BTreeMap<&str, Vec<&str>> = state
+        .steps
+        .keys()
+        .map(|step_id| (step_id.as_str(), Vec::new()))
+        .collect();
+    for (step_id, step) in &state.steps {
+        metrics.record_validation_step();
+        let mut unique = BTreeSet::new();
+        for dependency_id in &step.depends_on {
+            metrics.record_validation_dependency();
+            if dependency_id == step_id {
+                return Err(FrontierError::SelfDependency {
+                    step_id: step_id.clone(),
+                });
+            }
+            if !unique.insert(dependency_id.as_str()) {
+                return Err(FrontierError::DuplicateDependency {
+                    step_id: step_id.clone(),
+                    dependency_id: dependency_id.clone(),
+                });
+            }
+            let Some(children) = dependents.get_mut(dependency_id.as_str()) else {
+                return Err(FrontierError::UnknownDependency {
+                    step_id: step_id.clone(),
+                    dependency_id: dependency_id.clone(),
+                });
+            };
+            children.push(step_id);
+        }
+        remaining_dependencies.insert(step_id.as_str(), step.depends_on.len());
+    }
+    for children in dependents.values_mut() {
+        children.sort_unstable();
+    }
+    let zero_indegree = remaining_dependencies
+        .iter()
+        .filter_map(|(step_id, count)| (*count == 0).then_some(*step_id))
+        .collect();
+    Ok(ValidatedFrontierGraph {
+        remaining_dependencies,
+        dependents,
+        zero_indegree,
+    })
+}
+
+/// Derive the current actionable, waiting, and transitively blocked `WorkGraph` frontier.
+///
+/// The calculation is iterative and performs one validation and one classification visit per
+/// Step and dependency edge. It never executes tools or changes durable state. This pure function
+/// checks projected Receipt identity shape, not a Receipt sidecar or chain; execution-authoritative
+/// callers must supply a `RunState` from a store that verified those bindings.
+///
+/// # Errors
+///
+/// Returns an error for an unknown, duplicate, self, or cyclic dependency, or when an already
+/// active/terminal Step could only have been reached by bypassing an unreleased dependency.
+pub fn derive_frontier(state: &RunState) -> Result<WorkFrontier, FrontierError> {
+    derive_frontier_with_metrics(state, &mut FrontierMetrics::default())
+}
+
+fn derive_frontier_with_metrics(
+    state: &RunState,
+    metrics: &mut FrontierMetrics,
+) -> Result<WorkFrontier, FrontierError> {
+    let ValidatedFrontierGraph {
+        mut remaining_dependencies,
+        dependents,
+        mut zero_indegree,
+    } = validate_frontier_graph(state, metrics)?;
+    let mut assembly = FrontierAssembly::default();
+    while let Some(step_id) = zero_indegree.pop_first() {
+        assembly.record_step(state, step_id, metrics)?;
+        for child in &dependents[step_id] {
+            let remaining = remaining_dependencies
+                .get_mut(child)
+                .expect("dependent was indexed during validation");
+            *remaining = remaining
+                .checked_sub(1)
+                .expect("dependency count cannot underflow");
+            if *remaining == 0 {
+                zero_indegree.insert(child);
+            }
+        }
+    }
+    if assembly.processed != state.steps.len() {
+        return Err(FrontierError::DependencyCycle);
+    }
+    Ok(assembly.finish(state))
+}
+
+/// Return whether this Step carries a non-empty terminal Core Receipt ID and a well-formed
+/// lowercase SHA-256 Receipt digest required to release a downstream dependency.
+///
+/// This is a projection-shape check. Receipt document authenticity and journal binding are the
+/// responsibility of the verified store that supplied the [`RunState`].
+#[must_use]
+pub fn receipt_releases_dependency(step: &StepState) -> bool {
+    step.status == StepStatus::Completed
+        && step
+            .execution_receipt_id
+            .as_deref()
+            .is_some_and(|receipt_id| !receipt_id.is_empty())
+        && step
+            .execution_receipt_digest
+            .as_deref()
+            .is_some_and(is_sha256_digest)
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|encoded| {
+        encoded.len() == 64
+            && encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+/// Return the fail-closed reason a Step cannot release a dependency, if any.
+#[must_use]
+pub fn dependency_release_block_reason(step: &StepState) -> Option<DependencyBlockReason> {
+    if receipt_releases_dependency(step) {
+        return None;
+    }
+    Some(match step.status {
+        StepStatus::Failed => DependencyBlockReason::Failed,
+        StepStatus::ManualRequired => DependencyBlockReason::ManualRequired,
+        StepStatus::Completed => DependencyBlockReason::ReceiptMissing,
+        _ => DependencyBlockReason::NotCompleted,
+    })
+}
+
+fn blocker_reason(step: &StepState) -> DependencyBlockReason {
+    match step.status {
+        StepStatus::Failed => DependencyBlockReason::Failed,
+        StepStatus::ManualRequired => DependencyBlockReason::ManualRequired,
+        StepStatus::Completed if !receipt_releases_dependency(step) => {
+            DependencyBlockReason::ReceiptMissing
+        }
+        _ => DependencyBlockReason::DependencyBlocked,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -992,31 +1504,64 @@ fn verify_record_against_state(
 fn apply_body(state: &mut RunState, body: &RunEventBody) -> Result<(), TransitionError> {
     match body {
         RunEventBody::RunCreated { .. } => unreachable!("handled by apply_record"),
-        RunEventBody::StepPlanned { step_id, objective } => {
-            if state.steps.contains_key(step_id) {
-                return Err(TransitionError::DuplicateStep(step_id.clone()));
-            }
-            state.steps.insert(
-                step_id.clone(),
-                StepState {
-                    step_id: step_id.clone(),
-                    objective: objective.clone(),
-                    status: StepStatus::Planned,
-                    attempts: 0,
-                    intent: None,
-                    effect_evidence_digest: None,
-                    execution_receipt_id: None,
-                    execution_receipt_digest: None,
-                    uncertainty_reason: None,
-                    reconciliation_evidence_digest: None,
-                },
-            );
-        }
+        RunEventBody::StepPlanned {
+            step_id,
+            objective,
+            depends_on,
+        } => plan_step(state, step_id, objective, depends_on)?,
         RunEventBody::EffectIntentCommitted { step_id, intent } => {
             commit_effect_intent(state, step_id, intent)?;
         }
         _ => apply_effect_lifecycle(state, body)?,
     }
+    Ok(())
+}
+
+fn plan_step(
+    state: &mut RunState,
+    step_id: &str,
+    objective: &str,
+    depends_on: &[String],
+) -> Result<(), TransitionError> {
+    if state.steps.contains_key(step_id) {
+        return Err(TransitionError::DuplicateStep(step_id.to_owned()));
+    }
+    let mut unique = BTreeSet::new();
+    for dependency_id in depends_on {
+        if dependency_id == step_id {
+            return Err(TransitionError::SelfDependency {
+                step_id: step_id.to_owned(),
+            });
+        }
+        if !unique.insert(dependency_id.as_str()) {
+            return Err(TransitionError::DuplicateDependency {
+                step_id: step_id.to_owned(),
+                dependency_id: dependency_id.clone(),
+            });
+        }
+        if !state.steps.contains_key(dependency_id) {
+            return Err(TransitionError::UnknownDependency {
+                step_id: step_id.to_owned(),
+                dependency_id: dependency_id.clone(),
+            });
+        }
+    }
+    state.steps.insert(
+        step_id.to_owned(),
+        StepState {
+            step_id: step_id.to_owned(),
+            objective: objective.to_owned(),
+            depends_on: depends_on.to_vec(),
+            status: StepStatus::Planned,
+            attempts: 0,
+            intent: None,
+            effect_evidence_digest: None,
+            execution_receipt_id: None,
+            execution_receipt_digest: None,
+            uncertainty_reason: None,
+            reconciliation_evidence_digest: None,
+        },
+    );
     Ok(())
 }
 
@@ -1293,8 +1838,6 @@ fn commit_effect_intent(
         return Err(TransitionError::DuplicateEffect(intent.effect_id.clone()));
     }
 
-    validate_authorization_binding(state, step_id, intent)?;
-
     let step = state
         .steps
         .get(step_id)
@@ -1307,6 +1850,15 @@ fn commit_effect_intent(
             intent: Box::new(intent.clone()),
         },
     )?;
+    if let Some(blocker) = first_unreleased_dependency(state, step)? {
+        return Err(TransitionError::DependencyNotReleased {
+            step_id: step_id.to_owned(),
+            dependency_id: blocker.step_id,
+            reason: blocker.reason,
+        });
+    }
+
+    validate_authorization_binding(state, step_id, intent)?;
 
     let consumption = state
         .authorization_consumption
@@ -1340,6 +1892,33 @@ fn commit_effect_intent(
     step.intent = Some(intent.clone());
     step.status = StepStatus::IntentCommitted;
     Ok(())
+}
+
+fn first_unreleased_dependency(
+    state: &RunState,
+    step: &StepState,
+) -> Result<Option<DependencyBlocker>, TransitionError> {
+    let mut first = None;
+    for dependency_id in &step.depends_on {
+        let dependency =
+            state
+                .steps
+                .get(dependency_id)
+                .ok_or_else(|| TransitionError::UnknownDependency {
+                    step_id: step.step_id.clone(),
+                    dependency_id: dependency_id.clone(),
+                })?;
+        if let Some(reason) = dependency_release_block_reason(dependency) {
+            let candidate = DependencyBlocker {
+                step_id: dependency_id.clone(),
+                reason,
+            };
+            if first.as_ref().is_none_or(|current| candidate < *current) {
+                first = Some(candidate);
+            }
+        }
+    }
+    Ok(first)
 }
 
 fn validate_authorization_binding(
@@ -1532,8 +2111,26 @@ pub enum TransitionError {
     AuthorityEpochMismatch,
     #[error("step `{0}` already exists")]
     DuplicateStep(String),
+    #[error("step `{step_id}` depends on itself")]
+    SelfDependency { step_id: String },
+    #[error("step `{step_id}` repeats dependency `{dependency_id}`")]
+    DuplicateDependency {
+        step_id: String,
+        dependency_id: String,
+    },
+    #[error("step `{step_id}` refers to unknown dependency `{dependency_id}`")]
+    UnknownDependency {
+        step_id: String,
+        dependency_id: String,
+    },
     #[error("unknown step `{0}`")]
     UnknownStep(String),
+    #[error("step `{step_id}` dependency `{dependency_id}` is not released ({reason:?})")]
+    DependencyNotReleased {
+        step_id: String,
+        dependency_id: String,
+        reason: DependencyBlockReason,
+    },
     #[error("effect `{0}` already has a committed intent")]
     DuplicateEffect(String),
     #[error("step `{step_id}` expected effect {expected:?}, got `{actual}`")]
@@ -1714,6 +2311,7 @@ mod tests {
                 RunEventBody::StepPlanned {
                     step_id: "step-material".to_owned(),
                     objective: "prepare effect".to_owned(),
+                    depends_on: Vec::new(),
                 },
             ),
         )
@@ -1868,6 +2466,7 @@ mod tests {
                 RunEventBody::StepPlanned {
                     step_id: "step-1".to_owned(),
                     objective: "write file".to_owned(),
+                    depends_on: Vec::new(),
                 },
             ),
         );
@@ -1941,6 +2540,7 @@ mod tests {
                 RunEventBody::StepPlanned {
                     step_id: "step-1".into(),
                     objective: "o".into(),
+                    depends_on: Vec::new(),
                 },
             ),
         );
@@ -2003,6 +2603,7 @@ mod tests {
                 RunEventBody::StepPlanned {
                     step_id: "step-1".into(),
                     objective: "o".into(),
+                    depends_on: Vec::new(),
                 },
             ),
         );
@@ -2075,6 +2676,7 @@ mod tests {
                     RunEventBody::StepPlanned {
                         step_id: step_id.into(),
                         objective: step_id.into(),
+                        depends_on: Vec::new(),
                     },
                 ),
             );
@@ -2132,6 +2734,7 @@ mod tests {
                 RunEventBody::StepPlanned {
                     step_id: "step-1".into(),
                     objective: "o".into(),
+                    depends_on: Vec::new(),
                 },
             ),
         );
@@ -2219,6 +2822,7 @@ mod tests {
                 RunEventBody::StepPlanned {
                     step_id: "step-1".into(),
                     objective: "o".into(),
+                    depends_on: Vec::new(),
                 },
             ),
         );
@@ -2246,6 +2850,7 @@ mod tests {
                 RunEventBody::StepPlanned {
                     step_id: "step-1".into(),
                     objective: "o".into(),
+                    depends_on: Vec::new(),
                 },
             ),
         );
@@ -2285,6 +2890,7 @@ mod tests {
             RunEventBody::StepPlanned {
                 step_id: "step-1".into(),
                 objective: "o".into(),
+                depends_on: Vec::new(),
             },
         );
         stale_event.authority_epoch -= 1;
@@ -2314,6 +2920,7 @@ mod tests {
                     RunEventBody::StepPlanned {
                         step_id: "step-1".into(),
                         objective: "o".into(),
+                        depends_on: Vec::new(),
                     },
                 ),
             ),
@@ -2340,6 +2947,98 @@ mod tests {
         assert_eq!(round_trip, body);
     }
 
+    #[test]
+    fn empty_dependencies_preserve_legacy_event_and_projection_wire_shape() {
+        let body = RunEventBody::StepPlanned {
+            step_id: "step-legacy".to_owned(),
+            objective: "legacy plan".to_owned(),
+            depends_on: Vec::new(),
+        };
+        let body_value = serde_json::to_value(&body).expect("event body should serialize");
+        assert!(body_value.pointer("/dependsOn").is_none());
+        assert_eq!(
+            serde_json::from_value::<RunEventBody>(body_value).expect("legacy body should load"),
+            body
+        );
+
+        let step = StepState {
+            step_id: "step-legacy".to_owned(),
+            objective: "legacy plan".to_owned(),
+            depends_on: Vec::new(),
+            status: StepStatus::Planned,
+            attempts: 0,
+            intent: None,
+            effect_evidence_digest: None,
+            execution_receipt_id: None,
+            execution_receipt_digest: None,
+            uncertainty_reason: None,
+            reconciliation_evidence_digest: None,
+        };
+        let step_value = serde_json::to_value(&step).expect("Step projection should serialize");
+        assert!(step_value.pointer("/dependsOn").is_none());
+        assert_eq!(
+            serde_json::from_value::<StepState>(step_value).expect("legacy Step should load"),
+            step
+        );
+    }
+
+    #[test]
+    fn frontier_visits_each_step_and_dependency_a_constant_number_of_times() {
+        let step_count = 1_000_u32;
+        let mut steps = BTreeMap::new();
+        for index in 0..step_count {
+            let step_id = format!("step-{index:04}");
+            let depends_on = if index > 0 {
+                vec![format!("step-{:04}", index - 1)]
+            } else {
+                Vec::new()
+            };
+            let mut step = StepState {
+                step_id: step_id.clone(),
+                objective: step_id.clone(),
+                depends_on,
+                status: StepStatus::Completed,
+                attempts: 1,
+                intent: None,
+                effect_evidence_digest: None,
+                execution_receipt_id: Some(format!("receipt-{index:04}")),
+                execution_receipt_digest: Some(format!("sha256:{}", "a".repeat(64))),
+                uncertainty_reason: None,
+                reconciliation_evidence_digest: None,
+            };
+            if index == step_count - 1 {
+                step.status = StepStatus::Planned;
+                step.execution_receipt_id = None;
+                step.execution_receipt_digest = None;
+            }
+            steps.insert(step_id, step);
+        }
+        let state = RunState {
+            run_id: RUN_ID.to_owned(),
+            authority: AUTHORITY.to_owned(),
+            authority_epoch: AUTHORITY_EPOCH,
+            goal: "measure frontier visits".to_owned(),
+            revision: u64::from(step_count),
+            journal_sequence: u64::from(step_count),
+            journal_head_digest: "sha256:head".to_owned(),
+            steps,
+            authorization_consumption: BTreeMap::new(),
+        };
+        let mut metrics = FrontierMetrics::default();
+
+        let frontier =
+            derive_frontier_with_metrics(&state, &mut metrics).expect("linear chain should derive");
+
+        assert_eq!(frontier.actionable.len(), 1);
+        assert_eq!(metrics.validation_steps, u64::from(step_count));
+        assert_eq!(metrics.validation_dependencies, u64::from(step_count - 1));
+        assert_eq!(metrics.classification_steps, u64::from(step_count));
+        assert_eq!(
+            metrics.classification_dependencies,
+            u64::from(step_count - 1)
+        );
+    }
+
     fn planned_journal(step_count: u8) -> (Vec<EventRecord>, RunState) {
         let mut records = Vec::new();
         let mut state = append(
@@ -2356,6 +3055,7 @@ mod tests {
                     RunEventBody::StepPlanned {
                         step_id: format!("step-{index}"),
                         objective: format!("objective-{index}"),
+                        depends_on: Vec::new(),
                     },
                 ),
             );

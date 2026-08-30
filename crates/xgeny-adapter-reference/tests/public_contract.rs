@@ -487,6 +487,7 @@ fn seed<S: RunStore>(store: &mut S) {
                 body: RunEventBody::StepPlanned {
                     step_id: STEP_ID.to_owned(),
                     objective: "commit a marker through a preopened handle".to_owned(),
+                    depends_on: Vec::new(),
                 },
             },
         )

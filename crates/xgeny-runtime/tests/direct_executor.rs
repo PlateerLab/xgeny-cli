@@ -764,6 +764,7 @@ fn seed<S: RunStore>(store: &mut S) {
                 body: RunEventBody::StepPlanned {
                     step_id: STEP_ID.to_owned(),
                     objective: "write one fake marker".to_owned(),
+                    depends_on: Vec::new(),
                 },
             },
         )
@@ -893,6 +894,7 @@ fn legacy_replay_store(
             body: RunEventBody::StepPlanned {
                 step_id: STEP_ID.to_owned(),
                 objective: "write one fake marker".to_owned(),
+                depends_on: Vec::new(),
             },
         },
         RunEvent {

@@ -275,8 +275,12 @@ pub trait RunStore {
 
     /// Load only the current verified projection for runtime coordination.
     ///
-    /// The default preserves compatibility by using a full audit. Built-in stores override this
-    /// with a generation-checked index so callers do not materialize the historical journal.
+    /// Implementations used for execution-authoritative dependency release must verify that the
+    /// projection is replay-equivalent and that every projected Receipt identity is backed by the
+    /// complete, valid Receipt sidecar/chain. The built-in stores provide that contract. The
+    /// default preserves compatibility by using `load`; built-in stores override it with a
+    /// generation-checked index, whose warm path avoids historical materialization. Cold open,
+    /// generation change, or the default implementation can still perform a full audit.
     ///
     /// # Errors
     ///
@@ -1075,15 +1079,72 @@ mod tests {
     };
     use xgeny_protocol::canonical_digest_without_field;
     use xgeny_workgraph::{
-        AuthorizationBinding, AuthorizationUse, EffectClass, EffectIntent, InvocationBinding,
-        InvocationMaterialRecord, InvocationMaterialRetention, ReceiptPlacement, ReceiptProvenance,
-        ReceiptVerificationRule, ReceiptVerificationStrategy, ReconciliationResolution, RunEvent,
-        RunEventBody, RunState, SinkGuarantee, StepStatus, VerificationDisposition,
-        authorization_digest, invocation_material_digest, invocation_material_retention_digest,
-        once_authorization_id, receipt_provenance_digest,
+        AuthorizationBinding, AuthorizationUse, ContinuationAction, EffectClass, EffectIntent,
+        InvocationBinding, InvocationMaterialRecord, InvocationMaterialRetention, ReceiptPlacement,
+        ReceiptProvenance, ReceiptVerificationRule, ReceiptVerificationStrategy,
+        ReconciliationResolution, RunEvent, RunEventBody, RunState, SinkGuarantee, StepStatus,
+        VerificationDisposition, authorization_digest, derive_frontier, invocation_material_digest,
+        invocation_material_retention_digest, once_authorization_id, receipt_provenance_digest,
     };
 
     use super::*;
+
+    fn sqlite_blob_rows(connection: &rusqlite::Connection, query: &str) -> Vec<Vec<u8>> {
+        let mut statement = connection.prepare(query).expect("query should prepare");
+        statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .expect("query should run")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("blob rows should load")
+    }
+
+    type SqliteEventRow = (i64, String, Option<String>, String, Vec<u8>);
+
+    fn sqlite_event_rows(connection: &rusqlite::Connection) -> Vec<SqliteEventRow> {
+        let mut statement = connection
+            .prepare(
+                "SELECT sequence, event_id, previous_digest, digest, event_json \
+                 FROM run_events ORDER BY sequence",
+            )
+            .expect("event query should prepare");
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .expect("event query should run")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("event rows should load")
+    }
+
+    fn sqlite_authorization_rows(
+        connection: &rusqlite::Connection,
+    ) -> Vec<(String, String, String, String, i64)> {
+        let mut statement = connection
+            .prepare(
+                "SELECT grant_id, effect_id, action_digest, grant_digest, max_uses \
+                 FROM authorization_consumption ORDER BY grant_id, effect_id",
+            )
+            .expect("authorization query should prepare");
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .expect("authorization query should run")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("authorization rows should load")
+    }
 
     fn event(event_id: &str, body: RunEventBody) -> RunEvent {
         RunEvent {
@@ -1183,6 +1244,7 @@ mod tests {
                     RunEventBody::StepPlanned {
                         step_id: "step-1".to_owned(),
                         objective: "perform effect".to_owned(),
+                        depends_on: Vec::new(),
                     },
                 ),
             )
@@ -1543,6 +1605,7 @@ mod tests {
                     RunEventBody::StepPlanned {
                         step_id: "step-2".to_owned(),
                         objective: "perform another effect".to_owned(),
+                        depends_on: Vec::new(),
                     },
                 ),
             )
@@ -1624,6 +1687,7 @@ mod tests {
                 RunEventBody::StepPlanned {
                     step_id: "step-1".to_owned(),
                     objective: "perform legacy effect".to_owned(),
+                    depends_on: Vec::new(),
                 },
             ),
         );
@@ -1750,6 +1814,79 @@ mod tests {
     }
 
     #[test]
+    fn receipt_finalization_atomically_releases_the_dependent_frontier() {
+        fn complete_parent<S: RunStore>(store: &mut S) -> xgeny_workgraph::WorkFrontier {
+            let parent = seed(store);
+            let graph = store
+                .append(
+                    ExpectedHead::from_state(&parent.state),
+                    event(
+                        "frontier-child-plan",
+                        RunEventBody::StepPlanned {
+                            step_id: "step-2".to_owned(),
+                            objective: "run after verified parent".to_owned(),
+                            depends_on: vec!["step-1".to_owned()],
+                        },
+                    ),
+                )
+                .expect("dependent Step should plan");
+            let effect = receipt_intent(&graph.state);
+            let validating = append_receipt_effect_to_validating(
+                store,
+                &graph.state,
+                "step-1",
+                &effect,
+                "frontier-parent",
+            );
+            assert!(
+                derive_frontier(&validating.state)
+                    .expect("validating graph should derive")
+                    .actionable
+                    .iter()
+                    .all(|action| action.step_id != "step-2"),
+                "effect success without a Receipt must not release the child"
+            );
+            let receipt = successful_receipt(&effect);
+            let completed = store
+                .append_with_execution_receipt(
+                    ExpectedHead::from_state(&validating.state),
+                    receipt_event_for("frontier-parent-receipt", "step-1", &effect, &receipt),
+                    receipt,
+                )
+                .expect("Receipt and completion should commit atomically");
+            derive_frontier(&completed.state).expect("completed graph should derive")
+        }
+
+        let mut memory = MemoryRunStore::new();
+        let memory_frontier = complete_parent(&mut memory);
+        let directory = tempdir().expect("temp directory should exist");
+        let path = directory.path().join("run.db");
+        let mut sqlite = SqliteRunStore::open(&path).expect("SQLite should open");
+        let sqlite_frontier = complete_parent(&mut sqlite);
+
+        assert_eq!(memory_frontier, sqlite_frontier);
+        assert_eq!(sqlite_frontier.actionable.len(), 1);
+        assert_eq!(sqlite_frontier.actionable[0].step_id, "step-2");
+        assert_eq!(
+            sqlite_frontier.actionable[0].action,
+            ContinuationAction::Admit
+        );
+        drop(sqlite);
+
+        let reopened = SqliteRunStore::open(&path).expect("SQLite should reopen");
+        let state = reopened
+            .load_current()
+            .expect("verified state should load")
+            .expect("Run should exist");
+        assert_eq!(
+            derive_frontier(&state)
+                .expect("reopened graph should derive")
+                .actionable,
+            sqlite_frontier.actionable
+        );
+    }
+
+    #[test]
     fn memory_and_sqlite_export_the_same_complete_receipt_chain_jsonl() {
         let directory = tempdir().expect("temp directory should exist");
         let mut memory = MemoryRunStore::new();
@@ -1802,6 +1939,7 @@ mod tests {
                     RunEventBody::StepPlanned {
                         step_id: "step-2".to_owned(),
                         objective: "perform another effect".to_owned(),
+                        depends_on: Vec::new(),
                     },
                 ),
             )
@@ -2016,7 +2154,20 @@ mod tests {
             let directory = tempdir().expect("temp directory should exist");
             let mut store =
                 SqliteRunStore::open(directory.path().join("run.db")).expect("SQLite should open");
-            let (validating, effect) = seed_validating(&mut store);
+            let (validating_parent, effect) = seed_validating(&mut store);
+            let validating = store
+                .append(
+                    ExpectedHead::from_state(&validating_parent.state),
+                    event(
+                        "receipt-fault-child-plan",
+                        RunEventBody::StepPlanned {
+                            step_id: "step-2".to_owned(),
+                            objective: "wait for the parent Receipt".to_owned(),
+                            depends_on: vec!["step-1".to_owned()],
+                        },
+                    ),
+                )
+                .expect("dependent Step should plan");
             let receipt = successful_receipt(&effect);
             let candidate = receipt_event(&effect, &receipt);
             let result = store.append_receipt_with_fault(
@@ -2032,14 +2183,28 @@ mod tests {
                 .expect("Run should remain");
             assert_eq!(recovered.state, validating.state);
             assert_eq!(store.execution_receipt_count().expect("receipt count"), 0);
+            assert!(
+                derive_frontier(&recovered.state)
+                    .expect("recovered frontier should derive")
+                    .actionable
+                    .iter()
+                    .all(|action| action.step_id != "step-2")
+            );
 
-            store
+            let completed = store
                 .append_with_execution_receipt(
                     ExpectedHead::from_state(&validating.state),
                     candidate,
                     receipt,
                 )
                 .expect("retry should atomically commit");
+            assert_eq!(
+                derive_frontier(&completed.state)
+                    .expect("completed frontier should derive")
+                    .actionable[0]
+                    .step_id,
+                "step-2"
+            );
         }
     }
 
@@ -2075,7 +2240,20 @@ mod tests {
         let path = directory.path().join("run.db");
         let validating = {
             let mut store = SqliteRunStore::open(&path).expect("SQLite should open");
-            seed_validating(&mut store).0
+            let validating_parent = seed_validating(&mut store).0;
+            store
+                .append(
+                    ExpectedHead::from_state(&validating_parent.state),
+                    event(
+                        "receipt-crash-child-plan",
+                        RunEventBody::StepPlanned {
+                            step_id: "step-2".to_owned(),
+                            objective: "wait for the parent Receipt".to_owned(),
+                            depends_on: vec!["step-1".to_owned()],
+                        },
+                    ),
+                )
+                .expect("dependent Step should plan")
         };
         let status = Command::new(std::env::current_exe().expect("test executable should exist"))
             .args([
@@ -2103,13 +2281,20 @@ mod tests {
             reopened.execution_receipt_count().expect("receipt count"),
             0
         );
+        assert!(
+            derive_frontier(&recovered.state)
+                .expect("crash-recovered frontier should derive")
+                .actionable
+                .iter()
+                .all(|action| action.step_id != "step-2")
+        );
         let effect = recovered.state.steps["step-1"]
             .intent
             .as_ref()
             .expect("intent should remain")
             .clone();
         let receipt = successful_receipt(&effect);
-        reopened
+        let completed = reopened
             .append_with_execution_receipt(
                 ExpectedHead::from_state(&recovered.state),
                 receipt_event(&effect, &receipt),
@@ -2119,6 +2304,13 @@ mod tests {
         assert_eq!(
             reopened.execution_receipt_count().expect("receipt count"),
             1
+        );
+        assert_eq!(
+            derive_frontier(&completed.state)
+                .expect("completed frontier should derive")
+                .actionable[0]
+                .step_id,
+            "step-2"
         );
     }
 
@@ -2202,7 +2394,7 @@ mod tests {
         let connection = rusqlite::Connection::open(&path).expect("SQLite file should open");
         drop(connection);
 
-        for version in [1_i64, 2_i64, 5_i64] {
+        for version in [1_i64, 2_i64, 6_i64] {
             let connection = rusqlite::Connection::open(&path).expect("SQLite file should open");
             connection
                 .pragma_update(None, "user_version", version)
@@ -2222,7 +2414,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_sqlite_store_uses_schema_version_four() {
+    fn fresh_sqlite_store_uses_schema_version_five() {
         let directory = tempdir().expect("temp directory should exist");
         let path = directory.path().join("run.db");
         drop(SqliteRunStore::open(&path).expect("fresh SQLite should open"));
@@ -2230,7 +2422,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("schema version should be readable");
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
     }
 
     #[test]
@@ -2238,7 +2430,7 @@ mod tests {
         let directory = tempdir().expect("temp directory should exist");
         let path = directory.path().join("run.db");
         let (expected_state, expected_jsonl, expected_events) = {
-            let mut store = SqliteRunStore::open(&path).expect("schema four store should open");
+            let mut store = SqliteRunStore::open(&path).expect("schema five store should open");
             let seed = seed(&mut store);
             let committed = append_intent(&mut store, &seed);
             let jsonl = store.export_jsonl().expect("journal should export");
@@ -2276,7 +2468,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("schema version should load");
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         let mut statement = connection
             .prepare("SELECT event_json FROM run_events ORDER BY sequence")
             .expect("event query should prepare");
@@ -2286,6 +2478,252 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("event bytes should load");
         assert_eq!(actual_events, expected_events);
+    }
+
+    #[test]
+    fn schema_three_with_receipt_finalization_fails_without_publishing_schema_five() {
+        let directory = tempdir().expect("temp directory should exist");
+        let path = directory.path().join("run.db");
+        {
+            let mut store = SqliteRunStore::open(&path).expect("schema five store should open");
+            commit_two_receipt_chain(&mut store);
+        }
+        let expected_events = {
+            let connection = rusqlite::Connection::open(&path).expect("raw SQLite should open");
+            connection
+                .execute("DROP TABLE execution_receipts", [])
+                .expect("hostile schema-three fixture should omit Receipt storage");
+            connection
+                .pragma_update(None, "user_version", 3_i64)
+                .expect("fixture should declare schema three");
+            sqlite_event_rows(&connection)
+        };
+
+        assert!(matches!(
+            SqliteRunStore::open(&path),
+            Err(StoreError::Corrupt(message))
+                if message.contains("execution receipt count differs from finalization events")
+        ));
+
+        let connection = rusqlite::Connection::open(&path).expect("SQLite should reopen");
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("schema version should load");
+        assert_eq!(version, 3);
+        let receipt_table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'execution_receipts'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("schema should be inspectable");
+        assert_eq!(receipt_table_count, 0);
+        assert_eq!(sqlite_event_rows(&connection), expected_events);
+    }
+
+    #[test]
+    fn sqlite_migrates_schema_four_by_auditing_without_rewriting_run_data() {
+        let directory = tempdir().expect("temp directory should exist");
+        let path = directory.path().join("run.db");
+        let (
+            journal,
+            receipts,
+            events,
+            projection,
+            intents,
+            authorizations,
+            materials,
+            receipt_rows,
+        ) = {
+            let mut store = SqliteRunStore::open(&path).expect("schema five store should open");
+            commit_two_receipt_chain(&mut store);
+            let journal = store.export_jsonl().expect("journal should export");
+            let receipts = store
+                .export_execution_receipts_jsonl()
+                .expect("Receipts should export");
+            drop(store);
+            let connection = rusqlite::Connection::open(&path).expect("raw SQLite should open");
+            let events = sqlite_event_rows(&connection);
+            let projection = sqlite_blob_rows(
+                &connection,
+                "SELECT state_json FROM run_projection ORDER BY singleton",
+            );
+            let intents = sqlite_blob_rows(
+                &connection,
+                "SELECT intent_json FROM effect_intents ORDER BY effect_id",
+            );
+            let authorizations = sqlite_authorization_rows(&connection);
+            let materials = sqlite_blob_rows(
+                &connection,
+                "SELECT record_json FROM invocation_materials ORDER BY effect_id",
+            );
+            let receipt_rows = sqlite_blob_rows(
+                &connection,
+                "SELECT receipt_json FROM execution_receipts ORDER BY event_sequence",
+            );
+            connection
+                .pragma_update(None, "user_version", 4_i64)
+                .expect("fixture should declare schema four");
+            (
+                journal,
+                receipts,
+                events,
+                projection,
+                intents,
+                authorizations,
+                materials,
+                receipt_rows,
+            )
+        };
+
+        let migrated = SqliteRunStore::open(&path).expect("schema four should migrate");
+        assert_eq!(migrated.export_jsonl().expect("journal"), journal);
+        assert_eq!(
+            migrated
+                .export_execution_receipts_jsonl()
+                .expect("Receipts"),
+            receipts
+        );
+        drop(migrated);
+
+        let connection = rusqlite::Connection::open(&path).expect("SQLite should reopen");
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("schema version should load");
+        assert_eq!(version, 5);
+        assert_eq!(sqlite_event_rows(&connection), events);
+        assert_eq!(
+            sqlite_blob_rows(
+                &connection,
+                "SELECT state_json FROM run_projection ORDER BY singleton"
+            ),
+            projection
+        );
+        assert_eq!(
+            sqlite_blob_rows(
+                &connection,
+                "SELECT intent_json FROM effect_intents ORDER BY effect_id"
+            ),
+            intents
+        );
+        assert_eq!(sqlite_authorization_rows(&connection), authorizations);
+        assert_eq!(
+            sqlite_blob_rows(
+                &connection,
+                "SELECT record_json FROM invocation_materials ORDER BY effect_id"
+            ),
+            materials
+        );
+        assert_eq!(
+            sqlite_blob_rows(
+                &connection,
+                "SELECT receipt_json FROM execution_receipts ORDER BY event_sequence"
+            ),
+            receipt_rows
+        );
+    }
+
+    #[test]
+    fn stale_schema_three_migration_observation_converges_when_version_is_already_four() {
+        let directory = tempdir().expect("temp directory should exist");
+        let path = directory.path().join("run.db");
+        {
+            let mut store = SqliteRunStore::open(&path).expect("schema five store should open");
+            commit_two_receipt_chain(&mut store);
+        }
+        let mut connection = rusqlite::Connection::open(&path).expect("SQLite should reopen");
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .expect("foreign keys should enable");
+        connection
+            .pragma_update(None, "user_version", 4_i64)
+            .expect("concurrent legacy migration should publish schema four");
+
+        sqlite::migrate_schema_three(&mut connection)
+            .expect("stale schema-three open should converge from schema four");
+
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("schema version should load");
+        assert_eq!(version, 5);
+        drop(connection);
+        SqliteRunStore::open(&path).expect("converged store should pass full open verification");
+    }
+
+    #[test]
+    fn failed_schema_four_audit_keeps_version_and_all_durable_rows_unchanged() {
+        let directory = tempdir().expect("temp directory should exist");
+        let path = directory.path().join("run.db");
+        {
+            let mut store = SqliteRunStore::open(&path).expect("schema five store should open");
+            commit_two_receipt_chain(&mut store);
+        }
+        let before = {
+            let connection = rusqlite::Connection::open(&path).expect("raw SQLite should open");
+            connection
+                .execute(
+                    "UPDATE run_events SET event_id = 'event-index-tampered' WHERE sequence = 1",
+                    [],
+                )
+                .expect("fixture event index should be corrupted");
+            connection
+                .pragma_update(None, "user_version", 4_i64)
+                .expect("fixture should declare schema four");
+            (
+                sqlite_event_rows(&connection),
+                sqlite_blob_rows(
+                    &connection,
+                    "SELECT state_json FROM run_projection ORDER BY singleton",
+                ),
+                sqlite_blob_rows(
+                    &connection,
+                    "SELECT intent_json FROM effect_intents ORDER BY effect_id",
+                ),
+                sqlite_authorization_rows(&connection),
+                sqlite_blob_rows(
+                    &connection,
+                    "SELECT record_json FROM invocation_materials ORDER BY effect_id",
+                ),
+                sqlite_blob_rows(
+                    &connection,
+                    "SELECT receipt_json FROM execution_receipts ORDER BY event_sequence",
+                ),
+            )
+        };
+
+        assert!(matches!(
+            SqliteRunStore::open(&path),
+            Err(StoreError::Corrupt(message))
+                if message == "run event ID index differs from the journal event"
+        ));
+
+        let connection = rusqlite::Connection::open(&path).expect("SQLite should reopen");
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("schema version should load");
+        assert_eq!(version, 4);
+        let after = (
+            sqlite_event_rows(&connection),
+            sqlite_blob_rows(
+                &connection,
+                "SELECT state_json FROM run_projection ORDER BY singleton",
+            ),
+            sqlite_blob_rows(
+                &connection,
+                "SELECT intent_json FROM effect_intents ORDER BY effect_id",
+            ),
+            sqlite_authorization_rows(&connection),
+            sqlite_blob_rows(
+                &connection,
+                "SELECT record_json FROM invocation_materials ORDER BY effect_id",
+            ),
+            sqlite_blob_rows(
+                &connection,
+                "SELECT receipt_json FROM execution_receipts ORDER BY event_sequence",
+            ),
+        );
+        assert_eq!(after, before);
     }
 
     #[test]
@@ -2491,6 +2929,7 @@ mod tests {
                     RunEventBody::StepPlanned {
                         step_id: "step-after-refresh".to_owned(),
                         objective: "continue after observing the winning writer".to_owned(),
+                        depends_on: Vec::new(),
                     },
                 ),
             )
@@ -2819,6 +3258,7 @@ mod tests {
                         RunEventBody::StepPlanned {
                             step_id,
                             objective: "exercise warm append".to_owned(),
+                            depends_on: Vec::new(),
                         },
                     ),
                 )
@@ -2857,6 +3297,7 @@ mod tests {
                     RunEventBody::StepPlanned {
                         step_id: "scale-step-final".to_owned(),
                         objective: "prove cached append".to_owned(),
+                        depends_on: Vec::new(),
                     },
                 ),
             )
@@ -2896,6 +3337,7 @@ mod tests {
                         RunEventBody::StepPlanned {
                             step_id: step_id.clone(),
                             objective: "exercise Receipt indexing".to_owned(),
+                            depends_on: Vec::new(),
                         },
                     ),
                 )
