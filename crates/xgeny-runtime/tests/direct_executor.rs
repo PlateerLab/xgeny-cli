@@ -861,7 +861,23 @@ fn instance_fixture(definition: &CapabilityDefinitionBody) -> CapabilityInstance
     "builtin://test/filesystem-writer".clone_into(&mut instance.binding.binding_ref);
     instance.binding.operation_ref = Some("writeMarker".to_owned());
     instance.binding.protocol_version = Some("1".to_owned());
+    instance.platform = host_platform();
     *instance
+}
+
+fn host_platform() -> Platform {
+    let os = match std::env::consts::OS {
+        "linux" => OperatingSystem::Linux,
+        "macos" => OperatingSystem::Macos,
+        "windows" => OperatingSystem::Windows,
+        unsupported => panic!("unsupported test OS: {unsupported}"),
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => Architecture::X86_64,
+        "aarch64" => Architecture::Aarch64,
+        unsupported => panic!("unsupported test architecture: {unsupported}"),
+    };
+    Platform { os, arch }
 }
 
 fn registry_with(
@@ -881,10 +897,7 @@ fn registry_with(
 fn route_request(definition: &CapabilityDefinitionBody) -> RouteRequest {
     RouteRequest {
         capability: capability(definition),
-        target_platform: Platform {
-            os: OperatingSystem::Linux,
-            arch: Architecture::X86_64,
-        },
+        target_platform: host_platform(),
         required_features: RequiredRouteFeatures {
             execution_style: ExecutionStyle::Sync,
             cancellation: false,
