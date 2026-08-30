@@ -1028,8 +1028,8 @@ fn seed_planned_read_only<S: RunStore>(store: &mut S, definition: &CapabilityDef
         action_digest,
         material_digest,
         PlannedExecutionProfile::LocalSyncReadOnlyV1,
-        "linux",
-        "x86_64",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
     )
     .expect("planned invocation should validate");
     let reference = ReconstructableMaterialReference::new("run-recipe", "recipe-1", "rev-1")
