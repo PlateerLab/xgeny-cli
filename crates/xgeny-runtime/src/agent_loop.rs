@@ -30,6 +30,17 @@ const MAX_PROPOSAL_BYTES: usize = 256 * 1024;
 const MAX_PROPOSAL_KEY_BYTES: usize = 128;
 const MAX_COMPLETION_SUMMARY_BYTES: usize = 5_000;
 const MAX_CAPABILITY_SUMMARY_BYTES: usize = 512;
+const MAX_PLANNING_CONTEXT_BYTES: u64 = 512 * 1024;
+const MAX_PLANNING_CATALOG_DEFINITIONS: usize = 1_024;
+const MAX_PLANNING_SOURCE_STEPS: usize = 4_096;
+const MAX_PLANNING_DEFINITION_BYTES: usize = 256 * 1024;
+const MAX_PLANNING_STEP_BYTES: usize = 64 * 1024;
+const MAX_PLANNING_SOURCE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PLANNING_VALUE_DEPTH: usize = 64;
+const MAX_PLANNING_VALUE_NODES: usize = 32_768;
+const MAX_PLANNING_VALUE_TEXT_BYTES: usize = 256 * 1024;
+const MAX_PLANNING_DEFINITION_COLLECTION_ITEMS: usize = 4_096;
+const MAX_PLANNING_HEADER_TEXT_BYTES: usize = 256 * 1024;
 
 /// One immutable journal position exposed by a bounded loop tick.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -502,6 +513,8 @@ pub enum PlannerPortFailure {
     InvalidResponse,
     #[error("planner request exceeded provider limits")]
     ProviderLimit,
+    #[error("planner provider rejected the request")]
+    ProviderRejected,
 }
 
 /// Core-owned envelope for exactly one durably reserved planner call.
@@ -664,6 +677,7 @@ pub enum AgentLoopQuiescence {
     PlannedStepBudgetExhausted,
     ToolCallBudgetExhausted,
     ContextBudgetExceeded,
+    ContextInputLimitExceeded,
     NoActionableWork,
 }
 
@@ -931,6 +945,12 @@ impl AgentLoop {
             Err(ContextBuildError::BudgetExceeded) => {
                 return Ok(AgentLoopTick::Quiescent {
                     reason: AgentLoopQuiescence::ContextBudgetExceeded,
+                    head: AgentLoopHead::from_state(&state),
+                });
+            }
+            Err(ContextBuildError::InputLimitExceeded) => {
+                return Ok(AgentLoopTick::Quiescent {
+                    reason: AgentLoopQuiescence::ContextInputLimitExceeded,
                     head: AgentLoopHead::from_state(&state),
                 });
             }
@@ -1433,6 +1453,16 @@ impl AgentLoop {
                 ),
                 ModelCallConflictIntent::RejectStale,
             ),
+            PlannerPortFailure::ProviderRejected => (
+                append_model_call_rejection(
+                    store,
+                    events,
+                    reserved_state,
+                    call_id,
+                    ModelCallRejectionReason::ProviderRejected,
+                ),
+                ModelCallConflictIntent::RejectStale,
+            ),
         };
         let commit = match commit {
             Ok(commit) => commit,
@@ -1706,6 +1736,7 @@ fn valid_sha256_digest(value: &str) -> bool {
 #[derive(Debug)]
 enum ContextBuildError {
     BudgetExceeded,
+    InputLimitExceeded,
     Canonicalization,
     Catalog,
 }
@@ -1717,11 +1748,37 @@ fn build_context(
     registry: &CapabilityRegistry,
     budget: &AgentLoopBudget,
 ) -> Result<PlanningContext, ContextBuildError> {
+    if state
+        .run_id
+        .len()
+        .checked_add(state.authority.len())
+        .and_then(|total| total.checked_add(state.journal_head_digest.len()))
+        .and_then(|total| total.checked_add(state.goal.len()))
+        .is_none_or(|total| total > MAX_PLANNING_HEADER_TEXT_BYTES)
+    {
+        return Err(ContextBuildError::InputLimitExceeded);
+    }
+    if registry.definition_count() > MAX_PLANNING_CATALOG_DEFINITIONS
+        || state.steps.len() > MAX_PLANNING_SOURCE_STEPS
+    {
+        return Err(ContextBuildError::InputLimitExceeded);
+    }
+    let mut source_bytes = 0_usize;
     let mut summaries = Vec::new();
     for definition in registry.definitions() {
+        validate_planning_definition_shape(definition)?;
+        let definition_size =
+            canonical_size(definition).map_err(|_| ContextBuildError::Canonicalization)?;
+        if definition_size > MAX_PLANNING_DEFINITION_BYTES {
+            return Err(ContextBuildError::InputLimitExceeded);
+        }
+        source_bytes = source_bytes
+            .checked_add(definition_size)
+            .filter(|size| *size <= MAX_PLANNING_SOURCE_BYTES)
+            .ok_or(ContextBuildError::InputLimitExceeded)?;
         let definition_digest =
             definition_contract_digest(definition).map_err(|_| ContextBuildError::Catalog)?;
-        summaries.push(PlanningCapabilitySummary {
+        let summary = PlanningCapabilitySummary {
             capability: CapabilityRef {
                 capability_id: definition.metadata.id.clone(),
                 contract_version: definition.metadata.contract_version.clone(),
@@ -1746,21 +1803,24 @@ fn build_context(
             idempotency_key_supported: definition.spec.execution.idempotency_key_supported,
             default_timeout_ms: definition.spec.execution.default_timeout_ms,
             max_timeout_ms: definition.spec.execution.max_timeout_ms,
-        });
+        };
+        let summary_size =
+            canonical_size(&summary).map_err(|_| ContextBuildError::Canonicalization)?;
+        summaries.push((summary, summary_size));
     }
     summaries.sort_by(|left, right| {
         (
-            left.capability.capability_id.as_str(),
-            left.capability.contract_version.as_str(),
+            left.0.capability.capability_id.as_str(),
+            left.0.capability.contract_version.as_str(),
         )
             .cmp(&(
-                right.capability.capability_id.as_str(),
-                right.capability.contract_version.as_str(),
+                right.0.capability.capability_id.as_str(),
+                right.0.capability.contract_version.as_str(),
             ))
     });
     let catalog_entries: Vec<_> = summaries
         .iter()
-        .map(|summary| CatalogDigestEntry {
+        .map(|(summary, _)| CatalogDigestEntry {
             capability_id: &summary.capability.capability_id,
             contract_version: &summary.capability.contract_version,
             definition_digest: &summary.definition_digest,
@@ -1771,10 +1831,10 @@ fn build_context(
         entries: &catalog_entries,
     })
     .map_err(|_| ContextBuildError::Canonicalization)?;
-    let step_summaries: Vec<_> = state
-        .steps
-        .values()
-        .map(|step| PlanningStepSummary {
+    let mut step_summaries = Vec::with_capacity(state.steps.len());
+    for step in state.steps.values() {
+        validate_planning_step_shape(step)?;
+        let summary = PlanningStepSummary {
             step_id: step.step_id.clone(),
             objective: step.objective.clone(),
             depends_on: step.depends_on.clone(),
@@ -1788,8 +1848,18 @@ fn build_context(
                     contract_version: invocation.contract_version().to_owned(),
                 }),
             dependency_released: receipt_releases_dependency(step),
-        })
-        .collect();
+        };
+        let summary_size =
+            canonical_size(&summary).map_err(|_| ContextBuildError::Canonicalization)?;
+        if summary_size > MAX_PLANNING_STEP_BYTES {
+            return Err(ContextBuildError::InputLimitExceeded);
+        }
+        source_bytes = source_bytes
+            .checked_add(summary_size)
+            .filter(|size| *size <= MAX_PLANNING_SOURCE_BYTES)
+            .ok_or(ContextBuildError::InputLimitExceeded)?;
+        step_summaries.push((summary, summary_size));
+    }
     let total_steps = step_summaries.len();
     let total_capabilities = summaries.len();
     let mut payload = PlanningContextPayload {
@@ -1808,8 +1878,12 @@ fn build_context(
         capabilities: Vec::new(),
         omitted_capabilities: total_capabilities,
     };
-    let maximum_size = usize::try_from(budget.max_context_bytes).unwrap_or(usize::MAX);
-    if canonical_size(&payload).map_err(|_| ContextBuildError::Canonicalization)? > maximum_size {
+    let maximum_size = usize::try_from(budget.max_context_bytes)
+        .unwrap_or(usize::MAX)
+        .min(usize::try_from(MAX_PLANNING_CONTEXT_BYTES).unwrap_or(usize::MAX));
+    let mut conservative_size =
+        canonical_size(&payload).map_err(|_| ContextBuildError::Canonicalization)?;
+    if conservative_size > maximum_size {
         return Err(ContextBuildError::BudgetExceeded);
     }
 
@@ -1817,28 +1891,29 @@ fn build_context(
     // monopolizing the bounded context. Schemas and Step summaries are included as whole items;
     // an item that does not fit is omitted rather than truncated into an ambiguous contract.
     for index in 0..step_summaries.len().max(summaries.len()) {
-        if let Some(step) = step_summaries.get(index) {
-            payload.steps.push(step.clone());
-            payload.omitted_steps = total_steps - payload.steps.len();
-            let size = canonical_size(&payload).map_err(|_| ContextBuildError::Canonicalization)?;
-            if size > maximum_size {
-                payload.steps.pop();
+        if let Some((step, item_size)) = step_summaries.get(index) {
+            let delta = item_size.saturating_add(usize::from(!payload.steps.is_empty()));
+            if conservative_size.saturating_add(delta) <= maximum_size {
+                payload.steps.push(step.clone());
                 payload.omitted_steps = total_steps - payload.steps.len();
+                conservative_size += delta;
             }
         }
-        if let Some(summary) = summaries.get(index) {
-            payload.capabilities.push(summary.clone());
-            payload.omitted_capabilities = total_capabilities - payload.capabilities.len();
-            let size = canonical_size(&payload).map_err(|_| ContextBuildError::Canonicalization)?;
-            if size > maximum_size {
-                payload.capabilities.pop();
+        if let Some((summary, item_size)) = summaries.get(index) {
+            let delta = item_size.saturating_add(usize::from(!payload.capabilities.is_empty()));
+            if conservative_size.saturating_add(delta) <= maximum_size {
+                payload.capabilities.push(summary.clone());
                 payload.omitted_capabilities = total_capabilities - payload.capabilities.len();
+                conservative_size += delta;
             }
         }
     }
+    let exact_size = canonical_size(&payload).map_err(|_| ContextBuildError::Canonicalization)?;
+    if exact_size > maximum_size {
+        return Err(ContextBuildError::BudgetExceeded);
+    }
     let canonical_size_bytes =
-        u64::try_from(canonical_size(&payload).map_err(|_| ContextBuildError::Canonicalization)?)
-            .map_err(|_| ContextBuildError::BudgetExceeded)?;
+        u64::try_from(exact_size).map_err(|_| ContextBuildError::BudgetExceeded)?;
     let context_digest = digest_serializable(&ContextDigestInput {
         domain: "xgeny.planning-context.digest/v1",
         payload: &payload,
@@ -1849,6 +1924,156 @@ fn build_context(
         context_digest,
         canonical_size_bytes,
     })
+}
+
+fn validate_planning_definition_shape(
+    definition: &xgeny_domain::CapabilityDefinitionBody,
+) -> Result<(), ContextBuildError> {
+    let collection_items = definition
+        .extensions
+        .len()
+        .saturating_add(definition.required_extensions.len())
+        .saturating_add(definition.metadata.labels.len())
+        .saturating_add(definition.spec.required_capabilities.len())
+        .saturating_add(definition.spec.effect.resource_selectors.len())
+        .saturating_add(definition.spec.effect.critical_actions.len())
+        .saturating_add(definition.spec.execution.styles.len())
+        .saturating_add(definition.spec.verification.len())
+        .saturating_add(definition.spec.discovery.as_ref().map_or(0, |discovery| {
+            discovery
+                .keywords
+                .len()
+                .saturating_add(discovery.examples.len())
+        }));
+    if collection_items > MAX_PLANNING_DEFINITION_COLLECTION_ITEMS {
+        return Err(ContextBuildError::InputLimitExceeded);
+    }
+    let mut stats = PlanningValueStats::default();
+    add_planning_text(&mut stats, definition.api_version.len())?;
+    for extension in &definition.required_extensions {
+        add_planning_text(&mut stats, extension.len())?;
+    }
+    for key in definition.extensions.keys() {
+        add_planning_text(&mut stats, key.len())?;
+    }
+    add_planning_text(&mut stats, definition.metadata.id.len())?;
+    add_planning_text(&mut stats, definition.metadata.contract_version.len())?;
+    add_planning_text(&mut stats, definition.metadata.display_name.len())?;
+    for (key, value) in &definition.metadata.labels {
+        add_planning_text(&mut stats, key.len())?;
+        add_planning_text(&mut stats, value.len())?;
+    }
+    add_planning_text(&mut stats, definition.spec.summary.len())?;
+    for required in &definition.spec.required_capabilities {
+        add_planning_text(&mut stats, required.capability_id.len())?;
+        add_planning_text(&mut stats, required.contract_version.len())?;
+    }
+    for selector in &definition.spec.effect.resource_selectors {
+        add_planning_text(&mut stats, selector.scope.len())?;
+        add_planning_text(&mut stats, selector.argument_pointer.len())?;
+    }
+    for rule in &definition.spec.verification {
+        if let Some(description) = &rule.description {
+            add_planning_text(&mut stats, description.len())?;
+        }
+    }
+    if let Some(discovery) = &definition.spec.discovery {
+        for keyword in &discovery.keywords {
+            add_planning_text(&mut stats, keyword.len())?;
+        }
+        for example in &discovery.examples {
+            add_planning_text(&mut stats, example.len())?;
+        }
+        if let Some(details_ref) = &discovery.details_ref {
+            add_planning_text(&mut stats, details_ref.len())?;
+        }
+    }
+    validate_planning_value(&definition.spec.input_schema, &mut stats)?;
+    validate_planning_value(&definition.spec.output_schema, &mut stats)?;
+    for value in definition.extensions.values() {
+        validate_planning_value(value, &mut stats)?;
+    }
+    Ok(())
+}
+
+fn validate_planning_step_shape(
+    step: &xgeny_workgraph::StepState,
+) -> Result<(), ContextBuildError> {
+    if step.depends_on.len() > MAX_PLANNING_DEFINITION_COLLECTION_ITEMS {
+        return Err(ContextBuildError::InputLimitExceeded);
+    }
+    let mut text_bytes = step
+        .step_id
+        .len()
+        .checked_add(step.objective.len())
+        .ok_or(ContextBuildError::InputLimitExceeded)?;
+    for dependency in &step.depends_on {
+        text_bytes = text_bytes
+            .checked_add(dependency.len())
+            .filter(|total| *total <= MAX_PLANNING_STEP_BYTES)
+            .ok_or(ContextBuildError::InputLimitExceeded)?;
+    }
+    if let Some(invocation) = &step.planned_invocation {
+        text_bytes = text_bytes
+            .checked_add(invocation.capability_id().len())
+            .and_then(|total| total.checked_add(invocation.contract_version().len()))
+            .ok_or(ContextBuildError::InputLimitExceeded)?;
+    }
+    if text_bytes > MAX_PLANNING_STEP_BYTES {
+        return Err(ContextBuildError::InputLimitExceeded);
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct PlanningValueStats {
+    nodes: usize,
+    text_bytes: usize,
+}
+
+fn validate_planning_value(
+    root: &Value,
+    stats: &mut PlanningValueStats,
+) -> Result<(), ContextBuildError> {
+    let mut pending = vec![(root, 1_usize)];
+    while let Some((value, depth)) = pending.pop() {
+        if depth > MAX_PLANNING_VALUE_DEPTH {
+            return Err(ContextBuildError::InputLimitExceeded);
+        }
+        stats.nodes = stats
+            .nodes
+            .checked_add(1)
+            .filter(|nodes| *nodes <= MAX_PLANNING_VALUE_NODES)
+            .ok_or(ContextBuildError::InputLimitExceeded)?;
+        match value {
+            Value::String(text) => add_planning_text(stats, text.len())?,
+            Value::Array(values) => {
+                for child in values {
+                    pending.push((child, depth + 1));
+                }
+            }
+            Value::Object(values) => {
+                for (key, child) in values {
+                    add_planning_text(stats, key.len())?;
+                    pending.push((child, depth + 1));
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn add_planning_text(
+    stats: &mut PlanningValueStats,
+    bytes: usize,
+) -> Result<(), ContextBuildError> {
+    stats.text_bytes = stats
+        .text_bytes
+        .checked_add(bytes)
+        .filter(|total| *total <= MAX_PLANNING_VALUE_TEXT_BYTES)
+        .ok_or(ContextBuildError::InputLimitExceeded)?;
+    Ok(())
 }
 
 fn bounded_summary(value: &str) -> String {
@@ -2614,5 +2839,84 @@ mod tests {
         .expect("context should fit");
         validate_proposal_structure(&state, &frontier, &context, &proposal("released"))
             .expect("receipt-released dependency should remain usable");
+    }
+
+    #[test]
+    fn context_hard_limit_caps_a_larger_forward_compatible_budget() {
+        let state = state(Vec::new());
+        let frontier = derive_frontier(&state).expect("frontier should derive");
+        let oversized = AgentLoopBudget::new(1, 1, 1, MAX_PLANNING_CONTEXT_BYTES + 1)
+            .expect("durable budget itself remains forward-compatible");
+        let context = build_context(&state, &frontier, &CapabilityRegistry::new(), &oversized)
+            .expect("hard cap should not invalidate an otherwise fitting legacy budget");
+        assert!(context.canonical_size_bytes() <= MAX_PLANNING_CONTEXT_BYTES);
+    }
+
+    #[test]
+    fn deeply_nested_capability_schema_is_rejected_before_clone_and_digest() {
+        let document: xgeny_domain::ProtocolDocument = serde_json::from_str(include_str!(
+            "../../../protocol/fixtures/v1alpha1/valid/capability-definition.fs-read-text.json"
+        ))
+        .expect("definition fixture should deserialize");
+        let xgeny_domain::ProtocolDocument::CapabilityDefinition(mut definition) = document else {
+            panic!("expected CapabilityDefinition fixture")
+        };
+        let mut schema = serde_json::json!({"type": "string"});
+        for _ in 0..=MAX_PLANNING_VALUE_DEPTH {
+            schema = serde_json::json!({"nested": schema});
+        }
+        definition.spec.input_schema = schema;
+        let mut registry = CapabilityRegistry::new();
+        registry
+            .register_schema_validated_definition(*definition)
+            .expect("registry trusts the protocol ingress boundary");
+        let state = state(Vec::new());
+        let frontier = derive_frontier(&state).expect("frontier should derive");
+        assert!(matches!(
+            build_context(&state, &frontier, &registry, &test_budget()),
+            Err(ContextBuildError::InputLimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn oversized_capability_text_is_rejected_before_canonicalization() {
+        let document: xgeny_domain::ProtocolDocument = serde_json::from_str(include_str!(
+            "../../../protocol/fixtures/v1alpha1/valid/capability-definition.fs-read-text.json"
+        ))
+        .expect("definition fixture should deserialize");
+        let xgeny_domain::ProtocolDocument::CapabilityDefinition(mut definition) = document else {
+            panic!("expected CapabilityDefinition fixture")
+        };
+        definition.spec.summary = "x".repeat(MAX_PLANNING_VALUE_TEXT_BYTES + 1);
+        assert!(matches!(
+            validate_planning_definition_shape(&definition),
+            Err(ContextBuildError::InputLimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn oversized_step_text_is_rejected_before_clone_and_canonicalization() {
+        let mut oversized = step("oversized", StepStatus::Planned, Vec::new());
+        oversized.objective = "x".repeat(MAX_PLANNING_STEP_BYTES + 1);
+        assert!(matches!(
+            validate_planning_step_shape(&oversized),
+            Err(ContextBuildError::InputLimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn oversized_context_header_text_is_rejected_before_goal_clone() {
+        let mut oversized = state(Vec::new());
+        oversized.goal = "x".repeat(MAX_PLANNING_HEADER_TEXT_BYTES + 1);
+        let frontier = derive_frontier(&oversized).expect("frontier should derive");
+        assert!(matches!(
+            build_context(
+                &oversized,
+                &frontier,
+                &CapabilityRegistry::new(),
+                &test_budget(),
+            ),
+            Err(ContextBuildError::InputLimitExceeded)
+        ));
     }
 }

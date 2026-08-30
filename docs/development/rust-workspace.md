@@ -4,7 +4,7 @@
 
 ## 범위
 
-현재 워크스페이스는 다음 여덟 crate로 구성된다.
+현재 워크스페이스는 다음 아홉 crate로 구성된다.
 
 ```text
 crates/
@@ -15,10 +15,11 @@ crates/
   xgeny-local-store/  메모리 참조 구현과 embedded SQLite 후보
   xgeny-policy/       concrete resource 해석 경계와 순수 정책 교집합
   xgeny-runtime/      durable effect 실행·복구와 Capability Registry·Router 기본형
+  xgeny-provider-openai/ OpenAI-compatible 단일 요청 planner leaf adapter
   xgeny-cli/          xgeny 실행 파일과 protocol check 명령
 ```
 
-`xgeny-workgraph`, `xgeny-local-store`, `xgeny-runtime`의 durable effect, invocation material, Direct Executor, Core verification, VerifiedRunIndex, Persistent dependency frontier, bounded AgentLoop와 model-call lifecycle 계약은 ADR-0008·0010·0011·0012·0013·0014·0015·0016 연구 gate를 위한 내부 실험이다. Public protocol v0.1 schema는 바꾸지 않았지만 기존 WorkGraph `dependsOn`의 DAG·상태 의미 검증은 강화했다. Registry와 Router 기본형도 기존 `CapabilityDefinition`·`CapabilityInstance`를 그대로 사용하며 wire 문서를 추가하지 않는다. `xgeny-policy`의 Allow는 provisional 결과로 유지되고, runtime의 Admission 기본형만 exact invocation에서 만든 local one-shot allow를 current Run/Step/action/Instance/material과 결합해 durable intent로 발행한다. Admission은 Receipt용 canonical PolicyDecision ID/digest commitment를 만들지만 reusable `Grant`나 조회 가능한 `PolicyDecision` wire document를 저장하지 않는다. `xgeny-adapter-reference`는 public runtime port를 실제 preopened 임시 파일 I/O와 read-only verifier로 검증하지만 `publish = false`인 비제품 기준이다. Provider-neutral planner port, durable plan input과 provider 호출 전 possible-send reservation은 포함하지만 실제 모델 네트워크 provider, provider별 tokenizer/prompt, 사용자 workspace용 파일·process adapter, 승인 UI, MCP, Connector, XGEN 원격 연동, `InvocationPlan` wire 투영 또는 사용자용 resume 명령은 구현하지 않는다.
+`xgeny-workgraph`, `xgeny-local-store`, `xgeny-runtime`의 durable effect, invocation material, Direct Executor, Core verification, VerifiedRunIndex, Persistent dependency frontier, bounded AgentLoop와 model-call lifecycle 계약은 ADR-0008·0010·0011·0012·0013·0014·0015·0016 연구 gate를 위한 내부 실험이다. Public protocol v0.1 schema는 바꾸지 않았지만 기존 WorkGraph `dependsOn`의 DAG·상태 의미 검증은 강화했다. Registry와 Router 기본형도 기존 `CapabilityDefinition`·`CapabilityInstance`를 그대로 사용하며 wire 문서를 추가하지 않는다. `xgeny-policy`의 Allow는 provisional 결과로 유지되고, runtime의 Admission 기본형만 exact invocation에서 만든 local one-shot allow를 current Run/Step/action/Instance/material과 결합해 durable intent로 발행한다. Admission은 Receipt용 canonical PolicyDecision ID/digest commitment를 만들지만 reusable `Grant`나 조회 가능한 `PolicyDecision` wire document를 저장하지 않는다. `xgeny-adapter-reference`는 public runtime port를 실제 preopened 임시 파일 I/O와 read-only verifier로 검증하지만 `publish = false`인 비제품 기준이다. `xgeny-provider-openai`는 Core가 역의존하지 않는 leaf crate로 model/tokenizer/prompt/schema profile과 단일 HTTP request를 구현한다. 사용자 workspace용 파일·process 제품 adapter, 승인 UI, MCP, Connector, XGEN 원격 연동, `InvocationPlan` wire 투영 또는 사용자용 resume 명령은 아직 구현하지 않는다.
 
 ## 준비물
 

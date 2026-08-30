@@ -1,7 +1,7 @@
 # Durable Planner와 bounded agent loop
 
 - 기준일: 2026-08-30
-- 상태: provider-free durable planning 연구 gate 기본형
+- 상태: provider-neutral durable planning + 첫 OpenAI-compatible adapter
 - 공개 protocol v0.1 schema 변경: 없음
 - local store schema: 6
 
@@ -9,7 +9,7 @@
 
 한 Run의 model-owned 작업 부분에 host-selected budget을 고정하고, 한 planning decision이 만든 여러 Step과 각 Step의 secret-free reconstructable input reference를 Memory 또는 embedded SQLite에 원자 저장할 수 있다. Embedded SQLite에서는 process 재시작 뒤에도 accepted Capability/input commitment와 dependency DAG를 검증해 같은 frontier를 복원한다.
 
-현재 구현은 injected provider-neutral planner fake/port를 호출하기 전에 durable possible-send slot을 예약하고 accepted/rejected/Unknown 상태를 재시작 뒤 복원한다. 실제 model API에는 연결하지 않고 tool도 자동 실행하지 않는다. Runtime coordinator가 제공하는 것은 bounded context/decision, 한 번에 하나의 continuation 경계와 provider-free model-call lifecycle이다. Product model adapter, dispatcher와 사용자 interaction이 붙기 전까지 이것을 완전한 autonomous CLI로 설명하지 않는다.
+현재 구현은 provider-neutral planner port를 호출하기 전에 durable possible-send slot을 예약하고 accepted/rejected/Unknown 상태를 재시작 뒤 복원한다. Fake port와 별도 `xgeny-provider-openai` leaf adapter가 같은 경계를 사용하며, 후자는 OpenAI-compatible model API의 strict structured proposal을 Core validation까지 연결한다. Tool은 자동 실행하지 않으며 dispatcher와 사용자 interaction이 붙기 전까지 이것을 완전한 autonomous CLI로 설명하지 않는다.
 
 ```mermaid
 flowchart TB
@@ -213,7 +213,7 @@ Context membership 목록 자체는 durable event에 저장하지 않으므로 r
 
 Model-call identifier도 같은 경계다. `planner_id` validator는 길이와 ASCII `[A-Za-z0-9._-]`만 검사하고 secret/token-like content는 판별하지 않는다. Trusted composition root가 registry의 stable non-secret ID를 공급해야 하며 raw prompt/response/error/credential을 identifier 또는 ad-hoc digest field로 우회 저장하면 안 된다. `request_profile_digest`의 SHA-256 shape 검증 역시 입력 provenance나 confidentiality 검증이 아니다.
 
-`max_context_bytes`는 최종 serialized payload만 제한한다. 전체 catalog/schema와 Step 후보를 모으는 CPU·peak memory·scan 시간은 아직 별도 상한이 없고, `Debug` redaction도 `PlanningContext`의 명시적 serialization이나 adapter logging을 차단하지 않는다. Production adapter 전에 catalog input bound/streaming packer와 raw proposal/request/response log 금지 검증이 필요하다.
+`max_context_bytes`와 별도로 production hard gate가 context 512 KiB, Definition/Step 수, per-item/aggregate canonical bytes와 JSON depth/node/text를 제한한다. 더 큰 기존 host budget은 effective payload budget만 512 KiB로 clamp하므로 fitting Run을 upgrade 뒤 무조건 멈추지 않는다. Item canonical size를 한 번 계산한 보수적 incremental packing 뒤 final exact size를 다시 검사하므로 과거의 반복 전체 canonicalization 경로를 사용하지 않는다. Catalog/source/item hard gate를 넘으면 `ContextInputLimitExceeded`로 reservation 전에 pause한다. 이 경계는 context assembler를 제한하며 그 전에 실행되는 WorkGraph frontier derivation 전체의 CPU·memory bound까지 새로 보장하지 않는다. 이 allowlist와 size gate도 content DLP는 아니므로 composition root의 egress policy 책임은 유지된다.
 
 Artifact/Memory reference, raw Receipt evidence/tool output와 사용자 conversation excerpt는 아직 context에 넣지 않는다. 이를 추가할 때는 provenance/sensitivity, stable priority와 section별 budget을 먼저 정의해야 한다.
 
@@ -394,13 +394,14 @@ Public protocol schema를 바꾸지 않았으므로 기존 protocol fixture coun
 
 ## 아직 할 수 없는 것
 
-- 실제 모델 provider를 호출해 Proposal을 받기
+- XGEN Model Gateway, 다른 provider dialect와 다중 provider routing
+- 사용자용 provider 설정·credential 입력과 `xgeny run` composition root
 - provider request-status/idempotency를 조회해 Unknown을 자동 reconciliation하기
 - 실제 outbound/청구/token/금액/rate-limit/wall-clock을 정확히 정산하기
-- provider별 tokenizer와 prompt/structured-output adapter
-- context assembly CPU/peak-memory/catalog-scan 상한과 streaming packer
+- exact tokenizer 실행 기반 token budget과 alias 가능한 response-model identity
+- whole-tick frontier CPU/memory bound, section별 context budget과 streaming packer
 - tick 결과를 자동 실행하는 dispatcher와 취소/backoff/fallback
-- provider 또는 port 내부의 hidden retry
+- provider 서버 내부 retry·과금 정책 검증
 - 사용자 승인, 질문, 인증과 critical-action UI
 - 제품 filesystem/process/network/MCP/Connector/XGEN adapter
 - raw prompt/response/error, transcript와 chain-of-thought 저장
@@ -410,4 +411,4 @@ Public protocol schema를 바꾸지 않았으므로 기존 protocol fixture coun
 - completion candidate를 검증해 Run을 terminal completed로 전이하기
 - public `PlanProposal`, WorkGraph delta와 full `InvocationPlan` document 조회
 
-계획·context·WorkGraph 설계는 [ADR-0015](../adr/0015-durable-planner-contract-and-bounded-agent-loop.md), provider 호출 전 reservation과 불확정 복구는 [ADR-0016](../adr/0016-durable-model-call-lifecycle.md)을 따른다.
+계획·context·WorkGraph 설계는 [ADR-0015](../adr/0015-durable-planner-contract-and-bounded-agent-loop.md), provider 호출 전 reservation과 불확정 복구는 [ADR-0016](../adr/0016-durable-model-call-lifecycle.md), 첫 실제 HTTP adapter는 [ADR-0017](../adr/0017-openai-compatible-provider-adapter.md)을 따른다.

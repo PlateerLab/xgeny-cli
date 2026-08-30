@@ -1,0 +1,28 @@
+[package]
+name = "xgeny-provider-openai"
+description = "Bounded OpenAI-compatible planner provider adapter for XGENy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_jcs.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+ureq.workspace = true
+url.workspace = true
+xgeny-domain = { path = "../xgeny-domain" }
+xgeny-runtime = { path = "../xgeny-runtime" }
+
+[dev-dependencies]
+xgeny-local-store = { path = "../xgeny-local-store" }
+xgeny-policy = { path = "../xgeny-policy" }
+xgeny-workgraph = { path = "../xgeny-workgraph" }
+
+[lints]
+workspace = true

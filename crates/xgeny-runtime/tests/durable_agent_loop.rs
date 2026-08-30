@@ -647,6 +647,10 @@ fn seed_event(event_id: &str, run_id: &str, body: RunEventBody) -> RunEvent {
 }
 
 fn create_run<S: RunStore>(store: &mut S, run_id: &str) -> RunState {
+    create_run_with_goal(store, run_id, "complete a durable two-step local task")
+}
+
+fn create_run_with_goal<S: RunStore>(store: &mut S, run_id: &str, goal: &str) -> RunState {
     store
         .append(
             ExpectedHead::Empty,
@@ -654,7 +658,7 @@ fn create_run<S: RunStore>(store: &mut S, run_id: &str) -> RunState {
                 "seed-run-created",
                 run_id,
                 RunEventBody::RunCreated {
-                    goal: "complete a durable two-step local task".to_owned(),
+                    goal: goal.to_owned(),
                 },
             ),
         )
@@ -1870,6 +1874,75 @@ fn context_base_over_budget_yields_without_calling_planner_or_mutating_run() {
 }
 
 #[test]
+fn context_input_hard_limit_yields_before_reservation_or_planner_call() {
+    let run_id = "run-agent-loop-context-input-limit";
+    let loop_budget = budget(2, 2, 2, 262_144);
+    let mut store = MemoryRunStore::new();
+    create_run(&mut store, run_id);
+    let agent_loop = configure(&mut store, run_id, &loop_budget);
+    let mut definition = definition_fixture("xgeny.test/oversized-planning-source");
+    definition.spec.summary = "x".repeat(256 * 1024 + 1);
+    let registry = registry_with(definition);
+    let before = store.load_current().unwrap().unwrap();
+    let mut planner = ScriptedPlanner::default();
+    let result = agent_loop
+        .tick(
+            &mut store,
+            &mut DeterministicEvents,
+            &FixedLease(run_id.to_owned()),
+            &registry,
+            &CanonicalResolver::default(),
+            &mut planner,
+            &mut RecordingMaterializer::default(),
+        )
+        .expect("context input limit should be classified");
+    assert!(matches!(
+        result,
+        AgentLoopTick::Quiescent {
+            reason: AgentLoopQuiescence::ContextInputLimitExceeded,
+            ..
+        }
+    ));
+    assert_eq!(planner.calls, 0);
+    let after = store.load_current().unwrap().unwrap();
+    assert_eq!(after, before);
+    assert_model_call_counters(&after, 0, 0, 0, 0);
+}
+
+#[test]
+fn oversized_goal_yields_before_reservation_or_planner_call() {
+    let run_id = "run-agent-loop-oversized-goal";
+    let loop_budget = budget(2, 2, 2, 262_144);
+    let mut store = MemoryRunStore::new();
+    create_run_with_goal(&mut store, run_id, &"x".repeat(256 * 1024 + 1));
+    let agent_loop = configure(&mut store, run_id, &loop_budget);
+    let before = store.load_current().unwrap().unwrap();
+    let mut planner = ScriptedPlanner::default();
+    let result = agent_loop
+        .tick(
+            &mut store,
+            &mut DeterministicEvents,
+            &FixedLease(run_id.to_owned()),
+            &xgeny_runtime::CapabilityRegistry::new(),
+            &CanonicalResolver::default(),
+            &mut planner,
+            &mut RecordingMaterializer::default(),
+        )
+        .expect("oversized goal should be classified");
+    assert!(matches!(
+        result,
+        AgentLoopTick::Quiescent {
+            reason: AgentLoopQuiescence::ContextInputLimitExceeded,
+            ..
+        }
+    ));
+    assert_eq!(planner.calls, 0);
+    let after = store.load_current().unwrap().unwrap();
+    assert_eq!(after, before);
+    assert_model_call_counters(&after, 0, 0, 0, 0);
+}
+
+#[test]
 fn invalid_planner_identity_or_profile_fails_before_reservation_and_provider_call() {
     let run_id = "run-agent-loop-invalid-planner-metadata";
     let loop_budget = budget(2, 2, 2, 32_768);
@@ -2240,7 +2313,7 @@ fn durable_turn_step_and_tool_budgets_fail_closed_at_exact_boundaries() {
 fn model_call_budget_is_independent_from_accepted_turn_budget() {
     let run_id = "run-agent-loop-call-budget";
     let loop_budget = budget(4, 4, 4, 32_768);
-    let call_budget = ModelCallBudget::new(2).expect("call budget should validate");
+    let call_budget = ModelCallBudget::new(3).expect("call budget should validate");
     let agent_loop = AgentLoop::with_model_call_budget(loop_budget, call_budget);
     let mut store = MemoryRunStore::new();
     create_run(&mut store, run_id);
@@ -2249,6 +2322,7 @@ fn model_call_budget_is_independent_from_accepted_turn_budget() {
     for failure in [
         PlannerPortFailure::InvalidResponse,
         PlannerPortFailure::ProviderLimit,
+        PlannerPortFailure::ProviderRejected,
     ] {
         let outcome = agent_loop
             .tick(
@@ -2270,7 +2344,7 @@ fn model_call_budget_is_independent_from_accepted_turn_budget() {
         ));
     }
     let after_failures = store.load_current().unwrap().unwrap();
-    assert_model_call_counters(&after_failures, 2, 2, 0, 0);
+    assert_model_call_counters(&after_failures, 3, 3, 0, 0);
 
     let mut no_call = ScriptedPlanner::default();
     let exhausted = agent_loop
