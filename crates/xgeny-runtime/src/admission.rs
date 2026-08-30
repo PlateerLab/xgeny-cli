@@ -7,9 +7,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use xgeny_domain::{
-    CapabilityDefinitionBody, CapabilityInstanceBody, CapabilityRef, Decision,
-    EffectClass as DomainEffectClass, ExecutionStyle, Grant, GrantLifetime, Placement,
-    PolicyDecisionBody, PolicySource, ProtocolDocument, ResolvedResource, VerificationStrategy,
+    Architecture, CapabilityDefinitionBody, CapabilityInstanceBody, CapabilityRef, Decision,
+    EffectClass as DomainEffectClass, ExecutionStyle, Grant, GrantLifetime, OperatingSystem,
+    Placement, PolicyDecisionBody, PolicySource, ProtocolDocument, ResolvedResource,
+    VerificationStrategy,
 };
 use xgeny_local_store::{Commit, ExpectedHead, RunStore, StoreError};
 use xgeny_policy::{
@@ -23,10 +24,10 @@ use xgeny_protocol::{
 use xgeny_workgraph::{
     AuthorizationBinding, AuthorizationDigestError, AuthorizationUse, DependencyBlockReason,
     EffectClass as WorkGraphEffectClass, EffectIntent, InvocationBinding, InvocationMaterialError,
-    InvocationMaterialRecord, InvocationMaterialRetention, ReceiptPlacement, ReceiptProvenance,
-    ReceiptVerificationRule, ReceiptVerificationStrategy, ReconstructableMaterialReference,
-    RunEvent, RunEventBody, RunState, SinkGuarantee, StepStatus, authorization_digest,
-    dependency_release_block_reason, invocation_material_digest,
+    InvocationMaterialRecord, InvocationMaterialRetention, PlannedExecutionProfile,
+    ReceiptPlacement, ReceiptProvenance, ReceiptVerificationRule, ReceiptVerificationStrategy,
+    ReconstructableMaterialReference, RunEvent, RunEventBody, RunState, SinkGuarantee, StepStatus,
+    authorization_digest, dependency_release_block_reason, invocation_material_digest,
     invocation_material_retention_digest, once_authorization_id, receipt_provenance_digest,
 };
 
@@ -100,6 +101,7 @@ pub struct PendingInvocation {
     action_digest: String,
     material_digest: String,
     material_retention: InvocationMaterialRetention,
+    plan_id: Option<String>,
 }
 
 impl PendingInvocation {
@@ -115,15 +117,31 @@ impl PendingInvocation {
         &self.action_digest
     }
 
+    /// Exact immutable Capability Definition identity used during preparation.
+    #[must_use]
+    pub fn definition_digest(&self) -> &str {
+        &self.definition_digest
+    }
+
+    /// Canonical normalized-argument identity used by durable material bindings.
+    #[must_use]
+    pub fn material_digest(&self) -> &str {
+        &self.material_digest
+    }
+
     /// Select a secret-free, immutable recipe reference for restart reconstruction.
     ///
     /// The host creates the typed reference. Models and adapters cannot supply raw paths, URLs,
-    /// credentials, or bearer tokens through this API.
+    /// credentials, or bearer tokens through this API. A durably planned invocation is already
+    /// pinned to its atomically committed plan-input reference, so this method cannot replace it.
     pub fn with_reconstructable_material(
         mut self,
         reference: ReconstructableMaterialReference,
     ) -> Self {
-        self.material_retention = InvocationMaterialRetention::ReconstructableReference(reference);
+        if self.plan_id.is_none() {
+            self.material_retention =
+                InvocationMaterialRetention::ReconstructableReference(reference);
+        }
         self
     }
 }
@@ -140,6 +158,7 @@ impl fmt::Debug for PendingInvocation {
             .field("action_digest", &self.action_digest)
             .field("material_digest", &self.material_digest)
             .field("material_retention", &self.material_retention)
+            .field("plan_id", &self.plan_id)
             .finish()
     }
 }
@@ -266,62 +285,48 @@ impl InvocationAdmission {
             .ok_or(AdmissionError::RunNotInitialized)?;
         verify_lease(lease, &state)?;
         require_admission_ready_step(&state, &request.step_id)?;
-        if request.route.required_features.execution_style != ExecutionStyle::Sync {
-            return Err(AdmissionError::UnsupportedExecutionStyle);
-        }
-        if !request.route.required_features.idempotency_key {
-            return Err(AdmissionError::IdempotencyKeyFeatureRequired);
-        }
+        verify_planned_route_binding(&state, &request.step_id, &request.route)?;
+        verify_planned_definition_binding(&state, &request.step_id, registry)?;
+        let planned_input = verify_planned_input_sidecar(store, &state, &request.step_id)?;
 
-        let definition = registry
-            .definition(&request.route.capability)
-            .ok_or_else(|| AdmissionError::DefinitionNotFound {
-                capability_id: request.route.capability.capability_id.clone(),
-                contract_version: request.route.capability.contract_version.clone(),
-            })?;
-        map_effect_class(definition.spec.effect.class)?;
-        if !definition.spec.execution.idempotency_key_supported {
-            return Err(AdmissionError::DefinitionDoesNotSupportIdempotencyKey);
-        }
-        validate_arguments(definition, &request.arguments)?;
-
-        let request_identity = digest_serializable(&RequestIdentityDigestInput {
-            domain: "xgeny.permission-request/v1",
-            run_id: &state.run_id,
-            step_id: &request.step_id,
-            capability: &request.route.capability,
-            arguments: &request.arguments,
-        })?;
-        let request_id = content_id("permission", &request_identity);
-        let derived_request = PermissionRequestResolver::new(resolver).resolve_invocation(
-            &request_id,
+        let facts = prepare_invocation_facts(
             &state.run_id,
             &request.step_id,
-            definition,
-            &request.arguments,
-            GrantLifetime::Once,
-        )?;
-        validate_arguments(definition, derived_request.normalized_arguments())?;
-
-        let definition_digest = definition_contract_digest(definition)?;
-        let action_digest = semantic_action_digest(
             &request.route.capability,
-            &definition_digest,
-            definition.spec.effect.class,
-            derived_request.normalized_arguments(),
-            derived_request.permission_request(),
+            &request.arguments,
+            registry,
+            resolver,
         )?;
-        let material_digest = invocation_material_digest(derived_request.normalized_arguments())?;
+        let plan_id = verify_planned_admission_binding(
+            &state,
+            &request,
+            &facts.definition_digest,
+            &facts.action_digest,
+            &facts.material_digest,
+        )?;
+        let material_retention = match (&plan_id, planned_input.as_ref()) {
+            (Some(_), Some(input)) => {
+                InvocationMaterialRetention::ReconstructableReference(input.reference().clone())
+            }
+            (None, None) => InvocationMaterialRetention::Ephemeral,
+            _ => {
+                return Err(AdmissionError::PlannedInvocationMismatch {
+                    step_id: request.step_id.clone(),
+                    field: "plan_input_sidecar",
+                });
+            }
+        };
 
         Ok(PendingInvocation {
             run_binding: PendingRunBinding::from_state(&state),
             route: request.route,
-            normalized_arguments: derived_request.normalized_arguments().clone(),
-            permission_request: derived_request.permission_request().clone(),
-            definition_digest,
-            action_digest,
-            material_digest,
-            material_retention: InvocationMaterialRetention::Ephemeral,
+            normalized_arguments: facts.normalized_arguments,
+            permission_request: facts.permission_request,
+            definition_digest: facts.definition_digest,
+            action_digest: facts.action_digest,
+            material_digest: facts.material_digest,
+            material_retention,
+            plan_id,
         })
     }
 
@@ -357,7 +362,10 @@ impl InvocationAdmission {
         if !pending.run_binding.matches(&state) {
             return Err(AdmissionError::RunHeadChanged);
         }
-        require_admission_ready_step(&state, pending.permission_request.step_id())?;
+        let step_id = pending.permission_request.step_id();
+        require_admission_ready_step(&state, step_id)?;
+        let planned_input = verify_planned_input_sidecar(store, &state, step_id)?;
+        verify_pending_planned_material(&state, step_id, &pending, planned_input.as_ref())?;
 
         let definition = registry
             .definition(&pending.route.capability)
@@ -435,6 +443,89 @@ impl InvocationAdmission {
     }
 }
 
+pub(crate) struct PreparedInvocationFacts {
+    pub(crate) normalized_arguments: Value,
+    pub(crate) permission_request: ResolvedPermissionRequest,
+    pub(crate) definition_digest: String,
+    pub(crate) action_digest: String,
+    pub(crate) material_digest: String,
+}
+
+impl fmt::Debug for PreparedInvocationFacts {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedInvocationFacts")
+            .field("normalized_arguments", &"<redacted>")
+            .field("permission_request", &"<resolved/redacted>")
+            .field("definition_digest", &self.definition_digest)
+            .field("action_digest", &self.action_digest)
+            .field("material_digest", &self.material_digest)
+            .finish()
+    }
+}
+
+/// Normalize and bind invocation facts without policy, routing, persistence, or execution.
+///
+/// Planning callers must supply a deterministic, side-effect-free `ResourceResolver`: no network
+/// access, credential dereference, filesystem mutation, or permission change is allowed here.
+/// Admission repeats the same derivation from reconstructed input before authority is issued.
+pub(crate) fn prepare_invocation_facts<R: ResourceResolver>(
+    run_id: &str,
+    step_id: &str,
+    capability: &CapabilityRef,
+    arguments: &Value,
+    registry: &CapabilityRegistry,
+    resolver: &R,
+) -> Result<PreparedInvocationFacts, AdmissionError> {
+    let definition =
+        registry
+            .definition(capability)
+            .ok_or_else(|| AdmissionError::DefinitionNotFound {
+                capability_id: capability.capability_id.clone(),
+                contract_version: capability.contract_version.clone(),
+            })?;
+    map_effect_class(definition.spec.effect.class)?;
+    if !definition.spec.execution.idempotency_key_supported {
+        return Err(AdmissionError::DefinitionDoesNotSupportIdempotencyKey);
+    }
+    validate_arguments(definition, arguments)?;
+
+    let request_identity = digest_serializable(&RequestIdentityDigestInput {
+        domain: "xgeny.permission-request/v1",
+        run_id,
+        step_id,
+        capability,
+        arguments,
+    })?;
+    let request_id = content_id("permission", &request_identity);
+    let derived_request = PermissionRequestResolver::new(resolver).resolve_invocation(
+        &request_id,
+        run_id,
+        step_id,
+        definition,
+        arguments,
+        GrantLifetime::Once,
+    )?;
+    validate_arguments(definition, derived_request.normalized_arguments())?;
+
+    let definition_digest = definition_contract_digest(definition)?;
+    let action_digest = semantic_action_digest(
+        capability,
+        &definition_digest,
+        definition.spec.effect.class,
+        derived_request.normalized_arguments(),
+        derived_request.permission_request(),
+    )?;
+    let material_digest = invocation_material_digest(derived_request.normalized_arguments())?;
+    Ok(PreparedInvocationFacts {
+        normalized_arguments: derived_request.normalized_arguments().clone(),
+        permission_request: derived_request.permission_request().clone(),
+        definition_digest,
+        action_digest,
+        material_digest,
+    })
+}
+
 struct IssuedEffect {
     intent: EffectIntent,
     instance_binding_digest: String,
@@ -486,6 +577,7 @@ fn issue_once_effect(
     )?;
     let receipt_provenance = build_receipt_provenance(
         &effect_identity_digest,
+        pending.plan_id.as_deref(),
         policy_decision_id,
         policy_decision_digest,
         instance,
@@ -555,6 +647,7 @@ fn issue_once_effect(
 
 fn build_receipt_provenance(
     effect_identity_digest: &str,
+    planned_plan_id: Option<&str>,
     policy_decision_id: String,
     policy_decision_digest: String,
     instance: &CapabilityInstanceBody,
@@ -563,7 +656,8 @@ fn build_receipt_provenance(
     ReceiptProvenance {
         profile_version: CORE_RECEIPT_PROFILE_V1.to_owned(),
         invocation_id: content_id("invocation", effect_identity_digest),
-        plan_id: content_id("plan", effect_identity_digest),
+        plan_id: planned_plan_id
+            .map_or_else(|| content_id("plan", effect_identity_digest), str::to_owned),
         policy_decision_id,
         policy_decision_digest,
         executor_id: LOCAL_EXECUTOR_ID.to_owned(),
@@ -654,7 +748,10 @@ fn verify_lease<L: RunLease>(lease: &L, state: &RunState) -> Result<(), Admissio
     Ok(())
 }
 
-fn require_admission_ready_step(state: &RunState, step_id: &str) -> Result<(), AdmissionError> {
+pub(crate) fn require_admission_ready_step(
+    state: &RunState,
+    step_id: &str,
+) -> Result<(), AdmissionError> {
     let step = state
         .steps
         .get(step_id)
@@ -691,6 +788,194 @@ fn require_admission_ready_step(state: &RunState, step_id: &str) -> Result<(), A
         });
     }
     Ok(())
+}
+
+fn verify_planned_input_sidecar<S: RunStore>(
+    store: &S,
+    state: &RunState,
+    step_id: &str,
+) -> Result<Option<xgeny_workgraph::PlannedInvocationMaterialRecord>, AdmissionError> {
+    let step = state
+        .steps
+        .get(step_id)
+        .ok_or_else(|| AdmissionError::StepNotFound(step_id.to_owned()))?;
+    let Some(binding) = &step.planned_invocation else {
+        return Ok(None);
+    };
+    let input = store
+        .load_planned_invocation(step_id)?
+        .ok_or_else(|| AdmissionError::PlannedInputMissing(step_id.to_owned()))?;
+    input.verify_for(&state.run_id, step_id, binding)?;
+    Ok(Some(input))
+}
+
+fn verify_pending_planned_material(
+    state: &RunState,
+    step_id: &str,
+    pending: &PendingInvocation,
+    input: Option<&xgeny_workgraph::PlannedInvocationMaterialRecord>,
+) -> Result<(), AdmissionError> {
+    let step = state
+        .steps
+        .get(step_id)
+        .ok_or_else(|| AdmissionError::StepNotFound(step_id.to_owned()))?;
+    let Some(planned) = &step.planned_invocation else {
+        if pending.plan_id.is_some() || input.is_some() {
+            return Err(AdmissionError::PlannedInvocationMismatch {
+                step_id: step_id.to_owned(),
+                field: "plan_input_sidecar",
+            });
+        }
+        return Ok(());
+    };
+    if pending.plan_id.as_deref() != Some(planned.plan_id()) {
+        return Err(AdmissionError::PlannedInvocationMismatch {
+            step_id: step_id.to_owned(),
+            field: "plan_id",
+        });
+    }
+    let input = input.ok_or_else(|| AdmissionError::PlannedInputMissing(step_id.to_owned()))?;
+    if !matches!(
+        &pending.material_retention,
+        InvocationMaterialRetention::ReconstructableReference(reference)
+            if reference == input.reference()
+    ) {
+        return Err(AdmissionError::PlannedInvocationMismatch {
+            step_id: step_id.to_owned(),
+            field: "material_retention.reference",
+        });
+    }
+    Ok(())
+}
+
+fn verify_planned_admission_binding(
+    state: &RunState,
+    request: &AdmissionRequest,
+    definition_digest: &str,
+    action_digest: &str,
+    material_digest: &str,
+) -> Result<Option<String>, AdmissionError> {
+    verify_planned_route_binding(state, &request.step_id, &request.route)?;
+    let step = state
+        .steps
+        .get(&request.step_id)
+        .ok_or_else(|| AdmissionError::StepNotFound(request.step_id.clone()))?;
+    let Some(planned) = &step.planned_invocation else {
+        return Ok(None);
+    };
+    let checks = [
+        (
+            "definition_digest",
+            planned.definition_digest() == definition_digest,
+        ),
+        ("action_digest", planned.action_digest() == action_digest),
+        (
+            "plan_input_digest",
+            planned.plan_input_digest() == material_digest,
+        ),
+    ];
+    if let Some((field, _)) = checks.into_iter().find(|(_, matches)| !matches) {
+        return Err(AdmissionError::PlannedInvocationMismatch {
+            step_id: request.step_id.clone(),
+            field,
+        });
+    }
+    Ok(Some(planned.plan_id().to_owned()))
+}
+
+pub(crate) fn verify_planned_route_binding(
+    state: &RunState,
+    step_id: &str,
+    route: &RouteRequest,
+) -> Result<(), AdmissionError> {
+    if route.required_features.execution_style != ExecutionStyle::Sync {
+        return Err(AdmissionError::UnsupportedExecutionStyle);
+    }
+    if !route.required_features.idempotency_key {
+        return Err(AdmissionError::IdempotencyKeyFeatureRequired);
+    }
+    let step = state
+        .steps
+        .get(step_id)
+        .ok_or_else(|| AdmissionError::StepNotFound(step_id.to_owned()))?;
+    let Some(planned) = &step.planned_invocation else {
+        return Ok(());
+    };
+    let checks = [
+        (
+            "capability_id",
+            planned.capability_id() == route.capability.capability_id,
+        ),
+        (
+            "contract_version",
+            planned.contract_version() == route.capability.contract_version,
+        ),
+        (
+            "execution_profile",
+            planned.execution_profile() == PlannedExecutionProfile::LocalSyncOnceV1,
+        ),
+        (
+            "target_os",
+            planned.target_os() == operating_system_name(route.target_platform.os),
+        ),
+        (
+            "target_arch",
+            planned.target_arch() == architecture_name(route.target_platform.arch),
+        ),
+    ];
+    if let Some((field, _)) = checks.into_iter().find(|(_, matches)| !matches) {
+        return Err(AdmissionError::PlannedInvocationMismatch {
+            step_id: step_id.to_owned(),
+            field,
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_planned_definition_binding(
+    state: &RunState,
+    step_id: &str,
+    registry: &CapabilityRegistry,
+) -> Result<(), AdmissionError> {
+    let step = state
+        .steps
+        .get(step_id)
+        .ok_or_else(|| AdmissionError::StepNotFound(step_id.to_owned()))?;
+    let Some(planned) = &step.planned_invocation else {
+        return Ok(());
+    };
+    let capability = CapabilityRef {
+        capability_id: planned.capability_id().to_owned(),
+        contract_version: planned.contract_version().to_owned(),
+    };
+    let definition =
+        registry
+            .definition(&capability)
+            .ok_or_else(|| AdmissionError::DefinitionNotFound {
+                capability_id: capability.capability_id,
+                contract_version: capability.contract_version,
+            })?;
+    if definition_contract_digest(definition)? != planned.definition_digest() {
+        return Err(AdmissionError::DefinitionChanged);
+    }
+    Ok(())
+}
+
+const fn operating_system_name(os: OperatingSystem) -> &'static str {
+    match os {
+        OperatingSystem::Linux => "linux",
+        OperatingSystem::Macos => "macos",
+        OperatingSystem::Windows => "windows",
+        OperatingSystem::Any => "any",
+    }
+}
+
+const fn architecture_name(architecture: Architecture) -> &'static str {
+    match architecture {
+        Architecture::X86_64 => "x86_64",
+        Architecture::Aarch64 => "aarch64",
+        Architecture::Any => "any",
+    }
 }
 
 pub(crate) fn validate_arguments(
@@ -940,6 +1225,8 @@ pub enum AdmissionError {
     #[error(transparent)]
     InvocationMaterial(#[from] InvocationMaterialError),
     #[error(transparent)]
+    PlanningContract(#[from] xgeny_workgraph::PlanningContractError),
+    #[error(transparent)]
     Protocol(#[from] ProtocolError),
     #[error("JSON operation failed: {0}")]
     Json(#[from] serde_json::Error),
@@ -964,6 +1251,13 @@ pub enum AdmissionError {
         step_id: String,
         dependency_id: String,
         reason: xgeny_workgraph::DependencyBlockReason,
+    },
+    #[error("step `{0}` has no durable planned-invocation input")]
+    PlannedInputMissing(String),
+    #[error("step `{step_id}` planned invocation differs at `{field}`")]
+    PlannedInvocationMismatch {
+        step_id: String,
+        field: &'static str,
     },
     #[error("Run head or authority changed while the invocation awaited policy evaluation")]
     RunHeadChanged,

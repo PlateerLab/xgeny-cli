@@ -2,7 +2,7 @@
 
 Local-first general-purpose agent CLI and harness.
 
-> 현재 상태: 프로토콜 v0.1 검증, dependency DAG와 Receipt-gated 재개 frontier를 갖춘 model-free WorkGraph, embedded SQLite schema 5 store, effect 실행·복구 조정기, 결정론적 Capability Registry·Router, I/O 없는 Permission Broker, secret-free invocation material 복구, Direct Executor와 Core-owned Execution Receipt 검증 경계, 장기 Run용 VerifiedRunIndex를 실행할 수 있습니다. 별도 public-port 참조 adapter가 preopened 임시 파일로 Started 이후 I/O, read-only verification과 crash recovery 계약을 검증하지만 제품용 filesystem 도구는 아닙니다. 모델 loop와 durable plan input, 실제 filesystem/process resolver·adapter, 승인 UI와 사용자용 CLI 연결은 아직 구현하지 않았습니다.
+> 현재 상태: 프로토콜 v0.1 검증, dependency DAG와 Receipt-gated 재개 frontier를 갖춘 model-free WorkGraph, embedded SQLite schema 6 store, effect 실행·복구 조정기, 결정론적 Capability Registry·Router, I/O 없는 Permission Broker, secret-free invocation material 복구, Direct Executor와 Core-owned Execution Receipt 검증 경계, 장기 Run용 VerifiedRunIndex를 실행할 수 있습니다. Provider-neutral bounded AgentLoop는 비신뢰 `PlanProposal`을 검증해 다중 Step DAG와 reconstructable input sidecar를 원자 commit하고 재시작 뒤 한 frontier action씩 이어갑니다. 별도 public-port 참조 adapter는 preopened 임시 파일로 Started 이후 I/O, read-only verification과 crash recovery 계약을 검증하지만 제품용 filesystem 도구는 아닙니다. 실제 모델 네트워크 provider와 provider별 tokenizer/prompt, 실제 filesystem/process adapter, 승인 UI와 사용자용 CLI 연결은 아직 구현하지 않았습니다.
 
 ## 제품 원칙
 
@@ -34,6 +34,7 @@ Local-first general-purpose agent CLI and harness.
 - [ADR-0012: Core verification과 Execution Receipt 원자 확정](docs/adr/0012-core-verification-and-execution-receipt.md)
 - [ADR-0013: Verified Run Index와 bounded history 검증](docs/adr/0013-verified-run-index-and-bounded-history-validation.md)
 - [ADR-0014: Persistent WorkGraph dependency와 Receipt-gated frontier](docs/adr/0014-persistent-workgraph-frontier-and-resume.md)
+- [ADR-0015: Durable planner 계약과 bounded AgentLoop](docs/adr/0015-durable-planner-contract-and-bounded-agent-loop.md)
 
 ## 개발 및 검증
 
@@ -44,7 +45,7 @@ cargo test --workspace --locked
 cargo run --locked --quiet -p xgeny-cli -- protocol check
 ```
 
-상세한 로컬·CI 검증 범위는 [Rust 워크스페이스 개발 환경](docs/development/rust-workspace.md)을 참고합니다. Router의 fail-closed filter, ranking과 권한 경계는 [결정론적 Capability Router 기본형](docs/development/deterministic-router.md), 재시작 전 실행 인자 경계는 [Recoverable Invocation Material 기본형](docs/development/recoverable-invocation-material.md), exact adapter 실행 경계는 [Direct Executor 기본형](docs/development/direct-executor.md), 검증과 Receipt 종결은 [Core Verification과 Execution Receipt 기본형](docs/development/execution-receipt.md), 장기 Run 검증 비용은 [Verified Run Index와 장기 Run 검증](docs/development/verified-run-index.md), dependency와 재개 순서는 [Persistent WorkGraph와 재개 frontier](docs/development/persistent-workgraph.md), 실제 OS I/O를 쓰는 비제품 기준은 [Preopened Reference Adapter Conformance](docs/development/reference-adapter-conformance.md), 기능 개발 순서와 테스트 계층·완료 기준은 [XGENy 개발 방법론과 테스트 전략](docs/development/engineering-method.md)을 따릅니다.
+상세한 로컬·CI 검증 범위는 [Rust 워크스페이스 개발 환경](docs/development/rust-workspace.md)을 참고합니다. Router의 fail-closed filter, ranking과 권한 경계는 [결정론적 Capability Router 기본형](docs/development/deterministic-router.md), 재시작 전 실행 인자 경계는 [Recoverable Invocation Material 기본형](docs/development/recoverable-invocation-material.md), exact adapter 실행 경계는 [Direct Executor 기본형](docs/development/direct-executor.md), 검증과 Receipt 종결은 [Core Verification과 Execution Receipt 기본형](docs/development/execution-receipt.md), 장기 Run 검증 비용은 [Verified Run Index와 장기 Run 검증](docs/development/verified-run-index.md), dependency와 재개 순서는 [Persistent WorkGraph와 재개 frontier](docs/development/persistent-workgraph.md), 계획 수락·예산·재시작 계약은 [Durable Planner와 bounded AgentLoop](docs/development/durable-planner-loop.md), 실제 OS I/O를 쓰는 비제품 기준은 [Preopened Reference Adapter Conformance](docs/development/reference-adapter-conformance.md), 기능 개발 순서와 테스트 계층·완료 기준은 [XGENy 개발 방법론과 테스트 전략](docs/development/engineering-method.md)을 따릅니다.
 
 ## Research
 

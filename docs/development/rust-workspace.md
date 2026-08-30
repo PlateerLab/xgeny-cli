@@ -18,7 +18,7 @@ crates/
   xgeny-cli/          xgeny 실행 파일과 protocol check 명령
 ```
 
-`xgeny-workgraph`, `xgeny-local-store`, `xgeny-runtime`의 durable effect, invocation material, Direct Executor, Core verification, VerifiedRunIndex와 Persistent dependency frontier는 ADR-0008·0010·0011·0012·0013·0014 연구 gate를 위한 내부 실험이다. Public protocol v0.1 schema는 바꾸지 않았지만 기존 WorkGraph `dependsOn`의 DAG·상태 의미 검증은 강화했다. Registry와 Router 기본형도 기존 `CapabilityDefinition`·`CapabilityInstance`를 그대로 사용하며 wire 문서를 추가하지 않는다. `xgeny-policy`의 Allow는 provisional 결과로 유지되고, runtime의 Admission 기본형만 exact invocation에서 만든 local one-shot allow를 current Run/Step/action/Instance/material과 결합해 durable intent로 발행한다. Admission은 Receipt용 canonical PolicyDecision ID/digest commitment를 만들지만 reusable `Grant`나 조회 가능한 `PolicyDecision` wire document를 저장하지 않는다. `xgeny-adapter-reference`는 public runtime port를 실제 preopened 임시 파일 I/O와 read-only verifier로 검증하지만 `publish = false`인 비제품 기준이다. 모델 호출, durable plan input, 사용자 workspace용 파일·process adapter, 승인 UI, MCP, Connector, XGEN 원격 연동, `InvocationPlan` 투영 또는 사용자용 resume 명령은 구현하지 않는다.
+`xgeny-workgraph`, `xgeny-local-store`, `xgeny-runtime`의 durable effect, invocation material, Direct Executor, Core verification, VerifiedRunIndex, Persistent dependency frontier와 bounded durable AgentLoop 계약은 ADR-0008·0010·0011·0012·0013·0014·0015 연구 gate를 위한 내부 실험이다. Public protocol v0.1 schema는 바꾸지 않았지만 기존 WorkGraph `dependsOn`의 DAG·상태 의미 검증은 강화했다. Registry와 Router 기본형도 기존 `CapabilityDefinition`·`CapabilityInstance`를 그대로 사용하며 wire 문서를 추가하지 않는다. `xgeny-policy`의 Allow는 provisional 결과로 유지되고, runtime의 Admission 기본형만 exact invocation에서 만든 local one-shot allow를 current Run/Step/action/Instance/material과 결합해 durable intent로 발행한다. Admission은 Receipt용 canonical PolicyDecision ID/digest commitment를 만들지만 reusable `Grant`나 조회 가능한 `PolicyDecision` wire document를 저장하지 않는다. `xgeny-adapter-reference`는 public runtime port를 실제 preopened 임시 파일 I/O와 read-only verifier로 검증하지만 `publish = false`인 비제품 기준이다. Provider-neutral planner port와 durable plan input은 포함하지만 실제 모델 네트워크 provider, provider별 tokenizer/prompt, 사용자 workspace용 파일·process adapter, 승인 UI, MCP, Connector, XGEN 원격 연동, `InvocationPlan` wire 투영 또는 사용자용 resume 명령은 구현하지 않는다.
 
 ## 준비물
 
@@ -44,7 +44,7 @@ crates/
 - durable 실행 attempt 상한과 승인 예산 비중복 소비
 - 메모리 참조 저장소와 SQLite 후보의 동일한 journal JSONL 및 complete Receipt JSONL export
 - 임의 길이 journal 재생과 event 변조 탐지 property test
-- schema 3 journal bytes를 보존하는 schema 5 원자 migration, schema 4 → 5 byte-preserving audit migration과 version 1·2·6+ fail-closed 거부
+- schema 3/4/5 durable bytes를 보존하는 schema 6 원자 migration과 version 1·2·7+ fail-closed 거부
 - 외부 reference crate의 Started 이후 preopened-file I/O, fixed-error redaction과 exact binding
 - write·sync·read-back 뒤 outcome 전 child process 종료 + SQLite 재시작에서 adapter execute 0회와 unknown 복원
 - `Validating` 재시작의 exact verifier-only 재개, Core Receipt schema/digest/binding 검증과 tamper 탐지
@@ -54,6 +54,8 @@ crates/
 - recovery·reconciliation·verification 우선의 single-orchestrator continuation 순서와 admission/reducer 이중 gate
 - 10,000-Step 반복형 traversal, Memory/SQLite frontier parity와 reopen continuity
 - Receipt finalization fault/process-exit rollback 중 child 비해제와 atomic retry commit 뒤 child 해제
+- 모델 출력과 분리된 `PlanAccepted` DAG, N개 reconstructable input sidecar의 원자 commit과 schema 6 재개
+- bounded context·accepted model-turn·planned-step·external-start 예산, 단일 frontier action 우선 AgentLoop와 completion candidate gate
 
 세부 실행 순서와 재시작 판정은 [Durable effect 실행·복구 수직 슬라이스](durable-effect-runtime.md), Receipt 종결 경계는 [Core Verification과 Execution Receipt](execution-receipt.md), 장기 Run 검증 비용은 [Verified Run Index와 장기 Run 검증](verified-run-index.md), dependency release와 frontier는 [Persistent WorkGraph와 재개 frontier](persistent-workgraph.md), 외부 adapter 범위는 [Preopened Reference Adapter Conformance](reference-adapter-conformance.md)를 따른다. Reference test는 임시 디렉터리의 전용 일반 파일만 사용하며 path sandbox가 아니다. power-loss, filesystem 손상, 사용자 workspace의 실제 권한 경계, 설치 패키지와 반복 fault matrix는 아직 통과했다고 주장하지 않는다. SQLite 채택 여부도 ADR-0008의 hardened JSONL 비교와 나머지 gate가 끝난 뒤 확정한다.
 

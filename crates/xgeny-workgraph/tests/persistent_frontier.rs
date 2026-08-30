@@ -17,6 +17,7 @@ fn step(step_id: &str, depends_on: &[&str], status: StepStatus) -> StepState {
         step_id: step_id.to_owned(),
         objective: format!("complete {step_id}"),
         depends_on: depends_on.iter().map(|value| (*value).to_owned()).collect(),
+        planned_invocation: None,
         status,
         attempts: 0,
         intent: None,
@@ -49,6 +50,7 @@ fn state(steps: impl IntoIterator<Item = StepState>) -> RunState {
             .map(|step| (step.step_id.clone(), step))
             .collect(),
         authorization_consumption: BTreeMap::new(),
+        agent_loop: None,
     }
 }
 

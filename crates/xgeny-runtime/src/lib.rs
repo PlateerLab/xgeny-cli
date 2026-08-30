@@ -1,6 +1,7 @@
 #![doc = "Capability catalog and routing, durable effect execution, and conservative recovery for `XGENy`."]
 
 mod admission;
+mod agent_loop;
 mod executor;
 mod frontier;
 mod lease;
@@ -14,6 +15,7 @@ mod verification;
 mod runtime_tests;
 
 pub use admission::*;
+pub use agent_loop::*;
 pub use executor::*;
 pub use frontier::*;
 pub use lease::*;

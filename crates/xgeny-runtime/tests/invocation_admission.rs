@@ -21,12 +21,15 @@ use xgeny_runtime::{
     AdmissionError, AdmissionOutcome, AdmissionRequest, CapabilityRegistry, EventFactory,
     EventFactoryError, EventMetadata, InvocationAdmission, InvocationMaterialProvider,
     InvocationMaterialRecovery, LocalRunLease, MaterialProviderFailure, MaterialProviderRegistry,
-    MaterialRecoveryError, RequiredRouteFeatures, RouteOutcome, RouteRequest,
+    MaterialRecoveryError, PlannedAdmissionRequest, RequiredRouteFeatures, RouteOutcome,
+    RouteRequest,
 };
 use xgeny_workgraph::{
-    DependencyBlockReason, InvocationMaterialRecord, InvocationMaterialUnavailableReason,
-    ReconstructableMaterialReference, RunEvent, RunEventBody, RunState, StepStatus,
-    invocation_material_digest,
+    AcceptedPlanStep, AgentLoopBudget, DependencyBlockReason, ExpectedPlanningTurn,
+    InvocationMaterialRecord, InvocationMaterialRetention, InvocationMaterialUnavailableReason,
+    PlannedExecutionProfile, PlannedInvocationBinding, PlannedInvocationMaterialRecord,
+    PlannedInvocationSpec, ReconstructableMaterialReference, RunEvent, RunEventBody, RunState,
+    StepStatus, invocation_material_digest,
 };
 
 const RUN_ID: &str = "run-admission-1";
@@ -208,9 +211,30 @@ fn instance_fixture(definition: &CapabilityDefinitionBody) -> CapabilityInstance
     };
     "local.fs.writer.v1".clone_into(&mut instance.instance_id);
     instance.definition = capability(definition);
+    instance.platform = current_platform();
     "builtin://test/filesystem-writer".clone_into(&mut instance.binding.binding_ref);
     instance.binding.operation_ref = Some("writeMarker".to_owned());
     *instance
+}
+
+fn current_platform() -> Platform {
+    let os = if cfg!(target_os = "linux") {
+        OperatingSystem::Linux
+    } else if cfg!(target_os = "macos") {
+        OperatingSystem::Macos
+    } else if cfg!(target_os = "windows") {
+        OperatingSystem::Windows
+    } else {
+        panic!("unsupported admission test OS")
+    };
+    let arch = if cfg!(target_arch = "x86_64") {
+        Architecture::X86_64
+    } else if cfg!(target_arch = "aarch64") {
+        Architecture::Aarch64
+    } else {
+        panic!("unsupported admission test architecture")
+    };
+    Platform { os, arch }
 }
 
 fn registry_with(
@@ -232,10 +256,7 @@ fn registry_with(
 fn route_request(definition: &CapabilityDefinitionBody) -> RouteRequest {
     RouteRequest {
         capability: capability(definition),
-        target_platform: Platform {
-            os: OperatingSystem::Linux,
-            arch: Architecture::X86_64,
-        },
+        target_platform: current_platform(),
         required_features: RequiredRouteFeatures {
             execution_style: ExecutionStyle::Sync,
             cancellation: false,
@@ -295,6 +316,107 @@ fn seed<S: RunStore>(store: &mut S, run_id: &str, step_id: &str) -> RunState {
         )
         .expect("Step should be planned")
         .state
+}
+
+fn planning_facts(
+    registry: &CapabilityRegistry,
+    resolver: &CanonicalResolver,
+    definition: &CapabilityDefinitionBody,
+    invocation_arguments: Value,
+) -> (String, String, String) {
+    let mut store = MemoryRunStore::new();
+    seed(&mut store, RUN_ID, STEP_ID);
+    let (_directory, lease) = acquire_lease(RUN_ID);
+    let pending = prepare(
+        &store,
+        &lease,
+        registry,
+        resolver,
+        definition,
+        invocation_arguments,
+    )
+    .expect("planning fixture should normalize through admission facts");
+    (
+        pending.definition_digest().to_owned(),
+        pending.action_digest().to_owned(),
+        pending.material_digest().to_owned(),
+    )
+}
+
+fn seed_accepted_plan<S: RunStore>(
+    store: &mut S,
+    definition: &CapabilityDefinitionBody,
+    definition_digest: String,
+    action_digest: String,
+    material_digest: String,
+) -> (RunState, PlannedInvocationBinding) {
+    let created = store
+        .append(
+            ExpectedHead::Empty,
+            seed_event(
+                "planned-seed-event-1",
+                RUN_ID,
+                RunEventBody::RunCreated {
+                    goal: "admit one durable planned effect".to_owned(),
+                },
+            ),
+        )
+        .expect("Run should be created")
+        .state;
+    let configured = store
+        .append(
+            ExpectedHead::from_state(&created),
+            seed_event(
+                "planned-seed-event-2",
+                RUN_ID,
+                RunEventBody::AgentLoopConfigured {
+                    budget: AgentLoopBudget::new(2, 2, 2, 16_384).expect("budget should validate"),
+                },
+            ),
+        )
+        .expect("agent loop should configure")
+        .state;
+    let proposal_digest = format!("sha256:{}", "a".repeat(64));
+    let spec = PlannedInvocationSpec::new(
+        definition.metadata.id.clone(),
+        definition.metadata.contract_version.clone(),
+        definition_digest,
+        action_digest,
+        material_digest,
+        PlannedExecutionProfile::LocalSyncOnceV1,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    )
+    .expect("planned invocation facts should validate");
+    let reference = ReconstructableMaterialReference::new("run-recipe", "recipe-1", "rev-1")
+        .expect("reference should validate");
+    let (binding, input) =
+        PlannedInvocationMaterialRecord::bind(RUN_ID, STEP_ID, &proposal_digest, spec, reference)
+            .expect("planned input should bind");
+    let decision =
+        ExpectedPlanningTurn::new(1, format!("sha256:{}", "b".repeat(64)), proposal_digest)
+            .expect("planning turn should bind");
+    let state = store
+        .append_with_plan_inputs(
+            ExpectedHead::from_state(&configured),
+            seed_event(
+                "planned-seed-event-3",
+                RUN_ID,
+                RunEventBody::PlanAccepted {
+                    decision,
+                    steps: vec![AcceptedPlanStep {
+                        step_id: STEP_ID.to_owned(),
+                        objective: "write one marker".to_owned(),
+                        depends_on: Vec::new(),
+                        invocation: binding.clone(),
+                    }],
+                },
+            ),
+            vec![input],
+        )
+        .expect("accepted plan and input should commit atomically")
+        .state;
+    (state, binding)
 }
 
 fn source(kind: PolicySourceKind, id: &str, byte: char) -> PolicySource {
@@ -434,6 +556,368 @@ fn commit_reconstructable<S: RunStore>(
         panic!("invocation should authorize")
     };
     admitted
+}
+
+#[test]
+fn accepted_plan_reconstructs_after_sqlite_reopen_and_commits_the_exact_plan_id() {
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, [instance]);
+    let resolver = CanonicalResolver::default();
+    let expected_arguments = arguments(CANONICAL_PATH, SECRET_SENTINEL);
+    let (definition_digest, action_digest, material_digest) = planning_facts(
+        &registry,
+        &resolver,
+        &definition,
+        expected_arguments.clone(),
+    );
+    let directory = tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("planned-run.db");
+    let binding = {
+        let mut store = SqliteRunStore::open(&path).expect("SQLite should open");
+        seed_accepted_plan(
+            &mut store,
+            &definition,
+            definition_digest,
+            action_digest,
+            material_digest,
+        )
+        .1
+    };
+
+    let mut store = SqliteRunStore::open(&path).expect("SQLite should reopen");
+    let (_lease_directory, lease) = acquire_lease(RUN_ID);
+    let mut providers = FixedMaterialProvider::available("run-recipe", expected_arguments);
+    let pending = InvocationMaterialRecovery::new()
+        .prepare_planned_admission(
+            &store,
+            &lease,
+            &registry,
+            &resolver,
+            &mut providers,
+            PlannedAdmissionRequest::new(STEP_ID, route_request(&definition)),
+        )
+        .expect("accepted input should reconstruct and prepare");
+    assert_eq!(providers.calls.get(), 1);
+    assert!(!format!("{pending:?}").contains(SECRET_SENTINEL));
+    let inputs = allow_inputs(pending.permission_request());
+    let mut events = DeterministicEvents;
+    let outcome = InvocationAdmission::new()
+        .authorize_and_commit(pending, &inputs, &registry, &mut store, &mut events, &lease)
+        .expect("planned invocation should authorize");
+    let AdmissionOutcome::Authorized(admitted) = outcome else {
+        panic!("planned invocation should be authorized")
+    };
+    let step = &admitted.commit().state.steps[STEP_ID];
+    assert_eq!(step.status, StepStatus::IntentCommitted);
+    assert_eq!(
+        step.intent
+            .as_ref()
+            .and_then(|intent| intent.receipt_provenance.as_ref())
+            .map(|provenance| provenance.plan_id.as_str()),
+        Some(binding.plan_id())
+    );
+    drop(store);
+    assert_sqlite_artifacts_exclude(directory.path(), &[SECRET_SENTINEL.as_bytes()]);
+}
+
+#[test]
+fn direct_planned_prepare_pins_the_accepted_recipe_and_ignores_reference_replacement() {
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, [instance]);
+    let resolver = CanonicalResolver::default();
+    let exact_arguments = arguments(CANONICAL_PATH, SECRET_SENTINEL);
+    let (definition_digest, action_digest, material_digest) =
+        planning_facts(&registry, &resolver, &definition, exact_arguments.clone());
+    let mut store = MemoryRunStore::new();
+    seed_accepted_plan(
+        &mut store,
+        &definition,
+        definition_digest,
+        action_digest,
+        material_digest,
+    );
+    let (_directory, lease) = acquire_lease(RUN_ID);
+    let pending = InvocationAdmission::new()
+        .prepare(
+            &store,
+            &lease,
+            &registry,
+            &resolver,
+            AdmissionRequest {
+                step_id: STEP_ID.to_owned(),
+                route: route_request(&definition),
+                arguments: exact_arguments,
+            },
+        )
+        .expect("direct planned preparation should validate")
+        .with_reconstructable_material(
+            ReconstructableMaterialReference::new("other-provider", "other-recipe", "rev-9")
+                .expect("replacement reference should be well formed"),
+        );
+    let inputs = allow_inputs(pending.permission_request());
+    let outcome = InvocationAdmission::new()
+        .authorize_and_commit(
+            pending,
+            &inputs,
+            &registry,
+            &mut store,
+            &mut DeterministicEvents,
+            &lease,
+        )
+        .expect("planned invocation should authorize");
+    let AdmissionOutcome::Authorized(admitted) = outcome else {
+        panic!("planned invocation should be authorized")
+    };
+    assert!(matches!(
+        admitted.material_record().retention(),
+        InvocationMaterialRetention::ReconstructableReference(reference)
+            if reference.provider_id() == "run-recipe"
+                && reference.reference_id() == "recipe-1"
+                && reference.revision() == "rev-1"
+    ));
+}
+
+#[test]
+fn planned_definition_drift_is_rejected_before_recipe_or_resource_access() {
+    let definition = definition_fixture();
+    let original_instance = instance_fixture(&definition);
+    let original_registry = registry_with(&definition, [original_instance]);
+    let original_resolver = CanonicalResolver::default();
+    let exact_arguments = arguments(CANONICAL_PATH, SECRET_SENTINEL);
+    let (definition_digest, action_digest, material_digest) = planning_facts(
+        &original_registry,
+        &original_resolver,
+        &definition,
+        exact_arguments.clone(),
+    );
+    let mut store = MemoryRunStore::new();
+    let planned = seed_accepted_plan(
+        &mut store,
+        &definition,
+        definition_digest,
+        action_digest,
+        material_digest,
+    )
+    .0;
+
+    let mut drifted = definition.clone();
+    drifted.spec.summary.push_str(" drifted");
+    let drifted_instance = instance_fixture(&drifted);
+    let drifted_registry = registry_with(&drifted, [drifted_instance]);
+    let resolver = CanonicalResolver::default();
+    let (_directory, lease) = acquire_lease(RUN_ID);
+    let mut providers = FixedMaterialProvider::available("run-recipe", exact_arguments);
+
+    let result = InvocationMaterialRecovery::new().prepare_planned_admission(
+        &store,
+        &lease,
+        &drifted_registry,
+        &resolver,
+        &mut providers,
+        PlannedAdmissionRequest::new(STEP_ID, route_request(&drifted)),
+    );
+
+    assert!(matches!(
+        result,
+        Err(MaterialRecoveryError::Admission(
+            AdmissionError::DefinitionChanged
+        ))
+    ));
+    assert_eq!(providers.calls.get(), 0);
+    assert_eq!(resolver.calls.get(), 0);
+    assert_eq!(
+        store.load_current().expect("Run should load"),
+        Some(planned)
+    );
+}
+
+#[test]
+fn reconstructed_arguments_that_differ_from_the_accepted_plan_leave_the_run_unchanged() {
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, [instance]);
+    let resolver = CanonicalResolver::default();
+    let expected_arguments = arguments(CANONICAL_PATH, SECRET_SENTINEL);
+    let (definition_digest, action_digest, material_digest) =
+        planning_facts(&registry, &resolver, &definition, expected_arguments);
+    let mut store = MemoryRunStore::new();
+    let (planned, _) = seed_accepted_plan(
+        &mut store,
+        &definition,
+        definition_digest,
+        action_digest,
+        material_digest,
+    );
+    let (_directory, lease) = acquire_lease(RUN_ID);
+    let mut providers =
+        FixedMaterialProvider::available("run-recipe", arguments(CANONICAL_PATH, "changed"));
+
+    let result = InvocationMaterialRecovery::new().prepare_planned_admission(
+        &store,
+        &lease,
+        &registry,
+        &resolver,
+        &mut providers,
+        PlannedAdmissionRequest::new(STEP_ID, route_request(&definition)),
+    );
+
+    assert!(matches!(
+        result,
+        Err(MaterialRecoveryError::Admission(
+            AdmissionError::PlannedInvocationMismatch {
+                step_id,
+                field: "action_digest" | "plan_input_digest",
+            }
+        )) if step_id == STEP_ID
+    ));
+    let after = store
+        .load_current()
+        .expect("Run should load")
+        .expect("Run should exist");
+    assert_eq!(after, planned);
+    assert_eq!(after.steps[STEP_ID].status, StepStatus::Planned);
+}
+
+#[test]
+fn wrong_planned_route_is_rejected_before_material_provider_access() {
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, [instance]);
+    let resolver = CanonicalResolver::default();
+    let expected_arguments = arguments(CANONICAL_PATH, SECRET_SENTINEL);
+    let (definition_digest, action_digest, material_digest) = planning_facts(
+        &registry,
+        &resolver,
+        &definition,
+        expected_arguments.clone(),
+    );
+    let mut store = MemoryRunStore::new();
+    seed_accepted_plan(
+        &mut store,
+        &definition,
+        definition_digest,
+        action_digest,
+        material_digest,
+    );
+    let (_directory, lease) = acquire_lease(RUN_ID);
+    let mut providers = FixedMaterialProvider::available("run-recipe", expected_arguments);
+    let mut route = route_request(&definition);
+    route.capability.capability_id.push_str(".other");
+
+    let result = InvocationMaterialRecovery::new().prepare_planned_admission(
+        &store,
+        &lease,
+        &registry,
+        &resolver,
+        &mut providers,
+        PlannedAdmissionRequest::new(STEP_ID, route),
+    );
+
+    assert!(matches!(
+        result,
+        Err(MaterialRecoveryError::Admission(
+            AdmissionError::PlannedInvocationMismatch {
+                step_id,
+                field: "capability_id",
+            }
+        )) if step_id == STEP_ID
+    ));
+    assert_eq!(providers.calls.get(), 0);
+}
+
+#[test]
+fn unreleased_planned_dependency_is_rejected_before_material_provider_access() {
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, [instance]);
+    let resolver = CanonicalResolver::default();
+    let first_arguments = arguments(CANONICAL_PATH, "first");
+    let first_facts = planning_facts(&registry, &resolver, &definition, first_arguments);
+    let second_arguments = arguments(CANONICAL_PATH, "second");
+    let second_facts = planning_facts(&registry, &resolver, &definition, second_arguments.clone());
+    let mut store = MemoryRunStore::new();
+    let (first_planned, _) = seed_accepted_plan(
+        &mut store,
+        &definition,
+        first_facts.0,
+        first_facts.1,
+        first_facts.2,
+    );
+    let proposal_digest = format!("sha256:{}", "c".repeat(64));
+    let spec = PlannedInvocationSpec::new(
+        definition.metadata.id.clone(),
+        definition.metadata.contract_version.clone(),
+        second_facts.0,
+        second_facts.1,
+        second_facts.2,
+        PlannedExecutionProfile::LocalSyncOnceV1,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    )
+    .expect("planned invocation facts should validate");
+    let (binding, input) = PlannedInvocationMaterialRecord::bind(
+        RUN_ID,
+        OTHER_STEP_ID,
+        &proposal_digest,
+        spec,
+        ReconstructableMaterialReference::new("run-recipe", "recipe-2", "rev-1")
+            .expect("reference should validate"),
+    )
+    .expect("dependent planned input should bind");
+    let second_planned = store
+        .append_with_plan_inputs(
+            ExpectedHead::from_state(&first_planned),
+            seed_event(
+                "planned-seed-event-4",
+                RUN_ID,
+                RunEventBody::PlanAccepted {
+                    decision: ExpectedPlanningTurn::new(
+                        2,
+                        format!("sha256:{}", "d".repeat(64)),
+                        proposal_digest,
+                    )
+                    .expect("second planning turn should bind"),
+                    steps: vec![AcceptedPlanStep {
+                        step_id: OTHER_STEP_ID.to_owned(),
+                        objective: "wait for the first Step".to_owned(),
+                        depends_on: vec![STEP_ID.to_owned()],
+                        invocation: binding,
+                    }],
+                },
+            ),
+            vec![input],
+        )
+        .expect("dependent plan should commit")
+        .state;
+    let (_directory, lease) = acquire_lease(RUN_ID);
+    let mut providers = FixedMaterialProvider::available("run-recipe", second_arguments);
+
+    let result = InvocationMaterialRecovery::new().prepare_planned_admission(
+        &store,
+        &lease,
+        &registry,
+        &resolver,
+        &mut providers,
+        PlannedAdmissionRequest::new(OTHER_STEP_ID, route_request(&definition)),
+    );
+
+    assert!(matches!(
+        result,
+        Err(MaterialRecoveryError::Admission(
+            AdmissionError::StepDependencyNotReleased {
+                step_id,
+                dependency_id,
+                ..
+            }
+        )) if step_id == OTHER_STEP_ID && dependency_id == STEP_ID
+    ));
+    assert_eq!(providers.calls.get(), 0);
+    assert_eq!(
+        store.load_current().expect("Run should load"),
+        Some(second_planned)
+    );
 }
 
 #[test]
