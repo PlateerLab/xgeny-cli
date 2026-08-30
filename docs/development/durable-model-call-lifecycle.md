@@ -3,7 +3,7 @@
 - 기준일: 2026-08-30
 - 상태: reservation/recovery 기본형 + 첫 OpenAI-compatible leaf adapter
 - 공개 protocol v0.1 schema 변경: 없음
-- local store schema: 6
+- local store schema: 7
 - 정본 결정: [ADR-0016](../adr/0016-durable-model-call-lifecycle.md)
 
 ## 현재 가능한 것
@@ -140,7 +140,7 @@ Planning이 가능한 경우에도 다음 조건에서 port를 호출하지 않�
 
 ### 2. Context와 request commitment 생성
 
-Verified current state에서 `PlanningContext`를 만든다. Context는 reservation **전** base head를 포함한다. Runtime은 request profile commitment와 결합해 Core-owned request digest와 deterministic call ID를 만든다.
+Verified current state의 exact head로 generation-checked planning snapshot을 읽고 `PlanningContext`를 만든다. ADR-0020 이후 snapshot은 같은 store generation에서 검증된 passed-Receipt tool output을 포함하며, 독립 state/output point read를 조합하지 않는다. Context는 reservation **전** base head를 포함한다. Runtime은 request profile commitment와 결합해 Core-owned request digest와 deterministic call ID를 만든다.
 
 ### 3. Reservation commit
 
@@ -228,7 +228,7 @@ Model-call uncertainty는 WorkGraph safety transition을 전역 freeze하지 않
 
 Memory store는 reducer가 candidate를 모두 검증한 뒤 event, projection과 verified index를 갱신한다. 정상 `Result` 경로의 논리적 none-or-all과 replay parity를 검증하지만 process crash persistence는 제공하지 않는다.
 
-### SQLite schema 6
+### Model-call data in SQLite (introduced at schema 6; current schema 7)
 
 Model-call table, column 또는 sidecar를 추가하지 않는다.
 
@@ -258,7 +258,7 @@ PlanAccepted / CompletionCandidateRecorded
   -> exact active model call의 accepted settlement
 ```
 
-Schema version은 6을 유지한다. 물리 schema 의미가 바뀌지 않고 과거 schema 6 blob을 다시 쓰지 않는다. 과거 binary는 새 lifecycle event/projection을 이해하지 못하면 decode/replay에서 fail-closed해야 하며 새 의미를 legacy Plan으로 무시해서는 안 된다. 새 binary는 과거 값에 없던 optional field를 serialization에서 새로 방출해 과거 event digest를 바꾸면 안 된다.
+Model-call lifecycle slice 자체는 schema 6에서 새 table을 추가하지 않았고 과거 schema 6 blob도 다시 쓰지 않았다. 현재 store version은 ADR-0019의 `tool_outputs` sidecar 때문에 7이다. 과거 binary는 새 lifecycle event/projection을 이해하지 못하면 decode/replay에서 fail-closed해야 하며 새 의미를 legacy Plan으로 무시해서는 안 된다. 새 binary는 과거 값에 없던 optional field를 serialization에서 새로 방출해 과거 event digest를 바꾸면 안 된다.
 
 SQLite verified cache는 기존 `data_version + durable journal head` identity를 사용한다. 다른 connection이 event/projection을 바꾸면 cold full audit로 전환하며 warm normal append는 historical event/sidecar를 다시 scan하지 않는다. Model-call lifecycle의 순번과 stale binding은 runtime preflight만이 아니라 WorkGraph reducer replay에서도 검사해야 한다.
 

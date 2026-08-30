@@ -231,16 +231,16 @@ Verifier는 `RunVerificationSnapshot`의 durable output을 받는다. Output-req
 
 Schema 7 output durability만으로 사용자용 prototype은 완성되지 않는다. 다음 작업은 별도 결정과 회귀 gate가 필요하다.
 
-1. `Completed + passed Receipt + exact output`만 한 generation에서 읽는 `xgeny.planning-context/v2`
-2. model call/context/proposal/candidate와 raw final summary를 원자 저장하는 `CompletionOutputRecord`
-3. restart 뒤 completion을 모델 재호출 없이 복원하는 public run/resume 표현
-4. process restart에도 invocation argument를 복원할 권한 제한 durable recipe provider
-5. 실제 bounded filesystem adapter와 descriptor-relative/no-follow confinement
-6. filesystem read 승인과 model egress 승인 분리, untrusted output prompt-injection 경계
-7. 같은 ReadOnly semantic action을 다시 관찰할 occurrence/generation identity
-8. OpenAI-compatible provider의 planning context v2와 prompt revision 지원
-9. output commit, Receipt commit, completion commit 뒤 실제 process restart E2E
-10. packaged Linux/macOS/Windows binary와 opt-in live provider/tool smoke
+[ADR-0020](0020-generation-checked-planning-context-v2.md)이 `Completed + passed Receipt + exact output`의 same-generation snapshot, PlanningContext v2, OpenAI prompt v2와 output/Receipt commit 뒤 SQLite restart E2E를 완료했다. 남은 항목은 다음과 같다.
+
+1. model call/context/proposal/candidate와 raw final summary를 원자 저장하는 `CompletionOutputRecord`
+2. restart 뒤 completion을 모델 재호출 없이 복원하는 public run/resume 표현
+3. process restart에도 invocation argument를 복원할 권한 제한 durable recipe provider
+4. 실제 bounded filesystem adapter와 descriptor-relative/no-follow confinement
+5. filesystem read 승인과 model egress 승인 분리 및 public composition 적용
+6. 같은 ReadOnly semantic action을 다시 관찰할 occurrence/generation identity
+7. completion commit 뒤 실제 process restart E2E
+8. packaged Linux/macOS/Windows binary와 opt-in live provider/tool smoke
 
 현재 table은 effect당 bounded final JSON 하나만 지원한다. Streaming output, 여러 output generation, retention/GC, encryption과 remote synchronization은 이 schema의 암묵적 기능이 아니며 후속 schema 결정이 필요하다.
 
@@ -253,11 +253,11 @@ Schema 7 output durability만으로 사용자용 prototype은 완성되지 않�
 - Streaming/chunked output과 effect당 여러 final output
 - 동일 ReadOnly action 반복 관찰
 - 실제 filesystem confinement와 public `xgeny run`
-- planning context v2와 durable completion 본문
+- durable completion 본문
 - write/process/network/MCP/XGEN adapter
 
 ## 결과
 
 XGENy는 adapter가 반환한 bounded typed JSON을 exact Definition, intent와 execution attempt에 결합하고, `EffectSucceeded`, sidecar와 projection을 한 SQLite transaction으로 보존할 수 있다. Journal과 Receipt는 raw body 대신 검증 가능한 commitment만 유지한다. Schema 3~6 history는 재작성하거나 output을 발명하지 않고 schema 7로 이동한다.
 
-이 결정이 닫는 범위는 **durable tool observation과 verification continuity**다. Output을 다음 model turn에 전달하고 최종 사용자 답변을 restart 뒤 복원하는 product continuity는 남은 작업에 명시한 context v2와 completion durability가 완료되어야 성립한다.
+이 결정이 닫는 범위는 **durable tool observation과 verification continuity**다. 다음 model turn 전달은 ADR-0020에서 이어서 닫았고, 최종 사용자 답변의 restart 복원은 completion durability가 완료되어야 성립한다.

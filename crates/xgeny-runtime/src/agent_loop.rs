@@ -15,8 +15,8 @@ use xgeny_workgraph::{
     ModelCallRejectionReason, ModelCallReservation, ModelCallSettlement, ModelCallStatus,
     ModelCallUnknownReason, PlannedExecutionProfile, PlannedInvocationMaterialRecord,
     PlannedInvocationSpec, PlanningContractError, ReconstructableMaterialReference, RunEvent,
-    RunEventBody, RunState, StepStatus, WorkFrontier, dependency_release_block_reason,
-    derive_frontier, receipt_releases_dependency,
+    RunEventBody, RunState, StepStatus, ToolOutputRecord, WorkFrontier,
+    dependency_release_block_reason, derive_frontier, receipt_releases_dependency,
 };
 
 use crate::admission::{definition_contract_digest, prepare_invocation_facts};
@@ -25,7 +25,7 @@ use crate::{
     RunLease,
 };
 
-const PLANNING_CONTEXT_PROFILE_V1: &str = "xgeny.planning-context/v1";
+const PLANNING_CONTEXT_PROFILE_V2: &str = "xgeny.planning-context/v2";
 const MAX_PROPOSAL_BYTES: usize = 256 * 1024;
 const MAX_PROPOSAL_KEY_BYTES: usize = 128;
 const MAX_COMPLETION_SUMMARY_BYTES: usize = 5_000;
@@ -191,6 +191,74 @@ pub struct PlanningStepSummary {
     dependency_released: bool,
 }
 
+/// One exact, receipt-completed local tool observation selected for the next planner turn.
+///
+/// The raw output is serialized only into the provider-bound context. Diagnostics deliberately
+/// expose only its stable identities and digests.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanningToolOutput {
+    step_id: String,
+    capability: CapabilityRef,
+    output_id: String,
+    output_digest: String,
+    receipt_digest: String,
+    canonical_size_bytes: u64,
+    output: Value,
+}
+
+impl PlanningToolOutput {
+    #[must_use]
+    pub fn step_id(&self) -> &str {
+        &self.step_id
+    }
+
+    #[must_use]
+    pub const fn capability(&self) -> &CapabilityRef {
+        &self.capability
+    }
+
+    #[must_use]
+    pub fn output_id(&self) -> &str {
+        &self.output_id
+    }
+
+    #[must_use]
+    pub fn output_digest(&self) -> &str {
+        &self.output_digest
+    }
+
+    #[must_use]
+    pub fn receipt_digest(&self) -> &str {
+        &self.receipt_digest
+    }
+
+    #[must_use]
+    pub const fn canonical_size_bytes(&self) -> u64 {
+        self.canonical_size_bytes
+    }
+
+    #[must_use]
+    pub const fn output(&self) -> &Value {
+        &self.output
+    }
+}
+
+impl fmt::Debug for PlanningToolOutput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PlanningToolOutput")
+            .field("step_id", &self.step_id)
+            .field("capability", &self.capability)
+            .field("output_id", &self.output_id)
+            .field("output_digest", &self.output_digest)
+            .field("receipt_digest", &self.receipt_digest)
+            .field("canonical_size_bytes", &self.canonical_size_bytes)
+            .field("output", &"<redacted>")
+            .finish()
+    }
+}
+
 impl PlanningStepSummary {
     #[must_use]
     pub fn step_id(&self) -> &str {
@@ -255,6 +323,7 @@ struct PlanningContextPayload {
     goal: String,
     total_steps: usize,
     verified_completed_steps: usize,
+    tool_outputs: Vec<PlanningToolOutput>,
     steps: Vec<PlanningStepSummary>,
     omitted_steps: usize,
     catalog_digest: String,
@@ -351,6 +420,11 @@ impl PlanningContext {
     }
 
     #[must_use]
+    pub fn tool_outputs(&self) -> &[PlanningToolOutput] {
+        &self.payload.tool_outputs
+    }
+
+    #[must_use]
     pub fn steps(&self) -> &[PlanningStepSummary] {
         &self.payload.steps
     }
@@ -386,6 +460,7 @@ impl fmt::Debug for PlanningContext {
                 "verified_completed_steps",
                 &self.payload.verified_completed_steps,
             )
+            .field("tool_output_count", &self.payload.tool_outputs.len())
             .field("step_count", &self.payload.steps.len())
             .field("omitted_steps", &self.payload.omitted_steps)
             .field("catalog_digest", &self.payload.catalog_digest)
@@ -939,8 +1014,40 @@ impl AgentLoop {
                 head: AgentLoopHead::from_state(&state),
             });
         }
+        if !planning_context_preflight(&state, capabilities) {
+            return Ok(AgentLoopTick::Quiescent {
+                reason: AgentLoopQuiescence::ContextInputLimitExceeded,
+                head: AgentLoopHead::from_state(&state),
+            });
+        }
 
-        let context = match build_context(&state, &frontier, capabilities, &loop_state.budget) {
+        let planning_snapshot = match store.load_planning_snapshot(
+            ExpectedHead::from_state(&state),
+            loop_state
+                .budget
+                .max_context_bytes
+                .min(MAX_PLANNING_CONTEXT_BYTES),
+        ) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => return Err(AgentLoopError::RunNotInitialized),
+            Err(StoreError::PlanningSnapshotBudgetExceeded) => {
+                return Ok(AgentLoopTick::Quiescent {
+                    reason: AgentLoopQuiescence::ContextBudgetExceeded,
+                    head: AgentLoopHead::from_state(&state),
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if planning_snapshot.state != state {
+            return Err(AgentLoopError::PlanningSnapshotMismatch);
+        }
+        let context = match build_context(
+            &state,
+            planning_snapshot.completed_tool_outputs(),
+            &frontier,
+            capabilities,
+            &loop_state.budget,
+        ) {
             Ok(context) => context,
             Err(ContextBuildError::BudgetExceeded) => {
                 return Ok(AgentLoopTick::Quiescent {
@@ -958,6 +1065,9 @@ impl AgentLoop {
                 return Err(AgentLoopError::Canonicalization);
             }
             Err(ContextBuildError::Catalog) => return Err(AgentLoopError::CapabilityCatalog),
+            Err(ContextBuildError::OutputBinding) => {
+                return Err(AgentLoopError::PlanningSnapshotMismatch);
+            }
         };
         let planner_id = planner.planner_id().to_owned();
         let request_profile_digest = planner.request_profile_digest().to_owned();
@@ -1739,31 +1849,92 @@ enum ContextBuildError {
     InputLimitExceeded,
     Canonicalization,
     Catalog,
+    OutputBinding,
+}
+
+fn build_planning_tool_outputs(
+    state: &RunState,
+    completed_tool_outputs: &BTreeMap<String, ToolOutputRecord>,
+) -> Result<Vec<PlanningToolOutput>, ContextBuildError> {
+    let expected_count = state
+        .steps
+        .values()
+        .filter(|step| step.status == StepStatus::Completed && step.output_record_digest.is_some())
+        .count();
+    if expected_count != completed_tool_outputs.len() {
+        return Err(ContextBuildError::OutputBinding);
+    }
+    let mut outputs = Vec::with_capacity(expected_count);
+    for (step_id, step) in &state.steps {
+        if step.status != StepStatus::Completed || step.output_record_digest.is_none() {
+            continue;
+        }
+        if !receipt_releases_dependency(step) {
+            return Err(ContextBuildError::OutputBinding);
+        }
+        let intent = step
+            .intent
+            .as_ref()
+            .ok_or(ContextBuildError::OutputBinding)?;
+        let evidence_digest = step
+            .effect_evidence_digest
+            .as_deref()
+            .ok_or(ContextBuildError::OutputBinding)?;
+        let receipt_digest = step
+            .execution_receipt_digest
+            .as_deref()
+            .ok_or(ContextBuildError::OutputBinding)?;
+        let output = completed_tool_outputs
+            .get(step_id)
+            .ok_or(ContextBuildError::OutputBinding)?;
+        output
+            .verify_for(
+                &state.run_id,
+                step_id,
+                intent,
+                step.attempts,
+                evidence_digest,
+            )
+            .map_err(|_| ContextBuildError::OutputBinding)?;
+        if step.output_record_digest.as_deref() != Some(output.record_digest()) {
+            return Err(ContextBuildError::OutputBinding);
+        }
+        outputs.push(PlanningToolOutput {
+            step_id: step_id.clone(),
+            capability: CapabilityRef {
+                capability_id: output.capability_id().to_owned(),
+                contract_version: output.contract_version().to_owned(),
+            },
+            output_id: output.output_id().to_owned(),
+            output_digest: output.output_digest().to_owned(),
+            receipt_digest: receipt_digest.to_owned(),
+            canonical_size_bytes: output.canonical_size_bytes(),
+            output: output.output().clone(),
+        });
+    }
+    Ok(outputs)
 }
 
 #[allow(clippy::too_many_lines)] // Keeps one canonical packing pipeline and exact byte checks.
 fn build_context(
     state: &RunState,
+    completed_tool_outputs: &BTreeMap<String, ToolOutputRecord>,
     frontier: &WorkFrontier,
     registry: &CapabilityRegistry,
     budget: &AgentLoopBudget,
 ) -> Result<PlanningContext, ContextBuildError> {
-    if state
-        .run_id
-        .len()
-        .checked_add(state.authority.len())
-        .and_then(|total| total.checked_add(state.journal_head_digest.len()))
-        .and_then(|total| total.checked_add(state.goal.len()))
-        .is_none_or(|total| total > MAX_PLANNING_HEADER_TEXT_BYTES)
-    {
+    if !planning_context_preflight(state, registry) {
         return Err(ContextBuildError::InputLimitExceeded);
     }
-    if registry.definition_count() > MAX_PLANNING_CATALOG_DEFINITIONS
-        || state.steps.len() > MAX_PLANNING_SOURCE_STEPS
-    {
-        return Err(ContextBuildError::InputLimitExceeded);
-    }
-    let mut source_bytes = 0_usize;
+    let tool_outputs = build_planning_tool_outputs(state, completed_tool_outputs)?;
+    let mut source_bytes = tool_outputs.iter().try_fold(0_usize, |total, output| {
+        let output_size =
+            canonical_size(output).map_err(|_| ContextBuildError::Canonicalization)?;
+        total
+            .checked_add(output_size)
+            .filter(|size| *size <= MAX_PLANNING_SOURCE_BYTES)
+            .ok_or(ContextBuildError::InputLimitExceeded)
+    })?;
     let mut summaries = Vec::new();
     for definition in registry.definitions() {
         validate_planning_definition_shape(definition)?;
@@ -1863,7 +2034,7 @@ fn build_context(
     let total_steps = step_summaries.len();
     let total_capabilities = summaries.len();
     let mut payload = PlanningContextPayload {
-        profile_version: PLANNING_CONTEXT_PROFILE_V1,
+        profile_version: PLANNING_CONTEXT_PROFILE_V2,
         run_id: state.run_id.clone(),
         authority: state.authority.clone(),
         authority_epoch: state.authority_epoch,
@@ -1872,6 +2043,7 @@ fn build_context(
         goal: state.goal.clone(),
         total_steps: frontier.total_steps,
         verified_completed_steps: frontier.verified_completed_step_ids.len(),
+        tool_outputs,
         steps: Vec::new(),
         omitted_steps: total_steps,
         catalog_digest,
@@ -1915,7 +2087,7 @@ fn build_context(
     let canonical_size_bytes =
         u64::try_from(exact_size).map_err(|_| ContextBuildError::BudgetExceeded)?;
     let context_digest = digest_serializable(&ContextDigestInput {
-        domain: "xgeny.planning-context.digest/v1",
+        domain: "xgeny.planning-context.digest/v2",
         payload: &payload,
     })
     .map_err(|_| ContextBuildError::Canonicalization)?;
@@ -1924,6 +2096,18 @@ fn build_context(
         context_digest,
         canonical_size_bytes,
     })
+}
+
+fn planning_context_preflight(state: &RunState, registry: &CapabilityRegistry) -> bool {
+    state
+        .run_id
+        .len()
+        .checked_add(state.authority.len())
+        .and_then(|total| total.checked_add(state.journal_head_digest.len()))
+        .and_then(|total| total.checked_add(state.goal.len()))
+        .is_some_and(|total| total <= MAX_PLANNING_HEADER_TEXT_BYTES)
+        && registry.definition_count() <= MAX_PLANNING_CATALOG_DEFINITIONS
+        && state.steps.len() <= MAX_PLANNING_SOURCE_STEPS
 }
 
 fn validate_planning_definition_shape(
@@ -2706,6 +2890,8 @@ pub enum AgentLoopError {
     Canonicalization,
     #[error("Capability catalog could not be committed to planning context")]
     CapabilityCatalog,
+    #[error("generation-checked planning snapshot differs from its verified Run head")]
+    PlanningSnapshotMismatch,
     #[error("completion candidate event did not project a candidate")]
     CompletionCandidateNotProjected,
 }
@@ -2798,8 +2984,14 @@ mod tests {
 
     fn assert_blocked_before_materializer(state: &RunState, dependency: &str) {
         let frontier = derive_frontier(state).expect("frontier should derive");
-        let context = build_context(state, &frontier, &CapabilityRegistry::new(), &test_budget())
-            .expect("context should fit");
+        let context = build_context(
+            state,
+            &BTreeMap::new(),
+            &frontier,
+            &CapabilityRegistry::new(),
+            &test_budget(),
+        )
+        .expect("context should fit");
         let resolver = CountingResolver::default();
         let outcome = prepare_plan(
             state,
@@ -2845,6 +3037,7 @@ mod tests {
         let frontier = derive_frontier(&state).expect("frontier should derive");
         let context = build_context(
             &state,
+            &BTreeMap::new(),
             &frontier,
             &CapabilityRegistry::new(),
             &test_budget(),
@@ -2860,8 +3053,14 @@ mod tests {
         let frontier = derive_frontier(&state).expect("frontier should derive");
         let oversized = AgentLoopBudget::new(1, 1, 1, MAX_PLANNING_CONTEXT_BYTES + 1)
             .expect("durable budget itself remains forward-compatible");
-        let context = build_context(&state, &frontier, &CapabilityRegistry::new(), &oversized)
-            .expect("hard cap should not invalidate an otherwise fitting legacy budget");
+        let context = build_context(
+            &state,
+            &BTreeMap::new(),
+            &frontier,
+            &CapabilityRegistry::new(),
+            &oversized,
+        )
+        .expect("hard cap should not invalidate an otherwise fitting legacy budget");
         assert!(context.canonical_size_bytes() <= MAX_PLANNING_CONTEXT_BYTES);
     }
 
@@ -2886,7 +3085,13 @@ mod tests {
         let state = state(Vec::new());
         let frontier = derive_frontier(&state).expect("frontier should derive");
         assert!(matches!(
-            build_context(&state, &frontier, &registry, &test_budget()),
+            build_context(
+                &state,
+                &BTreeMap::new(),
+                &frontier,
+                &registry,
+                &test_budget()
+            ),
             Err(ContextBuildError::InputLimitExceeded)
         ));
     }
@@ -2925,6 +3130,7 @@ mod tests {
         assert!(matches!(
             build_context(
                 &oversized,
+                &BTreeMap::new(),
                 &frontier,
                 &CapabilityRegistry::new(),
                 &test_budget(),

@@ -7,14 +7,14 @@ use xgeny_workgraph::{
 };
 
 use crate::{
-    AuditMetrics, Commit, CommitAnchors, CommitSidecars, ExpectedHead, RunSnapshot, RunStore,
-    RunVerificationSnapshot, StoreError, StoredExecutionReceipt, StoredToolOutput,
-    VerifiedRunIndex, audit_snapshot, prepare_commit, verify_material_bundle,
-    verify_material_point, verify_material_records, verify_plan_input_bundle,
-    verify_plan_input_point, verify_plan_input_records, verify_planned_material_retention,
-    verify_receipt_bundle, verify_receipt_candidate, verify_receipt_records,
-    verify_tool_output_bundle, verify_tool_output_candidate, verify_tool_output_point,
-    verify_tool_output_records,
+    AuditMetrics, Commit, CommitAnchors, CommitSidecars, ExpectedHead, RunPlanningSnapshot,
+    RunSnapshot, RunStore, RunVerificationSnapshot, StoreError, StoredExecutionReceipt,
+    StoredToolOutput, VerifiedRunIndex, audit_snapshot, build_planning_snapshot, prepare_commit,
+    verify_material_bundle, verify_material_point, verify_material_records,
+    verify_plan_input_bundle, verify_plan_input_point, verify_plan_input_records,
+    verify_planned_material_retention, verify_receipt_bundle, verify_receipt_candidate,
+    verify_receipt_records, verify_tool_output_bundle, verify_tool_output_candidate,
+    verify_tool_output_point, verify_tool_output_records,
 };
 
 #[derive(Debug, Default)]
@@ -303,5 +303,15 @@ impl RunStore for MemoryRunStore {
             verify_tool_output_point(&self.index, effect_id, self.outputs.get(effect_id))?;
         }
         Ok(Some(snapshot))
+    }
+
+    fn load_planning_snapshot(
+        &self,
+        expected: ExpectedHead,
+        max_output_bytes: u64,
+    ) -> Result<Option<RunPlanningSnapshot>, StoreError> {
+        build_planning_snapshot(&self.index, expected, max_output_bytes, |effect_id| {
+            Ok(self.outputs.get(effect_id).cloned())
+        })
     }
 }

@@ -3,7 +3,7 @@
 - 기준일: 2026-08-30
 - 상태: provider-neutral durable planning + 첫 OpenAI-compatible adapter
 - 공개 protocol v0.1 schema 변경: 없음
-- local store schema: 6
+- local store schema: 7
 
 ## 현재 가능한 것
 
@@ -207,7 +207,7 @@ PlanDependency::ProposedStep
 
 Context membership 목록 자체는 durable event에 저장하지 않으므로 reducer가 이 visibility gate를 replay하지는 않는다. Provider의 `PlanProposal`은 반드시 `AgentLoop::tick`을 통해 수락하고, public 저수준 `PlanAccepted` append는 trusted Core/test 경계로만 취급한다. Reducer는 graph, turn/digest, planned binding과 budget처럼 journal만으로 검증 가능한 불변식을 별도로 유지한다.
 
-`context_digest`는 profile, Run/head binding, 선택된 item과 omission 결과를 domain-separated RFC 8785/SHA-256로 commit한다. SHA-256은 기밀화가 아니다. `PlanningContext` serialization은 digest input payload를 내보내고 digest 자신을 self-include하지 않으므로 adapter는 `context_digest()` companion 값을 사용해야 한다. Credential, raw argument/tool output, presigned URL, hidden reasoning과 전체 transcript는 구조적 context allowlist에 포함하지 않는다.
+`context_digest`는 profile, Run/head binding, 선택된 item과 omission 결과를 domain-separated RFC 8785/SHA-256로 commit한다. SHA-256은 기밀화가 아니다. `PlanningContext` serialization은 digest input payload를 내보내고 digest 자신을 self-include하지 않으므로 adapter는 `context_digest()` companion 값을 사용해야 한다. Credential, raw invocation argument, presigned URL, hidden reasoning과 전체 transcript는 구조적 context allowlist에 포함하지 않는다. ADR-0020의 v2 profile은 예외적으로 passed Core Receipt와 exact durable record에 결합된 bounded tool output만 별도 mandatory `toolOutputs` section에 넣는다.
 
 이 allowlist는 content DLP가 아니다. 허용 필드인 goal, 기존 Step objective, Capability summary/schema 안에 secret이 있으면 Core가 자동 탐지·삭제하지 않는다. 실제 외부 provider adapter를 붙이는 composition root가 secret-free 입력과 sensitivity/egress policy를 보장해야 한다.
 
@@ -215,7 +215,9 @@ Model-call identifier도 같은 경계다. `planner_id` validator는 길이와 A
 
 `max_context_bytes`와 별도로 production hard gate가 context 512 KiB, Definition/Step 수, per-item/aggregate canonical bytes와 JSON depth/node/text를 제한한다. 더 큰 기존 host budget은 effective payload budget만 512 KiB로 clamp하므로 fitting Run을 upgrade 뒤 무조건 멈추지 않는다. Item canonical size를 한 번 계산한 보수적 incremental packing 뒤 final exact size를 다시 검사하므로 과거의 반복 전체 canonicalization 경로를 사용하지 않는다. Catalog/source/item hard gate를 넘으면 `ContextInputLimitExceeded`로 reservation 전에 pause한다. 이 경계는 context assembler를 제한하며 그 전에 실행되는 WorkGraph frontier derivation 전체의 CPU·memory bound까지 새로 보장하지 않는다. 이 allowlist와 size gate도 content DLP는 아니므로 composition root의 egress policy 책임은 유지된다.
 
-Artifact/Memory reference, raw Receipt evidence/tool output와 사용자 conversation excerpt는 아직 context에 넣지 않는다. 이를 추가할 때는 provenance/sensitivity, stable priority와 section별 budget을 먼저 정의해야 한다.
+PlanningContext v2는 `load_planning_snapshot(expectedHead, maxOutputBytes)`가 같은 generation에서 검증한 `Completed` output 전체를 Step ID 순서로 먼저 넣는다. `Validating` output과 outputless legacy completion은 넣지 않는다. Eligible output 일부를 생략·요약·truncate하지 않으며 mandatory base가 budget을 넘으면 reservation과 provider 호출 전에 `ContextBudgetExceeded`로 멈춘다. Raw output은 실제 provider payload에는 포함되므로 composition root가 별도 sensitivity/egress policy를 적용해야 한다.
+
+Artifact/Memory reference, raw Receipt verification evidence와 사용자 conversation excerpt는 아직 context에 넣지 않는다. 이를 추가할 때는 provenance/sensitivity, stable priority와 section별 budget을 먼저 정의해야 한다.
 
 ## One-frontier-action tick
 

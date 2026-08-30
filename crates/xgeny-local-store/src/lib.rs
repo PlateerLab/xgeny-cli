@@ -24,8 +24,8 @@ use xgeny_workgraph::{
     EffectClass, EffectIntent, EventRecord, InvocationMaterialError, InvocationMaterialRecord,
     InvocationMaterialRetention, PlannedInvocationBinding, PlannedInvocationMaterialRecord,
     PlanningContractError, ReceiptPlacement, ReceiptVerificationStrategy, RecordError, ReplayError,
-    RunEvent, RunEventBody, RunState, TOOL_OUTPUT_PROFILE_V1, ToolOutputError, ToolOutputRecord,
-    TransitionError, VerificationDisposition, apply_record, replay,
+    RunEvent, RunEventBody, RunState, StepStatus, TOOL_OUTPUT_PROFILE_V1, ToolOutputError,
+    ToolOutputRecord, TransitionError, VerificationDisposition, apply_record, replay,
 };
 
 pub use memory::MemoryRunStore;
@@ -69,6 +69,71 @@ pub struct RunVerificationSnapshot {
     pub effect_started_at: Option<String>,
     pub previous_receipt_digest: Option<String>,
     pub tool_output: Option<ToolOutputRecord>,
+}
+
+/// One generation-checked view used to construct the next provider planning context.
+///
+/// Only output-bound Steps that reached `Completed` through a passed, fully verified Core
+/// Receipt are present. Raw output values remain local sidecars and are deliberately redacted
+/// from `Debug` output.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RunPlanningSnapshot {
+    pub state: RunState,
+    completed_tool_outputs: BTreeMap<String, ToolOutputRecord>,
+}
+
+impl RunPlanningSnapshot {
+    /// Construct a snapshot for a trusted [`RunStore`] implementation.
+    ///
+    /// Runtime consumers still validate every output against `state`; built-in stores additionally
+    /// guarantee one-generation reads and durable sidecar verification before construction.
+    #[must_use]
+    pub fn new(
+        state: RunState,
+        completed_tool_outputs: BTreeMap<String, ToolOutputRecord>,
+    ) -> Self {
+        Self {
+            state,
+            completed_tool_outputs,
+        }
+    }
+
+    #[must_use]
+    pub const fn completed_tool_outputs(&self) -> &BTreeMap<String, ToolOutputRecord> {
+        &self.completed_tool_outputs
+    }
+}
+
+impl std::fmt::Debug for RunPlanningSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RunPlanningSnapshot")
+            .field("state", &self.state)
+            .field(
+                "completed_tool_output_bindings",
+                &PlanningOutputBindingsDebug(&self.completed_tool_outputs),
+            )
+            .finish()
+    }
+}
+
+struct PlanningOutputBindingsDebug<'a>(&'a BTreeMap<String, ToolOutputRecord>);
+
+impl std::fmt::Debug for PlanningOutputBindingsDebug<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut map = formatter.debug_map();
+        for (step_id, output) in self.0 {
+            map.entry(
+                step_id,
+                &(
+                    output.output_id(),
+                    output.output_digest(),
+                    output.record_digest(),
+                ),
+            );
+        }
+        map.finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -193,6 +258,7 @@ struct VerifiedRunIndex {
     intents: BTreeMap<String, EffectIntentAnchor>,
     effect_starts: BTreeMap<String, EffectStartAnchor>,
     receipt_events: Vec<ReceiptEventAnchor>,
+    receipt_event_positions: BTreeMap<String, usize>,
     tool_output_events: BTreeMap<String, ToolOutputEventAnchor>,
     material_effect_ids: BTreeSet<String>,
     receipt_ids: BTreeSet<String>,
@@ -203,6 +269,7 @@ struct VerifiedRunIndex {
     tool_output_ids: BTreeSet<String>,
     tool_output_record_digests: BTreeSet<String>,
     tool_output_digests: BTreeMap<String, String>,
+    tool_output_sizes: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -592,6 +659,25 @@ pub trait RunStore {
                 .map(|receipt| receipt.receipt_digest.clone()),
             tool_output,
         }))
+    }
+
+    /// Load one exact Run head and every verified completed tool output from the same logical
+    /// store generation.
+    ///
+    /// Implementations must not compose this view from independent point reads. The default
+    /// fails closed because a cross-generation context could expose an output under the wrong
+    /// journal head.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported stores, a stale expected head, or any missing, corrupt,
+    /// or receipt-detached output sidecar.
+    fn load_planning_snapshot(
+        &self,
+        _expected: ExpectedHead,
+        _max_output_bytes: u64,
+    ) -> Result<Option<RunPlanningSnapshot>, StoreError> {
+        Err(StoreError::PlanningSnapshotStoreUnsupported)
     }
 
     /// Export committed journal records as RFC 8785 canonical JSON Lines in sequence order.
@@ -1020,6 +1106,10 @@ fn index_tool_output(
             .tool_output_digests
             .insert(anchor.effect_id.clone(), output.output_digest().to_owned())
             .is_some()
+        || index
+            .tool_output_sizes
+            .insert(anchor.effect_id.clone(), output.canonical_size_bytes())
+            .is_some()
     {
         return Err(StoreError::Corrupt(
             "duplicate tool-output identity".to_owned(),
@@ -1044,6 +1134,118 @@ fn verify_tool_output_point(
         )),
         (Some(anchor), Some(stored)) => verify_stored_tool_output(index, anchor, stored),
     }
+}
+
+fn build_planning_snapshot<F>(
+    index: &VerifiedRunIndex,
+    expected: ExpectedHead,
+    max_output_bytes: u64,
+    mut load_output: F,
+) -> Result<Option<RunPlanningSnapshot>, StoreError>
+where
+    F: FnMut(&str) -> Result<Option<StoredToolOutput>, StoreError>,
+{
+    let actual = index.head();
+    if expected != actual {
+        return Err(StoreError::HeadConflict { expected, actual });
+    }
+    let Some(state) = index.state.clone() else {
+        return Ok(None);
+    };
+    let mut selections = Vec::new();
+    let mut selected_output_bytes = 0_u64;
+    for (step_id, step) in &state.steps {
+        if step.status != StepStatus::Completed {
+            continue;
+        }
+        let Some(expected_record_digest) = step.output_record_digest.as_deref() else {
+            // Receipt-completed journals created before durable output sidecars remain readable,
+            // but no output is invented for them.
+            continue;
+        };
+        let intent = step.intent.as_ref().ok_or_else(|| {
+            StoreError::Corrupt(
+                "completed output-bound Step has no committed effect intent".to_owned(),
+            )
+        })?;
+        let receipt_id = step.execution_receipt_id.as_deref().ok_or_else(|| {
+            StoreError::Corrupt("completed output-bound Step has no Core Receipt ID".to_owned())
+        })?;
+        let receipt_digest = step.execution_receipt_digest.as_deref().ok_or_else(|| {
+            StoreError::Corrupt("completed output-bound Step has no Core Receipt digest".to_owned())
+        })?;
+        let receipt_anchor = index
+            .receipt_event_positions
+            .get(&intent.effect_id)
+            .and_then(|position| index.receipt_events.get(*position))
+            .ok_or_else(|| {
+                StoreError::Corrupt(
+                    "completed output-bound Step has no verified Core Receipt".to_owned(),
+                )
+            })?;
+        if receipt_anchor.step_id != *step_id
+            || receipt_anchor.disposition != VerificationDisposition::Passed
+            || receipt_anchor.receipt_id != receipt_id
+            || receipt_anchor.receipt_digest != receipt_digest
+            || !index.receipt_effect_ids.contains(&intent.effect_id)
+        {
+            return Err(StoreError::Corrupt(
+                "completed tool output differs from its passed Core Receipt".to_owned(),
+            ));
+        }
+        let output_size = index
+            .tool_output_sizes
+            .get(&intent.effect_id)
+            .copied()
+            .ok_or_else(|| {
+                StoreError::Corrupt(
+                    "completed tool output has no verified size commitment".to_owned(),
+                )
+            })?;
+        selected_output_bytes = selected_output_bytes
+            .checked_add(output_size)
+            .ok_or(StoreError::PlanningSnapshotBudgetExceeded)?;
+        if selected_output_bytes > max_output_bytes {
+            return Err(StoreError::PlanningSnapshotBudgetExceeded);
+        }
+        selections.push((
+            step_id.clone(),
+            intent.effect_id.clone(),
+            expected_record_digest.to_owned(),
+        ));
+    }
+    let mut completed_tool_outputs = BTreeMap::new();
+    for (step_id, effect_id, expected_record_digest) in selections {
+        let stored = load_output(&effect_id)?;
+        verify_tool_output_point(index, &effect_id, stored.as_ref())?;
+        let stored = stored.ok_or_else(|| {
+            StoreError::Corrupt("completed output-bound Step has no durable tool output".to_owned())
+        })?;
+        if stored.record.step_id() != step_id
+            || stored.record.record_digest() != expected_record_digest
+            || index
+                .tool_output_digests
+                .get(&effect_id)
+                .map(String::as_str)
+                != Some(stored.record.output_digest())
+        {
+            return Err(StoreError::Corrupt(
+                "completed tool output differs from its verified projection".to_owned(),
+            ));
+        }
+        if completed_tool_outputs
+            .insert(step_id, stored.record)
+            .is_some()
+        {
+            return Err(StoreError::Corrupt(
+                "completed tool output Step identity is duplicated".to_owned(),
+            ));
+        }
+    }
+    Ok(Some(RunPlanningSnapshot::new(
+        state,
+        completed_tool_outputs,
+    )))
 }
 
 fn verify_receipt_tool_output_binding(
@@ -1200,9 +1402,7 @@ impl VerifiedRunIndex {
                     }
                 }
                 RunEventBody::VerificationRecorded { .. } => {
-                    index
-                        .receipt_events
-                        .push(index.receipt_anchor_for(record, Some(metrics))?);
+                    index.index_receipt_event(record, metrics)?;
                 }
                 _ => {}
             }
@@ -1218,6 +1418,26 @@ impl VerifiedRunIndex {
                 sequence: record.sequence,
                 digest: record.digest.clone(),
             })
+    }
+
+    fn index_receipt_event(
+        &mut self,
+        record: &EventRecord,
+        metrics: &mut AuditMetrics,
+    ) -> Result<(), StoreError> {
+        let anchor = self.receipt_anchor_for(record, Some(metrics))?;
+        let position = self.receipt_events.len();
+        if self
+            .receipt_event_positions
+            .insert(anchor.effect_id.clone(), position)
+            .is_some()
+        {
+            return Err(StoreError::Corrupt(
+                "journal contains duplicate Receipt events for one effect".to_owned(),
+            ));
+        }
+        self.receipt_events.push(anchor);
+        Ok(())
     }
 
     fn receipt_anchor_for(
@@ -1400,9 +1620,13 @@ impl VerifiedRunIndex {
                 self.tool_output_events
                     .insert(anchor.effect_id.clone(), anchor);
             }
-            RunEventBody::VerificationRecorded { .. } => self.receipt_events.push(
-                receipt_anchor.expect("verified Receipt commit must retain its event anchor"),
-            ),
+            RunEventBody::VerificationRecorded { .. } => {
+                let anchor =
+                    receipt_anchor.expect("verified Receipt commit must retain its event anchor");
+                self.receipt_event_positions
+                    .insert(anchor.effect_id.clone(), self.receipt_events.len());
+                self.receipt_events.push(anchor);
+            }
             _ => {}
         }
         if let Some(inputs) = plan_inputs {
@@ -1420,7 +1644,9 @@ impl VerifiedRunIndex {
             self.tool_output_record_digests
                 .insert(output.record_digest().to_owned());
             self.tool_output_digests
-                .insert(effect_id, output.output_digest().to_owned());
+                .insert(effect_id.clone(), output.output_digest().to_owned());
+            self.tool_output_sizes
+                .insert(effect_id, output.canonical_size_bytes());
         }
         if let Some(receipt) = receipt {
             self.receipt_ids.insert(receipt.receipt_id.clone());
@@ -1867,6 +2093,10 @@ pub enum StoreError {
     ToolOutputProfileRequired,
     #[error("this Run store does not support durable tool outputs")]
     ToolOutputStoreUnsupported,
+    #[error("this Run store does not support generation-checked planning snapshots")]
+    PlanningSnapshotStoreUnsupported,
+    #[error("verified tool outputs exceed the planning snapshot byte budget")]
+    PlanningSnapshotBudgetExceeded,
     #[error("injected append fault after {0}")]
     InjectedFault(&'static str),
 }
@@ -3826,6 +4056,226 @@ mod tests {
             .load()
             .expect("cold full audit should pass")
             .expect("Run should remain");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One vertical snapshot/restart contract with shared fixtures.
+    fn planning_snapshot_exposes_only_receipt_completed_outputs_from_the_expected_head() {
+        const OUTPUT_SENTINEL: &str = "planning-output-visible-only-in-local-context";
+
+        fn append_output<S: RunStore>(store: &mut S) -> (Commit, EffectIntent, ToolOutputRecord) {
+            let (started, effect) = seed_read_only_executing(store);
+            let (candidate, output) = tool_output_success(
+                &started.state,
+                &effect,
+                "planning-output-succeeded",
+                serde_json::json!({"content": OUTPUT_SENTINEL}),
+            );
+            let validating = store
+                .append_with_tool_output(
+                    ExpectedHead::from_state(&started.state),
+                    candidate,
+                    output.clone(),
+                )
+                .expect("tool output should commit");
+            (validating, effect, output)
+        }
+
+        fn complete_output<S: RunStore>(
+            store: &mut S,
+            validating: &Commit,
+            effect: &EffectIntent,
+            output: &ToolOutputRecord,
+        ) -> Commit {
+            let mut receipt = successful_read_only_receipt(effect);
+            receipt.output_digest = output.output_digest().to_owned();
+            seal_receipt(&mut receipt);
+            store
+                .append_with_execution_receipt(
+                    ExpectedHead::from_state(&validating.state),
+                    receipt_event(effect, &receipt),
+                    receipt,
+                )
+                .expect("passed Receipt should complete the Step")
+        }
+
+        let directory = tempdir().expect("temporary directory should exist");
+        let path = directory.path().join("planning-snapshot.db");
+        let mut memory = MemoryRunStore::new();
+        let mut sqlite = SqliteRunStore::open(&path).expect("SQLite should open");
+        let (memory_validating, memory_effect, memory_output) = append_output(&mut memory);
+        let (sqlite_validating, sqlite_effect, sqlite_output) = append_output(&mut sqlite);
+
+        for snapshot in [
+            memory
+                .load_planning_snapshot(
+                    ExpectedHead::from_state(&memory_validating.state),
+                    u64::MAX,
+                )
+                .expect("memory planning snapshot should load")
+                .expect("memory Run should exist"),
+            sqlite
+                .load_planning_snapshot(
+                    ExpectedHead::from_state(&sqlite_validating.state),
+                    u64::MAX,
+                )
+                .expect("SQLite planning snapshot should load")
+                .expect("SQLite Run should exist"),
+        ] {
+            assert!(snapshot.completed_tool_outputs().is_empty());
+        }
+
+        let memory_completed = complete_output(
+            &mut memory,
+            &memory_validating,
+            &memory_effect,
+            &memory_output,
+        );
+        let sqlite_completed = complete_output(
+            &mut sqlite,
+            &sqlite_validating,
+            &sqlite_effect,
+            &sqlite_output,
+        );
+        let expected = ExpectedHead::from_state(&memory_completed.state);
+        let memory_snapshot = memory
+            .load_planning_snapshot(expected.clone(), u64::MAX)
+            .expect("memory planning snapshot should load")
+            .expect("memory Run should exist");
+        let sqlite_snapshot = sqlite
+            .load_planning_snapshot(ExpectedHead::from_state(&sqlite_completed.state), u64::MAX)
+            .expect("SQLite planning snapshot should load")
+            .expect("SQLite Run should exist");
+        assert_eq!(memory_snapshot, sqlite_snapshot);
+        assert_eq!(
+            memory_snapshot.completed_tool_outputs().get("step-1"),
+            Some(&memory_output)
+        );
+        assert!(!format!("{memory_snapshot:?}").contains(OUTPUT_SENTINEL));
+        sqlite.reset_test_metrics();
+        sqlite
+            .load_planning_snapshot(
+                ExpectedHead::from_state(&sqlite_completed.state),
+                sqlite_output.canonical_size_bytes(),
+            )
+            .expect("warm planning snapshot should fit the exact raw-output budget")
+            .expect("SQLite Run should exist");
+        let warm_metrics = sqlite.test_metrics();
+        assert_eq!(warm_metrics.full_audits, 0);
+        assert_eq!(warm_metrics.historical_tool_outputs, 0);
+        assert!(matches!(
+            sqlite.load_planning_snapshot(
+                ExpectedHead::from_state(&sqlite_completed.state),
+                sqlite_output
+                    .canonical_size_bytes()
+                    .checked_sub(1)
+                    .expect("non-empty output should have a positive canonical size"),
+            ),
+            Err(StoreError::PlanningSnapshotBudgetExceeded)
+        ));
+        assert!(matches!(
+            memory.load_planning_snapshot(ExpectedHead::Empty, u64::MAX),
+            Err(StoreError::HeadConflict { .. })
+        ));
+
+        drop(sqlite);
+        let reopened = SqliteRunStore::open(&path).expect("SQLite should reopen");
+        let reopened_snapshot = reopened
+            .load_planning_snapshot(ExpectedHead::from_state(&sqlite_completed.state), u64::MAX)
+            .expect("reopened planning snapshot should verify")
+            .expect("reopened Run should exist");
+        assert_eq!(reopened_snapshot, memory_snapshot);
+    }
+
+    #[test]
+    fn planning_snapshot_fails_closed_when_a_completed_output_sidecar_disappears() {
+        let directory = tempdir().expect("temporary directory should exist");
+        let path = directory.path().join("missing-output.db");
+        let mut sqlite = SqliteRunStore::open(&path).expect("SQLite should open");
+        let (started, effect) = seed_read_only_executing(&mut sqlite);
+        let (candidate, output) = tool_output_success(
+            &started.state,
+            &effect,
+            "missing-planning-output-succeeded",
+            serde_json::json!({"content": "must-not-be-silently-omitted"}),
+        );
+        let validating = sqlite
+            .append_with_tool_output(
+                ExpectedHead::from_state(&started.state),
+                candidate,
+                output.clone(),
+            )
+            .expect("output should commit");
+        let mut receipt = successful_read_only_receipt(&effect);
+        receipt.output_digest = output.output_digest().to_owned();
+        seal_receipt(&mut receipt);
+        let completed = sqlite
+            .append_with_execution_receipt(
+                ExpectedHead::from_state(&validating.state),
+                receipt_event(&effect, &receipt),
+                receipt,
+            )
+            .expect("Receipt should complete the Step");
+        sqlite
+            .load_planning_snapshot(ExpectedHead::from_state(&completed.state), u64::MAX)
+            .expect("planning snapshot should warm the verified cache")
+            .expect("Run should exist");
+        sqlite.reset_test_metrics();
+        let external = rusqlite::Connection::open(&path).expect("external SQLite should open");
+        external
+            .execute(
+                "UPDATE tool_outputs SET output_digest = 'sha256:corrupted'",
+                [],
+            )
+            .expect("external corruption should commit");
+        drop(external);
+        assert!(matches!(
+            sqlite.load_planning_snapshot(ExpectedHead::from_state(&completed.state), u64::MAX,),
+            Err(StoreError::Corrupt(_))
+        ));
+        assert_eq!(sqlite.test_metrics().full_audits, 1);
+
+        let external = rusqlite::Connection::open(&path).expect("external SQLite should reopen");
+        external
+            .execute(
+                "UPDATE tool_outputs SET output_digest = ?1",
+                [output.output_digest()],
+            )
+            .expect("test repair should commit");
+        drop(external);
+        sqlite
+            .load_planning_snapshot(ExpectedHead::from_state(&completed.state), u64::MAX)
+            .expect("repaired planning snapshot should verify")
+            .expect("Run should exist");
+        sqlite
+            .delete_tool_outputs()
+            .expect("test corruption should delete output rows");
+
+        assert!(matches!(
+            sqlite.load_planning_snapshot(ExpectedHead::from_state(&completed.state), u64::MAX,),
+            Err(StoreError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn planning_snapshot_does_not_invent_outputs_for_legacy_receipt_completions() {
+        let mut memory = MemoryRunStore::new();
+        commit_two_receipt_chain(&mut memory);
+        let state = memory
+            .load_current()
+            .expect("legacy completion should load")
+            .expect("Run should exist");
+        assert!(
+            state
+                .steps
+                .values()
+                .all(|step| step.status == StepStatus::Completed)
+        );
+        let snapshot = memory
+            .load_planning_snapshot(ExpectedHead::from_state(&state), u64::MAX)
+            .expect("legacy planning snapshot should load")
+            .expect("Run should exist");
+        assert!(snapshot.completed_tool_outputs().is_empty());
     }
 
     #[test]
@@ -6482,6 +6932,16 @@ mod tests {
         let path = directory.path().join("run.db");
         let mut store = SqliteRunStore::open(&path).expect("sqlite should open");
         commit_two_receipt_chain(&mut store);
+        let expected = ExpectedHead::from_state(
+            &store
+                .load_current()
+                .expect("current state should load")
+                .expect("Run should exist"),
+        );
+        store
+            .load_planning_snapshot(expected.clone(), u64::MAX)
+            .expect("planning snapshot should warm the verified cache")
+            .expect("Run should exist");
         store.reset_test_metrics();
 
         let outsider = rusqlite::Connection::open(&path).expect("outside connection should open");
@@ -6503,7 +6963,10 @@ mod tests {
             .expect("outside mutation should commit");
         drop(outsider);
 
-        assert!(store.load_execution_receipts().is_err());
+        assert!(matches!(
+            store.load_planning_snapshot(expected, u64::MAX),
+            Err(StoreError::Corrupt(_))
+        ));
         assert_eq!(store.test_metrics().full_audits, 1);
     }
 
