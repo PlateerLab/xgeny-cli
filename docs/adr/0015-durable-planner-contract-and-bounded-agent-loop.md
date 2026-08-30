@@ -6,6 +6,8 @@
 - 공개 protocol v0.1 schema 변경: 없음
 - local store schema: 5 → 6
 
+> 후속 상태: ADR-0018이 기존 `local_sync_once_v1` 의미를 유지하면서 accepted planned ReadOnly 전용 `local_sync_read_only_v1` profile을 추가했다. 아래 단일 profile 설명은 ADR-0015 결정 당시의 기록이다.
+
 ## 문맥
 
 ADR-0014는 immutable dependency DAG와 Receipt-gated frontier를 추가했다. 그러나 `StepPlanned`에는 objective와 dependency만 남아 있어 재시작 뒤 그 Step이 어떤 Capability와 입력으로 admission되어야 하는지 복원할 수 없었다. 모델 응답을 그대로 journal에 넣으면 raw argument, provider 응답과 보안 결정을 durable authority로 오인하게 되고, 여러 Step을 하나씩 append하면 crash 시 plan 일부만 남는다.

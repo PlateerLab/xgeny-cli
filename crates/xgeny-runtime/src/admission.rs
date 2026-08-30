@@ -18,8 +18,8 @@ use xgeny_policy::{
     PermissionRequestResolver, PolicyInputs, ResolvedPermissionRequest, ResourceResolver,
 };
 use xgeny_protocol::{
-    CORE_RECEIPT_INPUT_SUMMARY_V1, CORE_RECEIPT_PROFILE_V1, ProtocolError, canonical_digest,
-    validate_policy_decision,
+    CORE_RECEIPT_INPUT_SUMMARY_V1, CORE_RECEIPT_PROFILE_V1, CORE_RECEIPT_PROFILE_V2, ProtocolError,
+    canonical_digest, validate_policy_decision,
 };
 use xgeny_workgraph::{
     AuthorizationBinding, AuthorizationDigestError, AuthorizationUse, DependencyBlockReason,
@@ -285,6 +285,12 @@ impl InvocationAdmission {
             .ok_or(AdmissionError::RunNotInitialized)?;
         verify_lease(lease, &state)?;
         require_admission_ready_step(&state, &request.step_id)?;
+        verify_unplanned_read_only_boundary(
+            &state,
+            &request.step_id,
+            &request.route.capability,
+            registry,
+        )?;
         verify_planned_route_binding(&state, &request.step_id, &request.route)?;
         verify_planned_definition_binding(&state, &request.step_id, registry)?;
         let planned_input = verify_planned_input_sidecar(store, &state, &request.step_id)?;
@@ -443,6 +449,32 @@ impl InvocationAdmission {
     }
 }
 
+fn verify_unplanned_read_only_boundary(
+    state: &RunState,
+    step_id: &str,
+    capability: &CapabilityRef,
+    registry: &CapabilityRegistry,
+) -> Result<(), AdmissionError> {
+    let step = state
+        .steps
+        .get(step_id)
+        .ok_or_else(|| AdmissionError::StepNotFound(step_id.to_owned()))?;
+    if step.planned_invocation.is_some() {
+        return Ok(());
+    }
+    let definition =
+        registry
+            .definition(capability)
+            .ok_or_else(|| AdmissionError::DefinitionNotFound {
+                capability_id: capability.capability_id.clone(),
+                contract_version: capability.contract_version.clone(),
+            })?;
+    if definition.spec.effect.class == DomainEffectClass::ReadOnly {
+        return Err(AdmissionError::UnplannedReadOnlyUnsupported);
+    }
+    Ok(())
+}
+
 pub(crate) struct PreparedInvocationFacts {
     pub(crate) normalized_arguments: Value,
     pub(crate) permission_request: ResolvedPermissionRequest,
@@ -485,7 +517,9 @@ pub(crate) fn prepare_invocation_facts<R: ResourceResolver>(
                 contract_version: capability.contract_version.clone(),
             })?;
     map_effect_class(definition.spec.effect.class)?;
-    if !definition.spec.execution.idempotency_key_supported {
+    if definition.spec.effect.class != DomainEffectClass::ReadOnly
+        && !definition.spec.execution.idempotency_key_supported
+    {
         return Err(AdmissionError::DefinitionDoesNotSupportIdempotencyKey);
     }
     validate_arguments(definition, arguments)?;
@@ -533,6 +567,7 @@ struct IssuedEffect {
     material_record: InvocationMaterialRecord,
 }
 
+#[allow(clippy::too_many_lines)] // Keep the authorization and Receipt digest bindings adjacent.
 fn issue_once_effect(
     pending: &PendingInvocation,
     state: &RunState,
@@ -614,12 +649,14 @@ fn issue_once_effect(
     };
     let grant_digest = authorization_digest(&binding, ONCE_MAX_USES)?;
     let effect_id = content_id("effect", &effect_identity_digest);
+    let effect_class = map_effect_class(definition.spec.effect.class)?;
     let intent = EffectIntent {
         effect_id: effect_id.clone(),
         action_digest: pending.action_digest.clone(),
         invocation,
-        effect_class: map_effect_class(definition.spec.effect.class)?,
-        idempotency_key: Some(content_id("xgeny", &effect_identity_digest)),
+        effect_class,
+        idempotency_key: (effect_class != WorkGraphEffectClass::ReadOnly)
+            .then(|| content_id("xgeny", &effect_identity_digest)),
         sink_guarantee: SinkGuarantee::None,
         authorization: AuthorizationUse {
             grant_id: once_authorization_id(&state.run_id, &pending.action_digest)?,
@@ -654,7 +691,14 @@ fn build_receipt_provenance(
     definition: &CapabilityDefinitionBody,
 ) -> ReceiptProvenance {
     ReceiptProvenance {
-        profile_version: CORE_RECEIPT_PROFILE_V1.to_owned(),
+        profile_version: match definition.spec.effect.class {
+            DomainEffectClass::ReadOnly => CORE_RECEIPT_PROFILE_V2,
+            DomainEffectClass::Idempotent
+            | DomainEffectClass::Compensatable
+            | DomainEffectClass::NonIdempotent
+            | DomainEffectClass::Unknown => CORE_RECEIPT_PROFILE_V1,
+        }
+        .to_owned(),
         invocation_id: content_id("invocation", effect_identity_digest),
         plan_id: planned_plan_id
             .map_or_else(|| content_id("plan", effect_identity_digest), str::to_owned),
@@ -891,15 +935,19 @@ pub(crate) fn verify_planned_route_binding(
     if route.required_features.execution_style != ExecutionStyle::Sync {
         return Err(AdmissionError::UnsupportedExecutionStyle);
     }
-    if !route.required_features.idempotency_key {
-        return Err(AdmissionError::IdempotencyKeyFeatureRequired);
-    }
     let step = state
         .steps
         .get(step_id)
         .ok_or_else(|| AdmissionError::StepNotFound(step_id.to_owned()))?;
     let Some(planned) = &step.planned_invocation else {
+        if !route.required_features.idempotency_key {
+            return Err(AdmissionError::IdempotencyKeyFeatureRequired);
+        }
         return Ok(());
+    };
+    let idempotency_feature_matches = match planned.execution_profile() {
+        PlannedExecutionProfile::LocalSyncOnceV1 => route.required_features.idempotency_key,
+        PlannedExecutionProfile::LocalSyncReadOnlyV1 => !route.required_features.idempotency_key,
     };
     let checks = [
         (
@@ -910,10 +958,7 @@ pub(crate) fn verify_planned_route_binding(
             "contract_version",
             planned.contract_version() == route.capability.contract_version,
         ),
-        (
-            "execution_profile",
-            planned.execution_profile() == PlannedExecutionProfile::LocalSyncOnceV1,
-        ),
+        ("execution_profile", idempotency_feature_matches),
         (
             "target_os",
             planned.target_os() == operating_system_name(route.target_platform.os),
@@ -957,6 +1002,22 @@ pub(crate) fn verify_planned_definition_binding(
             })?;
     if definition_contract_digest(definition)? != planned.definition_digest() {
         return Err(AdmissionError::DefinitionChanged);
+    }
+    let profile_matches = matches!(
+        (planned.execution_profile(), definition.spec.effect.class),
+        (
+            PlannedExecutionProfile::LocalSyncReadOnlyV1,
+            DomainEffectClass::ReadOnly
+        ) | (
+            PlannedExecutionProfile::LocalSyncOnceV1,
+            DomainEffectClass::Idempotent | DomainEffectClass::NonIdempotent
+        )
+    );
+    if !profile_matches {
+        return Err(AdmissionError::PlannedInvocationMismatch {
+            step_id: step_id.to_owned(),
+            field: "execution_profile",
+        });
     }
     Ok(())
 }
@@ -1012,11 +1073,10 @@ const fn map_effect_class(
     effect_class: DomainEffectClass,
 ) -> Result<WorkGraphEffectClass, AdmissionError> {
     match effect_class {
+        DomainEffectClass::ReadOnly => Ok(WorkGraphEffectClass::ReadOnly),
         DomainEffectClass::Idempotent => Ok(WorkGraphEffectClass::Idempotent),
         DomainEffectClass::NonIdempotent => Ok(WorkGraphEffectClass::NonIdempotent),
-        DomainEffectClass::ReadOnly
-        | DomainEffectClass::Compensatable
-        | DomainEffectClass::Unknown => {
+        DomainEffectClass::Compensatable | DomainEffectClass::Unknown => {
             Err(AdmissionError::UnsupportedEffectClass { effect_class })
         }
     }
@@ -1272,6 +1332,8 @@ pub enum AdmissionError {
     DefinitionChanged,
     #[error("effect admission currently supports only synchronous execution")]
     UnsupportedExecutionStyle,
+    #[error("ReadOnly admission requires an accepted planned-invocation binding")]
+    UnplannedReadOnlyUnsupported,
     #[error("effect admission requires the Router to enforce idempotency-key support")]
     IdempotencyKeyFeatureRequired,
     #[error("Capability Definition does not support an idempotency key")]

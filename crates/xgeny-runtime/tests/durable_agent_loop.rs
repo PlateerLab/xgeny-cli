@@ -21,8 +21,8 @@ use xgeny_runtime::{
 use xgeny_workgraph::{
     AgentLoopBudget, AgentLoopState, ContinuationAction, EventRecord, ModelCallBudget,
     ModelCallLifecycleState, ModelCallRejectionReason, ModelCallSettlement, ModelCallUnknownReason,
-    ReconstructableMaterialReference, RunEvent, RunEventBody, RunState, StepState, StepStatus,
-    apply_record,
+    PlannedExecutionProfile, ReconstructableMaterialReference, RunEvent, RunEventBody, RunState,
+    StepState, StepStatus, apply_record,
 };
 
 const AUTHORITY: &str = "local:test";
@@ -749,6 +749,14 @@ fn definition_fixture(id: &str) -> CapabilityDefinitionBody {
     *definition
 }
 
+fn read_only_definition_fixture(id: &str) -> CapabilityDefinitionBody {
+    let mut definition = definition_fixture(id);
+    definition.spec.effect.class = EffectClass::ReadOnly;
+    "filesystem.read".clone_into(&mut definition.spec.effect.resource_selectors[0].scope);
+    definition.spec.execution.idempotency_key_supported = false;
+    definition
+}
+
 fn registry_with(definition: CapabilityDefinitionBody) -> xgeny_runtime::CapabilityRegistry {
     let mut registry = xgeny_runtime::CapabilityRegistry::new();
     registry
@@ -1458,6 +1466,49 @@ fn sqlite_reopen_restores_atomic_plan_without_calling_planner() {
             .expect("journal should export")
             .windows(RAW_SENTINEL.len())
             .any(|window| window == RAW_SENTINEL.as_bytes())
+    );
+}
+
+#[test]
+fn read_only_plan_uses_distinct_profile_without_idempotency_support() {
+    let run_id = "run-agent-loop-read-only";
+    let definition = read_only_definition_fixture("xgeny.test/read-only-marker");
+    let cap = capability(&definition);
+    let registry = registry_with(definition);
+    let loop_budget = budget(2, 2, 2, 262_144);
+    let mut store = MemoryRunStore::new();
+    create_run(&mut store, run_id);
+    let agent_loop = configure(&mut store, run_id, &loop_budget);
+    let mut planner = ScriptedPlanner::returning(PlanProposal::plan(vec![proposed_step(
+        "read",
+        Vec::new(),
+        cap,
+        CANONICAL_PATH,
+        RAW_SENTINEL,
+    )]));
+
+    let tick = agent_loop
+        .tick(
+            &mut store,
+            &mut DeterministicEvents,
+            &FixedLease(run_id.to_owned()),
+            &registry,
+            &CanonicalResolver::default(),
+            &mut planner,
+            &mut RecordingMaterializer::default(),
+        )
+        .expect("read-only plan should be accepted");
+    assert!(matches!(tick, AgentLoopTick::PlanAccepted { .. }));
+    let state = store.load_current().unwrap().unwrap();
+    let planned_binding = state
+        .steps
+        .values()
+        .next()
+        .and_then(|step| step.planned_invocation.as_ref())
+        .expect("accepted Step should retain its binding");
+    assert_eq!(
+        planned_binding.execution_profile(),
+        PlannedExecutionProfile::LocalSyncReadOnlyV1
     );
 }
 

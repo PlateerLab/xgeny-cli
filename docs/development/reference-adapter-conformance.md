@@ -101,13 +101,13 @@ Workspace CI가 Linux, macOS, Windows에서 이 integration test를 함께 실�
 
 - `xgeny.fs/read-text` 또는 사용자 workspace의 임의 파일 접근
 - path normalization, directory confinement, symlink/junction/reparse-point, TOCTOU 방어
-- ReadOnly effect 의미와 idempotency 없는 호출
-- typed tool output, Artifact와 제품용 output digest 계약
+- 제품 filesystem ReadOnly 호출과 idempotency 없는 실제 I/O
+- typed tool output body, Artifact content store와 제품용 output digest 계약
 - adapter definite failure·effect unknown·cancelled/not-started Receipt
 - process, network, MCP, Connector 또는 XGEN adapter
 - credential resolution, approval UI, CLI 명령과 model loop
 - in-process hostile plugin 격리
 
-실제 filesystem adapter는 이 참조 구현을 이름만 바꿔 확장하지 않는다. WorkGraph의 ReadOnly 의미, bounded typed output와 Artifact, failure/unknown Receipt, root directory capability와 OS별 path race 규칙을 별도 ADR과 실패 테스트로 먼저 정해야 한다. Tracked/Persistent WorkGraph와 restart frontier는 ADR-0014에서 구현했지만 제품 adapter나 자동 model loop를 연결한 것은 아니다.
+실제 filesystem adapter는 이 참조 구현을 이름만 바꿔 확장하지 않는다. ADR-0018이 WorkGraph ReadOnly profile과 bounded Artifact descriptor/Receipt v2 의미를 먼저 고정했지만, typed output body와 content store, failure/unknown Receipt, root directory capability와 OS별 path race 규칙은 아직 제품 adapter 전에 별도 ADR과 실패 테스트가 필요하다. ReadOnly Admission도 현재 accepted planned-invocation 경로에만 열려 있고 legacy direct path는 닫혀 있다. Tracked/Persistent WorkGraph와 restart frontier는 ADR-0014에서 구현했지만 제품 adapter나 자동 model loop를 연결한 것은 아니다.
 
 공통 adapter contract testkit은 두 번째 실제 adapter가 생길 때 이 suite에서 구현별 fixture를 분리해 추출한다. 지금은 재사용 추상화를 미리 고정하지 않고 public-port conformance의 첫 실행 가능한 기준으로 유지한다.

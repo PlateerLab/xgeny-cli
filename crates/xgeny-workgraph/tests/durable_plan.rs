@@ -67,13 +67,34 @@ fn accepted_step(
     proposal_digest: &str,
     marker: char,
 ) -> (AcceptedPlanStep, PlannedInvocationMaterialRecord) {
+    accepted_step_with_profile(
+        run_id,
+        step_id,
+        objective,
+        depends_on,
+        proposal_digest,
+        marker,
+        PlannedExecutionProfile::LocalSyncOnceV1,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accepted_step_with_profile(
+    run_id: &str,
+    step_id: &str,
+    objective: &str,
+    depends_on: Vec<String>,
+    proposal_digest: &str,
+    marker: char,
+    profile: PlannedExecutionProfile,
+) -> (AcceptedPlanStep, PlannedInvocationMaterialRecord) {
     let spec = PlannedInvocationSpec::new(
         "local.fs.read_text",
         "1.0.0",
         digest('d'),
         digest(marker),
         digest('e'),
-        PlannedExecutionProfile::LocalSyncOnceV1,
+        profile,
         "linux",
         "x86_64",
     )
@@ -93,6 +114,85 @@ fn accepted_step(
         },
         input,
     )
+}
+
+#[test]
+fn read_only_profile_rejects_effect_downgrade_and_keyed_semantics_before_budget_consumption() {
+    let state = configured_state();
+    let proposal_digest = digest('f');
+    let (step, _) = accepted_step_with_profile(
+        RUN_ID,
+        "step-read",
+        "read the source",
+        Vec::new(),
+        &proposal_digest,
+        'a',
+        PlannedExecutionProfile::LocalSyncReadOnlyV1,
+    );
+    let planned = append(
+        Some(&state),
+        "read-plan-accepted",
+        RunEventBody::PlanAccepted {
+            decision: ExpectedPlanningTurn::new(1, digest('c'), proposal_digest)
+                .expect("turn should bind"),
+            steps: vec![step],
+        },
+    );
+
+    let effectful = planned_intent(&planned, "step-read", "effect-read");
+    let effectful_record = record_after(
+        &planned,
+        "read-effect-downgrade",
+        RunEventBody::EffectIntentCommitted {
+            step_id: "step-read".to_owned(),
+            intent: Box::new(effectful),
+        },
+    );
+    assert!(matches!(
+        apply_record(Some(&planned), &effectful_record),
+        Err(TransitionError::PlannedInvocationMismatch {
+            field: "effect_class",
+            ..
+        })
+    ));
+    assert!(planned.authorization_consumption.is_empty());
+
+    let mut keyed_read = planned_intent(&planned, "step-read", "effect-read");
+    keyed_read.effect_class = EffectClass::ReadOnly;
+    let keyed_record = record_after(
+        &planned,
+        "read-keyed-semantics",
+        RunEventBody::EffectIntentCommitted {
+            step_id: "step-read".to_owned(),
+            intent: Box::new(keyed_read),
+        },
+    );
+    assert!(matches!(
+        apply_record(Some(&planned), &keyed_record),
+        Err(TransitionError::ReadOnlyEffectSemanticsInvalid { .. })
+    ));
+    assert!(planned.authorization_consumption.is_empty());
+
+    let mut read_only = planned_intent(&planned, "step-read", "effect-read");
+    read_only.effect_class = EffectClass::ReadOnly;
+    read_only.idempotency_key = None;
+    let committed = apply_record(
+        Some(&planned),
+        &record_after(
+            &planned,
+            "read-correct-semantics",
+            RunEventBody::EffectIntentCommitted {
+                step_id: "step-read".to_owned(),
+                intent: Box::new(read_only),
+            },
+        ),
+    )
+    .expect("exact read-only semantics should commit");
+    assert_eq!(
+        committed.steps["step-read"].status,
+        StepStatus::IntentCommitted
+    );
+    assert_eq!(committed.authorization_consumption.len(), 1);
 }
 
 fn planned_intent(state: &RunState, step_id: &str, effect_id: &str) -> EffectIntent {

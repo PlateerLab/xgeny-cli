@@ -32,6 +32,52 @@ static WORK_GRAPH_VALIDATOR: OnceLock<Result<BundledDocumentValidator, String>> 
 
 /// Stable identifier for the first Core-owned Receipt construction and verification profile.
 pub const CORE_RECEIPT_PROFILE_V1: &str = "xgeny.core-receipt/v1";
+/// Core-owned Receipt profile for bounded Artifact commitments.
+///
+/// Version 1 permanently means that the Receipt has no artifacts. Version 2 is selected only for
+/// execution semantics whose verified output must be represented by one or more bounded artifact
+/// descriptors.
+pub const CORE_RECEIPT_PROFILE_V2: &str = "xgeny.core-receipt/v2";
+/// Maximum artifact commitments permitted by Core Receipt profile v2.
+pub const CORE_RECEIPT_MAX_ARTIFACTS_V2: usize = 8;
+/// Maximum byte size represented by one Core Receipt profile v2 artifact.
+pub const CORE_RECEIPT_MAX_ARTIFACT_SIZE_BYTES_V2: u64 = 1024 * 1024;
+/// Maximum aggregate byte size represented by Core Receipt profile v2 artifacts.
+pub const CORE_RECEIPT_MAX_ARTIFACT_TOTAL_BYTES_V2: u64 = 4 * 1024 * 1024;
+
+/// Check the non-provenance descriptor shape emitted by Core Receipt profile v2.
+///
+/// Receipt provenance and aggregate count/size are contextual and must be checked separately.
+#[must_use]
+pub fn core_artifact_descriptor_v2_is_valid(
+    artifact_id: &str,
+    name: Option<&str>,
+    media_type: &str,
+    size: u64,
+    digest: &str,
+) -> bool {
+    let identifier_valid = !artifact_id.is_empty()
+        && artifact_id.len() <= 200
+        && artifact_id.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphanumeric() || (index > 0 && matches!(byte, b'.' | b'_' | b':' | b'-'))
+        });
+    let name_valid = name.is_none_or(|name| {
+        !name.is_empty() && name.len() <= 512 && !name.chars().any(char::is_control)
+    });
+    let media_type_valid =
+        (3..=200).contains(&media_type.len()) && !media_type.chars().any(char::is_control);
+    let digest_valid = digest.strip_prefix("sha256:").is_some_and(|encoded| {
+        encoded.len() == 64
+            && encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    });
+    identifier_valid
+        && name_valid
+        && media_type_valid
+        && size <= CORE_RECEIPT_MAX_ARTIFACT_SIZE_BYTES_V2
+        && digest_valid
+}
 /// Secret-free input description required by the first Core Receipt profile.
 pub const CORE_RECEIPT_INPUT_SUMMARY_V1: &str = "Invocation input retained by digest only.";
 /// Exact redaction declarations required by the first Core Receipt profile.
@@ -808,6 +854,32 @@ mod tests {
         assert_eq!(report.valid_fixture_count, 11);
         assert_eq!(report.invalid_fixture_count, 9);
         assert!(report.semantic_check_count >= 10);
+    }
+
+    #[test]
+    fn core_artifact_descriptor_v2_shape_is_closed_and_bounded() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        assert!(core_artifact_descriptor_v2_is_valid(
+            "artifact-1",
+            Some("output.json"),
+            "application/json",
+            128,
+            &digest,
+        ));
+        assert!(!core_artifact_descriptor_v2_is_valid(
+            "artifact-1",
+            Some("output\n.json"),
+            "application/json",
+            128,
+            &digest,
+        ));
+        assert!(!core_artifact_descriptor_v2_is_valid(
+            "artifact-1",
+            None,
+            "application/json",
+            CORE_RECEIPT_MAX_ARTIFACT_SIZE_BYTES_V2 + 1,
+            &digest,
+        ));
     }
 
     #[test]

@@ -2366,12 +2366,39 @@ fn credential_identity_retarget_is_detected_before_material_provider_access() {
 }
 
 #[test]
-fn unsupported_effect_classes_and_non_once_policy_are_closed() {
-    for effect_class in [
-        EffectClass::ReadOnly,
-        EffectClass::Compensatable,
-        EffectClass::Unknown,
-    ] {
+fn unplanned_read_only_admission_is_explicitly_closed_before_resource_resolution() {
+    let mut definition = definition_fixture();
+    definition.spec.effect.class = EffectClass::ReadOnly;
+    definition.spec.execution.idempotency_key_supported = false;
+    let registry = registry_with(&definition, [instance_fixture(&definition)]);
+    let resolver = CanonicalResolver::default();
+    let mut store = MemoryRunStore::new();
+    let initial = seed(&mut store, RUN_ID, STEP_ID);
+    let (_directory, lease) = acquire_lease(RUN_ID);
+
+    let result = prepare(
+        &store,
+        &lease,
+        &registry,
+        &resolver,
+        &definition,
+        arguments(CANONICAL_PATH, "unplanned-read-only"),
+    );
+
+    assert!(matches!(
+        result,
+        Err(AdmissionError::UnplannedReadOnlyUnsupported)
+    ));
+    assert_eq!(resolver.calls.get(), 0);
+    assert_eq!(
+        store.load_current().expect("store should load"),
+        Some(initial)
+    );
+}
+
+#[test]
+fn still_unsupported_effect_classes_and_non_once_policy_are_closed() {
+    for effect_class in [EffectClass::Compensatable, EffectClass::Unknown] {
         let mut definition = definition_fixture();
         definition.spec.effect.class = effect_class;
         let registry = registry_with(&definition, [instance_fixture(&definition)]);

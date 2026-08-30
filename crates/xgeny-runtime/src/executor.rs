@@ -7,7 +7,9 @@ use xgeny_domain::{
     AuthState, CapabilityInstanceBody, CapabilityRef, HealthStatus, InstanceBinding, Placement,
 };
 use xgeny_local_store::{RunStore, StoreError};
-use xgeny_protocol::{CORE_RECEIPT_INPUT_SUMMARY_V1, CORE_RECEIPT_PROFILE_V1};
+use xgeny_protocol::{
+    CORE_RECEIPT_INPUT_SUMMARY_V1, CORE_RECEIPT_PROFILE_V1, CORE_RECEIPT_PROFILE_V2,
+};
 use xgeny_workgraph::{
     EffectIntent, InvocationMaterialError, InvocationMaterialRecord, ReceiptPlacement, RunState,
     SinkGuarantee, StepStatus, invocation_material_digest, receipt_provenance_digest,
@@ -722,7 +724,19 @@ fn verify_receipt_provenance(intent: &EffectIntent) -> Result<(), DirectExecutor
             effect_id: intent.effect_id.clone(),
         }
     })?;
-    if provenance.profile_version != CORE_RECEIPT_PROFILE_V1 {
+    let profile_matches_effect = matches!(
+        (provenance.profile_version.as_str(), intent.effect_class),
+        (
+            CORE_RECEIPT_PROFILE_V2,
+            xgeny_workgraph::EffectClass::ReadOnly
+        ) | (
+            CORE_RECEIPT_PROFILE_V1,
+            xgeny_workgraph::EffectClass::Reversible
+                | xgeny_workgraph::EffectClass::Idempotent
+                | xgeny_workgraph::EffectClass::NonIdempotent
+        )
+    );
+    if !profile_matches_effect {
         return Err(DirectExecutorError::UnsupportedReceiptProfile);
     }
     if provenance.input_summary != CORE_RECEIPT_INPUT_SUMMARY_V1 {

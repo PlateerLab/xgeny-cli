@@ -2101,6 +2101,7 @@ struct PreparedPlanStep {
     definition_digest: String,
     action_digest: String,
     material_digest: String,
+    effect_class: EffectClass,
 }
 
 #[derive(Serialize)]
@@ -2131,6 +2132,7 @@ struct ValidatedPlanStep {
     definition_digest: String,
     action_digest: String,
     material_digest: String,
+    effect_class: EffectClass,
 }
 
 #[derive(Serialize)]
@@ -2271,6 +2273,7 @@ fn prepare_plan<R: ResourceResolver>(
             definition_digest: facts.definition_digest,
             action_digest: facts.action_digest,
             material_digest: facts.material_digest,
+            effect_class: definition.spec.effect.class,
         });
     }
     let digest_steps: Vec<_> = validated
@@ -2332,6 +2335,7 @@ fn prepare_plan<R: ResourceResolver>(
             definition_digest: final_facts.definition_digest,
             action_digest: final_facts.action_digest,
             material_digest: final_facts.material_digest,
+            effect_class: step.effect_class,
         });
     }
     Ok(PreparedPlan {
@@ -2516,7 +2520,15 @@ fn materialize_plan<M: PlanMaterializer>(
             step.definition_digest.as_str(),
             step.action_digest.as_str(),
             step.material_digest.as_str(),
-            PlannedExecutionProfile::LocalSyncOnceV1,
+            match step.effect_class {
+                EffectClass::ReadOnly => PlannedExecutionProfile::LocalSyncReadOnlyV1,
+                EffectClass::Idempotent | EffectClass::NonIdempotent => {
+                    PlannedExecutionProfile::LocalSyncOnceV1
+                }
+                EffectClass::Compensatable | EffectClass::Unknown => {
+                    return Err(PlanMaterializerFailure::Rejected);
+                }
+            },
             std::env::consts::OS,
             std::env::consts::ARCH,
         )
