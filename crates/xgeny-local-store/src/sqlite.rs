@@ -11,13 +11,13 @@ use xgeny_workgraph::{
 };
 
 use crate::{
-    AuditMetrics, Commit, CommitAnchors, CommitSidecars, ExpectedHead, RunSnapshot, RunStore,
-    RunVerificationSnapshot, StoreError, StoredExecutionReceipt, StoredToolOutput,
-    VerifiedRunIndex, audit_snapshot, index_tool_output, prepare_commit, verify_commit_sidecars,
-    verify_material_point, verify_material_records, verify_plan_input_point,
-    verify_plan_input_records, verify_planned_material_retention, verify_receipt_candidate,
-    verify_receipt_records, verify_stored_tool_output, verify_tool_output_candidate,
-    verify_tool_output_point,
+    AuditMetrics, Commit, CommitAnchors, CommitSidecars, ExpectedHead, RunPlanningSnapshot,
+    RunSnapshot, RunStore, RunVerificationSnapshot, StoreError, StoredExecutionReceipt,
+    StoredToolOutput, VerifiedRunIndex, audit_snapshot, build_planning_snapshot, index_tool_output,
+    prepare_commit, verify_commit_sidecars, verify_material_point, verify_material_records,
+    verify_plan_input_point, verify_plan_input_records, verify_planned_material_retention,
+    verify_receipt_candidate, verify_receipt_records, verify_stored_tool_output,
+    verify_tool_output_candidate, verify_tool_output_point,
 };
 
 const STORE_SCHEMA_VERSION: i64 = 7;
@@ -1215,6 +1215,27 @@ impl RunStore for SqliteRunStore {
             )?;
             snapshot.tool_output = output.map(|stored| stored.record);
         }
+        transaction.commit()?;
+        Ok(snapshot)
+    }
+
+    fn load_planning_snapshot(
+        &self,
+        expected: ExpectedHead,
+        max_output_bytes: u64,
+    ) -> Result<Option<RunPlanningSnapshot>, StoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        ensure_verified_cache(&self.cache, &self.metrics, &transaction)?;
+        let snapshot = {
+            let cache = self.cache.borrow();
+            let index = &cache
+                .as_ref()
+                .expect("cache refresh must install a verified index")
+                .index;
+            build_planning_snapshot(index, expected, max_output_bytes, |effect_id| {
+                load_tool_output(&transaction, effect_id)
+            })?
+        };
         transaction.commit()?;
         Ok(snapshot)
     }

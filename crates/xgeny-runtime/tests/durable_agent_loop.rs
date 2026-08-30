@@ -9,7 +9,8 @@ use xgeny_domain::{
     ProtocolDocument,
 };
 use xgeny_local_store::{
-    Commit, ExpectedHead, MemoryRunStore, RunSnapshot, RunStore, SqliteRunStore, StoreError,
+    Commit, ExpectedHead, MemoryRunStore, RunPlanningSnapshot, RunSnapshot, RunStore,
+    SqliteRunStore, StoreError,
 };
 use xgeny_policy::{ResourceResolutionFailure, ResourceResolver};
 use xgeny_runtime::{
@@ -241,6 +242,21 @@ impl RunStore for ProjectionStore {
     fn load_current(&self) -> Result<Option<RunState>, StoreError> {
         Ok(Some(self.state.clone()))
     }
+
+    fn load_planning_snapshot(
+        &self,
+        expected: ExpectedHead,
+        _max_output_bytes: u64,
+    ) -> Result<Option<RunPlanningSnapshot>, StoreError> {
+        let actual = ExpectedHead::from_state(&self.state);
+        if expected != actual {
+            return Err(StoreError::HeadConflict { expected, actual });
+        }
+        Ok(Some(RunPlanningSnapshot::new(
+            self.state.clone(),
+            BTreeMap::new(),
+        )))
+    }
 }
 
 struct ReservationObservingStore {
@@ -282,6 +298,15 @@ impl RunStore for ReservationObservingStore {
 
     fn load_current(&self) -> Result<Option<RunState>, StoreError> {
         self.inner.load_current()
+    }
+
+    fn load_planning_snapshot(
+        &self,
+        expected: ExpectedHead,
+        max_output_bytes: u64,
+    ) -> Result<Option<RunPlanningSnapshot>, StoreError> {
+        self.inner
+            .load_planning_snapshot(expected, max_output_bytes)
     }
 
     fn load_planned_invocation(
@@ -345,6 +370,15 @@ impl RunStore for StalePlanStore {
 
     fn load_current(&self) -> Result<Option<RunState>, StoreError> {
         self.inner.load_current()
+    }
+
+    fn load_planning_snapshot(
+        &self,
+        expected: ExpectedHead,
+        max_output_bytes: u64,
+    ) -> Result<Option<RunPlanningSnapshot>, StoreError> {
+        self.inner
+            .load_planning_snapshot(expected, max_output_bytes)
     }
 
     fn load_planned_invocation(
@@ -426,6 +460,15 @@ impl RunStore for OutcomeConflictStore {
 
     fn load_current(&self) -> Result<Option<RunState>, StoreError> {
         self.inner.load_current()
+    }
+
+    fn load_planning_snapshot(
+        &self,
+        expected: ExpectedHead,
+        max_output_bytes: u64,
+    ) -> Result<Option<RunPlanningSnapshot>, StoreError> {
+        self.inner
+            .load_planning_snapshot(expected, max_output_bytes)
     }
 
     fn load_planned_invocation(
@@ -511,6 +554,15 @@ impl RunStore for StalePlanOutcomeStore {
         self.inner.load_current()
     }
 
+    fn load_planning_snapshot(
+        &self,
+        expected: ExpectedHead,
+        max_output_bytes: u64,
+    ) -> Result<Option<RunPlanningSnapshot>, StoreError> {
+        self.inner
+            .load_planning_snapshot(expected, max_output_bytes)
+    }
+
     fn load_planned_invocation(
         &self,
         step_id: &str,
@@ -581,6 +633,15 @@ impl<S: RunStore> RunStore for CommitAckLossStore<S> {
         self.inner.load_current()
     }
 
+    fn load_planning_snapshot(
+        &self,
+        expected: ExpectedHead,
+        max_output_bytes: u64,
+    ) -> Result<Option<RunPlanningSnapshot>, StoreError> {
+        self.inner
+            .load_planning_snapshot(expected, max_output_bytes)
+    }
+
     fn load_planned_invocation(
         &self,
         step_id: &str,
@@ -622,6 +683,79 @@ impl RunStore for FailingReservationStore {
 
     fn load_current(&self) -> Result<Option<RunState>, StoreError> {
         self.0.load_current()
+    }
+
+    fn load_planning_snapshot(
+        &self,
+        expected: ExpectedHead,
+        max_output_bytes: u64,
+    ) -> Result<Option<RunPlanningSnapshot>, StoreError> {
+        self.0.load_planning_snapshot(expected, max_output_bytes)
+    }
+}
+
+struct ReservationHeadRaceStore {
+    inner: MemoryRunStore,
+    injected: bool,
+}
+
+impl ReservationHeadRaceStore {
+    fn new() -> Self {
+        Self {
+            inner: MemoryRunStore::new(),
+            injected: false,
+        }
+    }
+}
+
+impl RunStore for ReservationHeadRaceStore {
+    fn append(&mut self, expected: ExpectedHead, event: RunEvent) -> Result<Commit, StoreError> {
+        if !self.injected && matches!(&event.body, RunEventBody::ModelCallReserved { .. }) {
+            let current = self
+                .inner
+                .load_current()?
+                .expect("configured Run should exist");
+            self.inner.append(
+                ExpectedHead::from_state(&current),
+                seed_event(
+                    "reservation-head-race",
+                    &current.run_id,
+                    RunEventBody::StepPlanned {
+                        step_id: "step-reservation-race".to_owned(),
+                        objective: "concurrent trusted state change".to_owned(),
+                        depends_on: Vec::new(),
+                    },
+                ),
+            )?;
+            self.injected = true;
+        }
+        self.inner.append(expected, event)
+    }
+
+    fn append_with_plan_inputs(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        inputs: Vec<xgeny_workgraph::PlannedInvocationMaterialRecord>,
+    ) -> Result<Commit, StoreError> {
+        self.inner.append_with_plan_inputs(expected, event, inputs)
+    }
+
+    fn load(&self) -> Result<Option<RunSnapshot>, StoreError> {
+        self.inner.load()
+    }
+
+    fn load_current(&self) -> Result<Option<RunState>, StoreError> {
+        self.inner.load_current()
+    }
+
+    fn load_planning_snapshot(
+        &self,
+        expected: ExpectedHead,
+        max_output_bytes: u64,
+    ) -> Result<Option<RunPlanningSnapshot>, StoreError> {
+        self.inner
+            .load_planning_snapshot(expected, max_output_bytes)
     }
 }
 
@@ -1812,7 +1946,8 @@ fn context_preserves_whole_schemas_steps_and_host_owned_digest_envelope() {
         }
     ));
     let context = &planner.contexts[0];
-    assert_eq!(context.profile_version(), "xgeny.planning-context/v1");
+    assert_eq!(context.profile_version(), "xgeny.planning-context/v2");
+    assert!(context.tool_outputs().is_empty());
     assert_eq!(context.steps().len(), 1);
     assert_eq!(context.omitted_steps(), 0);
     assert_eq!(context.steps()[0].step_id(), "step-completed");
@@ -2075,6 +2210,37 @@ fn reservation_append_failure_never_invokes_planner_or_consumes_slot() {
     assert_eq!(planner.calls, 0);
     let after = store.load_current().unwrap().unwrap();
     assert_eq!(after, before);
+    assert_model_call_counters(&after, 0, 0, 0, 0);
+}
+
+#[test]
+fn head_change_after_snapshot_rejects_reservation_before_planner_call() {
+    let run_id = "run-agent-loop-reservation-head-race";
+    let loop_budget = budget(2, 2, 2, 32_768);
+    let mut store = ReservationHeadRaceStore::new();
+    create_run(&mut store, run_id);
+    let agent_loop = configure(&mut store, run_id, &loop_budget);
+    let before = store.load_current().unwrap().unwrap();
+    let mut planner = ScriptedPlanner::default();
+    let error = agent_loop
+        .tick(
+            &mut store,
+            &mut DeterministicEvents,
+            &FixedLease(run_id.to_owned()),
+            &xgeny_runtime::CapabilityRegistry::new(),
+            &CanonicalResolver::default(),
+            &mut planner,
+            &mut RecordingMaterializer::default(),
+        )
+        .expect_err("concurrent head change must reject the stale reservation");
+    assert!(matches!(
+        error,
+        AgentLoopError::Store(StoreError::HeadConflict { .. })
+    ));
+    assert_eq!(planner.calls, 0);
+    let after = store.load_current().unwrap().unwrap();
+    assert_eq!(after.journal_sequence, before.journal_sequence + 1);
+    assert!(after.steps.contains_key("step-reservation-race"));
     assert_model_call_counters(&after, 0, 0, 0, 0);
 }
 

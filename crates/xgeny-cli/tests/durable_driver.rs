@@ -15,7 +15,9 @@ use xgeny_domain::{
     EffectClass, GrantLifetime, OperatingSystem, Platform, PolicySource, PolicySourceKind,
     ProtocolDocument, TrustLevel, VerificationResult,
 };
-use xgeny_local_store::{ExpectedHead, RunStore, SqliteRunStore};
+use xgeny_local_store::{
+    Commit, ExpectedHead, RunPlanningSnapshot, RunSnapshot, RunStore, SqliteRunStore, StoreError,
+};
 use xgeny_policy::{
     PolicyAllowance, PolicyContribution, PolicyInputs, ResolvedPermissionRequest,
     ResourceResolutionFailure, ResourceResolver,
@@ -23,18 +25,19 @@ use xgeny_policy::{
 use xgeny_runtime::{
     AdapterEvidenceDigest, AdapterExecutionObservation, AdapterPrepareFailure,
     AdapterPrepareRequest, AdapterReconcileRequest, AdapterReconciliationInconclusiveReason,
-    AdapterReconciliationObservation, AdapterToolOutput, AgentLoop, CapabilityRegistry,
-    EffectAdapter, EffectAdapterRegistry, EffectVerifier, EffectVerifierRegistry, EventFactory,
-    EventFactoryError, EventMetadata, InvocationMaterialProvider, LocalRunLease,
-    MaterialProviderFailure, MaterialProviderRegistry, PlanMaterializationRequest,
-    PlanMaterializer, PlanMaterializerFailure, PlanProposal, PlannerCallRequest, PlannerPort,
-    PlannerPortFailure, PreparedAdapterInvocation, ProposedPlanStep, RequiredRouteFeatures,
-    RouteRequest, RuleVerificationObservation, VerificationPortFailure, VerificationReport,
-    VerificationRequest, VerifiedArtifactDescriptor, VerifierOutputDigest,
+    AdapterReconciliationObservation, AdapterToolOutput, AgentLoop, AgentLoopError,
+    AgentLoopQuiescence, AgentLoopTick, CapabilityRegistry, EffectAdapter, EffectAdapterRegistry,
+    EffectVerifier, EffectVerifierRegistry, EventFactory, EventFactoryError, EventMetadata,
+    InvocationMaterialProvider, LocalRunLease, MaterialProviderFailure, MaterialProviderRegistry,
+    PlanMaterializationRequest, PlanMaterializer, PlanMaterializerFailure, PlanProposal,
+    PlannerCallRequest, PlannerPort, PlannerPortFailure, PreparedAdapterInvocation,
+    ProposedPlanStep, RequiredRouteFeatures, RouteRequest, RuleVerificationObservation,
+    VerificationPortFailure, VerificationReport, VerificationRequest, VerifiedArtifactDescriptor,
+    VerifierOutputDigest,
 };
 use xgeny_workgraph::{
-    AgentLoopBudget, PlannedExecutionProfile, ReconstructableMaterialReference, RunEvent,
-    RunEventBody, RunState, StepStatus,
+    AgentLoopBudget, EventRecord, PlannedExecutionProfile, ReconstructableMaterialReference,
+    RunEvent, RunEventBody, RunState, StepStatus, ToolOutputRecord, apply_record,
 };
 
 const RUN_ID: &str = "run-cli-driver-read-only";
@@ -74,6 +77,9 @@ impl ResourceResolver for CanonicalResolver {
 struct ScriptedPlanner {
     proposals: VecDeque<PlanProposal>,
     calls: Rc<Cell<usize>>,
+    contexts: Rc<RefCell<Vec<Value>>>,
+    context_sizes: Rc<RefCell<Vec<u64>>>,
+    context_digests: Rc<RefCell<Vec<String>>>,
 }
 
 impl PlannerPort for ScriptedPlanner {
@@ -87,13 +93,97 @@ impl PlannerPort for ScriptedPlanner {
 
     fn plan(
         &mut self,
-        _request: &PlannerCallRequest<'_>,
+        request: &PlannerCallRequest<'_>,
     ) -> Result<PlanProposal, PlannerPortFailure> {
         self.calls.set(self.calls.get() + 1);
+        assert!(!format!("{request:?}").contains("fixture-content"));
+        assert!(!format!("{:?}", request.context()).contains("fixture-content"));
+        assert!(
+            request
+                .context()
+                .tool_outputs()
+                .iter()
+                .all(|output| !format!("{output:?}").contains("fixture-content"))
+        );
+        self.contexts.borrow_mut().push(
+            serde_json::to_value(request.context())
+                .expect("planning context should serialize for observation"),
+        );
+        self.context_sizes
+            .borrow_mut()
+            .push(request.context().canonical_size_bytes());
+        self.context_digests
+            .borrow_mut()
+            .push(request.context().context_digest().to_owned());
         Ok(self
             .proposals
             .pop_front()
             .expect("planner calls must be scripted"))
+    }
+}
+
+struct PlanningProjectionStore {
+    state: RunState,
+    outputs: BTreeMap<String, ToolOutputRecord>,
+}
+
+impl RunStore for PlanningProjectionStore {
+    fn append(&mut self, expected: ExpectedHead, event: RunEvent) -> Result<Commit, StoreError> {
+        let actual = ExpectedHead::from_state(&self.state);
+        if expected != actual {
+            return Err(StoreError::HeadConflict { expected, actual });
+        }
+        let previous = EventRecord {
+            sequence: self.state.journal_sequence,
+            previous_digest: None,
+            event: RunEvent {
+                event_id: "planning-projection-placeholder".to_owned(),
+                run_id: self.state.run_id.clone(),
+                authority: self.state.authority.clone(),
+                authority_epoch: self.state.authority_epoch,
+                recorded_at: "2026-08-30T10:00:00Z".to_owned(),
+                body: RunEventBody::RunCreated {
+                    goal: self.state.goal.clone(),
+                },
+            },
+            digest: self.state.journal_head_digest.clone(),
+        };
+        let record = EventRecord::next(Some(&previous), event)?;
+        let state = apply_record(Some(&self.state), &record)?;
+        self.state = state.clone();
+        Ok(Commit { record, state })
+    }
+
+    fn load(&self) -> Result<Option<RunSnapshot>, StoreError> {
+        Ok(Some(RunSnapshot {
+            records: Vec::new(),
+            state: self.state.clone(),
+        }))
+    }
+
+    fn load_current(&self) -> Result<Option<RunState>, StoreError> {
+        Ok(Some(self.state.clone()))
+    }
+
+    fn load_planning_snapshot(
+        &self,
+        expected: ExpectedHead,
+        max_output_bytes: u64,
+    ) -> Result<Option<RunPlanningSnapshot>, StoreError> {
+        let actual = ExpectedHead::from_state(&self.state);
+        if expected != actual {
+            return Err(StoreError::HeadConflict { expected, actual });
+        }
+        let total = self.outputs.values().try_fold(0_u64, |bytes, output| {
+            bytes.checked_add(output.canonical_size_bytes())
+        });
+        if total.is_none_or(|bytes| bytes > max_output_bytes) {
+            return Err(StoreError::PlanningSnapshotBudgetExceeded);
+        }
+        Ok(Some(RunPlanningSnapshot::new(
+            self.state.clone(),
+            self.outputs.clone(),
+        )))
     }
 }
 
@@ -391,6 +481,9 @@ fn sqlite_driver_completes_read_only_plan_with_core_bound_artifact_and_replays()
         .register("test-recipes", MemoryRecipeProvider(recipes))
         .expect("provider should register");
     let planner_calls = Rc::new(Cell::new(0));
+    let planner_contexts = Rc::new(RefCell::new(Vec::new()));
+    let planner_context_sizes = Rc::new(RefCell::new(Vec::new()));
+    let planner_context_digests = Rc::new(RefCell::new(Vec::new()));
     let mut planner = ScriptedPlanner {
         proposals: VecDeque::from([
             PlanProposal::plan(vec![ProposedPlanStep::new(
@@ -403,6 +496,9 @@ fn sqlite_driver_completes_read_only_plan_with_core_bound_artifact_and_replays()
             PlanProposal::completion_candidate("test-only completion"),
         ]),
         calls: Rc::clone(&planner_calls),
+        contexts: Rc::clone(&planner_contexts),
+        context_sizes: Rc::clone(&planner_context_sizes),
+        context_digests: Rc::clone(&planner_context_digests),
     };
     let mut routes = ExactReadOnlyRoute {
         capability,
@@ -448,6 +544,7 @@ fn sqlite_driver_completes_read_only_plan_with_core_bound_artifact_and_replays()
         .expect("driver should yield for explicit approval");
     assert!(matches!(outcome, DriverOutcome::ApprovalPending { .. }));
     assert_eq!(planner_calls.get(), 1);
+    assert_eq!(planner_contexts.borrow()[0]["toolOutputs"], json!([]));
     assert_eq!(prepare_calls.get(), 0);
     assert_eq!(execute_calls.get(), 0);
     assert_eq!(verify_calls.get(), 0);
@@ -552,6 +649,11 @@ fn sqlite_driver_completes_read_only_plan_with_core_bound_artifact_and_replays()
             .status,
         StepStatus::Validating
     );
+    assert_eq!(
+        planner_calls.get(),
+        1,
+        "Validating must not invoke the planner"
+    );
     drop(reopened);
 
     let mut reopened = SqliteRunStore::open(&database).expect("SQLite should reopen at validation");
@@ -580,6 +682,27 @@ fn sqlite_driver_completes_read_only_plan_with_core_bound_artifact_and_replays()
         state.steps.values().next().unwrap().status,
         StepStatus::Completed
     );
+    assert_eq!(
+        planner_calls.get(),
+        1,
+        "verification must not invoke the planner"
+    );
+    let completed_state = state.clone();
+    let completed_step = completed_state
+        .steps
+        .values()
+        .next()
+        .expect("completed Step should exist");
+    let completed_output = reopened
+        .load_tool_output(
+            &completed_step
+                .intent
+                .as_ref()
+                .expect("completed Step should retain its intent")
+                .effect_id,
+        )
+        .expect("tool output should load")
+        .expect("completed read-only Step should retain exact output");
     let receipts = reopened.load_execution_receipts().unwrap();
     assert_eq!(receipts.len(), 1);
     let receipt = &receipts[0];
@@ -615,8 +738,76 @@ fn sqlite_driver_completes_read_only_plan_with_core_bound_artifact_and_replays()
                 .load_verification_snapshot(&receipt.step_id)
                 .expect("verification snapshot should load")
         ),
+        format!(
+            "{:?}",
+            reopened
+                .load_planning_snapshot(ExpectedHead::from_state(&state), budget.max_context_bytes,)
+                .expect("planning snapshot should load")
+        ),
     ] {
         assert!(!public_surface.contains("fixture-content"));
+    }
+
+    let tampered_output = ToolOutputRecord::new(
+        RUN_ID,
+        completed_step.step_id.clone(),
+        completed_step
+            .intent
+            .as_ref()
+            .expect("completed Step should retain its intent"),
+        completed_step.attempts,
+        completed_step
+            .effect_evidence_digest
+            .as_deref()
+            .expect("completed Step should retain evidence"),
+        json!({"content": "fixture-content-tampered", "digest": ARTIFACT_DIGEST}),
+    )
+    .expect("alternate output should be internally valid");
+    let forged_cases = [
+        ("missing", BTreeMap::new()),
+        (
+            "body-digest-mismatch",
+            BTreeMap::from([(completed_step.step_id.clone(), tampered_output)]),
+        ),
+        (
+            "step-binding-mismatch",
+            BTreeMap::from([("step-wrong-binding".to_owned(), completed_output.clone())]),
+        ),
+    ];
+    for (case, outputs) in forged_cases {
+        let forged_calls = Rc::new(Cell::new(0));
+        let mut forged_planner = ScriptedPlanner {
+            proposals: VecDeque::from([PlanProposal::completion_candidate(
+                "must never be requested",
+            )]),
+            calls: Rc::clone(&forged_calls),
+            contexts: Rc::new(RefCell::new(Vec::new())),
+            context_sizes: Rc::new(RefCell::new(Vec::new())),
+            context_digests: Rc::new(RefCell::new(Vec::new())),
+        };
+        let mut forged_store = PlanningProjectionStore {
+            state: completed_state.clone(),
+            outputs,
+        };
+        let forged_before = forged_store.state.clone();
+        let forged = AgentLoop::new(budget.clone()).tick(
+            &mut forged_store,
+            &mut events,
+            &lease,
+            &registry,
+            &CanonicalResolver,
+            &mut forged_planner,
+            &mut materializer,
+        );
+        assert!(
+            matches!(forged, Err(AgentLoopError::PlanningSnapshotMismatch)),
+            "unexpected forged snapshot result for {case}: {forged:?}"
+        );
+        assert_eq!(forged_calls.get(), 0, "planner called for {case}");
+        assert_eq!(
+            forged_store.state, forged_before,
+            "state changed for {case}"
+        );
     }
     drop(reopened);
 
@@ -639,6 +830,180 @@ fn sqlite_driver_completes_read_only_plan_with_core_bound_artifact_and_replays()
         .expect("completed Step should allow the scripted completion candidate");
     assert!(matches!(completion, DriverOutcome::CompletionCandidate(_)));
     assert_eq!(planner_calls.get(), 2);
+    let contexts = planner_contexts.borrow();
+    assert_eq!(contexts.len(), 2);
+    let continued = &contexts[1];
+    assert_eq!(continued["profileVersion"], "xgeny.planning-context/v2");
+    let outputs = continued["toolOutputs"]
+        .as_array()
+        .expect("toolOutputs should be an array");
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(
+        outputs[0]["output"],
+        json!({"content": "fixture-content", "digest": ARTIFACT_DIGEST})
+    );
+    assert_eq!(outputs[0]["outputDigest"], OUTPUT_DIGEST);
+    assert_eq!(outputs[0]["receiptDigest"], receipt.receipt_digest);
+    assert_eq!(
+        serde_json::to_string(continued)
+            .expect("continued context should serialize")
+            .matches("fixture-content")
+            .count(),
+        1
+    );
+    drop(contexts);
+    let generous_context_bytes = planner_context_sizes.borrow()[1];
+    let output_map = BTreeMap::from([(
+        completed_output.step_id().to_owned(),
+        completed_output.clone(),
+    )]);
+    let completed_intent = completed_step
+        .intent
+        .as_ref()
+        .expect("completed Step should retain its intent");
+    let completed_evidence = completed_step
+        .effect_evidence_digest
+        .as_deref()
+        .expect("completed Step should retain evidence");
+    let output_with_order = |raw: &str| {
+        ToolOutputRecord::new(
+            RUN_ID,
+            completed_step.step_id.clone(),
+            completed_intent,
+            completed_step.attempts,
+            completed_evidence,
+            serde_json::from_str(raw).expect("ordered output should be valid JSON"),
+        )
+        .expect("ordered output should bind")
+    };
+    let ordered_ab = output_with_order(r#"{"a":1,"b":2}"#);
+    let ordered_ba = output_with_order(r#"{"b":2,"a":1}"#);
+    let mutated = output_with_order(r#"{"a":1,"b":3}"#);
+    let mut capture_output_context_digest = |output: ToolOutputRecord| {
+        let mut candidate_state = completed_state.clone();
+        candidate_state
+            .steps
+            .get_mut(completed_output.step_id())
+            .expect("completed Step should exist")
+            .output_record_digest = Some(output.record_digest().to_owned());
+        let calls = Rc::new(Cell::new(0));
+        let digests = Rc::new(RefCell::new(Vec::new()));
+        let mut candidate_planner = ScriptedPlanner {
+            proposals: VecDeque::from([PlanProposal::completion_candidate("digest")]),
+            calls: Rc::clone(&calls),
+            contexts: Rc::new(RefCell::new(Vec::new())),
+            context_sizes: Rc::new(RefCell::new(Vec::new())),
+            context_digests: Rc::clone(&digests),
+        };
+        let mut candidate_store = PlanningProjectionStore {
+            state: candidate_state,
+            outputs: BTreeMap::from([(completed_output.step_id().to_owned(), output)]),
+        };
+        let tick = AgentLoop::new(budget.clone())
+            .tick(
+                &mut candidate_store,
+                &mut events,
+                &lease,
+                &registry,
+                &CanonicalResolver,
+                &mut candidate_planner,
+                &mut materializer,
+            )
+            .expect("digest fixture should complete");
+        assert!(matches!(tick, AgentLoopTick::CompletionCandidate { .. }));
+        assert_eq!(calls.get(), 1);
+        digests.borrow()[0].clone()
+    };
+    let digest_ab = capture_output_context_digest(ordered_ab);
+    let digest_ba = capture_output_context_digest(ordered_ba);
+    let digest_mutated = capture_output_context_digest(mutated);
+    assert_eq!(
+        digest_ab, digest_ba,
+        "JSON key order must not affect context digest"
+    );
+    assert_ne!(
+        digest_ab, digest_mutated,
+        "exact output body changes must affect context digest"
+    );
+    let mut boundary_tick = |limit: u64| {
+        let mut candidate_budget = budget.clone();
+        candidate_budget.max_context_bytes = limit;
+        let mut candidate_state = completed_state.clone();
+        candidate_state
+            .agent_loop
+            .as_mut()
+            .expect("AgentLoop should be configured")
+            .budget = candidate_budget.clone();
+        let calls = Rc::new(Cell::new(0));
+        let mut candidate_planner = ScriptedPlanner {
+            proposals: VecDeque::from([PlanProposal::completion_candidate("boundary")]),
+            calls: Rc::clone(&calls),
+            contexts: Rc::new(RefCell::new(Vec::new())),
+            context_sizes: Rc::new(RefCell::new(Vec::new())),
+            context_digests: Rc::new(RefCell::new(Vec::new())),
+        };
+        let mut candidate_store = PlanningProjectionStore {
+            state: candidate_state,
+            outputs: output_map.clone(),
+        };
+        let before = candidate_store.state.clone();
+        let tick = AgentLoop::new(candidate_budget)
+            .tick(
+                &mut candidate_store,
+                &mut events,
+                &lease,
+                &registry,
+                &CanonicalResolver,
+                &mut candidate_planner,
+                &mut materializer,
+            )
+            .expect("context boundary should have a closed outcome");
+        (tick, calls.get(), before, candidate_store.state)
+    };
+    let mut lower = 1_u64;
+    let mut upper = generous_context_bytes;
+    while lower < upper {
+        let middle = lower + (upper - lower) / 2;
+        let (tick, calls, _, _) = boundary_tick(middle);
+        match tick {
+            xgeny_runtime::AgentLoopTick::CompletionCandidate { .. } => {
+                assert_eq!(calls, 1);
+                upper = middle;
+            }
+            xgeny_runtime::AgentLoopTick::Quiescent {
+                reason: AgentLoopQuiescence::ContextBudgetExceeded,
+                ..
+            } => {
+                assert_eq!(calls, 0);
+                lower = middle + 1;
+            }
+            other => panic!("unexpected context-boundary tick: {other:?}"),
+        }
+    }
+    let exact_context_bytes = lower;
+    let (exact_tick, exact_calls, _, _) = boundary_tick(exact_context_bytes);
+    assert!(matches!(
+        exact_tick,
+        xgeny_runtime::AgentLoopTick::CompletionCandidate {
+            newly_recorded: true,
+            ..
+        }
+    ));
+    assert_eq!(exact_calls, 1);
+    let (short_tick, short_calls, short_before, short_after) = boundary_tick(
+        exact_context_bytes
+            .checked_sub(1)
+            .expect("planning context should be non-empty"),
+    );
+    assert!(matches!(
+        short_tick,
+        xgeny_runtime::AgentLoopTick::Quiescent {
+            reason: AgentLoopQuiescence::ContextBudgetExceeded,
+            ..
+        }
+    ));
+    assert_eq!(short_calls, 0);
+    assert_eq!(short_after, short_before);
     assert_eq!(execute_calls.get(), 1);
     assert_eq!(verify_calls.get(), 1);
     drop(reopened);
