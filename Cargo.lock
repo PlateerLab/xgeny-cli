@@ -1786,16 +1786,24 @@ dependencies = [
 name = "xgeny-cli"
 version = "0.1.0"
 dependencies = [
+ "cap-fs-ext",
+ "cap-std",
  "clap",
+ "getrandom 0.3.4",
+ "rusqlite",
+ "serde",
+ "serde_jcs",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror",
+ "time",
  "xgeny-adapter-filesystem",
  "xgeny-domain",
  "xgeny-local-store",
  "xgeny-policy",
  "xgeny-protocol",
+ "xgeny-provider-openai",
  "xgeny-runtime",
  "xgeny-workgraph",
 ]
@@ -1812,6 +1820,7 @@ dependencies = [
 name = "xgeny-local-store"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rusqlite",
  "serde",
  "serde_jcs",
@@ -1819,6 +1828,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "time",
+ "url",
  "xgeny-domain",
  "xgeny-protocol",
  "xgeny-workgraph",

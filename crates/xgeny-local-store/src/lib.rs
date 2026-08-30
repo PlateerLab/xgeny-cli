@@ -2304,6 +2304,16 @@ pub enum StoreError {
     Protocol(#[from] ProtocolError),
     #[error("event id `{0}` is already committed")]
     DuplicateEventId(String),
+    #[error("local store database path must identify a durable file")]
+    InvalidDatabasePath,
+    #[error("local store database already exists")]
+    DatabaseAlreadyExists,
+    #[error("local store database could not be created")]
+    DatabaseCreateFailed,
+    #[error("local store database could not be opened")]
+    DatabaseOpenFailed,
+    #[error("local store database has not been initialized")]
+    DatabaseNotInitialized,
     #[error("SQLite operation failed: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("JSON operation failed: {0}")]
@@ -6040,6 +6050,325 @@ mod tests {
                 .invocation_material_count()
                 .expect("material count should work"),
             1
+        );
+    }
+
+    #[test]
+    fn sqlite_create_is_exclusive_and_open_existing_reopens() {
+        let directory = tempdir().expect("temp directory should exist");
+        let path = directory.path().join("run.db");
+
+        let created = SqliteRunStore::create(&path).expect("new SQLite store should be created");
+        assert!(path.exists());
+        assert!(created.load().expect("fresh store should load").is_none());
+
+        assert!(matches!(
+            SqliteRunStore::create(&path),
+            Err(StoreError::DatabaseAlreadyExists)
+        ));
+
+        drop(created);
+        let reopened =
+            SqliteRunStore::open_existing(&path).expect("existing SQLite store should reopen");
+        assert!(
+            reopened
+                .load()
+                .expect("reopened store should load")
+                .is_none()
+        );
+
+        drop(reopened);
+        let read_only = SqliteRunStore::open_existing_read_only(&path)
+            .expect("current schema should open read-only");
+        assert!(
+            read_only
+                .load()
+                .expect("read-only store should verify")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn sqlite_read_only_preflight_does_not_reconfigure_or_migrate() {
+        let directory = tempdir().expect("temp directory should exist");
+        let path = directory.path().join("run.db");
+        let expected = {
+            let mut store = SqliteRunStore::create(&path).expect("store should create");
+            seed(&mut store).state
+        };
+        let before_database = fs::read(&path).expect("database should be readable");
+        let before_entries = fs::read_dir(directory.path())
+            .expect("directory should be readable")
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        let read_only = SqliteRunStore::open_existing_read_only(&path)
+            .expect("schema 8 should pass read-only preflight");
+        assert_eq!(
+            read_only
+                .load_current()
+                .expect("verified state should load")
+                .expect("run should exist"),
+            expected
+        );
+        let during_entries = fs::read_dir(directory.path())
+            .expect("directory should remain readable")
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(during_entries, before_entries);
+        assert!(!crate::sqlite::sqlite_sidecar_path(&path, "-wal").exists());
+        assert!(!crate::sqlite::sqlite_sidecar_path(&path, "-shm").exists());
+        drop(read_only);
+
+        assert_eq!(
+            fs::read(&path).expect("database should remain readable"),
+            before_database
+        );
+        let after_entries = fs::read_dir(directory.path())
+            .expect("directory should remain readable")
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(after_entries, before_entries);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep both crash-WAL/SHM source-invariance cases adjacent.
+    fn sqlite_read_only_preflight_recovers_a_private_wal_copy_without_touching_source_files() {
+        let directory = tempdir().expect("temp directory should exist");
+        let writer_path = directory.path().join("writer.db");
+        let mut writer = SqliteRunStore::create(&writer_path).expect("writer store should create");
+        let expected = seed(&mut writer).state;
+        let writer_wal = crate::sqlite::sqlite_sidecar_path(&writer_path, "-wal");
+        let writer_shm = crate::sqlite::sqlite_sidecar_path(&writer_path, "-shm");
+        assert!(
+            writer_wal.exists(),
+            "fixture must retain committed WAL pages"
+        );
+        assert!(
+            fs::metadata(&writer_wal)
+                .expect("writer WAL should have metadata")
+                .len()
+                > 0,
+            "fixture WAL must be non-empty"
+        );
+        assert!(writer_shm.exists(), "writer fixture should expose SHM");
+
+        for (fixture_name, copy_source_shm) in
+            [("crashed-without-shm", false), ("crashed-with-shm", true)]
+        {
+            let crash_directory = directory.path().join(fixture_name);
+            fs::create_dir(&crash_directory).expect("crash fixture directory should create");
+            let crash_path = crash_directory.join("run.sqlite3");
+            let crash_wal = crate::sqlite::sqlite_sidecar_path(&crash_path, "-wal");
+            let crash_shm = crate::sqlite::sqlite_sidecar_path(&crash_path, "-shm");
+            fs::copy(&writer_path, &crash_path).expect("database fixture should copy");
+            fs::copy(&writer_wal, &crash_wal).expect("WAL fixture should copy");
+            if copy_source_shm {
+                fs::copy(&writer_shm, &crash_shm).expect("SHM fixture should copy");
+            } else {
+                assert!(
+                    !crash_shm.exists(),
+                    "fixture intentionally models a WAL without source SHM"
+                );
+            }
+
+            let before_files = fs::read_dir(&crash_directory)
+                .expect("crash directory should be readable")
+                .map(|entry| {
+                    let entry = entry.expect("fixture entry should be readable");
+                    (
+                        entry.file_name(),
+                        fs::read(entry.path()).expect("fixture file should be readable"),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let before_entries = before_files
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+
+            let read_only = SqliteRunStore::open_existing_read_only(&crash_path)
+                .expect("private snapshot should recover committed WAL pages");
+            assert_eq!(
+                read_only
+                    .load_current()
+                    .expect("snapshot state should load")
+                    .expect("snapshot should contain the run"),
+                expected
+            );
+            for (name, bytes) in &before_files {
+                assert_eq!(
+                    fs::read(crash_directory.join(name))
+                        .expect("source SQLite file should remain readable"),
+                    *bytes,
+                    "source DB/WAL/SHM bytes must remain unchanged"
+                );
+            }
+            if !copy_source_shm {
+                assert!(
+                    !crash_shm.exists(),
+                    "SQLite must create WAL-index metadata only beside the private copy"
+                );
+            }
+
+            let snapshot_directories = fs::read_dir(&crash_directory)
+                .expect("crash directory should be readable")
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".xgeny-read-only-")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(snapshot_directories.len(), 1);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    snapshot_directories[0]
+                        .metadata()
+                        .expect("snapshot directory should have metadata")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o700
+                );
+            }
+
+            drop(read_only);
+            let after_entries = fs::read_dir(&crash_directory)
+                .expect("crash directory should remain readable")
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(after_entries, before_entries);
+            for (name, bytes) in &before_files {
+                assert_eq!(
+                    fs::read(crash_directory.join(name))
+                        .expect("source SQLite file should remain readable"),
+                    *bytes
+                );
+            }
+            assert_eq!(crash_shm.exists(), copy_source_shm);
+        }
+    }
+
+    #[test]
+    fn sqlite_read_only_preflight_rejects_legacy_schema_without_migration() {
+        let directory = tempdir().expect("temp directory should exist");
+        let path = directory.path().join("legacy.db");
+        drop(SqliteRunStore::create(&path).expect("store should create"));
+        let connection = rusqlite::Connection::open(&path).expect("fixture should open");
+        connection
+            .pragma_update(None, "user_version", 7_i64)
+            .expect("legacy version should write");
+        drop(connection);
+        let before = fs::read(&path).expect("legacy bytes should be readable");
+
+        assert!(matches!(
+            SqliteRunStore::open_existing_read_only(&path),
+            Err(StoreError::UnsupportedSchemaVersion(7))
+        ));
+        assert_eq!(
+            fs::read(&path).expect("legacy bytes should remain readable"),
+            before
+        );
+        assert!(!path.with_extension("db-wal").exists());
+        assert!(!path.with_extension("db-shm").exists());
+    }
+
+    #[test]
+    fn sqlite_open_existing_missing_path_does_not_create_or_disclose_it() {
+        let directory = tempdir().expect("temp directory should exist");
+        let secret_name = "resume-typo-secret-run.db";
+        let path = directory.path().join(secret_name);
+        assert!(!path.exists());
+
+        let error = SqliteRunStore::open_existing(&path)
+            .expect_err("a resume typo must not initialize a new database");
+
+        assert!(matches!(error, StoreError::DatabaseOpenFailed));
+        assert!(!path.exists(), "open_existing must never create a database");
+        assert!(!format!("{error}").contains(secret_name));
+        assert!(!format!("{error:?}").contains(secret_name));
+        assert!(!format!("{error}").contains(&*path.to_string_lossy()));
+        assert!(!format!("{error:?}").contains(&*path.to_string_lossy()));
+    }
+
+    #[test]
+    fn sqlite_open_existing_rejects_an_uninitialized_file_without_mutation() {
+        let directory = tempdir().expect("temp directory should exist");
+        let path = directory.path().join("empty.db");
+        fs::write(&path, []).expect("empty database placeholder should be created");
+        let before = fs::read(&path).expect("placeholder should be readable");
+
+        let error = SqliteRunStore::open_existing(&path)
+            .expect_err("an empty file is not an initialized run store");
+
+        assert!(matches!(error, StoreError::DatabaseNotInitialized));
+        assert_eq!(
+            fs::read(&path).expect("rejected placeholder should remain readable"),
+            before,
+            "open_existing must not initialize an uninitialized file"
+        );
+    }
+
+    #[test]
+    fn sqlite_compat_open_keeps_memory_database_support() {
+        let store =
+            SqliteRunStore::open(":memory:").expect("in-memory SQLite should remain usable");
+        assert!(store.load().expect("in-memory store should load").is_none());
+
+        for invalid_path in ["", ":memory:"] {
+            assert!(matches!(
+                SqliteRunStore::create(invalid_path),
+                Err(StoreError::InvalidDatabasePath)
+            ));
+            assert!(matches!(
+                SqliteRunStore::open_existing(invalid_path),
+                Err(StoreError::InvalidDatabasePath)
+            ));
+        }
+    }
+
+    #[test]
+    fn sqlite_store_debug_does_not_disclose_database_path() {
+        let directory = tempdir().expect("temp directory should exist");
+        let secret_name = "debug-secret-run.db";
+        let path = directory.path().join(secret_name);
+        let store = SqliteRunStore::create(&path).expect("SQLite store should be created");
+
+        let debug = format!("{store:?}");
+        assert!(debug.contains("SqliteRunStore"));
+        assert!(!debug.contains(secret_name));
+        assert!(!debug.contains(&*path.to_string_lossy()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_file_open_modes_reject_a_symlink_without_mutating_its_target() {
+        let directory = tempdir().expect("temp directory should exist");
+        let target_name = "symlink-target-secret.db";
+        let link_name = "symlink-entry-secret.db";
+        let target = directory.path().join(target_name);
+        let link = directory.path().join(link_name);
+        drop(SqliteRunStore::create(&target).expect("target SQLite store should be created"));
+        let before = fs::read(&target).expect("target database should be readable");
+        std::os::unix::fs::symlink(&target, &link).expect("database symlink should be created");
+
+        let existing_error = SqliteRunStore::open_existing(&link)
+            .expect_err("open_existing must reject a symlink database");
+        assert!(matches!(existing_error, StoreError::DatabaseOpenFailed));
+        assert!(!format!("{existing_error}").contains(link_name));
+        assert!(!format!("{existing_error:?}").contains(target_name));
+
+        let compat_error =
+            SqliteRunStore::open(&link).expect_err("compatibility open must reject a symlink");
+        assert!(matches!(compat_error, StoreError::DatabaseOpenFailed));
+        assert_eq!(
+            fs::read(&target).expect("target database should remain readable"),
+            before,
+            "rejected symlink opens must not mutate the target"
         );
     }
 

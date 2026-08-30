@@ -12,20 +12,28 @@ name = "xgeny"
 path = "src/main.rs"
 
 [dependencies]
+cap-fs-ext.workspace = true
+cap-std.workspace = true
 clap.workspace = true
+getrandom.workspace = true
+serde.workspace = true
+serde_jcs.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
+time.workspace = true
+xgeny-adapter-filesystem = { path = "../xgeny-adapter-filesystem" }
+xgeny-domain = { path = "../xgeny-domain" }
 xgeny-local-store = { path = "../xgeny-local-store" }
 xgeny-policy = { path = "../xgeny-policy" }
 xgeny-protocol = { path = "../xgeny-protocol" }
+xgeny-provider-openai = { path = "../xgeny-provider-openai" }
 xgeny-runtime = { path = "../xgeny-runtime" }
 xgeny-workgraph = { path = "../xgeny-workgraph" }
 
 [dev-dependencies]
-serde_json.workspace = true
-sha2.workspace = true
+rusqlite.workspace = true
 tempfile.workspace = true
-xgeny-adapter-filesystem = { path = "../xgeny-adapter-filesystem" }
-xgeny-domain = { path = "../xgeny-domain" }
 
 [lints]
 workspace = true
