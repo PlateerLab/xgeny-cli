@@ -16,7 +16,7 @@ use crate::{
     verify_receipt_candidate, verify_receipt_records,
 };
 
-const STORE_SCHEMA_VERSION: i64 = 4;
+const STORE_SCHEMA_VERSION: i64 = 5;
 
 const CREATE_RECEIPT_SCHEMA: &str = r"
 CREATE TABLE execution_receipts (
@@ -125,6 +125,10 @@ impl SqliteRunStore {
             3 => {
                 configure_connection(&connection)?;
                 migrate_schema_three(&mut connection)?;
+            }
+            4 => {
+                configure_connection(&connection)?;
+                migrate_schema_four(&mut connection)?;
             }
             STORE_SCHEMA_VERSION => configure_connection(&connection)?,
             unsupported => return Err(StoreError::UnsupportedSchemaVersion(unsupported)),
@@ -572,7 +576,7 @@ fn load_verified_store_data(
     Ok((snapshot, receipts, index))
 }
 
-fn migrate_schema_three(connection: &mut Connection) -> Result<(), StoreError> {
+pub(crate) fn migrate_schema_three(connection: &mut Connection) -> Result<(), StoreError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let version: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match version {
@@ -583,6 +587,36 @@ fn migrate_schema_three(connection: &mut Connection) -> Result<(), StoreError> {
             let (_, mut index) = audit_snapshot(records, projection, &mut metrics)?;
             validate_derived_state_without_receipts(&transaction, &mut index, &mut metrics)?;
             transaction.execute_batch(CREATE_RECEIPT_SCHEMA)?;
+            verify_receipt_records(&mut index, &[], &mut metrics)?;
+            transaction.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
+            transaction.commit()?;
+            Ok(())
+        }
+        4 => {
+            // Another schema-4 binary may have completed the 3 -> 4 migration after `open`
+            // observed version 3 but before this immediate transaction acquired the writer lock.
+            // Re-audit the now-current format and converge instead of requiring a process restart.
+            let mut metrics = AuditMetrics::default();
+            let _ = load_verified_store_data(&transaction, &mut metrics)?;
+            transaction.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
+            transaction.commit()?;
+            Ok(())
+        }
+        STORE_SCHEMA_VERSION => {
+            transaction.commit()?;
+            Ok(())
+        }
+        unsupported => Err(StoreError::UnsupportedSchemaVersion(unsupported)),
+    }
+}
+
+fn migrate_schema_four(connection: &mut Connection) -> Result<(), StoreError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let version: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    match version {
+        4 => {
+            let mut metrics = AuditMetrics::default();
+            let _ = load_verified_store_data(&transaction, &mut metrics)?;
             transaction.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())
@@ -938,21 +972,28 @@ fn write_projection(transaction: &Transaction<'_>, state: &RunState) -> Result<(
 
 fn load_records(connection: &Connection) -> Result<Vec<EventRecord>, StoreError> {
     let mut statement = connection.prepare(
-        "SELECT sequence, previous_digest, digest, event_json FROM run_events ORDER BY sequence",
+        "SELECT sequence, event_id, previous_digest, digest, event_json \
+         FROM run_events ORDER BY sequence",
     )?;
     let rows = statement.query_map([], |row| {
         Ok((
             row.get::<_, i64>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, Vec<u8>>(3)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Vec<u8>>(4)?,
         ))
     })?;
     let mut records = Vec::new();
     for row in rows {
-        let (sequence, previous_digest, digest, event_json) = row?;
+        let (sequence, event_id, previous_digest, digest, event_json) = row?;
         let sequence = u64::try_from(sequence).map_err(|_| StoreError::SequenceOutOfRange)?;
-        let event = serde_json::from_slice(&event_json)?;
+        let event: RunEvent = serde_json::from_slice(&event_json)?;
+        if event.event_id != event_id {
+            return Err(StoreError::Corrupt(
+                "run event ID index differs from the journal event".to_owned(),
+            ));
+        }
         records.push(EventRecord {
             sequence,
             previous_digest,

@@ -6,6 +6,8 @@
 - 공개 protocol v0.1 변경: 없음
 - local store schema 변경: 없음 (schema 4 유지)
 
+> 후속 상태: ADR-0014가 journal/index 구조를 바꾸지 않고 immutable dependency DAG와 derived frontier를 추가했다. Schema 4가 새 dependency 의미를 무시하는 downgrade를 막기 위해 current local store schema는 5이며, 아래 schema 4 설명은 ADR-0013 결정 당시의 기록이다.
+
 ## 문맥
 
 ADR-0012까지는 store append와 runtime coordination이 매번 journal, projection, material sidecar와 전체 Receipt chain을 다시 읽고 검증했다. Receipt 검증도 각 Receipt마다 intent, start와 final event를 journal에서 다시 찾았기 때문에 Receipt 수를 `R`, event 수를 `E`라 할 때 최악 `O(R × E)`의 역사 검색이 발생했다.
@@ -111,4 +113,4 @@ SQLite의 `data_version`과 transaction 의미는 공식 문서를 기준으로 
 
 장기 Run의 정상 coordination과 Receipt finalization은 더 이상 전체 journal과 Receipt chain을 매번 복제·재검증하지 않는다. 동시에 fresh open, 외부 generation 변경과 명시적 audit/export에서는 기존 hash-chain, projection, material과 Receipt 검증을 유지한다.
 
-다음 성능 병목은 `RunState` 전체 clone과 projection rewrite다. 기능 순서상 다음 큰 수직 slice인 Tracked/Persistent WorkGraph와 runnable frontier를 구현할 때 graph 규모 계측을 함께 추가하고, reducer 구조 변경은 측정 결과를 근거로 별도 ADR에서 결정한다.
+다음 성능 병목은 `RunState` 전체 clone과 projection rewrite다. 후속 ADR-0014는 Tracked/Persistent WorkGraph와 runnable frontier, graph 규모 계측을 추가했으며 reducer 구조 변경은 여전히 측정 결과를 근거로 별도 ADR에서 결정한다.

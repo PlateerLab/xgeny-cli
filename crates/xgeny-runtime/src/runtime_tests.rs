@@ -350,6 +350,7 @@ fn seed_intent<S: RunStore>(store: &mut S, guarantee: SinkGuarantee) -> RunState
         RunEventBody::StepPlanned {
             step_id: STEP_ID.to_owned(),
             objective: "perform effect".to_owned(),
+            depends_on: Vec::new(),
         },
     );
     let effect = effect_intent(&planned, guarantee);
@@ -983,6 +984,7 @@ fn prepared_effect_from_an_older_head_never_starts_execution() {
         RunEventBody::StepPlanned {
             step_id: "step-unrelated".to_owned(),
             objective: "advance the journal head".to_owned(),
+            depends_on: Vec::new(),
         },
     );
     trace.borrow_mut().clear();

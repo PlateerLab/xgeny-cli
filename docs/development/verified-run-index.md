@@ -3,7 +3,9 @@
 - 기준일: 2026-08-30
 - 상태: ADR-0013 연구 gate 기본형
 - 공개 protocol v0.1 변경: 없음
-- local store schema: 4 유지
+- 도입 당시 schema: 4; current local store schema: 5
+
+> ADR-0014는 index row 구조를 바꾸지 않고 Persistent WorkGraph frontier를 추가했다. Schema 5는 dependency 의미 downgrade를 막는 version fence이며 schema 4 blob을 다시 쓰지 않는다.
 
 ## 목적
 
@@ -114,9 +116,10 @@ cargo build --workspace --release --locked
 
 ## 후속 작업
 
-- Tracked/Persistent WorkGraph와 runnable frontier에 graph 규모 counter 추가
 - Step 수 증가 시 `apply_record` clone과 projection rewrite characterization
 - 필요할 때 persistent collections, reducer mutation 전략 또는 projection 분할을 별도 ADR로 비교
 - portable journal+Receipt archive/import generation 계약
+
+Tracked/Persistent WorkGraph와 graph 규모 counter는 ADR-0014에서 구현했다. Frontier 자체는 반복형 one-pass visit을 검증하지만 owned projection clone/rewrite 병목은 그대로다.
 
 의미 결정과 정확한 범위는 [ADR-0013](../adr/0013-verified-run-index-and-bounded-history-validation.md)을 따른다.

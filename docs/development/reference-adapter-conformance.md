@@ -3,7 +3,7 @@
 - 기준일: 2026-08-29
 - 상태: 비제품·비배포 public-port 참조 구현
 - 공개 protocol v0.1 변경: 없음
-- local store schema: 4
+- Receipt 도입 schema: 4; current local store schema: 5
 
 ## 목적
 
@@ -49,7 +49,7 @@ opaque targetRef + marker
 - executable binding digest
 - idempotency key
 
-기록 byte의 SHA-256을 adapter outcome의 `evidence_digest`로 전달한다. 이는 실제 파일 byte와 연결되는 실행 evidence이며 protocol Receipt가 아니다. 이후 별도 verifier가 같은 preopened handle을 read-only로 다시 읽고 digest를 비교한다. Core는 그 결과와 admission provenance로 protocol `ExecutionReceipt`를 만들고 SQLite schema 4에 terminal event와 함께 저장한다.
+기록 byte의 SHA-256을 adapter outcome의 `evidence_digest`로 전달한다. 이는 실제 파일 byte와 연결되는 실행 evidence이며 protocol Receipt가 아니다. 이후 별도 verifier가 같은 preopened handle을 read-only로 다시 읽고 digest를 비교한다. Core는 그 결과와 admission provenance로 protocol `ExecutionReceipt`를 만들고 current SQLite schema 5에 terminal event와 함께 저장한다.
 
 Reference adapter에는 typed tool output이 없으므로 Receipt `outputDigest`는 canonical empty object의 고정 digest다. Artifact 또는 실제 output body를 제공한다는 뜻이 아니다.
 
@@ -108,6 +108,6 @@ Workspace CI가 Linux, macOS, Windows에서 이 integration test를 함께 실�
 - credential resolution, approval UI, CLI 명령과 model loop
 - in-process hostile plugin 격리
 
-실제 filesystem adapter는 이 참조 구현을 이름만 바꿔 확장하지 않는다. WorkGraph의 ReadOnly 의미, bounded typed output와 Artifact, failure/unknown Receipt, root directory capability와 OS별 path race 규칙을 별도 ADR과 실패 테스트로 먼저 정해야 한다. 전체 구현 순서상 다음 큰 slice는 Tracked/Persistent WorkGraph와 crash recovery다.
+실제 filesystem adapter는 이 참조 구현을 이름만 바꿔 확장하지 않는다. WorkGraph의 ReadOnly 의미, bounded typed output와 Artifact, failure/unknown Receipt, root directory capability와 OS별 path race 규칙을 별도 ADR과 실패 테스트로 먼저 정해야 한다. Tracked/Persistent WorkGraph와 restart frontier는 ADR-0014에서 구현했지만 제품 adapter나 자동 model loop를 연결한 것은 아니다.
 
 공통 adapter contract testkit은 두 번째 실제 adapter가 생길 때 이 suite에서 구현별 fixture를 분리해 추출한다. 지금은 재사용 추상화를 미리 고정하지 않고 public-port conformance의 첫 실행 가능한 기준으로 유지한다.

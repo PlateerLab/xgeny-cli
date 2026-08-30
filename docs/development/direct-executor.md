@@ -3,7 +3,7 @@
 - 기준일: 2026-08-29
 - 상태: ADR-0011 실행 경계 + ADR-0012 Core verification 수직 슬라이스
 - 공개 protocol v0.1 변경: 없음
-- local store schema: 4
+- Receipt 도입 schema: 4; current local store schema: 5
 
 ## 현재 가능한 경로
 
@@ -142,6 +142,6 @@ cargo build --workspace --release --locked
 - Receipt commit acknowledgement 유실 뒤 effect·verifier 중복 0회
 - Debug, JSONL과 SQLite artifact plaintext sentinel scan. POSIX에서는 열린 DB에서 현재 존재하는 WAL/SHM까지 검사하고, Windows에서는 store를 clean close해 SQLite byte-range lock을 해제한 뒤 남아 있는 DB/WAL/SHM artifact를 검사한다.
 
-## 다음 수직 슬라이스
+## 후속 수직 슬라이스
 
-구현 순서상 다음 큰 slice는 Receipt-bound terminal gate를 dependency release 조건으로 사용하는 Tracked/Persistent WorkGraph와 crash recovery다. 제품용 read-only filesystem adapter는 참조 adapter의 단순 확장이 아니다. WorkGraph `ReadOnly`, bounded typed output와 Artifact, root directory capability와 symlink/junction/TOCTOU 규칙을 별도 ADR·gate에서 먼저 확정한다. Adapter definite failure·unknown Receipt, credential resolver와 process adapter도 각각 분리한다.
+ADR-0014는 Receipt-bound terminal gate를 dependency release 조건으로 사용하는 Tracked/Persistent WorkGraph와 restart frontier를 추가했다. 다음 실행 slice는 actionable `Planned` Step을 만들 durable plan input과 bounded model loop다. 제품용 read-only filesystem adapter는 참조 adapter의 단순 확장이 아니다. WorkGraph `ReadOnly`, bounded typed output와 Artifact, root directory capability와 symlink/junction/TOCTOU 규칙을 별도 ADR·gate에서 먼저 확정한다. Adapter definite failure·unknown Receipt, credential resolver와 process adapter도 각각 분리한다.

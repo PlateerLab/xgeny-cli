@@ -2,6 +2,7 @@
 
 mod admission;
 mod executor;
+mod frontier;
 mod lease;
 mod material;
 mod registry;
@@ -14,6 +15,7 @@ mod runtime_tests;
 
 pub use admission::*;
 pub use executor::*;
+pub use frontier::*;
 pub use lease::*;
 pub use material::*;
 pub use registry::*;
