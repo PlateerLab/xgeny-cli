@@ -172,6 +172,38 @@ Plan/Step/effect/Receipt/completion 각 1개, 원본 삭제 뒤 두 번째 model
 전에 종료하고 두 번째 model turn용 tunnel을 새로 열어 read process에 provider 경로가 없음을 고정한다.
 일반 CI는 이 test를 compile만 하고 외부 network 없이 ignore한다.
 
+### Workspace discovery live gate
+
+실제 Qwen이 알려지지 않은 상대 path를 스스로 찾는 경로는 같은 test binary의 별도 gate로 실행한다.
+이 gate는 기존 exact-file gate와 다른 확인 문자열을 요구하며, 실제 repository 대신 test-owned 임시
+workspace만 `--allow-dir .`로 연다.
+
+```bash
+XGENY_LIVE_CONFIRM=xgeny-go50902-workspace-discovery-v1 \
+XGENY_LIVE_KNOWN_HOSTS_FILE=/absolute/path/to/dedicated_known_hosts \
+XGENY_LIVE_OPENAI_BASE_URL=http://127.0.0.1:18000/v1 \
+cargo test --locked --release -p xgeny-cli \
+  --test live_go50902_public \
+  public_cli_workspace_discovery_and_offline_replay \
+  -- --ignored --exact
+```
+
+Test는 무작위 target path, 검색 locator와 결과 sentinel을 각각 만든다. Locator와 sentinel은 서로 다른
+줄에 있어 `search-text` preview만으로 최종 값을 알 수 없으며, goal에는 locator만 들어간다. 통과하려면
+모델이 root list, recursive search, matching file stat과 exact read를 모두 Receipt-completed Step으로
+수행하고 read 뒤 summary를 sentinel과 byte-exact하게 완성해야 한다. Discovery 전용 profile은 미래
+observation에 의존하는 argument를 추측하지 않고 turn마다 concrete Step 하나만 plan한다. 모델이 bounded
+추가 관찰을 선택할 수 있어 총 model call 수를 5로 고정하지 않지만, 전체 Step/model turn은 discovery Run
+budget 안이어야 하고 모든 effect는 1회 실행, model call은 전부 settled, Unknown/failure는 0이어야 한다.
+Tunnel을 닫고 workspace와 `materials.sqlite3`를 삭제한 뒤에도 summary가 offline replay되고 journal이
+변하지 않아야 한다.
+
+기존 exact-file live gate가 model egress와 local read를 서로 다른 process/tunnel 구간으로 분리해
+검증한다. Workspace gate는 그 권한 회귀를 중복하지 않고 실제 모델의 동적 capability 선택과 한 Run의
+vertical completion을 검증한다. 두 gate는 서로 다른 explicit confirmation을 요구하므로 위와 기존
+exact-file 명령으로 각각 실행하며, 같은 local forward port에서 동시에 실행하지 않는다. 일반 CI에서는
+두 test 모두 외부 연결 없이 compile만 한다.
+
 ## Clean-SHA live evidence (2026-08-31)
 
 2026-08-31 05:57 KST에 Linux x86_64, Rust 1.98.0, release profile에서 test 구현 commit

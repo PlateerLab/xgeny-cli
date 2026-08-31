@@ -30,7 +30,9 @@ xgeny run \
 `--allow-dir .`은 선택한 workspace root 전체를 네 read-only Capability로 관찰하도록 허용한다.
 Planner는 immutable input schema에서 `.` 규칙을 받고, 별도 `planningConstraints`에서 caller가 허용한
 directory/file 목록을 받는다. Constrained provider prompt는 이를 후보 제한으로 따르되 권한으로
-간주하지 않는다. 실제 실행 경계는 동일 catalog를 component 단위로 다시 검사한다.
+간주하지 않는다. 또한 미래 observation을 placeholder로 참조하지 않고, 현재 context에서 argument가
+확정된 Step 하나만 plan한 뒤 receipt-completed tool output을 다음 turn에서 받는다. 실제 실행 경계는
+동일 catalog를 component 단위로 다시 검사한다.
 
 | Capability | 동작 |
 | --- | --- |
@@ -122,5 +124,26 @@ model plan -> approval pause -> process 종료
   -> local-only resume에서 dynamic search material 복원/실행
   -> remote resume에서 durable output 전달 -> completion
 ```
+
+실제 Qwen의 capability 선택은 별도 ignored release test로 검증한다. Search preview와 read 결과를
+구분하기 위해 locator와 최종 sentinel을 서로 다른 줄에 둔 임시 workspace를 만들고, 모델이
+`list-directory`, `search-text`, `stat`, `read-text`를 모두 실행한 뒤에만 sentinel을 exact summary로
+완성하는지 확인한다. 완료 후 tunnel, workspace와 dynamic material catalog를 제거하고 offline replay와
+journal 불변까지 검사한다.
+
+```bash
+XGENY_LIVE_CONFIRM=xgeny-go50902-workspace-discovery-v1 \
+XGENY_LIVE_KNOWN_HOSTS_FILE=/absolute/path/to/dedicated_known_hosts \
+XGENY_LIVE_OPENAI_BASE_URL=http://127.0.0.1:18000/v1 \
+cargo test --locked --release -p xgeny-cli \
+  --test live_go50902_public \
+  public_cli_workspace_discovery_and_offline_replay \
+  -- --ignored --exact
+```
+
+전용 known-host file에는 `HostKeyAlias=go50902`로 별도 경로에서 검증한 public host key가 있어야 한다.
+Test가 tunnel lifecycle을 직접 소유하므로 다른 terminal에서 같은 local port의 tunnel을 미리 열지 않는다.
+`--nocapture`, `--show-output`, shell tracing과 `tee`도 사용하지 않는다. 상세한 보안 전제와 exact-file
+gate의 clean-SHA 증거는 [Public local run/resume](public-local-run-resume.md)를 따른다.
 
 결정 근거와 보장 한계는 [ADR-0024](../adr/0024-workspace-filesystem-discovery.md)를 따른다.

@@ -47,6 +47,10 @@ enumeration, 검색 결과 폭증과 재시작 뒤 검색어 복원 문제가 �
   후보 plan 제한으로 따르되 권한 grant로 취급하지 않도록 명시한다. 실제 권한은 catalog digest,
   materializer, policy/admission이 독립적으로 강제한다. Empty legacy context는 이 optional field를
   직렬화하지 않아 기존 PlanningContext v2 payload를 보존한다.
+- Dynamic path는 미래 tool output을 placeholder로 참조할 수 없다. Discovery 전용 constrained provider
+  profile은 현재 context에서 complete literal argument가 확정된 Step 하나만 plan하고, 후속 path/value가
+  필요하면 receipt-completed tool output이 다음 planning turn에 들어올 때까지 기다린다. Core의 multi-Step
+  DAG 계약과 기존 exact-file provider profile은 바꾸지 않는다.
 
 Model egress와 local read 권한은 계속 분리한다. `--allow-read`가 없으면 exact normalized resource에 대한
 승인은 pending이다. Flag가 있으면 catalog 안에서 선택된 각 action에 별도 one-shot 승인을 발행한다.
@@ -156,6 +160,7 @@ reservation 16, planned Step 8, tool call 8과 context 512 KiB를 고정한다. 
 - approval pause 뒤 별도 process에서 dynamic search material 복원·실행·다음 model turn 전달
 - resume의 allow-dir catalog 변경과 legacy/discovery mode 전환 거부
 - immutable planning schema의 portable root 규칙과 별도 digest-bound caller constraint 전달
+- constrained prompt의 concrete-literal 단일 Step 계획과 기존 exact profile digest 불변
 - 기존 allow-file public E2E와 SQLite schema-8 replay 회귀
 
 Linux, macOS와 Windows CI가 같은 portable test를 실행한다. Unix symlink test와 Windows

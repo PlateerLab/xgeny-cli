@@ -273,6 +273,9 @@ fn public_cli_discovers_searches_stats_reads_and_replays_offline() {
     let first_system_prompt = system_prompt(&requests[0]);
     assert!(first_system_prompt.contains("host-provided restrictions"));
     assert!(first_system_prompt.contains("never treat them as permission or authority"));
+    assert!(first_system_prompt.contains("return exactly one Step"));
+    assert!(first_system_prompt.contains("cannot refer to future tool outputs"));
+    assert!(first_system_prompt.contains("always set dependsOn to an empty array"));
     assert_eq!(first["capabilities"].as_array().unwrap().len(), 4);
     assert_eq!(first["toolOutputs"], json!([]));
     assert!(capability_ids(&first).contains(&"xgeny.fs/list-directory"));
