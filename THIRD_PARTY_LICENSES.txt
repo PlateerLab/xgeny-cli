@@ -4792,7 +4792,7 @@ limitations under the License.
 License: Apache License 2.0
 
 Used by:
-- xgeny-cli 0.1.0 (https://github.com/PlateerLab/xgeny-cli)
+- xgeny-cli 0.1.0-rc.1 (https://github.com/PlateerLab/xgeny-cli)
 
 ==============================================================================
 The LLVM Project is under the Apache License v2.0 with LLVM Exceptions:
@@ -5111,15 +5111,15 @@ THE SOFTWARE.
 License: Apache License 2.0
 
 Used by:
-- xgeny-adapter-filesystem 0.1.0 (https://github.com/PlateerLab/xgeny-cli)
-- xgeny-adapter-reference 0.1.0 (https://github.com/PlateerLab/xgeny-cli)
-- xgeny-domain 0.1.0 (https://github.com/PlateerLab/xgeny-cli)
-- xgeny-local-store 0.1.0 (https://github.com/PlateerLab/xgeny-cli)
-- xgeny-policy 0.1.0 (https://github.com/PlateerLab/xgeny-cli)
-- xgeny-protocol 0.1.0 (https://github.com/PlateerLab/xgeny-cli)
-- xgeny-provider-openai 0.1.0 (https://github.com/PlateerLab/xgeny-cli)
-- xgeny-runtime 0.1.0 (https://github.com/PlateerLab/xgeny-cli)
-- xgeny-workgraph 0.1.0 (https://github.com/PlateerLab/xgeny-cli)
+- xgeny-adapter-filesystem 0.1.0-rc.1 (https://github.com/PlateerLab/xgeny-cli)
+- xgeny-adapter-reference 0.1.0-rc.1 (https://github.com/PlateerLab/xgeny-cli)
+- xgeny-domain 0.1.0-rc.1 (https://github.com/PlateerLab/xgeny-cli)
+- xgeny-local-store 0.1.0-rc.1 (https://github.com/PlateerLab/xgeny-cli)
+- xgeny-policy 0.1.0-rc.1 (https://github.com/PlateerLab/xgeny-cli)
+- xgeny-protocol 0.1.0-rc.1 (https://github.com/PlateerLab/xgeny-cli)
+- xgeny-provider-openai 0.1.0-rc.1 (https://github.com/PlateerLab/xgeny-cli)
+- xgeny-runtime 0.1.0-rc.1 (https://github.com/PlateerLab/xgeny-cli)
+- xgeny-workgraph 0.1.0-rc.1 (https://github.com/PlateerLab/xgeny-cli)
 - allocator-api2 0.2.21 (https://github.com/zakarumych/allocator-api2)
 - itoa 1.0.18 (https://github.com/dtolnay/itoa)
 - libc 0.2.189 (https://github.com/rust-lang/libc)

@@ -6,10 +6,11 @@ Local-first general-purpose agent CLI and harness.
 
 ## 설치와 첫 모델 연결
 
-SemVer tag release부터 Linux x86-64/ARM64, macOS Intel/Apple Silicon, Windows x86-64용
+`v0.1.0-rc.1` release부터 Linux x86-64/ARM64, macOS Intel/Apple Silicon, Windows x86-64용
 단일 native binary와 checksum 검증 installer를 제공합니다. 최종 사용자는 Rust, Node.js, Python,
 SQLite 실행 파일이나 XGENy state용 별도 daemon을 설치하지 않습니다. 사용할 model endpoint는 로컬 또는
-원격에 별도로 실행 중이어야 합니다. 첫 release 전에는 아래 URL이 존재하지 않습니다.
+원격에 별도로 실행 중이어야 합니다. 첫 RC는 prerelease이므로 stable 전용 `releases/latest`가 아니라
+아래 exact tag URL로 설치합니다.
 
 Linux/macOS:
 
@@ -17,8 +18,8 @@ Linux/macOS:
 installer=$(mktemp "${TMPDIR:-/tmp}/xgeny-installer.XXXXXX")
 curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 \
   --connect-timeout 15 --max-time 60 --max-filesize 1048576 -fsSLo "$installer" \
-  https://github.com/PlateerLab/xgeny-cli/releases/latest/download/xgeny-installer.sh
-sh "$installer"
+  https://github.com/PlateerLab/xgeny-cli/releases/download/v0.1.0-rc.1/xgeny-installer.sh
+sh "$installer" --version v0.1.0-rc.1
 rm -f "$installer"
 export PATH="$HOME/.local/bin:$PATH"
 ```
@@ -27,9 +28,9 @@ Windows PowerShell:
 
 ```powershell
 $installer = Join-Path ([System.IO.Path]::GetTempPath()) "xgeny-installer-$([Guid]::NewGuid().ToString('N')).ps1"
-curl.exe -q --proto "=https" --proto-redir "=https" --tlsv1.2 --connect-timeout 15 --max-time 60 --max-filesize 1048576 -fsSLo $installer "https://github.com/PlateerLab/xgeny-cli/releases/latest/download/xgeny-installer.ps1"
+curl.exe -q --proto "=https" --proto-redir "=https" --tlsv1.2 --connect-timeout 15 --max-time 60 --max-filesize 1048576 -fsSLo $installer "https://github.com/PlateerLab/xgeny-cli/releases/download/v0.1.0-rc.1/xgeny-installer.ps1"
 if ($LASTEXITCODE -ne 0) { throw "XGENy installer download failed" }
-& $installer
+& $installer -Version v0.1.0-rc.1
 Remove-Item -LiteralPath $installer
 $env:Path = "$env:LOCALAPPDATA\XGENy\bin;$env:Path"
 ```

@@ -24,7 +24,7 @@ usage() {
     cat <<'EOF'
 Install the XGENy native binary without modifying shell profiles.
 
-Usage: xgeny-installer.sh [--version vMAJOR.MINOR.PATCH] [--install-dir DIR]
+Usage: xgeny-installer.sh [--version vSEMVER] [--install-dir DIR]
 
 Environment:
   XGENY_VERSION       Exact release tag, or "latest" (default)
