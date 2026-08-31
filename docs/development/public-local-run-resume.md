@@ -233,6 +233,27 @@ manifest의 base URL/workspace/state/상대 파일명/marker를 대상으로 통
 manifest에, marker는 completion/replay stdout에만 의도적으로 허용된다. Test harness는 capture한 stream
 원문을 출력하지 않았고 임시 state와 listener도 실행 종료 뒤 남지 않았다.
 
+## Workspace discovery clean-SHA live evidence (2026-09-01)
+
+2026-09-01 08:48 KST까지 Linux x86_64, Rust 1.98.0, release profile에서 강화된 discovery gate 구현
+commit `1af892bc0474abbaecbd9e0ab6698530413fe2ec`을 clean working tree로 검증했다. Gate는 served model
+`qwen3.8-27b`와 tokenizer identity `Qwen/Qwen3.8-27B-FP8`를 요청했다. 기존에 신뢰한 resolved host
+entry를 strict matching한 뒤 test 전용 `HostKeyAlias=go50902` snapshot으로 bootstrap했으므로, 이 기록
+역시 독립적인 host identity attestation은 아니다.
+
+서로 다른 무작위 workspace, target path, locator와 sentinel을 사용한 discovery 실행 두 번이 연속
+PASS했다. 각 실행에서 `list-directory`, `search-text`, `stat`, `read-text`가 모두 Receipt에 결합된
+완료 Step으로 관측됐고 각 Step의 실행 시도는 1회였다. Search preview에는 locator만 있고 sentinel은
+없었다. 모든 accepted Plan은 dependency가 없는 Step 하나만 포함했다. 모든 model call은 settled됐고
+모든 effect가 성공했으며 failure, Unknown, reconciliation은 0이었다. Read 뒤 completion과 삭제 뒤
+offline replay는 sentinel과 byte-exact했고 journal도 변하지 않았다. Gate 내부에는 model-call 재시도나
+실패 시 전체 실행 재시도가 없다.
+
+같은 commit에서 기존 exact-file gate도 별도로 PASS했다. 따라서 constrained sequential discovery
+prompt가 기존 exact-path Plan/Step/effect/Receipt, 두 model turn과 삭제 뒤 offline replay 계약을
+회귀시키지 않았음을 함께 확인했다. 원격 endpoint, host key, forward, Run ID, 임시 경로, 무작위 입력,
+model request/response와 ToolOutput 원문은 이 증거에 남기지 않았다.
+
 ## 보안·운영 메모
 
 - `manifest.json`에는 endpoint, token, root path, allow-file/allow-dir path, search query와 content가 없다.

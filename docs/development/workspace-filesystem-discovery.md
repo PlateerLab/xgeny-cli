@@ -145,6 +145,7 @@ cargo test --locked --release -p xgeny-cli \
 전용 known-host file에는 `HostKeyAlias=go50902`로 별도 경로에서 검증한 public host key가 있어야 한다.
 Test가 tunnel lifecycle을 직접 소유하므로 다른 terminal에서 같은 local port의 tunnel을 미리 열지 않는다.
 `--nocapture`, `--show-output`, shell tracing과 `tee`도 사용하지 않는다. 상세한 보안 전제와 exact-file
-gate의 clean-SHA 증거는 [Public local run/resume](public-local-run-resume.md)를 따른다.
+gate 및 discovery gate의 clean-SHA 증거는
+[Public local run/resume](public-local-run-resume.md)를 따른다.
 
 결정 근거와 보장 한계는 [ADR-0024](../adr/0024-workspace-filesystem-discovery.md)를 따른다.
