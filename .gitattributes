@@ -1,2 +1,3 @@
 # Generated from upstream license texts; preserve their original whitespace and line endings.
 THIRD_PARTY_LICENSES.txt -text -whitespace
+crates/xgeny-cli/licenses/* -text
