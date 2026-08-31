@@ -125,10 +125,11 @@ model plan -> approval pause -> process 종료
   -> remote resume에서 durable output 전달 -> completion
 ```
 
-실제 Qwen의 capability 선택은 별도 ignored release test로 검증한다. Search preview와 read 결과를
-구분하기 위해 locator와 최종 sentinel을 서로 다른 줄에 둔 임시 workspace를 만들고, 모델이
-`list-directory`, `search-text`, `stat`, `read-text`를 모두 실행한 뒤에만 sentinel을 exact summary로
-완성하는지 확인한다. 완료 후 tunnel, workspace와 dynamic material catalog를 제거하고 offline replay와
+실제 Qwen의 structured capability 호출과 동적 경로 continuation은 별도 ignored release test로
+검증한다. Search preview와 read 결과를 구분하기 위해 locator와 최종 sentinel을 서로 다른 줄에 둔 임시
+workspace를 만들고, 모델이 지시된 `list-directory`, `search-text`, `stat`, `read-text`를 모두 실행한
+뒤에만 sentinel을 exact summary로 완성하는지 확인한다. Accepted Plan마다 dependency 없는 Step 하나만
+있는지도 검사한다. 완료 후 tunnel, workspace와 dynamic material catalog를 제거하고 offline replay와
 journal 불변까지 검사한다.
 
 ```bash

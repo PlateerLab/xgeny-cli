@@ -705,9 +705,25 @@ fn verify_durable_workspace_result(
 
     let model_calls = usize::try_from(calls.reserved_calls)
         .unwrap_or_else(|_| panic!("live workspace model-call count did not fit usize"));
-    let plan_count = count_events(&snapshot.records, |body| {
-        matches!(body, RunEventBody::PlanAccepted { .. })
-    });
+    let accepted_plans = snapshot
+        .records
+        .iter()
+        .filter_map(|record| {
+            if let RunEventBody::PlanAccepted { steps, .. } = &record.event.body {
+                Some(steps)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let plan_count = accepted_plans.len();
+    require(
+        plan_count == step_count
+            && accepted_plans
+                .iter()
+                .all(|steps| steps.len() == 1 && steps[0].depends_on.is_empty()),
+        "live workspace accepted Plans were not strictly sequential single-Step plans",
+    );
     require(
         plan_count + 1 == model_calls,
         "live workspace model turns did not end in exactly one completion",

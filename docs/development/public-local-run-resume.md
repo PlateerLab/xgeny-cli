@@ -192,17 +192,20 @@ Test는 무작위 target path, 검색 locator와 결과 sentinel을 각각 만�
 줄에 있어 `search-text` preview만으로 최종 값을 알 수 없으며, goal에는 locator만 들어간다. 통과하려면
 모델이 root list, recursive search, matching file stat과 exact read를 모두 Receipt-completed Step으로
 수행하고 read 뒤 summary를 sentinel과 byte-exact하게 완성해야 한다. Discovery 전용 profile은 미래
-observation에 의존하는 argument를 추측하지 않고 turn마다 concrete Step 하나만 plan한다. 모델이 bounded
-추가 관찰을 선택할 수 있어 총 model call 수를 5로 고정하지 않지만, 전체 Step/model turn은 discovery Run
-budget 안이어야 하고 모든 effect는 1회 실행, model call은 전부 settled, Unknown/failure는 0이어야 한다.
+observation에 의존하는 argument를 추측하지 말고 turn마다 concrete Step 하나만 반환하도록 모델에
+요구한다. Gate는 실제 accepted Plan마다 Step이 하나이고 dependency가 비어 있는지도 확인한다. 모델이
+bounded 추가 관찰을 선택할 수 있어 총 model call 수를 5로 고정하지 않지만, 전체 Step/model turn은
+discovery Run budget 안이어야 하고 모든 effect는 1회 실행, model call은 전부 settled,
+Unknown/failure는 0이어야 한다.
 Tunnel을 닫고 workspace와 `materials.sqlite3`를 삭제한 뒤에도 summary가 offline replay되고 journal이
 변하지 않아야 한다.
 
 기존 exact-file live gate가 model egress와 local read를 서로 다른 process/tunnel 구간으로 분리해
-검증한다. Workspace gate는 그 권한 회귀를 중복하지 않고 실제 모델의 동적 capability 선택과 한 Run의
-vertical completion을 검증한다. 두 gate는 서로 다른 explicit confirmation을 요구하므로 위와 기존
-exact-file 명령으로 각각 실행하며, 같은 local forward port에서 동시에 실행하지 않는다. 일반 CI에서는
-두 test 모두 외부 연결 없이 compile만 한다.
+검증한다. Workspace gate는 그 권한 회귀를 중복하지 않고 실제 모델이 지시된 structured capability를
+호출하고 search observation에서 얻은 동적 path로 다음 turn을 이어 한 Run을 완료하는지 검증한다. 두
+gate는 서로 다른 explicit confirmation을 요구하므로 위와 기존 exact-file 명령으로 각각 실행하며, 같은
+local forward port에서 동시에 실행하지 않는다. 일반 CI에서는 두 test 모두 외부 연결 없이 compile만
+한다.
 
 ## Clean-SHA live evidence (2026-08-31)
 
