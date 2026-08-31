@@ -1,4 +1,7 @@
-use std::process::{Command, Stdio};
+use std::process::Command;
+
+#[cfg(unix)]
+use std::process::Stdio;
 
 use tempfile::tempdir;
 

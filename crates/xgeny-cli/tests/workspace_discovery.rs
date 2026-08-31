@@ -523,6 +523,7 @@ fn accept_with_timeout(listener: &TcpListener) -> io::Result<TcpStream> {
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
+                stream.set_nonblocking(false)?;
                 stream.set_read_timeout(Some(TEST_TIMEOUT))?;
                 stream.set_write_timeout(Some(TEST_TIMEOUT))?;
                 return Ok(stream);
