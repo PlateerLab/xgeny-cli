@@ -73,7 +73,7 @@ Publish 이전에는 다음을 다시 확인한다.
 5. Linux x86-64/ARM64 musl, macOS Intel/Apple Silicon, Windows x86-64 native build
 6. Linux ELF architecture와 `INTERP`/`NEEDED`/`RPATH`/`RUNPATH` 부재, macOS Xcode 16.4·SDK 15.5와
    Mach-O architecture/system-only dependency, Windows Server 2025 + Visual Studio 2026의 x64 PE와
-   static CRT/system-only import
+   static CRT, physical System32 DLL 또는 Windows 공개 API로 System32 구현체가 확인된 API-set contract로 한정된 import
 7. 각 target의 release `public_run_resume`, `environment_onboarding` process test
 8. loopback fixture에서 exact-tag download, checksum, 설치, 재설치, protocol check와 test-owned 삭제
 9. 최종 asset allow-list, `sha256sum -c`, 조립된 Linux fixture installer smoke와 GitHub artifact attestation

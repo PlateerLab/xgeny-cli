@@ -84,10 +84,54 @@ if ($DependencySections -eq 0) {
 if ($ImportedDlls.Count -eq 0) {
     throw "Windows dependency inspection found no imported system libraries"
 }
+$ApiSetPattern = '^(api|ext)-[A-Za-z0-9-]+-l[0-9]+-[0-9]+-[0-9]+\.dll$'
+$ApiSetResolverSource = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class XgenyApiSetResolver
+{
+    [DllImport(
+        "api-ms-win-core-apiquery-l2-1-0.dll",
+        ExactSpelling = true,
+        CallingConvention = CallingConvention.Winapi)]
+    public static extern int GetApiSetModuleBaseName(
+        [MarshalAs(UnmanagedType.LPStr)] string contractName,
+        uint bufferLength,
+        [MarshalAs(UnmanagedType.LPWStr)] StringBuilder moduleBaseName,
+        out uint actualNameLength);
+}
+'@
+Add-Type -TypeDefinition $ApiSetResolverSource -Language CSharp
 foreach ($ImportedDll in $ImportedDlls) {
-    if (-not (Test-Path -PathType Leaf -LiteralPath (Join-Path $env:SystemRoot "System32\$ImportedDll"))) {
-        throw "Windows release binary imports a non-system library"
+    if (Test-Path -PathType Leaf -LiteralPath (Join-Path $env:SystemRoot "System32\$ImportedDll")) {
+        continue
     }
+    if ($ImportedDll -match $ApiSetPattern) {
+        $HostBuffer = New-Object System.Text.StringBuilder 260
+        [uint32]$ActualNameLength = 0
+        $Result = [XgenyApiSetResolver]::GetApiSetModuleBaseName(
+            $ImportedDll,
+            [uint32]$HostBuffer.Capacity,
+            $HostBuffer,
+            [ref]$ActualNameLength
+        )
+        if ($Result -ne 0) {
+            throw "Windows API-set contract is not implemented: $ImportedDll"
+        }
+        $HostModule = $HostBuffer.ToString()
+        if (
+            $HostModule -notmatch '^[A-Za-z0-9._-]+\.dll$' -or
+            $ActualNameLength -ne [uint32]($HostModule.Length + 1) -or
+            -not (Test-Path -PathType Leaf -LiteralPath (Join-Path $env:SystemRoot "System32\$HostModule"))
+        ) {
+            throw "Windows API-set contract resolved outside System32: $ImportedDll"
+        }
+        Write-Output "API-set import: $ImportedDll -> $HostModule"
+        continue
+    }
+    throw "Windows release binary imports a non-system library: $ImportedDll"
 }
 
 Write-Output "runner image: $env:ImageOS $env:ImageVersion"
