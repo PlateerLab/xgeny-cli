@@ -69,6 +69,7 @@ impl fmt::Debug for BearerCredential {
 /// Immutable, non-secret request semantics for one OpenAI-compatible planner.
 pub struct OpenAiPlannerConfig {
     endpoint: Url,
+    model_catalog_endpoint: Url,
     planner_id: String,
     model: String,
     tokenizer: String,
@@ -99,7 +100,7 @@ impl OpenAiPlannerConfig {
         model: impl AsRef<str>,
         tokenizer: impl AsRef<str>,
     ) -> Result<Self, OpenAiPlannerConfigError> {
-        let endpoint = chat_completions_endpoint(base_url)?;
+        let (endpoint, model_catalog_endpoint) = api_endpoints(base_url)?;
         let planner_id = planner_id.as_ref();
         let model = model.as_ref();
         let tokenizer = tokenizer.as_ref();
@@ -108,6 +109,7 @@ impl OpenAiPlannerConfig {
         validate_profile_text("tokenizer", tokenizer)?;
         let mut config = Self {
             endpoint,
+            model_catalog_endpoint,
             planner_id: planner_id.to_owned(),
             model: model.to_owned(),
             tokenizer: tokenizer.to_owned(),
@@ -167,6 +169,16 @@ impl OpenAiPlannerConfig {
         &self.model
     }
 
+    /// Return whether bearer credentials may be attached to this HTTPS profile.
+    ///
+    /// Callers can use this to ignore an ambient credential for literal loopback HTTP without
+    /// ever attempting to construct or transmit the credential. `OpenAiPlanner::new` remains the
+    /// authoritative transport-policy check.
+    #[must_use]
+    pub fn accepts_bearer_credential(&self) -> bool {
+        self.endpoint.scheme() == "https"
+    }
+
     /// Return the immutable request-profile commitment.
     #[must_use]
     pub fn request_profile_digest(&self) -> &str {
@@ -214,6 +226,7 @@ impl fmt::Debug for OpenAiPlannerConfig {
         formatter
             .debug_struct("OpenAiPlannerConfig")
             .field("endpoint", &"<redacted>")
+            .field("model_catalog_endpoint", &"<redacted>")
             .field("planner_id", &self.planner_id)
             .field("model", &self.model)
             .field("tokenizer", &self.tokenizer)
@@ -248,14 +261,7 @@ impl OpenAiPlanner {
         config: OpenAiPlannerConfig,
         credential: Option<BearerCredential>,
     ) -> Result<Self, OpenAiPlannerConfigError> {
-        if config.endpoint.scheme() != "https" {
-            if credential.is_some() {
-                return Err(OpenAiPlannerConfigError::InsecureCredentialTransport);
-            }
-            if !is_loopback_endpoint(&config.endpoint) {
-                return Err(OpenAiPlannerConfigError::InsecureEndpointTransport);
-            }
-        }
+        validate_transport_security(&config.endpoint, credential.as_ref())?;
         let transport = UreqTransport::new(config.timeout);
         Ok(Self {
             config,
@@ -279,6 +285,100 @@ impl OpenAiPlanner {
             transport: Box::new(transport),
         }
     }
+}
+
+/// A bounded, non-inference check of one OpenAI-compatible model catalog.
+pub struct OpenAiModelChecker {
+    config: OpenAiPlannerConfig,
+    credential: Option<BearerCredential>,
+    transport: Box<dyn ModelCatalogTransport + Send>,
+}
+
+impl OpenAiModelChecker {
+    /// Build a checker with the same credential and plaintext transport policy as the planner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a credential would cross plaintext HTTP or when plaintext HTTP is
+    /// not addressed to a literal loopback IP.
+    pub fn new(
+        config: OpenAiPlannerConfig,
+        credential: Option<BearerCredential>,
+    ) -> Result<Self, OpenAiPlannerConfigError> {
+        validate_transport_security(&config.model_catalog_endpoint, credential.as_ref())?;
+        let transport = UreqModelCatalogTransport::new(config.timeout);
+        Ok(Self {
+            config,
+            credential,
+            transport: Box::new(transport),
+        })
+    }
+
+    #[cfg(test)]
+    fn with_transport<T>(
+        config: OpenAiPlannerConfig,
+        credential: Option<BearerCredential>,
+        transport: T,
+    ) -> Result<Self, OpenAiPlannerConfigError>
+    where
+        T: ModelCatalogTransport + Send + 'static,
+    {
+        validate_transport_security(&config.model_catalog_endpoint, credential.as_ref())?;
+        Ok(Self {
+            config,
+            credential,
+            transport: Box::new(transport),
+        })
+    }
+
+    /// Send exactly one model-catalog GET and require one exact advertised model identifier.
+    ///
+    /// This method does not send a prompt or a chat-completions request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted failure class for transport, status, response, or catalog mismatch.
+    pub fn check(&mut self) -> Result<(), OpenAiModelCheckFailure> {
+        let body = self.transport.fetch(ModelCatalogTransportRequest {
+            endpoint: &self.config.model_catalog_endpoint,
+            authorization: self.credential.as_ref().map(|value| &value.0),
+            max_response_bytes: self.config.max_response_bytes,
+        })?;
+        decode_model_catalog(&body, &self.config.model, self.config.max_json_depth)
+    }
+}
+
+impl fmt::Debug for OpenAiModelChecker {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OpenAiModelChecker")
+            .field("config", &self.config)
+            .field(
+                "credential",
+                &self.credential.as_ref().map(|_| "<redacted>"),
+            )
+            .field("transport", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Redacted outcome classes for a model-catalog connectivity check.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAiModelCheckFailure {
+    #[error("model catalog authentication was rejected")]
+    AuthenticationRejected,
+    #[error("model catalog request was rate limited")]
+    RateLimited,
+    #[error("model catalog request timed out")]
+    Timeout,
+    #[error("model catalog request was rejected")]
+    RequestRejected,
+    #[error("model catalog is unavailable")]
+    Unavailable,
+    #[error("model catalog response is invalid")]
+    InvalidResponse,
+    #[error("configured model is not advertised by the catalog")]
+    ModelNotAdvertised,
 }
 
 impl fmt::Debug for OpenAiPlanner {
@@ -464,23 +564,52 @@ trait Transport {
     fn send(&mut self, request: TransportRequest<'_>) -> Result<Vec<u8>, PlannerPortFailure>;
 }
 
+struct ModelCatalogTransportRequest<'a> {
+    endpoint: &'a Url,
+    authorization: Option<&'a HeaderValue>,
+    max_response_bytes: usize,
+}
+
+trait ModelCatalogTransport {
+    fn fetch(
+        &mut self,
+        request: ModelCatalogTransportRequest<'_>,
+    ) -> Result<Vec<u8>, OpenAiModelCheckFailure>;
+}
+
 struct UreqTransport {
     agent: Agent,
 }
 
+struct UreqModelCatalogTransport {
+    agent: Agent,
+}
+
+impl UreqModelCatalogTransport {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            agent: bounded_agent(timeout),
+        }
+    }
+}
+
 impl UreqTransport {
     fn new(timeout: Duration) -> Self {
-        let agent = Agent::config_builder()
-            .timeout_global(Some(timeout))
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .proxy(None)
-            .max_response_header_size(64 * 1024)
-            .user_agent("xgeny-provider-openai/0.1")
-            .build()
-            .new_agent();
+        let agent = bounded_agent(timeout);
         Self { agent }
     }
+}
+
+fn bounded_agent(timeout: Duration) -> Agent {
+    Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .proxy(None)
+        .max_response_header_size(64 * 1024)
+        .user_agent("xgeny-provider-openai/0.1")
+        .build()
+        .new_agent()
 }
 
 impl Transport for UreqTransport {
@@ -525,6 +654,50 @@ impl Transport for UreqTransport {
     }
 }
 
+impl ModelCatalogTransport for UreqModelCatalogTransport {
+    fn fetch(
+        &mut self,
+        request: ModelCatalogTransportRequest<'_>,
+    ) -> Result<Vec<u8>, OpenAiModelCheckFailure> {
+        let mut builder = self
+            .agent
+            .get(request.endpoint.as_str())
+            .header(ACCEPT, "application/json");
+        if let Some(authorization) = request.authorization {
+            builder = builder.header(AUTHORIZATION, authorization.clone());
+        }
+        let mut response = builder
+            .call()
+            .map_err(|error| map_model_check_transport_error(&error))?;
+        let status = response.status().as_u16();
+        if status != 200 {
+            return Err(map_model_check_status(status));
+        }
+        if response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|length| length > request.max_response_bytes as u64)
+        {
+            return Err(OpenAiModelCheckFailure::InvalidResponse);
+        }
+        let read_limit = u64::try_from(request.max_response_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let body = response
+            .body_mut()
+            .with_config()
+            .limit(read_limit)
+            .read_to_vec()
+            .map_err(|error| map_model_check_transport_error(&error))?;
+        if body.len() > request.max_response_bytes {
+            return Err(OpenAiModelCheckFailure::InvalidResponse);
+        }
+        Ok(body)
+    }
+}
+
 fn map_transport_error(error: &ureq::Error) -> PlannerPortFailure {
     match error {
         ureq::Error::Timeout(_) => PlannerPortFailure::Timeout,
@@ -542,10 +715,38 @@ fn map_status(status: u16) -> PlannerPortFailure {
     }
 }
 
+fn map_model_check_transport_error(error: &ureq::Error) -> OpenAiModelCheckFailure {
+    match error {
+        ureq::Error::Timeout(_) => OpenAiModelCheckFailure::Timeout,
+        ureq::Error::BodyExceedsLimit(_) => OpenAiModelCheckFailure::InvalidResponse,
+        _ => OpenAiModelCheckFailure::Unavailable,
+    }
+}
+
+fn map_model_check_status(status: u16) -> OpenAiModelCheckFailure {
+    match status {
+        401 | 403 => OpenAiModelCheckFailure::AuthenticationRejected,
+        408 | 504 => OpenAiModelCheckFailure::Timeout,
+        429 => OpenAiModelCheckFailure::RateLimited,
+        300..=499 => OpenAiModelCheckFailure::RequestRejected,
+        _ => OpenAiModelCheckFailure::Unavailable,
+    }
+}
+
 #[derive(Deserialize)]
 struct ChatCompletionResponse {
     model: String,
     choices: Vec<ChatChoice>,
+}
+
+#[derive(Deserialize)]
+struct ModelCatalogResponse {
+    data: Vec<ModelCatalogEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelCatalogEntry {
+    id: String,
 }
 
 #[derive(Deserialize)]
@@ -681,6 +882,27 @@ fn decode_chat_response(
             }
             Ok(PlanProposal::completion_candidate(proposal.summary))
         }
+    }
+}
+
+fn decode_model_catalog(
+    body: &[u8],
+    expected_model: &str,
+    max_json_depth: usize,
+) -> Result<(), OpenAiModelCheckFailure> {
+    let envelope = parse_unique_json(body, max_json_depth)
+        .map_err(|_| OpenAiModelCheckFailure::InvalidResponse)?;
+    let response: ModelCatalogResponse =
+        serde_json::from_value(envelope).map_err(|_| OpenAiModelCheckFailure::InvalidResponse)?;
+    match response
+        .data
+        .iter()
+        .filter(|entry| entry.id == expected_model)
+        .count()
+    {
+        1 => Ok(()),
+        0 => Err(OpenAiModelCheckFailure::ModelNotAdvertised),
+        _ => Err(OpenAiModelCheckFailure::InvalidResponse),
     }
 }
 
@@ -892,7 +1114,7 @@ fn proposal_schema() -> Value {
     })
 }
 
-fn chat_completions_endpoint(base_url: &str) -> Result<Url, OpenAiPlannerConfigError> {
+fn api_endpoints(base_url: &str) -> Result<(Url, Url), OpenAiPlannerConfigError> {
     if base_url.len() > MAX_BASE_URL_BYTES {
         return Err(OpenAiPlannerConfigError::InvalidBaseUrl);
     }
@@ -907,12 +1129,29 @@ fn chat_completions_endpoint(base_url: &str) -> Result<Url, OpenAiPlannerConfigE
     {
         return Err(OpenAiPlannerConfigError::InvalidBaseUrl);
     }
-    let path = endpoint.path().trim_end_matches('/');
+    let path = endpoint.path().trim_end_matches('/').to_owned();
     if !path.ends_with("/v1") {
         return Err(OpenAiPlannerConfigError::InvalidBasePath);
     }
+    let mut model_catalog_endpoint = endpoint.clone();
     endpoint.set_path(&format!("{path}/chat/completions"));
-    Ok(endpoint)
+    model_catalog_endpoint.set_path(&format!("{path}/models"));
+    Ok((endpoint, model_catalog_endpoint))
+}
+
+fn validate_transport_security(
+    endpoint: &Url,
+    credential: Option<&BearerCredential>,
+) -> Result<(), OpenAiPlannerConfigError> {
+    if endpoint.scheme() != "https" {
+        if credential.is_some() {
+            return Err(OpenAiPlannerConfigError::InsecureCredentialTransport);
+        }
+        if !is_loopback_endpoint(endpoint) {
+            return Err(OpenAiPlannerConfigError::InsecureEndpointTransport);
+        }
+    }
+    Ok(())
 }
 
 fn is_loopback_endpoint(endpoint: &Url) -> bool {
@@ -1034,6 +1273,22 @@ mod tests {
         }
     }
 
+    fn read_test_request_headers(stream: &mut TcpStream) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("request timeout should configure");
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).expect("request should read");
+            assert_ne!(read, 0, "request ended before its headers completed");
+            request.extend_from_slice(&chunk[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                return;
+            }
+        }
+    }
+
     #[test]
     fn profile_is_stable_across_tunnel_locations_but_changes_with_semantics() {
         let first = config("http://127.0.0.1:18000/v1");
@@ -1087,6 +1342,8 @@ mod tests {
             ),
             Err(OpenAiPlannerConfigError::InvalidBaseUrl)
         ));
+        assert!(!config("http://127.0.0.1:18000/v1").accepts_bearer_credential());
+        assert!(config("https://provider.example/v1").accepts_bearer_credential());
         let credential =
             BearerCredential::new("RAW-API-KEY-SENTINEL").expect("credential should validate");
         assert!(matches!(
@@ -1325,6 +1582,222 @@ mod tests {
     }
 
     #[test]
+    fn model_catalog_transport_does_not_follow_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("request should connect");
+            read_test_request_headers(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:9/v1/models\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .expect("response should write");
+        });
+        let endpoint = Url::parse(&format!("http://{address}/v1/models")).unwrap();
+        let mut transport = UreqModelCatalogTransport::new(Duration::from_secs(2));
+        let result = transport.fetch(ModelCatalogTransportRequest {
+            endpoint: &endpoint,
+            authorization: None,
+            max_response_bytes: 1024,
+        });
+        server.join().expect("server should finish");
+        assert_eq!(result, Err(OpenAiModelCheckFailure::RequestRejected));
+    }
+
+    #[test]
+    fn model_catalog_transport_rejects_oversized_declared_and_chunked_bodies() {
+        for response in [
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 10\r\nConnection: close\r\n\r\n0123456789".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nA\r\n0123456789\r\n0\r\n\r\n".as_slice(),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+            let address = listener.local_addr().unwrap();
+            let response = response.to_vec();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("request should connect");
+                read_test_request_headers(&mut stream);
+                stream
+                    .write_all(&response)
+                    .expect("response should write");
+            });
+            let endpoint = Url::parse(&format!("http://{address}/v1/models")).unwrap();
+            let mut transport = UreqModelCatalogTransport::new(Duration::from_secs(2));
+            let result = transport.fetch(ModelCatalogTransportRequest {
+                endpoint: &endpoint,
+                authorization: None,
+                max_response_bytes: 4,
+            });
+            server.join().expect("server should finish");
+            assert_eq!(result, Err(OpenAiModelCheckFailure::InvalidResponse));
+        }
+    }
+
+    #[test]
+    fn model_catalog_transport_maps_real_auth_status_without_reading_raw_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("request should connect");
+            read_test_request_headers(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 21\r\nConnection: close\r\n\r\nRAW-RESPONSE-SENTINEL",
+                )
+                .expect("response should write");
+        });
+        let endpoint = Url::parse(&format!("http://{address}/v1/models")).unwrap();
+        let mut transport = UreqModelCatalogTransport::new(Duration::from_secs(2));
+        let result = transport.fetch(ModelCatalogTransportRequest {
+            endpoint: &endpoint,
+            authorization: None,
+            max_response_bytes: 1024,
+        });
+        server.join().expect("server should finish");
+        assert_eq!(result, Err(OpenAiModelCheckFailure::AuthenticationRejected));
+        assert!(!format!("{result:?}").contains("RAW-RESPONSE-SENTINEL"));
+    }
+
+    #[test]
+    fn model_catalog_transport_times_out_without_retrying() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let address = listener.local_addr().unwrap();
+        listener
+            .set_nonblocking(true)
+            .expect("listener should become nonblocking");
+        let (send_finished, send_finished_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut first_stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "catalog request did not arrive");
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("catalog accept failed: {error}"),
+                }
+            };
+            read_test_request_headers(&mut first_stream);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok(_) => return true,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("second accept failed: {error}"),
+                }
+                match send_finished_receiver.try_recv() {
+                    Ok(()) | Err(mpsc::TryRecvError::Disconnected) => return false,
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+            }
+            panic!("catalog transport did not finish within the bounded test window")
+        });
+        let endpoint = Url::parse(&format!("http://{address}/v1/models")).unwrap();
+        let mut transport = UreqModelCatalogTransport::new(Duration::from_millis(200));
+        let result = transport.fetch(ModelCatalogTransportRequest {
+            endpoint: &endpoint,
+            authorization: None,
+            max_response_bytes: 1024,
+        });
+        send_finished
+            .send(())
+            .expect("server should observe transport completion");
+        assert_eq!(result, Err(OpenAiModelCheckFailure::Timeout));
+        assert!(!server.join().expect("server should finish"));
+    }
+
+    #[test]
+    fn model_catalog_transport_does_not_retry_after_connection_loss() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let address = listener.local_addr().unwrap();
+        let (send_finished, send_finished_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("request should connect");
+            read_test_request_headers(&mut stream);
+            drop(stream);
+
+            listener
+                .set_nonblocking(true)
+                .expect("listener should become nonblocking");
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok(_) => return true,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("second accept failed: {error}"),
+                }
+                match send_finished_receiver.try_recv() {
+                    Ok(()) | Err(mpsc::TryRecvError::Disconnected) => return false,
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+            }
+            panic!("catalog transport did not finish within the bounded test window")
+        });
+        let endpoint = Url::parse(&format!("http://{address}/v1/models")).unwrap();
+        let mut transport = UreqModelCatalogTransport::new(Duration::from_secs(2));
+        let result = transport.fetch(ModelCatalogTransportRequest {
+            endpoint: &endpoint,
+            authorization: None,
+            max_response_bytes: 1024,
+        });
+        send_finished
+            .send(())
+            .expect("server should observe transport completion");
+        assert_eq!(result, Err(OpenAiModelCheckFailure::Unavailable));
+        assert!(!server.join().expect("server should finish"));
+    }
+
+    #[test]
+    fn model_catalog_requires_one_exact_model_and_unique_bounded_json() {
+        assert_eq!(
+            decode_model_catalog(
+                br#"{"object":"list","data":[{"id":"qwen3.8-27b"}]}"#,
+                MODEL,
+                8,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            decode_model_catalog(br#"{"data":[{"id":"other-model"}]}"#, MODEL, 8),
+            Err(OpenAiModelCheckFailure::ModelNotAdvertised)
+        );
+        assert_eq!(
+            decode_model_catalog(
+                br#"{"data":[{"id":"qwen3.8-27b"},{"id":"qwen3.8-27b"}]}"#,
+                MODEL,
+                8,
+            ),
+            Err(OpenAiModelCheckFailure::InvalidResponse)
+        );
+        assert_eq!(
+            decode_model_catalog(br#"{"data":[],"data":[]}"#, MODEL, 8),
+            Err(OpenAiModelCheckFailure::InvalidResponse)
+        );
+        assert_eq!(
+            decode_model_catalog(br#"{"data":[[[[[{"id":"qwen3.8-27b"}]]]]]}"#, MODEL, 4),
+            Err(OpenAiModelCheckFailure::InvalidResponse)
+        );
+    }
+
+    #[test]
+    fn model_checker_attaches_sensitive_bearer_only_to_the_https_catalog_get() {
+        let config = config("https://provider.example/v1");
+        let credential = BearerCredential::new("catalog-secret").unwrap();
+        let mut checker =
+            OpenAiModelChecker::with_transport(config, Some(credential), ExpectedCatalogTransport)
+                .unwrap();
+
+        assert_eq!(checker.check(), Ok(()));
+        let debug = format!("{checker:?}");
+        assert!(!debug.contains("provider.example"));
+        assert!(!debug.contains("catalog-secret"));
+    }
+
+    #[test]
     fn status_mapping_is_closed_or_unknown_without_raw_body() {
         assert_eq!(map_status(400), PlannerPortFailure::ProviderRejected);
         assert_eq!(map_status(401), PlannerPortFailure::ProviderRejected);
@@ -1334,6 +1807,42 @@ mod tests {
         assert_eq!(map_status(500), PlannerPortFailure::Unavailable);
         assert_eq!(map_status(600), PlannerPortFailure::Unavailable);
         assert_eq!(map_status(504), PlannerPortFailure::Timeout);
+        assert_eq!(
+            map_model_check_status(401),
+            OpenAiModelCheckFailure::AuthenticationRejected
+        );
+        assert_eq!(
+            map_model_check_status(429),
+            OpenAiModelCheckFailure::RateLimited
+        );
+        assert_eq!(
+            map_model_check_status(307),
+            OpenAiModelCheckFailure::RequestRejected
+        );
+        assert_eq!(
+            map_model_check_status(500),
+            OpenAiModelCheckFailure::Unavailable
+        );
+    }
+
+    struct ExpectedCatalogTransport;
+
+    impl ModelCatalogTransport for ExpectedCatalogTransport {
+        fn fetch(
+            &mut self,
+            request: ModelCatalogTransportRequest<'_>,
+        ) -> Result<Vec<u8>, OpenAiModelCheckFailure> {
+            assert_eq!(
+                request.endpoint.as_str(),
+                "https://provider.example/v1/models"
+            );
+            let authorization = request
+                .authorization
+                .expect("credential should be attached");
+            assert_eq!(authorization.to_str().unwrap(), "Bearer catalog-secret");
+            assert!(authorization.is_sensitive());
+            Ok(br#"{"data":[{"id":"qwen3.8-27b"}]}"#.to_vec())
+        }
     }
 
     struct NeverTransport;

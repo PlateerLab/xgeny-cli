@@ -394,7 +394,8 @@ fn separate_processes_read_once_continue_with_exact_output_and_replay_offline() 
 
     let replay = xgeny(&state_root)
         .args(["resume", &run_id])
-        .env_remove("XGENY_OPENAI_API_KEY")
+        .env("XGENY_OPENAI_BASE_URL", "not-a-provider-url")
+        .env("XGENY_OPENAI_API_KEY", "invalid\ncredential")
         .bounded_output()
         .expect("offline replay process should run");
     assert_exit(&replay, 0);
@@ -758,13 +759,12 @@ fn resume_process(
     allow_file: &str,
 ) -> Output {
     xgeny(state_root)
+        .env("XGENY_OPENAI_BASE_URL", base_url)
         .args([
             "resume",
             run_id,
             "--workspace",
             path_text(workspace),
-            "--base-url",
-            base_url,
             "--allow-file",
             allow_file,
             "--allow-remote-model-egress",

@@ -1,0 +1,16 @@
+XGENy CLI Third-Party License Notices
+
+This file is generated from Cargo.lock with cargo-about. It is provided for attribution and is not legal advice.
+
+{{#each licenses}}
+================================================================================
+License: {{{name}}}
+
+Used by:
+{{#each used_by}}
+- {{{crate.name}}} {{{crate.version}}} ({{#if crate.repository}}{{{crate.repository}}}{{else}}https://crates.io/crates/{{{crate.name}}}{{/if}})
+{{/each}}
+
+{{{text}}}
+
+{{/each}}

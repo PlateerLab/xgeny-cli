@@ -23,7 +23,7 @@ repository = "https://github.com/PlateerLab/xgeny-cli"
 [workspace.dependencies]
 cap-fs-ext = "4.0.3"
 cap-std = "4.0.3"
-clap = { version = "4.6.6", features = ["derive"] }
+clap = { version = "4.6.6", features = ["derive", "env"] }
 getrandom = "0.3.4"
 jsonschema = { version = "0.52.0", default-features = false }
 libc = "0.2.189"
@@ -38,6 +38,11 @@ thiserror = "2.0.20"
 time = { version = "0.3.55", features = ["formatting", "parsing"] }
 ureq = { version = "3.4.0", default-features = false, features = ["rustls"] }
 url = "2.5.8"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

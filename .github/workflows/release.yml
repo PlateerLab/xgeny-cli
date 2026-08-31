@@ -1,0 +1,672 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: ["Release request"]
+    types: [completed]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  CC_aarch64_unknown_linux_musl: musl-gcc
+  CC_x86_64_unknown_linux_musl: musl-gcc
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Release quality gate
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Validate trusted release request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_RUN_ID: ${{ github.event.workflow_run.id }}
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          semver_tag_regex='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?$'
+          [[ "$RELEASE_TAG" =~ $semver_tag_regex ]]
+          [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$GITHUB_SHA" = "$RELEASE_SHA"
+          test "$(gh api "repos/$GITHUB_REPOSITORY" --jq '.default_branch')" = "main"
+          canonical_workflow_id=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/release-request.yml" --jq '.id')
+          source_run="$RUNNER_TEMP/xgeny-release-source-run.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RELEASE_RUN_ID" > "$source_run"
+          jq -e \
+            --argjson workflow_id "$canonical_workflow_id" \
+            --argjson run_id "$RELEASE_RUN_ID" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg tag "$RELEASE_TAG" \
+            --arg sha "$RELEASE_SHA" '
+              .id == $run_id and
+              .workflow_id == $workflow_id and
+              .path == ".github/workflows/release-request.yml" and
+              .event == "push" and
+              .status == "completed" and
+              .conclusion == "success" and
+              .head_repository.full_name == $repository and
+              .repository.full_name == $repository and
+              .head_branch == $tag and
+              .head_sha == $sha
+            ' "$source_run" >/dev/null
+
+      - name: Checkout exact release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install --no-self-update
+
+      - name: Require a SemVer tag at current main
+        env:
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          semver_tag_regex='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?$'
+          [[ "$RELEASE_TAG" =~ $semver_tag_regex ]]
+          verification_ref="refs/release-verification/source-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          git fetch --force --no-tags origin \
+            "+refs/heads/main:refs/remotes/origin/release-main" \
+            "+refs/tags/$RELEASE_TAG:$verification_ref"
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          test "$(git rev-parse refs/remotes/origin/release-main)" = "$RELEASE_SHA"
+          test "$(git rev-parse "$verification_ref^{commit}")" = "$RELEASE_SHA"
+          package_version=$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '[.packages[] | select(.name == "xgeny-cli") | .version] | if length == 1 then .[0] else empty end')
+          test -n "$package_version"
+          test "$RELEASE_TAG" = "v$package_version"
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test workspace
+        run: cargo test --workspace --locked
+
+      - name: Check third-party license notices
+        run: sh scripts/check-third-party-licenses.sh --check
+
+  build:
+    name: Build / ${{ matrix.target }}
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            asset: xgeny-x86_64-unknown-linux-musl
+            binary: target/x86_64-unknown-linux-musl/release/xgeny
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: xgeny-aarch64-unknown-linux-musl
+            binary: target/aarch64-unknown-linux-musl/release/xgeny
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: xgeny-x86_64-apple-darwin
+            binary: target/x86_64-apple-darwin/release/xgeny
+            developer_dir: /Applications/Xcode_16.4.app/Contents/Developer
+          - os: macos-15
+            target: aarch64-apple-darwin
+            asset: xgeny-aarch64-apple-darwin
+            binary: target/aarch64-apple-darwin/release/xgeny
+            developer_dir: /Applications/Xcode_16.4.app/Contents/Developer
+          - os: windows-2025-vs2026
+            target: x86_64-pc-windows-msvc
+            asset: xgeny-x86_64-pc-windows-msvc.exe
+            binary: target/x86_64-pc-windows-msvc/release/xgeny.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout exact release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Install pinned Rust toolchain and target
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install --no-self-update
+          rustup target add "${{ matrix.target }}"
+
+      - name: Install musl linker
+        if: runner.os == 'Linux'
+        shell: bash
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+
+      - name: Verify pinned Apple toolchain
+        if: runner.os == 'macOS'
+        env:
+          DEVELOPER_DIR: ${{ matrix.developer_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(xcodebuild -version)" = $'Xcode 16.4\nBuild version 16F6'
+          test "$(xcrun --sdk macosx --show-sdk-version)" = "15.5"
+
+      - name: Build release CLI
+        env:
+          DEVELOPER_DIR: ${{ matrix.developer_dir }}
+        run: cargo build --locked --release -p xgeny-cli --target ${{ matrix.target }}
+
+      - name: Run release CLI process tests
+        env:
+          DEVELOPER_DIR: ${{ matrix.developer_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --release -p xgeny-cli \
+            --test public_run_resume \
+            --target "${{ matrix.target }}"
+          cargo test --locked --release -p xgeny-cli \
+            --test environment_onboarding \
+            --target "${{ matrix.target }}"
+
+      - name: Audit Unix native dependencies
+        if: runner.os != 'Windows'
+        env:
+          DEVELOPER_DIR: ${{ matrix.developer_dir }}
+        shell: bash
+        run: sh scripts/audit-native-binary.sh "${{ matrix.binary }}" "${{ matrix.target }}"
+
+      - name: Audit Windows native dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/audit-native-binary.ps1 -Binary "${{ matrix.binary }}"
+
+      - name: Stage Unix release asset
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          install -m 0755 "${{ matrix.binary }}" "release/${{ matrix.asset }}"
+
+      - name: Stage Windows release asset
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release -Force | Out-Null
+          Copy-Item -LiteralPath "${{ matrix.binary }}" -Destination "release/${{ matrix.asset }}"
+
+      - name: Smoke shell installer against staged asset
+        if: runner.os != 'Windows'
+        shell: bash
+        run: sh scripts/smoke-installer.sh "release/${{ matrix.asset }}" "${{ matrix.asset }}" install/xgeny-installer.sh
+
+      - name: Smoke PowerShell installer against staged asset
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/smoke-installer.ps1 -Binary "release/${{ matrix.asset }}" -Asset "${{ matrix.asset }}" -Installer install/xgeny-installer.ps1
+
+      - name: Smoke Windows PowerShell 5.1 installer against staged asset
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./scripts/smoke-installer.ps1 -Binary "release/${{ matrix.asset }}" -Asset "${{ matrix.asset }}" -Installer install/xgeny-installer.ps1
+
+      - name: Upload verified release asset
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.asset }}
+          path: release/${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 7
+
+  assemble:
+    name: Assemble release bundle
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout exact release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Download verified release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+
+      - name: Assemble checksummed release
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=(
+            xgeny-x86_64-unknown-linux-musl
+            xgeny-aarch64-unknown-linux-musl
+            xgeny-x86_64-apple-darwin
+            xgeny-aarch64-apple-darwin
+            xgeny-x86_64-pc-windows-msvc.exe
+          )
+          test "$(find release -mindepth 1 -maxdepth 1 | wc -l)" -eq "${#expected[@]}"
+          for asset in "${expected[@]}"; do
+            test -f "release/$asset" && test ! -L "release/$asset"
+          done
+          chmod 0755 \
+            release/xgeny-x86_64-unknown-linux-musl \
+            release/xgeny-aarch64-unknown-linux-musl \
+            release/xgeny-x86_64-apple-darwin \
+            release/xgeny-aarch64-apple-darwin
+          install -m 0755 install/xgeny-installer.sh release/xgeny-installer.sh
+          install -m 0644 install/xgeny-installer.ps1 release/xgeny-installer.ps1
+          install -m 0644 LICENSE release/LICENSE.txt
+          install -m 0644 crates/xgeny-cli/licenses/NATIVE_RUNTIME_PROVENANCE.md \
+            release/NATIVE_RUNTIME_PROVENANCE.md
+          install -m 0644 THIRD_PARTY_LICENSES.txt release/THIRD_PARTY_LICENSES.txt
+          (
+            cd release
+            export LC_ALL=C
+            sha256sum LICENSE.txt NATIVE_RUNTIME_PROVENANCE.md THIRD_PARTY_LICENSES.txt xgeny-* \
+              > checksums.sha256
+            sha256sum -c checksums.sha256
+          )
+          expected+=(
+            xgeny-installer.sh
+            xgeny-installer.ps1
+            LICENSE.txt
+            NATIVE_RUNTIME_PROVENANCE.md
+            THIRD_PARTY_LICENSES.txt
+            checksums.sha256
+          )
+          test "$(find release -mindepth 1 -maxdepth 1 | wc -l)" -eq "${#expected[@]}"
+          for asset in "${expected[@]}"; do
+            test -f "release/$asset" && test ! -L "release/$asset"
+          done
+          sh scripts/smoke-installer.sh \
+            release/xgeny-x86_64-unknown-linux-musl \
+            xgeny-x86_64-unknown-linux-musl \
+            release/xgeny-installer.sh
+
+      - name: Upload assembled release bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: assembled-release
+          path: release/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Attest and publish GitHub Release
+    needs: assemble
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Download assembled release bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: assembled-release
+          path: release
+
+      - name: Verify assembled release bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=(
+            xgeny-x86_64-unknown-linux-musl
+            xgeny-aarch64-unknown-linux-musl
+            xgeny-x86_64-apple-darwin
+            xgeny-aarch64-apple-darwin
+            xgeny-x86_64-pc-windows-msvc.exe
+            xgeny-installer.sh
+            xgeny-installer.ps1
+            LICENSE.txt
+            NATIVE_RUNTIME_PROVENANCE.md
+            THIRD_PARTY_LICENSES.txt
+            checksums.sha256
+          )
+          test "$(find release -mindepth 1 -maxdepth 1 | wc -l)" -eq "${#expected[@]}"
+          for asset in "${expected[@]}"; do
+            test -f "release/$asset" && test ! -L "release/$asset"
+          done
+          (cd release && sha256sum -c checksums.sha256)
+          chmod 0755 \
+            release/xgeny-x86_64-unknown-linux-musl \
+            release/xgeny-aarch64-unknown-linux-musl \
+            release/xgeny-x86_64-apple-darwin \
+            release/xgeny-aarch64-apple-darwin \
+            release/xgeny-installer.sh
+
+      - name: Recheck tag binding and repository release policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMMUTABLE_RELEASES_ENABLED: ${{ vars.XGENY_IMMUTABLE_RELEASES_ENABLED }}
+          MAIN_PROTECTION_ENABLED: ${{ vars.XGENY_MAIN_PROTECTION_ENABLED }}
+          RELEASE_RULESET_NO_BYPASS: ${{ vars.XGENY_RELEASE_RULESET_NO_BYPASS }}
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          semver_tag_regex='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?$'
+          [[ "$RELEASE_TAG" =~ $semver_tag_regex ]]
+          [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$GITHUB_SHA" = "$RELEASE_SHA"
+          test "$(gh api "repos/$GITHUB_REPOSITORY" --jq '.default_branch')" = "main"
+          verification_repo="$RUNNER_TEMP/xgeny-release-verification"
+          mkdir "$verification_repo"
+          git -C "$verification_repo" init --quiet
+          git -C "$verification_repo" remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          verification_ref="refs/release-verification/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          git -C "$verification_repo" fetch --force --no-tags origin \
+            "+refs/heads/main:refs/remotes/origin/release-main" \
+            "+refs/tags/$RELEASE_TAG:$verification_ref"
+          test "$(git -C "$verification_repo" rev-parse refs/remotes/origin/release-main)" = "$RELEASE_SHA"
+          test "$(git -C "$verification_repo" rev-parse "$verification_ref^{commit}")" = "$RELEASE_SHA"
+          test "$IMMUTABLE_RELEASES_ENABLED" = "true"
+          test "$MAIN_PROTECTION_ENABLED" = "true"
+          test "$RELEASE_RULESET_NO_BYPASS" = "true"
+          github_actions_integration_id=$(gh api /apps/github-actions --jq '.id')
+          [[ "$github_actions_integration_id" =~ ^[1-9][0-9]*$ ]]
+          if [[ "$RELEASE_TAG" != *-* ]]; then
+            stable_tags="$RUNNER_TEMP/xgeny-stable-release-tags.txt"
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
+              > "$stable_tags"
+            python3 - "$RELEASE_TAG" "$stable_tags" <<'PY'
+          import re
+          import sys
+
+          pattern = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+
+          def version(tag: str) -> tuple[int, int, int] | None:
+              match = pattern.fullmatch(tag)
+              return tuple(map(int, match.groups())) if match else None
+
+          current = version(sys.argv[1])
+          assert current is not None
+          with open(sys.argv[2], encoding="utf-8") as source:
+              previous = [parsed for tag in source if (parsed := version(tag.strip())) is not None]
+          if previous and current <= max(previous):
+              raise SystemExit(
+                  f"stable release {sys.argv[1]} must be newer than v{'.'.join(map(str, max(previous)))}"
+              )
+          PY
+          fi
+          tag_ruleset_ok=false
+          while IFS= read -r ruleset_id; do
+            if gh api "repos/$GITHUB_REPOSITORY/rulesets/$ruleset_id" | jq -e '
+              .target == "tag" and
+              .enforcement == "active" and
+              ((.bypass_actors // []) | type == "array" and length == 0) and
+              (.conditions.ref_name.exclude | type == "array" and length == 0) and
+              (.conditions.ref_name.include | type == "array" and
+                (index("refs/tags/v*") != null or index("~ALL") != null)) and
+              (([.rules[].type]) as $types |
+                ($types | index("deletion") != null) and
+                ($types | index("update") != null))
+            ' >/dev/null; then
+              tag_ruleset_ok=true
+              break
+            fi
+          done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/rulesets?includes_parents=true&targets=tag&per_page=100" --jq '.[].id')
+          test "$tag_ruleset_ok" = "true"
+          main_ruleset_ok=false
+          while IFS= read -r ruleset_id; do
+            if gh api "repos/$GITHUB_REPOSITORY/rulesets/$ruleset_id" | jq -e \
+              --argjson github_actions_integration_id "$github_actions_integration_id" '
+              .target == "branch" and
+              .enforcement == "active" and
+              ((.bypass_actors // []) | type == "array" and length == 0) and
+              (.conditions.ref_name.exclude | type == "array" and length == 0) and
+              (.conditions.ref_name.include | type == "array" and
+                (index("refs/heads/main") != null or
+                 index("~DEFAULT_BRANCH") != null or
+                 index("~ALL") != null)) and
+              (([.rules[].type]) as $types |
+                ($types | index("deletion") != null) and
+                ($types | index("non_fast_forward") != null) and
+                ($types | index("pull_request") != null) and
+                ($types | index("required_status_checks") != null)) and
+              ([.rules[] |
+                select(.type == "required_status_checks") |
+                .parameters |
+                select(.strict_required_status_checks_policy == true) |
+                [.required_status_checks[] |
+                  select(.integration_id == $github_actions_integration_id) |
+                  .context]] |
+                any(
+                  (index("Quality / Linux") != null) and
+                  (index("Platform / x86_64-unknown-linux-musl") != null) and
+                  (index("Platform / aarch64-unknown-linux-musl") != null) and
+                  (index("Platform / x86_64-apple-darwin") != null) and
+                  (index("Platform / aarch64-apple-darwin") != null) and
+                  (index("Platform / x86_64-pc-windows-msvc") != null)
+                ))
+            ' >/dev/null; then
+              main_ruleset_ok=true
+              break
+            fi
+          done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/rulesets?includes_parents=true&targets=branch&per_page=100" --jq '.[].id')
+          test "$main_ruleset_ok" = "true"
+
+      - name: Attest every published artifact
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: release/*
+
+      - name: Publish tag-bound release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          semver_tag_regex='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?$'
+          [[ "$RELEASE_TAG" =~ $semver_tag_regex ]]
+          publish_repo="$RUNNER_TEMP/xgeny-release-immediate-verification"
+          mkdir "$publish_repo"
+          git -C "$publish_repo" init --quiet
+          git -C "$publish_repo" remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          publish_ref="refs/release-verification/publish-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          git -C "$publish_repo" fetch --force --no-tags origin \
+            "+refs/heads/main:refs/remotes/origin/release-main" \
+            "+refs/tags/$RELEASE_TAG:$publish_ref"
+          test "$(git -C "$publish_repo" rev-parse refs/remotes/origin/release-main)" = "$RELEASE_SHA"
+          test "$(git -C "$publish_repo" rev-parse "$publish_ref^{commit}")" = "$RELEASE_SHA"
+          release_flags=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            release_flags+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" release/* \
+            --verify-tag \
+            --generate-notes \
+            --title "XGENy ${RELEASE_TAG#v}" \
+            "${release_flags[@]}"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.immutable')" = "true"
+          post_publish_repo="$RUNNER_TEMP/xgeny-release-post-verification"
+          mkdir "$post_publish_repo"
+          git -C "$post_publish_repo" init --quiet
+          git -C "$post_publish_repo" remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          post_publish_ref="refs/release-verification/post-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          git -C "$post_publish_repo" fetch --force --no-tags origin \
+            "+refs/tags/$RELEASE_TAG:$post_publish_ref"
+          test "$GITHUB_SHA" = "$RELEASE_SHA"
+          test "$(git -C "$post_publish_repo" rev-parse "$post_publish_ref^{commit}")" = "$RELEASE_SHA"
+
+  verify-published:
+    name: Verify published install / ${{ matrix.os }}
+    needs: publish
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            executable: xgeny
+            verify_latest: true
+          - os: ubuntu-24.04-arm
+            executable: xgeny
+            verify_latest: false
+          - os: macos-15-intel
+            executable: xgeny
+            verify_latest: false
+          - os: macos-15
+            executable: xgeny
+            verify_latest: false
+          - os: windows-2025-vs2026
+            executable: xgeny.exe
+            verify_latest: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Install exact published release on Unix
+        if: runner.os != 'Windows'
+        env:
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+          VERIFY_LATEST: ${{ matrix.verify_latest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          semver_tag_regex='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?$'
+          [[ "$RELEASE_TAG" =~ $semver_tag_regex ]]
+          test_root=$(mktemp -d "${TMPDIR:-/tmp}/xgeny-published.XXXXXX")
+          trap 'rm -rf "$test_root"' EXIT HUP INT TERM
+          mkdir -p "$test_root/home"
+          installer="$test_root/xgeny-installer.sh"
+          curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --connect-timeout 15 --max-time 60 --max-filesize 1048576 \
+            --retry 5 --retry-delay 2 --retry-all-errors -fsSLo "$installer" \
+            "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/xgeny-installer.sh"
+          HOME="$test_root/home" \
+          XGENY_INSTALL_DIR="$test_root/install" \
+          XGENY_STATE_HOME="$test_root/state" \
+            sh "$installer" --version "$RELEASE_TAG" >/dev/null
+          test "$("$test_root/install/${{ matrix.executable }}" --version)" = "xgeny ${RELEASE_TAG#v}"
+          "$test_root/install/${{ matrix.executable }}" licenses > "$test_root/licenses.txt"
+          grep -Fq 'XGENy CLI Third-Party License Notices' "$test_root/licenses.txt"
+          grep -Fq 'Copyright notices for The Rust Standard Library' "$test_root/licenses.txt"
+          grep -Fq '===== musl C runtime notices =====' "$test_root/licenses.txt"
+          grep -Fq '===== LLVM libunwind notices =====' "$test_root/licenses.txt"
+          test ! -e "$test_root/state"
+
+          if [[ "$VERIFY_LATEST" == "true" && "$RELEASE_TAG" != *-* ]]; then
+            latest_ok=false
+            latest_installer="$test_root/xgeny-installer-latest.sh"
+            for _ in {1..12}; do
+              if curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 \
+                --connect-timeout 15 --max-time 30 --max-filesize 1048576 \
+                -fsSLo "$latest_installer" \
+                "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/xgeny-installer.sh" && \
+                HOME="$test_root/home" \
+                XGENY_INSTALL_DIR="$test_root/install" \
+                XGENY_STATE_HOME="$test_root/state" \
+                  sh "$latest_installer" >/dev/null 2>&1 && \
+                [[ "$("$test_root/install/${{ matrix.executable }}" --version)" == "xgeny ${RELEASE_TAG#v}" ]]; then
+                latest_ok=true
+                break
+              fi
+              sleep 5
+            done
+            test "$latest_ok" = "true"
+            test ! -e "$test_root/state"
+          fi
+
+      - name: Install exact published release on Windows
+        if: runner.os == 'Windows'
+        env:
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+          VERIFY_LATEST: ${{ matrix.verify_latest }}
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $Tag = $env:RELEASE_TAG
+          $SemVerTagPattern = '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?$'
+          if ($Tag -notmatch $SemVerTagPattern) {
+              throw "release tag is invalid"
+          }
+          $TestRoot = Join-Path ([System.IO.Path]::GetTempPath()) "xgeny-published-$([Guid]::NewGuid().ToString('N'))"
+          $Installer = Join-Path $TestRoot "xgeny-installer.ps1"
+          $LatestInstaller = Join-Path $TestRoot "xgeny-installer-latest.ps1"
+          $InstallRoot = Join-Path $TestRoot "install"
+          $StateRoot = Join-Path $TestRoot "state"
+          $PreviousState = $env:XGENY_STATE_HOME
+          $PreviousBase = $env:XGENY_DOWNLOAD_BASE_URL
+          $PreviousTesting = $env:XGENY_INSTALLER_TESTING
+          try {
+              New-Item -ItemType Directory -Path $TestRoot | Out-Null
+              curl.exe -q --proto "=https" --proto-redir "=https" --tlsv1.2 `
+                --connect-timeout 15 --max-time 60 --max-filesize 1048576 `
+                --retry 5 --retry-delay 2 --retry-all-errors -fsSLo $Installer `
+                "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$Tag/xgeny-installer.ps1"
+              if ($LASTEXITCODE -ne 0) { throw "installer download failed" }
+              $env:XGENY_STATE_HOME = $StateRoot
+              $env:XGENY_DOWNLOAD_BASE_URL = $null
+              $env:XGENY_INSTALLER_TESTING = $null
+              & $Installer -Version $Tag -InstallDir $InstallRoot | Out-Null
+              $Installed = Join-Path $InstallRoot "${{ matrix.executable }}"
+              $Observed = (& $Installed --version | Out-String).Trim()
+              if ($LASTEXITCODE -ne 0 -or $Observed -ne "xgeny $($Tag.Substring(1))") {
+                  throw "published binary version is wrong"
+              }
+              if (Test-Path -LiteralPath $StateRoot) {
+                  throw "published install created runtime state"
+              }
+              $LicenseOutput = (& $Installed licenses | Out-String)
+              if (
+                  $LASTEXITCODE -ne 0 -or
+                  -not $LicenseOutput.Contains("XGENy CLI Third-Party License Notices") -or
+                  -not $LicenseOutput.Contains("Copyright notices for The Rust Standard Library") -or
+                  -not $LicenseOutput.Contains("===== musl C runtime notices =====") -or
+                  -not $LicenseOutput.Contains("===== LLVM libunwind notices =====")
+              ) {
+                  throw "published binary is missing embedded license notices"
+              }
+              if ($env:VERIFY_LATEST -eq "true" -and -not $Tag.Contains("-")) {
+                  $LatestOk = $false
+                  foreach ($Attempt in 1..12) {
+                      try {
+                          curl.exe -q --proto "=https" --proto-redir "=https" --tlsv1.2 `
+                            --connect-timeout 15 --max-time 30 --max-filesize 1048576 `
+                            -fsSLo $LatestInstaller `
+                            "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download/xgeny-installer.ps1"
+                          if ($LASTEXITCODE -ne 0) { throw "latest installer download failed" }
+                          & $LatestInstaller -InstallDir $InstallRoot | Out-Null
+                          $LatestObserved = (& $Installed --version | Out-String).Trim()
+                          if ($LASTEXITCODE -eq 0 -and $LatestObserved -eq "xgeny $($Tag.Substring(1))") {
+                              $LatestOk = $true
+                              break
+                          }
+                      } catch {
+                          # GitHub's latest-release views can converge shortly after publication.
+                      }
+                      Start-Sleep -Seconds 5
+                  }
+                  if (-not $LatestOk) { throw "latest did not resolve to the published release" }
+                  if (Test-Path -LiteralPath $StateRoot) {
+                      throw "latest install created runtime state"
+                  }
+              }
+          } finally {
+              $env:XGENY_STATE_HOME = $PreviousState
+              $env:XGENY_DOWNLOAD_BASE_URL = $PreviousBase
+              $env:XGENY_INSTALLER_TESTING = $PreviousTesting
+              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -LiteralPath $TestRoot
+          }

@@ -8,13 +8,19 @@ on:
 permissions:
   contents: read
 
+env:
+  CC_aarch64_unknown_linux_musl: musl-gcc
+  CC_x86_64_unknown_linux_musl: musl-gcc
+
 jobs:
   quality:
     name: Quality / Linux
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install --no-self-update
@@ -28,22 +34,68 @@ jobs:
       - name: Lint workspace
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Check third-party license notices
+        run: sh scripts/check-third-party-licenses.sh --check
+
       - name: Build release workspace
         run: cargo build --workspace --release --locked
 
   platform:
-    name: Protocol / ${{ matrix.os }}
+    name: Platform / ${{ matrix.target }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            asset: xgeny-x86_64-unknown-linux-musl
+            binary: target/x86_64-unknown-linux-musl/release/xgeny
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: xgeny-aarch64-unknown-linux-musl
+            binary: target/aarch64-unknown-linux-musl/release/xgeny
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: xgeny-x86_64-apple-darwin
+            binary: target/x86_64-apple-darwin/release/xgeny
+            developer_dir: /Applications/Xcode_16.4.app/Contents/Developer
+          - os: macos-15
+            target: aarch64-apple-darwin
+            asset: xgeny-aarch64-apple-darwin
+            binary: target/aarch64-apple-darwin/release/xgeny
+            developer_dir: /Applications/Xcode_16.4.app/Contents/Developer
+          - os: windows-2025-vs2026
+            target: x86_64-pc-windows-msvc
+            asset: xgeny-x86_64-pc-windows-msvc.exe
+            binary: target/x86_64-pc-windows-msvc/release/xgeny.exe
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Install pinned Rust toolchain
-        run: rustup toolchain install --no-self-update
+      - name: Install pinned Rust toolchain and release target
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install --no-self-update
+          rustup target add "${{ matrix.target }}"
+
+      - name: Install musl linker
+        if: runner.os == 'Linux'
+        shell: bash
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+
+      - name: Verify pinned Apple toolchain
+        if: runner.os == 'macOS'
+        env:
+          DEVELOPER_DIR: ${{ matrix.developer_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(xcodebuild -version)" = $'Xcode 16.4\nBuild version 16F6'
+          test "$(xcrun --sdk macosx --show-sdk-version)" = "15.5"
 
       - name: Show active Rust toolchain
         run: rustup show active-toolchain
@@ -58,4 +110,48 @@ jobs:
         run: cargo run --locked --quiet -p xgeny-cli -- protocol check
 
       - name: Build release CLI
-        run: cargo build --locked --release -p xgeny-cli
+        env:
+          DEVELOPER_DIR: ${{ matrix.developer_dir }}
+        run: cargo build --locked --release -p xgeny-cli --target ${{ matrix.target }}
+
+      - name: Audit Unix native dependencies
+        if: runner.os != 'Windows'
+        env:
+          DEVELOPER_DIR: ${{ matrix.developer_dir }}
+        shell: bash
+        run: sh scripts/audit-native-binary.sh "${{ matrix.binary }}" "${{ matrix.target }}"
+
+      - name: Audit Windows native dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/audit-native-binary.ps1 -Binary "${{ matrix.binary }}"
+
+      - name: Stage Unix release asset
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          install -m 0755 "${{ matrix.binary }}" "release/${{ matrix.asset }}"
+
+      - name: Stage Windows release asset
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release -Force | Out-Null
+          Copy-Item -LiteralPath "${{ matrix.binary }}" -Destination "release/${{ matrix.asset }}"
+
+      - name: Smoke shell installer against staged asset
+        if: runner.os != 'Windows'
+        shell: bash
+        run: sh scripts/smoke-installer.sh "release/${{ matrix.asset }}" "${{ matrix.asset }}" install/xgeny-installer.sh
+
+      - name: Smoke PowerShell installer against staged asset
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/smoke-installer.ps1 -Binary "release/${{ matrix.asset }}" -Asset "${{ matrix.asset }}" -Installer install/xgeny-installer.ps1
+
+      - name: Smoke Windows PowerShell 5.1 installer against staged asset
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./scripts/smoke-installer.ps1 -Binary "release/${{ matrix.asset }}" -Asset "${{ matrix.asset }}" -Installer install/xgeny-installer.ps1
