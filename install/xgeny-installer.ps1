@@ -280,6 +280,7 @@ if (Test-Path -LiteralPath $Target) {
 $Nonce = [Guid]::NewGuid().ToString("N")
 $TemporaryBinary = Join-Path $InstallDir ".xgeny-$Nonce.tmp.exe"
 $TemporaryChecksums = Join-Path $InstallDir ".xgeny-$Nonce.sha256"
+$TemporaryBackup = Join-Path $InstallDir ".xgeny-$Nonce.backup.exe"
 
 try {
     Download-File "$DownloadBase/$Version/checksums.sha256" $TemporaryChecksums 1MB
@@ -317,7 +318,7 @@ try {
     }
 
     if (Test-Path -LiteralPath $Target) {
-        [System.IO.File]::Replace($TemporaryBinary, $Target, $null, $true)
+        [System.IO.File]::Replace($TemporaryBinary, $Target, $TemporaryBackup, $true)
     } else {
         [System.IO.File]::Move($TemporaryBinary, $Target)
     }
@@ -344,6 +345,7 @@ try {
 } finally {
     Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath $TemporaryBinary
     Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath $TemporaryChecksums
+    Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath $TemporaryBackup
 }
 
 Write-Output "XGENy $($Version.Substring(1)) installed at $Target"

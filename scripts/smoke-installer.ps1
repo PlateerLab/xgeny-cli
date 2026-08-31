@@ -149,6 +149,10 @@ try {
     Set-Acl -LiteralPath $Installed -AclObject $InstalledAcl
 
     & $Installer -Version $Tag -InstallDir $InstallRoot | Out-Null
+    $InstallEntries = @(Get-ChildItem -Force -LiteralPath $InstallRoot)
+    if ($InstallEntries.Count -ne 1 -or $InstallEntries[0].Name -ne "xgeny.exe") {
+        throw "installer left temporary or backup files after upgrade"
+    }
     $ObservedInstalledVersion = (& $Installed --version | Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or $ObservedInstalledVersion -ne $ReportedVersion) {
         throw "installed version is wrong"
