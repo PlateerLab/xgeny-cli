@@ -41,6 +41,9 @@ const MAX_PLANNING_VALUE_NODES: usize = 32_768;
 const MAX_PLANNING_VALUE_TEXT_BYTES: usize = 256 * 1024;
 const MAX_PLANNING_DEFINITION_COLLECTION_ITEMS: usize = 4_096;
 const MAX_PLANNING_HEADER_TEXT_BYTES: usize = 256 * 1024;
+const MAX_PLANNING_CONSTRAINTS: usize = 16;
+const MAX_PLANNING_CONSTRAINT_ID_BYTES: usize = 128;
+const MAX_PLANNING_CONSTRAINT_DESCRIPTION_BYTES: usize = 16 * 1024;
 
 /// One immutable journal position exposed by a bounded loop tick.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -311,6 +314,83 @@ impl fmt::Debug for PlanningStepSummary {
     }
 }
 
+/// One bounded, host-supplied planning restriction for the current composition.
+///
+/// A constraint helps a planner stay inside the host's current operating scope, but it is not an
+/// authority grant. Adapters, policy, admission, and material reconstruction must still enforce
+/// the actual boundary independently. Composition roots that need restart stability must derive
+/// the same constraints from their own durable, integrity-checked configuration.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanningConstraint {
+    constraint_id: String,
+    description: String,
+}
+
+impl PlanningConstraint {
+    /// Build one bounded constraint that is safe to include in provider-bound context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the identifier or description is empty, oversized, or contains an
+    /// unsupported character.
+    pub fn new(
+        constraint_id: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Result<Self, PlanningConstraintError> {
+        let constraint_id = constraint_id.into();
+        if constraint_id.is_empty()
+            || constraint_id.len() > MAX_PLANNING_CONSTRAINT_ID_BYTES
+            || !constraint_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err(PlanningConstraintError::InvalidIdentifier);
+        }
+        let description = description.into();
+        if !valid_bounded_text(&description, MAX_PLANNING_CONSTRAINT_DESCRIPTION_BYTES) {
+            return Err(PlanningConstraintError::InvalidDescription);
+        }
+        Ok(Self {
+            constraint_id,
+            description,
+        })
+    }
+
+    #[must_use]
+    pub fn constraint_id(&self) -> &str {
+        &self.constraint_id
+    }
+
+    #[must_use]
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+}
+
+impl fmt::Debug for PlanningConstraint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PlanningConstraint")
+            .field("constraint_id", &self.constraint_id)
+            .field("description", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Closed validation failures for provider-bound planning constraints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum PlanningConstraintError {
+    #[error("planning constraint identifier is invalid")]
+    InvalidIdentifier,
+    #[error("planning constraint description is invalid")]
+    InvalidDescription,
+    #[error("too many planning constraints were configured")]
+    TooMany,
+    #[error("planning constraint identifiers must be unique")]
+    DuplicateIdentifier,
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PlanningContextPayload {
@@ -321,6 +401,8 @@ struct PlanningContextPayload {
     journal_sequence: u64,
     journal_head_digest: String,
     goal: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    planning_constraints: Vec<PlanningConstraint>,
     total_steps: usize,
     verified_completed_steps: usize,
     tool_outputs: Vec<PlanningToolOutput>,
@@ -362,6 +444,11 @@ impl PlanningContext {
     #[must_use]
     pub fn goal(&self) -> &str {
         &self.payload.goal
+    }
+
+    #[must_use]
+    pub fn planning_constraints(&self) -> &[PlanningConstraint] {
+        &self.payload.planning_constraints
     }
 
     #[must_use]
@@ -455,6 +542,10 @@ impl fmt::Debug for PlanningContext {
             .field("journal_sequence", &self.payload.journal_sequence)
             .field("journal_head_digest", &self.payload.journal_head_digest)
             .field("goal", &"<redacted>")
+            .field(
+                "planning_constraint_count",
+                &self.payload.planning_constraints.len(),
+            )
             .field("total_steps", &self.payload.total_steps)
             .field(
                 "verified_completed_steps",
@@ -843,6 +934,7 @@ pub enum AgentLoopTick {
 pub struct AgentLoop {
     budget: AgentLoopBudget,
     model_call_budget: ModelCallBudget,
+    planning_constraints: Vec<PlanningConstraint>,
 }
 
 impl AgentLoop {
@@ -859,6 +951,7 @@ impl AgentLoop {
         Self {
             budget,
             model_call_budget,
+            planning_constraints: Vec::new(),
         }
     }
 
@@ -870,7 +963,31 @@ impl AgentLoop {
         Self {
             budget,
             model_call_budget,
+            planning_constraints: Vec::new(),
         }
+    }
+
+    /// Attach bounded, non-authoritative planning restrictions to every model context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the collection is too large or repeats an identifier.
+    pub fn with_planning_constraints(
+        mut self,
+        planning_constraints: Vec<PlanningConstraint>,
+    ) -> Result<Self, PlanningConstraintError> {
+        if planning_constraints.len() > MAX_PLANNING_CONSTRAINTS {
+            return Err(PlanningConstraintError::TooMany);
+        }
+        let mut identifiers = BTreeSet::new();
+        if planning_constraints
+            .iter()
+            .any(|constraint| !identifiers.insert(constraint.constraint_id()))
+        {
+            return Err(PlanningConstraintError::DuplicateIdentifier);
+        }
+        self.planning_constraints = planning_constraints;
+        Ok(self)
     }
 
     #[must_use]
@@ -881,6 +998,11 @@ impl AgentLoop {
     #[must_use]
     pub const fn model_call_budget(&self) -> &ModelCallBudget {
         &self.model_call_budget
+    }
+
+    #[must_use]
+    pub fn planning_constraints(&self) -> &[PlanningConstraint] {
+        &self.planning_constraints
     }
 
     /// Select at most one current frontier action, or make at most one planner decision.
@@ -1077,6 +1199,7 @@ impl AgentLoop {
             planning_snapshot.completed_tool_outputs(),
             &frontier,
             capabilities,
+            &self.planning_constraints,
             &loop_state.budget,
         ) {
             Ok(context) => context,
@@ -1930,20 +2053,33 @@ fn build_context(
     completed_tool_outputs: &BTreeMap<String, ToolOutputRecord>,
     frontier: &WorkFrontier,
     registry: &CapabilityRegistry,
+    planning_constraints: &[PlanningConstraint],
     budget: &AgentLoopBudget,
 ) -> Result<PlanningContext, ContextBuildError> {
     if !planning_context_preflight(state, registry) {
         return Err(ContextBuildError::InputLimitExceeded);
     }
+    let mut source_bytes = planning_constraints
+        .iter()
+        .try_fold(0_usize, |total, constraint| {
+            let constraint_size =
+                canonical_size(constraint).map_err(|_| ContextBuildError::Canonicalization)?;
+            total
+                .checked_add(constraint_size)
+                .filter(|size| *size <= MAX_PLANNING_SOURCE_BYTES)
+                .ok_or(ContextBuildError::InputLimitExceeded)
+        })?;
     let tool_outputs = build_planning_tool_outputs(state, completed_tool_outputs)?;
-    let mut source_bytes = tool_outputs.iter().try_fold(0_usize, |total, output| {
-        let output_size =
-            canonical_size(output).map_err(|_| ContextBuildError::Canonicalization)?;
-        total
-            .checked_add(output_size)
-            .filter(|size| *size <= MAX_PLANNING_SOURCE_BYTES)
-            .ok_or(ContextBuildError::InputLimitExceeded)
-    })?;
+    source_bytes = tool_outputs
+        .iter()
+        .try_fold(source_bytes, |total, output| {
+            let output_size =
+                canonical_size(output).map_err(|_| ContextBuildError::Canonicalization)?;
+            total
+                .checked_add(output_size)
+                .filter(|size| *size <= MAX_PLANNING_SOURCE_BYTES)
+                .ok_or(ContextBuildError::InputLimitExceeded)
+        })?;
     let mut summaries = Vec::new();
     for definition in registry.definitions() {
         validate_planning_definition_shape(definition)?;
@@ -2050,6 +2186,7 @@ fn build_context(
         journal_sequence: state.journal_sequence,
         journal_head_digest: state.journal_head_digest.clone(),
         goal: state.goal.clone(),
+        planning_constraints: planning_constraints.to_vec(),
         total_steps: frontier.total_steps,
         verified_completed_steps: frontier.verified_completed_step_ids.len(),
         tool_outputs,
@@ -2980,6 +3117,7 @@ mod tests {
             &BTreeMap::new(),
             &frontier,
             &CapabilityRegistry::new(),
+            &[],
             &test_budget(),
         )
         .expect("context should fit");
@@ -3031,6 +3169,7 @@ mod tests {
             &BTreeMap::new(),
             &frontier,
             &CapabilityRegistry::new(),
+            &[],
             &test_budget(),
         )
         .expect("context should fit");
@@ -3049,10 +3188,92 @@ mod tests {
             &BTreeMap::new(),
             &frontier,
             &CapabilityRegistry::new(),
+            &[],
             &oversized,
         )
         .expect("hard cap should not invalidate an otherwise fitting legacy budget");
         assert!(context.canonical_size_bytes() <= MAX_PLANNING_CONTEXT_BYTES);
+    }
+
+    #[test]
+    fn planning_constraints_are_optional_digest_bound_and_debug_redacted() {
+        let state = state(Vec::new());
+        let frontier = derive_frontier(&state).expect("frontier should derive");
+        let without = build_context(
+            &state,
+            &BTreeMap::new(),
+            &frontier,
+            &CapabilityRegistry::new(),
+            &[],
+            &test_budget(),
+        )
+        .expect("legacy context should fit");
+        let without_json = serde_json::to_value(&without).expect("context should serialize");
+        assert!(without_json.get("planningConstraints").is_none());
+
+        let constraint = PlanningConstraint::new(
+            "workspace.read-scope",
+            "Caller-authorized directory roots: [\".\"].",
+        )
+        .expect("constraint should validate");
+        let with = build_context(
+            &state,
+            &BTreeMap::new(),
+            &frontier,
+            &CapabilityRegistry::new(),
+            std::slice::from_ref(&constraint),
+            &test_budget(),
+        )
+        .expect("constrained context should fit");
+        assert_eq!(
+            with.planning_constraints(),
+            std::slice::from_ref(&constraint)
+        );
+        assert_ne!(with.context_digest(), without.context_digest());
+        assert_eq!(
+            serde_json::to_value(&with).expect("context should serialize")["planningConstraints"]
+                [0]["constraintId"],
+            "workspace.read-scope"
+        );
+        assert!(!format!("{constraint:?}").contains("Caller-authorized"));
+    }
+
+    #[test]
+    fn planning_constraint_configuration_rejects_invalid_or_ambiguous_inputs() {
+        assert_eq!(
+            PlanningConstraint::new("bad/id", "description").unwrap_err(),
+            PlanningConstraintError::InvalidIdentifier
+        );
+        assert_eq!(
+            PlanningConstraint::new("valid.id", "bad\ndescription").unwrap_err(),
+            PlanningConstraintError::InvalidDescription
+        );
+        assert_eq!(
+            PlanningConstraint::new(
+                "valid.id",
+                "x".repeat(MAX_PLANNING_CONSTRAINT_DESCRIPTION_BYTES + 1)
+            )
+            .unwrap_err(),
+            PlanningConstraintError::InvalidDescription
+        );
+
+        let duplicate = PlanningConstraint::new("duplicate", "first").unwrap();
+        let duplicate_again = PlanningConstraint::new("duplicate", "second").unwrap();
+        assert_eq!(
+            AgentLoop::new(test_budget())
+                .with_planning_constraints(vec![duplicate, duplicate_again])
+                .unwrap_err(),
+            PlanningConstraintError::DuplicateIdentifier
+        );
+        let too_many = (0..=MAX_PLANNING_CONSTRAINTS)
+            .map(|index| PlanningConstraint::new(format!("constraint-{index}"), "value").unwrap())
+            .collect();
+        assert_eq!(
+            AgentLoop::new(test_budget())
+                .with_planning_constraints(too_many)
+                .unwrap_err(),
+            PlanningConstraintError::TooMany
+        );
     }
 
     #[test]
@@ -3081,6 +3302,7 @@ mod tests {
                 &BTreeMap::new(),
                 &frontier,
                 &registry,
+                &[],
                 &test_budget()
             ),
             Err(ContextBuildError::InputLimitExceeded)
@@ -3124,6 +3346,7 @@ mod tests {
                 &BTreeMap::new(),
                 &frontier,
                 &CapabilityRegistry::new(),
+                &[],
                 &test_budget(),
             ),
             Err(ContextBuildError::InputLimitExceeded)

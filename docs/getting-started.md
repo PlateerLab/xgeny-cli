@@ -1,7 +1,9 @@
 # XGENy 설치와 첫 실행
 
-이 문서는 release binary 하나를 설치하고 OpenAI-compatible model에 연결해 현재 공개
-`read-text` capability를 실행하는 최소 절차다. 소스 개발 절차와 달리 Rust, C compiler, Python,
+이 문서는 release binary 하나를 설치하고 OpenAI-compatible model에 연결해 현재 배포된
+`read-text` capability를 실행하는 최소 절차다. 최신 prerelease `v0.1.0-rc.2`는 exact
+`--allow-file` mode만 포함한다. Source/main의 `--allow-dir` workspace discovery는 이 변경을 포함한
+다음 release부터 사용할 수 있다. 소스 개발 절차와 달리 Rust, C compiler, Python,
 Node.js, SQLite 실행 파일, Docker 또는 XGENy state용 별도 daemon이 필요하지 않다. 사용할 model
 endpoint 자체는 로컬 또는 원격에 별도로 실행 중이어야 한다.
 
@@ -191,8 +193,26 @@ xgeny run `
   "README를 읽고 핵심을 요약해줘."
 ```
 
-상태가 pause되면 stderr의 `run_id`를 사용한다. 미완료 Run은 workspace와 같은 allow-file catalog를
-다시 제공하고 필요한 동의를 명시한다. Base URL은 위 environment에서 다시 읽는다.
+이 변경을 포함한 source build 또는 다음 release에서는 사용자가 파일명을 미리 나열하지 않고 선택한
+workspace directory를 read-only로 탐색하게 할 수 있다.
+
+```bash
+xgeny run \
+  --workspace . \
+  --allow-dir . \
+  --allow-remote-model-egress \
+  --allow-read \
+  '프로젝트 구조를 확인하고 관련 구현을 찾아 설명해줘.'
+```
+
+이 mode는 `list-directory`, `stat`, case-sensitive literal `search-text`, bounded UTF-8
+`read-text`를 제공한다. 더 좁게 허용하려면 `--allow-dir src --allow-dir tests`처럼 반복하고,
+directory 밖의 exact file만 `--allow-file Cargo.toml`로 추가한다. 미완료 재개에는 원래와 동일한
+`--allow-dir`/`--allow-file` 집합을 다시 제공해야 한다.
+
+상태가 pause되면 stderr의 `run_id`를 사용한다. 미완료 Run은 workspace와 원래 사용한 동일한
+allow-file/allow-dir catalog를 다시 제공하고 필요한 동의를 명시한다. Base URL은 위 environment에서
+다시 읽는다.
 
 ```bash
 xgeny resume run-0123456789abcdef0123456789abcdef \
@@ -209,8 +229,10 @@ xgeny resume run-0123456789abcdef0123456789abcdef
 ```
 
 상세 재개 절차는 [Public local run/resume prototype](development/public-local-run-resume.md)을 따른다.
-현재 공개 capability는 allow-list 기반 UTF-8 file read 하나다. 일반 shell/process, file write,
-browser와 MCP는 후속 범위이므로 현 상태를 Claude Code/Codex 전체 기능과 동일하다고 해석하지 않는다.
+현재 배포된 RC2 capability는 allow-list 기반 UTF-8 file read 하나다. Source/main의 workspace
+discovery도 여전히 read-only다. 일반 shell/process, file write, browser와 MCP는 후속 범위이므로 현
+상태를 Claude Code/Codex 전체 기능과 동일하다고 해석하지 않는다. Discovery의 limit·state·재개
+경계는 [Workspace filesystem discovery](development/workspace-filesystem-discovery.md)를 따른다.
 
 ## 삭제
 

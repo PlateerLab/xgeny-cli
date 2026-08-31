@@ -64,6 +64,16 @@ impl Default for ManifestBudget {
 }
 
 impl ManifestBudget {
+    pub(crate) const fn workspace_discovery() -> Self {
+        Self {
+            max_model_turns: 8,
+            max_model_calls: 16,
+            max_planned_steps: 8,
+            max_tool_calls: 8,
+            max_context_bytes: 512 * 1024,
+        }
+    }
+
     pub(crate) fn agent_loop(&self) -> Result<AgentLoopBudget, ManifestError> {
         AgentLoopBudget::new(
             self.max_model_turns,

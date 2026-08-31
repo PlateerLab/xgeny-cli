@@ -6,6 +6,9 @@
 - 공개 protocol v0.1 schema 변경: 없음
 - local store schema: 8 유지
 
+> 후속 ADR-0024가 list/stat/search를 위해 `.` workspace-root logical resource를 추가했다. 기존
+> read-text의 regular-file-only 실행 의미와 legacy allow-file의 root 거부는 유지한다.
+
 ## 문맥
 
 [ADR-0021](0021-durable-completion-output-and-schema-8.md)까지 실제 tool output을 다음 model

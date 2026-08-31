@@ -28,8 +28,35 @@ pub(crate) struct RelativePath {
 }
 
 impl RelativePath {
+    pub(crate) const fn from_components(components: Vec<String>) -> Self {
+        Self { components }
+    }
+
     pub(crate) fn components(&self) -> &[String] {
         &self.components
+    }
+
+    pub(crate) fn join(&self, component: &str) -> Result<Self, PathError> {
+        validate_component(component)?;
+        if self.components.len() == MAX_COMPONENTS {
+            return Err(PathError::Invalid);
+        }
+        let mut components = self.components.clone();
+        components.push(component.to_owned());
+        if components.iter().map(String::len).sum::<usize>() + components.len().saturating_sub(1)
+            > MAX_RELATIVE_PATH_BYTES
+        {
+            return Err(PathError::Invalid);
+        }
+        Ok(Self { components })
+    }
+
+    pub(crate) fn display(&self) -> String {
+        if self.components.is_empty() {
+            ".".to_owned()
+        } else {
+            self.components.join("/")
+        }
     }
 }
 
@@ -43,7 +70,11 @@ pub(crate) fn canonical_resource(
     workspace_id: &WorkspaceId,
     resource: &str,
 ) -> Result<String, PathError> {
-    let prefix = canonical_prefix(workspace_id);
+    let root = canonical_root(workspace_id);
+    let prefix = format!("{root}/");
+    if resource == "." || resource == root {
+        return Ok(root);
+    }
     let relative = if let Some(relative) = resource.strip_prefix(&prefix) {
         relative
     } else if resource.starts_with(CANONICAL_PREFIX) {
@@ -59,7 +90,13 @@ pub(crate) fn parse_canonical(
     workspace_id: &WorkspaceId,
     resource: &str,
 ) -> Result<RelativePath, PathError> {
-    let prefix = canonical_prefix(workspace_id);
+    let root = canonical_root(workspace_id);
+    if resource == root {
+        return Ok(RelativePath {
+            components: Vec::new(),
+        });
+    }
+    let prefix = format!("{root}/");
     let relative = resource
         .strip_prefix(&prefix)
         .ok_or(PathError::OutsideBoundary)?;
@@ -67,8 +104,8 @@ pub(crate) fn parse_canonical(
     Ok(RelativePath { components })
 }
 
-fn canonical_prefix(workspace_id: &WorkspaceId) -> String {
-    format!("{CANONICAL_PREFIX}{}/", workspace_id.as_str())
+pub(crate) fn canonical_root(workspace_id: &WorkspaceId) -> String {
+    format!("{CANONICAL_PREFIX}{}", workspace_id.as_str())
 }
 
 fn validate_relative(relative: &str) -> Result<Vec<String>, PathError> {
@@ -165,10 +202,25 @@ mod tests {
     }
 
     #[test]
+    fn workspace_root_has_one_idempotent_logical_resource() {
+        let canonical = canonical_resource(&workspace(), ".").expect("root should resolve");
+        assert_eq!(canonical, "workspace:primary");
+        assert_eq!(
+            canonical_resource(&workspace(), &canonical).expect("root token should resolve"),
+            canonical
+        );
+        assert!(
+            parse_canonical(&workspace(), &canonical)
+                .expect("root token should parse")
+                .components()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn cross_platform_escape_and_alias_forms_are_rejected() {
         let candidates = [
             "",
-            ".",
             "..",
             "a/../b",
             "/etc/passwd",

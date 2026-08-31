@@ -1,0 +1,82 @@
+{
+  "apiVersion": "xgeny.io/v1alpha1",
+  "kind": "CapabilityDefinition",
+  "metadata": {
+    "id": "xgeny.fs/search-text",
+    "contractVersion": "1.0.0",
+    "displayName": "Search workspace text",
+    "labels": {
+      "xgeny.io/pack": "core-os"
+    }
+  },
+  "spec": {
+    "summary": "Search recursively for one literal UTF-8 query under a workspace directory without following symbolic links.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "required": ["path", "query"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Use '.' for the workspace root or a slash-separated workspace-relative directory path."
+        },
+        "query": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "Literal query with no control characters and at most 256 UTF-8 bytes."
+        }
+      },
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "required": ["matches", "truncated", "digest"],
+      "properties": {
+        "matches": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "type": "object",
+            "required": ["path", "line", "column", "preview"],
+            "properties": {
+              "path": {"type": "string", "minLength": 1, "description": "Workspace-relative matching file path."},
+              "line": {"type": "integer", "minimum": 1},
+              "column": {"type": "integer", "minimum": 1},
+              "preview": {"type": "string"}
+            },
+            "additionalProperties": false
+          }
+        },
+        "truncated": {"type": "boolean"},
+        "digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "effect": {
+      "class": "read_only",
+      "resourceSelectors": [
+        {"scope": "filesystem.read", "argumentPointer": "/path"}
+      ],
+      "criticalActions": []
+    },
+    "requiredCapabilities": [],
+    "execution": {
+      "styles": ["sync"],
+      "cancellable": false,
+      "idempotencyKeySupported": false,
+      "defaultTimeoutMs": 30000,
+      "maxTimeoutMs": 30000
+    },
+    "verification": [
+      {"strategy": "output_schema", "required": true},
+      {"strategy": "postcondition", "required": true, "description": "Digest matches the canonical bounded search observation."}
+    ],
+    "discovery": {
+      "keywords": ["code", "find", "search", "text", "workspace"],
+      "examples": ["Find every reference to WorkspaceRoot under src."]
+    }
+  }
+}

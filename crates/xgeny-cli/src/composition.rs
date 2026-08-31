@@ -1,14 +1,19 @@
 use std::env;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use xgeny_adapter_filesystem::{
-    FILESYSTEM_READ_SCOPE, READ_TEXT_CAPABILITY_ID, READ_TEXT_CONTRACT_VERSION, ReadTextLimits,
-    WorkspaceId, WorkspaceRoot,
+    FILESYSTEM_READ_SCOPE, LIST_DIRECTORY_CAPABILITY_ID, LIST_DIRECTORY_CONTRACT_VERSION,
+    MAX_DIRECTORY_SCAN_ENTRIES, MAX_LIST_DIRECTORY_ENTRIES, MAX_QUERY_OUTPUT_CANONICAL_BYTES,
+    MAX_SEARCH_FILE_BYTES, MAX_SEARCH_MATCHES, MAX_SEARCH_PREVIEW_BYTES, MAX_SEARCH_QUERY_BYTES,
+    MAX_SEARCH_QUERY_UNICODE_SCALARS, MAX_SEARCH_TOTAL_BYTES, MAX_SEARCH_VISITED_ENTRIES,
+    READ_TEXT_CAPABILITY_ID, READ_TEXT_CONTRACT_VERSION, ReadTextLimits, SEARCH_TEXT_CAPABILITY_ID,
+    SEARCH_TEXT_CONTRACT_VERSION, STAT_CAPABILITY_ID, STAT_CONTRACT_VERSION, WorkspaceId,
+    WorkspaceRoot,
 };
 use xgeny_domain::{
     Architecture, CapabilityDefinitionBody, CapabilityInstanceBody, CapabilityRef, DataBoundary,
@@ -29,7 +34,7 @@ use xgeny_runtime::{
     EffectAdapterRegistry, EffectVerifierRegistry, EventFactory, EventFactoryError, EventMetadata,
     LocalRunLease, MaterialProviderRegistry, PlanMaterializationRequest, PlanMaterializer,
     PlanMaterializerFailure, PlanProposal, PlannerCallRequest, PlannerPort, PlannerPortFailure,
-    RequiredRouteFeatures, RouteRequest,
+    PlanningConstraint, RequiredRouteFeatures, RouteRequest,
 };
 use xgeny_workgraph::{
     CompletionOutputRecord, ModelCallStatus, PlannedExecutionProfile,
@@ -38,11 +43,17 @@ use xgeny_workgraph::{
 };
 
 use crate::allow_file::{ALLOW_FILE_PROVIDER_ID, AllowFileCatalog};
+use crate::allow_path::WorkspaceReadAuthorization;
 use crate::driver::{
     ApprovalDecision, ApprovalPort, ApprovalPortFailure, DriverOutcome, PlannedRouteFailure,
     PlannedRoutePort, RunDriver,
 };
 use crate::manifest::{ManifestBudget, RunManifest};
+use crate::material_catalog::{
+    RunMaterialCatalog, WORKSPACE_READ_MATERIAL_CATALOG_SCHEMA_VERSION,
+    WORKSPACE_READ_MATERIAL_PROVIDER_ID, WORKSPACE_READ_RECIPE_DOMAIN,
+    WORKSPACE_READ_RECIPE_FORMAT_VERSION, WorkspaceReadMaterialProvider, WorkspaceReadMaterializer,
+};
 use crate::run_layout::{RunLayout, discover_state_root, generate_run_id};
 
 const WORKSPACE_ID: &str = "primary";
@@ -54,11 +65,18 @@ const MAX_OUTPUT_TOKENS: u32 = 1_024;
 const MODEL_TIMEOUT: Duration = Duration::from_secs(60);
 const MODEL_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCAL_EXECUTION_PROFILE_DOMAIN: &str = "xgeny.cli.local-execution-profile/v1";
+const WORKSPACE_DISCOVERY_PROFILE_DOMAIN: &str =
+    "xgeny.cli.workspace-discovery-execution-profile/v1";
 const ROUTE_PROFILE: &str = "xgeny.cli.exact-read-only-route/v1";
 const MATERIALIZER_PROFILE: &str = "xgeny.cli.allow-file-materializer/v1";
 const APPROVAL_PROFILE: &str = "xgeny.cli.exact-catalog-read-approval/v1";
 const HOST_POLICY_PROFILE: &str = "xgeny.cli.host-exact-catalog-read/v1";
+const WORKSPACE_HOST_POLICY_PROFILE: &str = "xgeny.cli.host-workspace-descendant-read/v1";
 const USER_READ_POLICY_PROFILE: &str = "xgeny.cli.explicit-allow-read-flag/v1";
+const WORKSPACE_ROUTE_PROFILE: &str = "xgeny.cli.workspace-read-only-route/v1";
+const WORKSPACE_MATERIALIZER_PROFILE: &str = "xgeny.cli.durable-workspace-read-materializer/v1";
+const WORKSPACE_APPROVAL_PROFILE: &str = "xgeny.cli.workspace-read-approval/v1";
+const WORKSPACE_PLANNING_CONSTRAINT_PROFILE: &str = "xgeny.cli.workspace-read-scope-constraint/v1";
 
 /// One new local Run invocation. Remote model transfer and local reads are separate decisions.
 pub struct LocalRunRequest {
@@ -69,6 +87,7 @@ pub struct LocalRunRequest {
     pub model: String,
     pub tokenizer: String,
     pub allow_files: Vec<String>,
+    pub allow_dirs: Vec<String>,
     pub allow_remote_model_egress: bool,
     pub allow_read: bool,
     pub max_ticks: u32,
@@ -92,6 +111,7 @@ impl LocalRunRequest {
             model,
             tokenizer,
             allow_files,
+            allow_dirs: Vec::new(),
             allow_remote_model_egress: false,
             allow_read: false,
             max_ticks: 32,
@@ -105,6 +125,7 @@ pub struct LocalResumeRequest {
     pub workspace: Option<PathBuf>,
     pub base_url: Option<String>,
     pub allow_files: Vec<String>,
+    pub allow_dirs: Vec<String>,
     pub allow_remote_model_egress: bool,
     pub allow_read: bool,
     pub max_ticks: u32,
@@ -312,6 +333,47 @@ impl PublicRunError {
     }
 }
 
+#[derive(Clone)]
+enum LocalReadCatalog {
+    ExactFiles(AllowFileCatalog),
+    Workspace(WorkspaceReadAuthorization),
+}
+
+impl LocalReadCatalog {
+    fn build(
+        workspace: &WorkspaceRoot,
+        allow_files: &[String],
+        allow_dirs: &[String],
+    ) -> Result<Self, PublicRunError> {
+        if allow_dirs.is_empty() {
+            return AllowFileCatalog::new(&workspace.resolver(), allow_files)
+                .map(Self::ExactFiles)
+                .map_err(|_| PublicRunError::Configuration);
+        }
+        WorkspaceReadAuthorization::new(&workspace.resolver(), allow_files, allow_dirs)
+            .map(Self::Workspace)
+            .map_err(|_| PublicRunError::Configuration)
+    }
+
+    fn catalog_digest(&self) -> &str {
+        match self {
+            Self::ExactFiles(catalog) => catalog.catalog_digest(),
+            Self::Workspace(authorization) => authorization.catalog_digest(),
+        }
+    }
+
+    const fn workspace_discovery(&self) -> bool {
+        matches!(self, Self::Workspace(_))
+    }
+
+    const fn workspace_authorization(&self) -> Option<&WorkspaceReadAuthorization> {
+        match self {
+            Self::ExactFiles(_) => None,
+            Self::Workspace(authorization) => Some(authorization),
+        }
+    }
+}
+
 /// Create and drive a new one-workspace, read-text prototype Run.
 ///
 /// # Errors
@@ -353,15 +415,15 @@ where
     let identity = workspace
         .physical_identity()
         .map_err(|_| PublicRunError::Configuration)?;
-    let catalog = AllowFileCatalog::new(&workspace.resolver(), &request.allow_files)
-        .map_err(|_| PublicRunError::Configuration)?;
+    let catalog = LocalReadCatalog::build(&workspace, &request.allow_files, &request.allow_dirs)?;
     let config = planner_config(
         &request.base_url,
         &request.planner_id,
         &request.model,
         &request.tokenizer,
+        catalog.workspace_discovery(),
     )?;
-    let local_execution_profile_digest = local_execution_profile_digest(&workspace)?;
+    let local_execution_profile_digest = local_execution_profile_digest(&workspace, &catalog)?;
     let run_id = generate_run_id().map_err(|_| PublicRunError::Internal)?;
     let manifest = RunManifest::new(
         &run_id,
@@ -374,7 +436,11 @@ where
         config.request_profile_digest(),
         catalog.catalog_digest(),
         &local_execution_profile_digest,
-        ManifestBudget::default(),
+        if catalog.workspace_discovery() {
+            ManifestBudget::workspace_discovery()
+        } else {
+            ManifestBudget::default()
+        },
     )
     .map_err(|_| PublicRunError::Configuration)?;
     let planner = remote_planner(config)?;
@@ -383,6 +449,10 @@ where
     layout
         .write_manifest(&manifest)
         .map_err(|_| PublicRunError::Integrity)?;
+    if catalog.workspace_discovery() {
+        RunMaterialCatalog::create(&layout.material_catalog_path(), manifest.run_id())
+            .map_err(|_| PublicRunError::Integrity)?;
+    }
     let lease = acquire_lease(&layout, manifest.run_id())?;
     let mut store =
         SqliteRunStore::create(layout.database_path()).map_err(|_| PublicRunError::Integrity)?;
@@ -395,6 +465,7 @@ where
         &workspace,
         Some(planner),
         catalog,
+        &layout.material_catalog_path(),
         request.allow_read,
         request.max_ticks,
     )
@@ -486,11 +557,12 @@ pub fn resume_local(request: LocalResumeRequest) -> Result<LocalCommandResult, P
     {
         return Err(PublicRunError::Configuration);
     }
-    if manifest.local_execution_profile_digest() != local_execution_profile_digest(&workspace)? {
+    let catalog = LocalReadCatalog::build(&workspace, &request.allow_files, &request.allow_dirs)?;
+    if manifest.local_execution_profile_digest()
+        != local_execution_profile_digest(&workspace, &catalog)?
+    {
         return Err(PublicRunError::Configuration);
     }
-    let catalog = AllowFileCatalog::new(&workspace.resolver(), &request.allow_files)
-        .map_err(|_| PublicRunError::Configuration)?;
     if manifest.allow_file_catalog_digest() != catalog.catalog_digest() {
         return Err(PublicRunError::Configuration);
     }
@@ -504,6 +576,7 @@ pub fn resume_local(request: LocalResumeRequest) -> Result<LocalCommandResult, P
             manifest.planner_id(),
             manifest.model(),
             manifest.tokenizer(),
+            catalog.workspace_discovery(),
         )?;
         if manifest.request_profile_digest() != config.request_profile_digest() {
             return Err(PublicRunError::Configuration);
@@ -521,6 +594,7 @@ pub fn resume_local(request: LocalResumeRequest) -> Result<LocalCommandResult, P
         &workspace,
         planner,
         catalog,
+        &layout.material_catalog_path(),
         request.allow_read,
         request.max_ticks,
     )
@@ -544,6 +618,23 @@ fn reopen_writable_verified(
     Ok(store)
 }
 
+enum LocalReadMaterializer {
+    ExactFiles(AllowFileCatalog),
+    Workspace(WorkspaceReadMaterializer),
+}
+
+impl PlanMaterializer for LocalReadMaterializer {
+    fn materialize(
+        &mut self,
+        request: PlanMaterializationRequest<'_>,
+    ) -> Result<ReconstructableMaterialReference, PlanMaterializerFailure> {
+        match self {
+            Self::ExactFiles(materializer) => materializer.materialize(request),
+            Self::Workspace(materializer) => materializer.materialize(request),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn continue_incomplete(
     store: &mut SqliteRunStore,
@@ -551,7 +642,8 @@ fn continue_incomplete(
     manifest: &RunManifest,
     workspace: &WorkspaceRoot,
     planner: Option<OpenAiPlanner>,
-    catalog: AllowFileCatalog,
+    catalog: LocalReadCatalog,
+    material_catalog_path: &Path,
     allow_read: bool,
     max_ticks: u32,
 ) -> Result<LocalCommandResult, PublicRunError> {
@@ -564,26 +656,56 @@ fn continue_incomplete(
             request_profile_digest: manifest.request_profile_digest().to_owned(),
         }
     };
-    let ReadTextProduct {
+    let ReadOnlyProduct {
         capabilities,
         mut adapters,
         mut verifiers,
         mut route,
-    } = read_text_product(workspace)?;
-    let resolver = workspace.resolver();
-    let mut materializer = catalog.clone();
-    let approval_catalog = catalog.clone();
-    let mut providers = MaterialProviderRegistry::new();
-    providers
-        .register(ALLOW_FILE_PROVIDER_ID, catalog)
+    } = read_only_product(workspace, &catalog)?;
+    let planning_constraint = catalog
+        .workspace_authorization()
+        .map(|authorization| {
+            PlanningConstraint::new("workspace.read-scope", authorization.planner_scope_hint())
+        })
+        .transpose()
         .map_err(|_| PublicRunError::Internal)?;
+    let resolver = workspace.resolver();
+    let mut providers = MaterialProviderRegistry::new();
+    let (mut materializer, approval_catalog) = match catalog {
+        LocalReadCatalog::ExactFiles(catalog) => {
+            let materializer = LocalReadMaterializer::ExactFiles(catalog.clone());
+            providers
+                .register(ALLOW_FILE_PROVIDER_ID, catalog.clone())
+                .map_err(|_| PublicRunError::Internal)?;
+            (materializer, ReadApprovalCatalog::ExactFiles(catalog))
+        }
+        LocalReadCatalog::Workspace(authorization) => {
+            let materializer_catalog =
+                RunMaterialCatalog::open_existing(material_catalog_path, manifest.run_id())
+                    .map_err(|_| PublicRunError::Integrity)?;
+            let provider_catalog =
+                RunMaterialCatalog::open_existing(material_catalog_path, manifest.run_id())
+                    .map_err(|_| PublicRunError::Integrity)?;
+            let materializer = LocalReadMaterializer::Workspace(WorkspaceReadMaterializer::new(
+                authorization.clone(),
+                materializer_catalog,
+            ));
+            providers
+                .register(
+                    WORKSPACE_READ_MATERIAL_PROVIDER_ID,
+                    WorkspaceReadMaterialProvider::new(authorization.clone(), provider_catalog),
+                )
+                .map_err(|_| PublicRunError::Internal)?;
+            (materializer, ReadApprovalCatalog::Workspace(authorization))
+        }
+    };
     let mut approvals = ExplicitReadApproval {
         allow_read,
         run_id: manifest.run_id().to_owned(),
         catalog: approval_catalog,
     };
     let mut events = HostEventFactory;
-    let loop_runtime = AgentLoop::with_model_call_budget(
+    let mut loop_runtime = AgentLoop::with_model_call_budget(
         manifest
             .budget()
             .agent_loop()
@@ -593,6 +715,11 @@ fn continue_incomplete(
             .model_calls()
             .map_err(|_| PublicRunError::Integrity)?,
     );
+    if let Some(constraint) = planning_constraint {
+        loop_runtime = loop_runtime
+            .with_planning_constraints(vec![constraint])
+            .map_err(|_| PublicRunError::Internal)?;
+    }
     let driver = RunDriver::new(
         loop_runtime,
         NonZeroU32::new(max_ticks).ok_or(PublicRunError::Configuration)?,
@@ -905,11 +1032,19 @@ fn planner_config(
     planner_id: &str,
     model: &str,
     tokenizer: &str,
+    planning_constraints_required: bool,
 ) -> Result<OpenAiPlannerConfig, PublicRunError> {
-    OpenAiPlannerConfig::new(base_url, planner_id, model, tokenizer)
+    let config = OpenAiPlannerConfig::new(base_url, planner_id, model, tokenizer)
         .and_then(|config| config.with_max_output_tokens(MAX_OUTPUT_TOKENS))
         .and_then(|config| config.with_timeout(MODEL_TIMEOUT))
-        .map_err(map_provider_config)
+        .map_err(map_provider_config)?;
+    if planning_constraints_required {
+        config
+            .with_planning_constraints_required()
+            .map_err(map_provider_config)
+    } else {
+        Ok(config)
+    }
 }
 
 fn remote_planner(config: OpenAiPlannerConfig) -> Result<OpenAiPlanner, PublicRunError> {
@@ -1086,7 +1221,7 @@ fn map_driver_outcome(
     })
 }
 
-struct ReadTextProduct {
+struct ReadOnlyProduct {
     capabilities: CapabilityRegistry,
     adapters: EffectAdapterRegistry,
     verifiers: EffectVerifierRegistry,
@@ -1108,7 +1243,48 @@ struct LocalExecutionProfileDescriptor<'a> {
     user_read_policy_profile: &'static str,
 }
 
-fn local_execution_profile_digest(workspace: &WorkspaceRoot) -> Result<String, PublicRunError> {
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceDiscoveryProfileDescriptor<'a> {
+    domain: &'static str,
+    definitions: Vec<&'a CapabilityDefinitionBody>,
+    instances: Vec<&'a CapabilityInstanceBody>,
+    limits: DiscoveryLimitsDescriptor,
+    route_profile: &'static str,
+    materializer_profile: &'static str,
+    material_provider_id: &'static str,
+    material_catalog_schema_version: i64,
+    material_recipe_domain: &'static str,
+    material_recipe_format_version: u32,
+    planning_constraint_profile: &'static str,
+    approval_profile: &'static str,
+    host_policy_profile: &'static str,
+    user_read_policy_profile: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiscoveryLimitsDescriptor {
+    read_text_bytes: usize,
+    list_entries: usize,
+    directory_scan_entries: usize,
+    search_query_bytes: usize,
+    search_query_unicode_scalars: usize,
+    search_matches: usize,
+    search_visited_entries: usize,
+    search_file_bytes: usize,
+    search_total_bytes: usize,
+    search_preview_bytes: usize,
+    query_output_canonical_bytes: usize,
+}
+
+fn local_execution_profile_digest(
+    workspace: &WorkspaceRoot,
+    catalog: &LocalReadCatalog,
+) -> Result<String, PublicRunError> {
+    if catalog.workspace_authorization().is_some() {
+        return workspace_discovery_profile_digest(workspace);
+    }
     let (definition, instance) = read_text_spec(workspace)?;
     let canonical = serde_jcs::to_vec(&LocalExecutionProfileDescriptor {
         domain: LOCAL_EXECUTION_PROFILE_DOMAIN,
@@ -1126,19 +1302,69 @@ fn local_execution_profile_digest(workspace: &WorkspaceRoot) -> Result<String, P
     Ok(sha256_digest(&canonical))
 }
 
+fn workspace_discovery_profile_digest(workspace: &WorkspaceRoot) -> Result<String, PublicRunError> {
+    let specs = workspace_discovery_specs(workspace)?;
+    let canonical = serde_jcs::to_vec(&WorkspaceDiscoveryProfileDescriptor {
+        domain: WORKSPACE_DISCOVERY_PROFILE_DOMAIN,
+        definitions: specs.iter().map(|(definition, _)| definition).collect(),
+        instances: specs.iter().map(|(_, instance)| instance).collect(),
+        limits: DiscoveryLimitsDescriptor {
+            read_text_bytes: ReadTextLimits::default().max_bytes(),
+            list_entries: MAX_LIST_DIRECTORY_ENTRIES,
+            directory_scan_entries: MAX_DIRECTORY_SCAN_ENTRIES,
+            search_query_bytes: MAX_SEARCH_QUERY_BYTES,
+            search_query_unicode_scalars: MAX_SEARCH_QUERY_UNICODE_SCALARS,
+            search_matches: MAX_SEARCH_MATCHES,
+            search_visited_entries: MAX_SEARCH_VISITED_ENTRIES,
+            search_file_bytes: MAX_SEARCH_FILE_BYTES,
+            search_total_bytes: MAX_SEARCH_TOTAL_BYTES,
+            search_preview_bytes: MAX_SEARCH_PREVIEW_BYTES,
+            query_output_canonical_bytes: MAX_QUERY_OUTPUT_CANONICAL_BYTES,
+        },
+        route_profile: WORKSPACE_ROUTE_PROFILE,
+        materializer_profile: WORKSPACE_MATERIALIZER_PROFILE,
+        material_provider_id: WORKSPACE_READ_MATERIAL_PROVIDER_ID,
+        material_catalog_schema_version: WORKSPACE_READ_MATERIAL_CATALOG_SCHEMA_VERSION,
+        material_recipe_domain: WORKSPACE_READ_RECIPE_DOMAIN,
+        material_recipe_format_version: WORKSPACE_READ_RECIPE_FORMAT_VERSION,
+        planning_constraint_profile: WORKSPACE_PLANNING_CONSTRAINT_PROFILE,
+        approval_profile: WORKSPACE_APPROVAL_PROFILE,
+        host_policy_profile: WORKSPACE_HOST_POLICY_PROFILE,
+        user_read_policy_profile: USER_READ_POLICY_PROFILE,
+    })
+    .map_err(|_| PublicRunError::Internal)?;
+    Ok(sha256_digest(&canonical))
+}
+
 fn read_text_spec(
     workspace: &WorkspaceRoot,
 ) -> Result<(CapabilityDefinitionBody, CapabilityInstanceBody), PublicRunError> {
-    let document: ProtocolDocument = serde_json::from_str(include_str!(
-        "../../../protocol/fixtures/v1alpha1/valid/capability-definition.fs-read-text.json"
-    ))
-    .map_err(|_| PublicRunError::Internal)?;
+    filesystem_spec(
+        include_str!(
+            "../../../protocol/fixtures/v1alpha1/valid/capability-definition.fs-read-text.json"
+        ),
+        READ_TEXT_CAPABILITY_ID,
+        READ_TEXT_CONTRACT_VERSION,
+        "local.fs.builtin.v1",
+        workspace.binding(),
+    )
+}
+
+fn filesystem_spec(
+    definition_json: &str,
+    capability_id: &str,
+    contract_version: &str,
+    instance_id: &str,
+    binding: xgeny_domain::InstanceBinding,
+) -> Result<(CapabilityDefinitionBody, CapabilityInstanceBody), PublicRunError> {
+    let document: ProtocolDocument =
+        serde_json::from_str(definition_json).map_err(|_| PublicRunError::Internal)?;
     let ProtocolDocument::CapabilityDefinition(definition) = document else {
         return Err(PublicRunError::Internal);
     };
     let definition: CapabilityDefinitionBody = *definition;
-    if definition.metadata.id != READ_TEXT_CAPABILITY_ID
-        || definition.metadata.contract_version != READ_TEXT_CONTRACT_VERSION
+    if definition.metadata.id != capability_id
+        || definition.metadata.contract_version != contract_version
     {
         return Err(PublicRunError::Internal);
     }
@@ -1150,6 +1376,7 @@ fn read_text_spec(
         return Err(PublicRunError::Internal);
     };
     let mut instance: CapabilityInstanceBody = *instance;
+    instance_id.clone_into(&mut instance.instance_id);
     instance.definition = CapabilityRef {
         capability_id: definition.metadata.id.clone(),
         contract_version: definition.metadata.contract_version.clone(),
@@ -1158,46 +1385,115 @@ fn read_text_spec(
         os: host_os()?,
         arch: host_arch()?,
     };
-    instance.binding = workspace.binding();
+    instance.binding = binding;
     instance.features.cancellable = false;
     Ok((definition, instance))
 }
 
-fn read_text_product(workspace: &WorkspaceRoot) -> Result<ReadTextProduct, PublicRunError> {
-    let (definition, instance) = read_text_spec(workspace)?;
+fn workspace_discovery_specs(
+    workspace: &WorkspaceRoot,
+) -> Result<Vec<(CapabilityDefinitionBody, CapabilityInstanceBody)>, PublicRunError> {
+    Ok(vec![
+        filesystem_spec(
+            include_str!(
+                "../../../protocol/fixtures/v1alpha1/valid/capability-definition.fs-list-directory.json"
+            ),
+            LIST_DIRECTORY_CAPABILITY_ID,
+            LIST_DIRECTORY_CONTRACT_VERSION,
+            "local.fs.list-directory.builtin.v1",
+            workspace.list_directory_binding(),
+        )?,
+        read_text_spec(workspace)?,
+        filesystem_spec(
+            include_str!(
+                "../../../protocol/fixtures/v1alpha1/valid/capability-definition.fs-search-text.json"
+            ),
+            SEARCH_TEXT_CAPABILITY_ID,
+            SEARCH_TEXT_CONTRACT_VERSION,
+            "local.fs.search-text.builtin.v1",
+            workspace.search_text_binding(),
+        )?,
+        filesystem_spec(
+            include_str!(
+                "../../../protocol/fixtures/v1alpha1/valid/capability-definition.fs-stat.json"
+            ),
+            STAT_CAPABILITY_ID,
+            STAT_CONTRACT_VERSION,
+            "local.fs.stat.builtin.v1",
+            workspace.stat_binding(),
+        )?,
+    ])
+}
 
-    let capability = instance.definition.clone();
+fn read_only_product(
+    workspace: &WorkspaceRoot,
+    catalog: &LocalReadCatalog,
+) -> Result<ReadOnlyProduct, PublicRunError> {
+    let workspace_discovery = catalog.workspace_discovery();
+    let specs = if workspace_discovery {
+        workspace_discovery_specs(workspace)?
+    } else {
+        vec![read_text_spec(workspace)?]
+    };
     let mut capabilities = CapabilityRegistry::new();
-    capabilities
-        .register_schema_validated_definition(definition)
-        .map_err(|_| PublicRunError::Internal)?;
-    capabilities
-        .register_schema_validated_instance(instance.clone())
-        .map_err(|_| PublicRunError::Internal)?;
-    let adapter = workspace.read_text_adapter(ReadTextLimits::default());
-    let verifier = adapter.verifier();
+    let mut routes = Vec::with_capacity(specs.len());
+    for (definition, instance) in specs {
+        routes.push((instance.definition.clone(), instance.instance_id.clone()));
+        capabilities
+            .register_schema_validated_definition(definition)
+            .map_err(|_| PublicRunError::Internal)?;
+        capabilities
+            .register_schema_validated_instance(instance)
+            .map_err(|_| PublicRunError::Internal)?;
+    }
     let mut adapters = EffectAdapterRegistry::new();
+    let read_adapter = workspace.read_text_adapter(ReadTextLimits::default());
+    let read_verifier = read_adapter.verifier();
     adapters
-        .register(&instance.binding, adapter)
+        .register(&workspace.binding(), read_adapter)
         .map_err(|_| PublicRunError::Internal)?;
     let mut verifiers = EffectVerifierRegistry::new();
     verifiers
-        .register(&instance.binding, verifier)
+        .register(&workspace.binding(), read_verifier)
         .map_err(|_| PublicRunError::Internal)?;
-    Ok(ReadTextProduct {
+    if workspace_discovery {
+        let list_adapter = workspace.list_directory_adapter();
+        let list_verifier = list_adapter.verifier();
+        adapters
+            .register(&workspace.list_directory_binding(), list_adapter)
+            .map_err(|_| PublicRunError::Internal)?;
+        verifiers
+            .register(&workspace.list_directory_binding(), list_verifier)
+            .map_err(|_| PublicRunError::Internal)?;
+
+        let search_adapter = workspace.search_text_adapter();
+        let search_verifier = search_adapter.verifier();
+        adapters
+            .register(&workspace.search_text_binding(), search_adapter)
+            .map_err(|_| PublicRunError::Internal)?;
+        verifiers
+            .register(&workspace.search_text_binding(), search_verifier)
+            .map_err(|_| PublicRunError::Internal)?;
+
+        let stat_adapter = workspace.stat_adapter();
+        let stat_verifier = stat_adapter.verifier();
+        adapters
+            .register(&workspace.stat_binding(), stat_adapter)
+            .map_err(|_| PublicRunError::Internal)?;
+        verifiers
+            .register(&workspace.stat_binding(), stat_verifier)
+            .map_err(|_| PublicRunError::Internal)?;
+    }
+    Ok(ReadOnlyProduct {
         capabilities,
         adapters,
         verifiers,
-        route: ExactReadOnlyRoute {
-            capability,
-            instance_id: instance.instance_id,
-        },
+        route: ExactReadOnlyRoute { routes },
     })
 }
 
 struct ExactReadOnlyRoute {
-    capability: CapabilityRef,
-    instance_id: String,
+    routes: Vec<(CapabilityRef, String)>,
 }
 
 impl PlannedRoutePort for ExactReadOnlyRoute {
@@ -1211,14 +1507,19 @@ impl PlannedRoutePort for ExactReadOnlyRoute {
             .get(step_id)
             .and_then(|step| step.planned_invocation.as_ref())
             .ok_or(PlannedRouteFailure::Rejected)?;
-        if planned.execution_profile() != PlannedExecutionProfile::LocalSyncReadOnlyV1
-            || planned.capability_id() != self.capability.capability_id
-            || planned.contract_version() != self.capability.contract_version
-        {
+        if planned.execution_profile() != PlannedExecutionProfile::LocalSyncReadOnlyV1 {
             return Err(PlannedRouteFailure::Rejected);
         }
+        let (capability, instance_id) = self
+            .routes
+            .iter()
+            .find(|(capability, _)| {
+                planned.capability_id() == capability.capability_id
+                    && planned.contract_version() == capability.contract_version
+            })
+            .ok_or(PlannedRouteFailure::Rejected)?;
         Ok(RouteRequest {
-            capability: self.capability.clone(),
+            capability: capability.clone(),
             target_platform: Platform {
                 os: host_os().map_err(|_| PlannedRouteFailure::Unavailable)?,
                 arch: host_arch().map_err(|_| PlannedRouteFailure::Unavailable)?,
@@ -1234,15 +1535,29 @@ impl PlannedRoutePort for ExactReadOnlyRoute {
             trust_preference: Vec::new(),
             data_boundary_preference: Vec::new(),
             preferred_instance_ids: Vec::new(),
-            pinned_instance_id: Some(self.instance_id.clone()),
+            pinned_instance_id: Some(instance_id.clone()),
         })
+    }
+}
+
+enum ReadApprovalCatalog {
+    ExactFiles(AllowFileCatalog),
+    Workspace(WorkspaceReadAuthorization),
+}
+
+impl ReadApprovalCatalog {
+    const fn host_policy_profile(&self) -> &'static str {
+        match self {
+            Self::ExactFiles(_) => HOST_POLICY_PROFILE,
+            Self::Workspace(_) => WORKSPACE_HOST_POLICY_PROFILE,
+        }
     }
 }
 
 struct ExplicitReadApproval {
     allow_read: bool,
     run_id: String,
-    catalog: AllowFileCatalog,
+    catalog: ReadApprovalCatalog,
 }
 
 impl ApprovalPort for ExplicitReadApproval {
@@ -1256,6 +1571,7 @@ impl ApprovalPort for ExplicitReadApproval {
         if !self.allow_read {
             return Ok(ApprovalDecision::Pending);
         }
+        let host_policy_profile = self.catalog.host_policy_profile();
         let allowance = || {
             PolicyAllowance::from_trusted_evaluation(
                 request.requested_scopes().iter().cloned(),
@@ -1270,7 +1586,7 @@ impl ApprovalPort for ExplicitReadApproval {
                 policy_source(
                     PolicySourceKind::Host,
                     "xgeny-cli-host",
-                    HOST_POLICY_PROFILE,
+                    host_policy_profile,
                 ),
                 allowance(),
             ),
@@ -1289,8 +1605,6 @@ impl ApprovalPort for ExplicitReadApproval {
 impl ExplicitReadApproval {
     fn is_exact_catalog_read(&self, request: &ResolvedPermissionRequest) -> bool {
         request.run_id() == self.run_id
-            && request.capability().capability_id == READ_TEXT_CAPABILITY_ID
-            && request.capability().contract_version == READ_TEXT_CONTRACT_VERSION
             && request.effect_class() == EffectClass::ReadOnly
             && request.requested_lifetime() == GrantLifetime::Once
             && request.requested_scopes().len() == 1
@@ -1301,9 +1615,20 @@ impl ExplicitReadApproval {
             && request.resources().len() == 1
             && request.resources().first().is_some_and(|resource| {
                 resource.scope() == FILESYSTEM_READ_SCOPE
-                    && self
-                        .catalog
-                        .contains_canonical_resource(resource.canonical_resource())
+                    && match &self.catalog {
+                        ReadApprovalCatalog::ExactFiles(catalog) => {
+                            request.capability().capability_id == READ_TEXT_CAPABILITY_ID
+                                && request.capability().contract_version
+                                    == READ_TEXT_CONTRACT_VERSION
+                                && catalog
+                                    .contains_canonical_resource(resource.canonical_resource())
+                        }
+                        ReadApprovalCatalog::Workspace(authorization) => authorization
+                            .authorizes_resource(
+                                request.capability(),
+                                resource.canonical_resource(),
+                            ),
+                    }
             })
             && request.critical_actions().is_empty()
     }
@@ -1387,6 +1712,7 @@ mod tests {
             model: "model".to_owned(),
             tokenizer: "tokenizer".to_owned(),
             allow_files: vec!["README.md".to_owned()],
+            allow_dirs: Vec::new(),
             allow_remote_model_egress: false,
             allow_read: true,
             max_ticks: 32,
@@ -1404,10 +1730,13 @@ mod tests {
     fn product_registry_is_bound_to_the_exact_workspace() {
         let directory = tempdir().unwrap();
         fs::write(directory.path().join("README.md"), "fixture").unwrap();
+        fs::create_dir(directory.path().join("src")).unwrap();
         let workspace =
             WorkspaceRoot::open_ambient(directory.path(), WorkspaceId::new(WORKSPACE_ID).unwrap())
                 .unwrap();
-        let product = read_text_product(&workspace).unwrap();
+        let exact_catalog =
+            LocalReadCatalog::build(&workspace, &["README.md".to_owned()], &[]).unwrap();
+        let product = read_only_product(&workspace, &exact_catalog).unwrap();
         assert_eq!(product.capabilities.definitions().count(), 1);
         assert!(
             product
@@ -1417,6 +1746,41 @@ mod tests {
         );
         assert_eq!(product.adapters.len(), 1);
         assert!(format!("{:?}", product.verifiers).contains("verifier_count: 1"));
+
+        let discovery_catalog =
+            LocalReadCatalog::build(&workspace, &[], &[".".to_owned()]).unwrap();
+        let discovery = read_only_product(&workspace, &discovery_catalog).unwrap();
+        assert_eq!(discovery.capabilities.definitions().count(), 4);
+        assert_eq!(discovery.capabilities.instances().count(), 4);
+        assert_eq!(discovery.adapters.len(), 4);
+        assert!(format!("{:?}", discovery.verifiers).contains("verifier_count: 4"));
+        let scoped_catalog = LocalReadCatalog::build(&workspace, &[], &["src".to_owned()]).unwrap();
+        let scoped = read_only_product(&workspace, &scoped_catalog).unwrap();
+        let root_definitions = discovery
+            .capabilities
+            .definitions()
+            .cloned()
+            .collect::<Vec<_>>();
+        let scoped_definitions = scoped
+            .capabilities
+            .definitions()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(root_definitions, scoped_definitions);
+        assert_eq!(
+            local_execution_profile_digest(&workspace, &discovery_catalog).unwrap(),
+            local_execution_profile_digest(&workspace, &scoped_catalog).unwrap()
+        );
+        assert_ne!(
+            discovery_catalog
+                .workspace_authorization()
+                .unwrap()
+                .catalog_digest(),
+            scoped_catalog
+                .workspace_authorization()
+                .unwrap()
+                .catalog_digest()
+        );
     }
 
     #[test]
@@ -1430,7 +1794,7 @@ mod tests {
         let mut approval = ExplicitReadApproval {
             allow_read: true,
             run_id: "run-0123456789abcdef0123456789abcdef".to_owned(),
-            catalog,
+            catalog: ReadApprovalCatalog::ExactFiles(catalog),
         };
         let ProtocolDocument::CapabilityDefinition(definition) =
             serde_json::from_str(include_str!(

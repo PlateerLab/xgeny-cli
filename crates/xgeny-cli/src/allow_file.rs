@@ -50,6 +50,11 @@ impl AllowFileCatalog {
             let canonical = resolver
                 .resolve(FILESYSTEM_READ_SCOPE, path.as_ref())
                 .map_err(|_| AllowFileCatalogError::InvalidEntry)?;
+            // Discovery capabilities may address the logical workspace root, but the legacy
+            // read-text catalog must continue to contain exact regular-file resources only.
+            if !canonical.contains('/') {
+                return Err(AllowFileCatalogError::InvalidEntry);
+            }
             canonical_arguments.push(json!({"path": canonical}));
         }
         if canonical_arguments.is_empty() {
@@ -294,6 +299,21 @@ mod tests {
             fixture
                 .reference_for_arguments(&json!({"path": "workspace:fixture/secret.txt"}))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_catalog_rejects_the_workspace_root() {
+        let directory = tempdir().expect("temporary directory should exist");
+        let workspace = WorkspaceRoot::open_ambient(
+            directory.path(),
+            WorkspaceId::new("fixture").expect("workspace ID should validate"),
+        )
+        .expect("workspace should open");
+
+        assert_eq!(
+            AllowFileCatalog::new(&workspace.resolver(), ["."]).unwrap_err(),
+            AllowFileCatalogError::InvalidEntry
         );
     }
 

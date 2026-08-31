@@ -2,6 +2,9 @@
   "apiVersion": "xgeny.io/v1alpha1",
   "fixtures": [
     {"file": "valid/capability-definition.fs-read-text.json", "schema": "capability-definition.schema.json", "expectedValid": true},
+    {"file": "valid/capability-definition.fs-list-directory.json", "schema": "capability-definition.schema.json", "expectedValid": true},
+    {"file": "valid/capability-definition.fs-stat.json", "schema": "capability-definition.schema.json", "expectedValid": true},
+    {"file": "valid/capability-definition.fs-search-text.json", "schema": "capability-definition.schema.json", "expectedValid": true},
     {"file": "valid/capability-instance.local-fs.json", "schema": "capability-instance.schema.json", "expectedValid": true},
     {"file": "valid/permission-request.fs-read.json", "schema": "permission-request.schema.json", "expectedValid": true},
     {"file": "valid/policy-decision.allow-once.json", "schema": "policy-decision.schema.json", "expectedValid": true},

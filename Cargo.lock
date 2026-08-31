@@ -1754,6 +1754,7 @@ version = "0.1.0-rc.2"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
+ "serde_jcs",
  "serde_json",
  "sha2",
  "tempfile",

@@ -1,0 +1,62 @@
+{
+  "apiVersion": "xgeny.io/v1alpha1",
+  "kind": "CapabilityDefinition",
+  "metadata": {
+    "id": "xgeny.fs/stat",
+    "contractVersion": "1.0.0",
+    "displayName": "Inspect path metadata",
+    "labels": {
+      "xgeny.io/pack": "core-os"
+    }
+  },
+  "spec": {
+    "summary": "Inspect the kind and bounded metadata of one workspace path without following symbolic links.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "required": ["path"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Use '.' for the workspace root or a slash-separated workspace-relative path."
+        }
+      },
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "required": ["kind", "sizeBytes", "digest"],
+      "properties": {
+        "kind": {"enum": ["file", "directory"]},
+        "sizeBytes": {"type": ["integer", "null"], "minimum": 0},
+        "digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "effect": {
+      "class": "read_only",
+      "resourceSelectors": [
+        {"scope": "filesystem.read", "argumentPointer": "/path"}
+      ],
+      "criticalActions": []
+    },
+    "requiredCapabilities": [],
+    "execution": {
+      "styles": ["sync"],
+      "cancellable": false,
+      "idempotencyKeySupported": false,
+      "defaultTimeoutMs": 30000,
+      "maxTimeoutMs": 30000
+    },
+    "verification": [
+      {"strategy": "output_schema", "required": true},
+      {"strategy": "postcondition", "required": true, "description": "Digest matches the canonical metadata observation."}
+    ],
+    "discovery": {
+      "keywords": ["file", "directory", "metadata", "stat"],
+      "examples": ["Check whether Cargo.toml is a file."]
+    }
+  }
+}

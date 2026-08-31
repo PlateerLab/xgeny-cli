@@ -2,7 +2,7 @@ use std::io::{ErrorKind, Write as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use xgeny_cli::{
     LocalCommandResult, LocalResumeRequest, LocalRunRequest, ModelCheckError, ModelCheckRequest,
     PublicRunError, check_openai_model, resume_local, run_local_with_started,
@@ -40,7 +40,7 @@ enum Command {
         #[command(subcommand)]
         command: ModelCommand,
     },
-    /// Start a bounded local Run using one OpenAI-compatible model and read-text capability.
+    /// Start a bounded local Run using one OpenAI-compatible model and read-only filesystem capabilities.
     Run(RunArgs),
     /// Continue an existing Run, or replay its durable completion without model access.
     Resume(ResumeArgs),
@@ -76,6 +76,12 @@ struct ModelCheckArgs {
 
 #[derive(Debug, Args)]
 #[command(
+    group(
+        ArgGroup::new("read_scope")
+            .required(true)
+            .multiple(true)
+            .args(["allow_files", "allow_dirs"])
+    ),
     after_long_help = "HTTPS authentication: set XGENY_OPENAI_API_KEY. Credentials are ignored for loopback HTTP and cannot be passed as a command-line argument."
 )]
 struct RunArgs {
@@ -96,13 +102,16 @@ struct RunArgs {
     /// Stable non-secret planner identity.
     #[arg(long, default_value = "xgeny.cli.openai")]
     planner_id: String,
-    /// Relative workspace file the model may select; repeat for more files.
-    #[arg(long = "allow-file", required = true)]
+    /// Exact relative workspace file the model may read; repeat for more files.
+    #[arg(long = "allow-file")]
     allow_files: Vec<String>,
+    /// Relative workspace directory the model may inspect recursively; use '.' for the root.
+    #[arg(long = "allow-dir")]
+    allow_dirs: Vec<String>,
     /// Explicitly allow goal/context/tool output transfer to the remote model boundary.
     #[arg(long)]
     allow_remote_model_egress: bool,
-    /// Explicitly approve one exact read selected from --allow-file.
+    /// Approve each one-shot read-only action selected within the declared file/directory scope.
     #[arg(long)]
     allow_read: bool,
     /// Bound work performed by this process invocation.
@@ -123,13 +132,16 @@ struct ResumeArgs {
     /// Current OpenAI-compatible base URL; unnecessary for completed replay.
     #[arg(long, env = "XGENY_OPENAI_BASE_URL", hide_env_values = true)]
     base_url: Option<String>,
-    /// Same allow-file catalog supplied to the original Run.
+    /// Same exact allow-file entries supplied to the original Run.
     #[arg(long = "allow-file")]
     allow_files: Vec<String>,
+    /// Same allow-dir catalog supplied to the original Run.
+    #[arg(long = "allow-dir")]
+    allow_dirs: Vec<String>,
     /// Allow a new remote model request to this invocation's supplied --base-url.
     #[arg(long)]
     allow_remote_model_egress: bool,
-    /// Explicitly approve one exact read selected from --allow-file.
+    /// Approve each one-shot read-only action selected within the declared file/directory scope.
     #[arg(long)]
     allow_read: bool,
     /// Bound work performed by this process invocation.
@@ -190,6 +202,7 @@ fn main() -> ExitCode {
                     model: args.model,
                     tokenizer,
                     allow_files: args.allow_files,
+                    allow_dirs: args.allow_dirs,
                     allow_remote_model_egress: args.allow_remote_model_egress,
                     allow_read: args.allow_read,
                     max_ticks: args.max_ticks,
@@ -202,6 +215,7 @@ fn main() -> ExitCode {
             workspace: args.workspace,
             base_url: args.base_url,
             allow_files: args.allow_files,
+            allow_dirs: args.allow_dirs,
             allow_remote_model_egress: args.allow_remote_model_egress,
             allow_read: args.allow_read,
             max_ticks: args.max_ticks,

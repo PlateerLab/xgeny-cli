@@ -1,0 +1,76 @@
+{
+  "apiVersion": "xgeny.io/v1alpha1",
+  "kind": "CapabilityDefinition",
+  "metadata": {
+    "id": "xgeny.fs/list-directory",
+    "contractVersion": "1.0.0",
+    "displayName": "List directory",
+    "labels": {
+      "xgeny.io/pack": "core-os"
+    }
+  },
+  "spec": {
+    "summary": "List one workspace directory without following symbolic links.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "required": ["path"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Use '.' for the workspace root or a slash-separated workspace-relative directory path."
+        }
+      },
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "required": ["entries", "truncated", "digest"],
+      "properties": {
+        "entries": {
+          "type": "array",
+          "maxItems": 512,
+          "items": {
+            "type": "object",
+            "required": ["name", "path", "kind", "sizeBytes"],
+            "properties": {
+              "name": {"type": "string", "minLength": 1},
+              "path": {"type": "string", "minLength": 1, "description": "Workspace-relative entry path."},
+              "kind": {"enum": ["file", "directory", "other"]},
+              "sizeBytes": {"type": ["integer", "null"], "minimum": 0}
+            },
+            "additionalProperties": false
+          }
+        },
+        "truncated": {"type": "boolean"},
+        "digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "effect": {
+      "class": "read_only",
+      "resourceSelectors": [
+        {"scope": "filesystem.read", "argumentPointer": "/path"}
+      ],
+      "criticalActions": []
+    },
+    "requiredCapabilities": [],
+    "execution": {
+      "styles": ["sync"],
+      "cancellable": false,
+      "idempotencyKeySupported": false,
+      "defaultTimeoutMs": 30000,
+      "maxTimeoutMs": 30000
+    },
+    "verification": [
+      {"strategy": "output_schema", "required": true},
+      {"strategy": "postcondition", "required": true, "description": "Digest matches the canonical bounded directory observation."}
+    ],
+    "discovery": {
+      "keywords": ["directory", "files", "list", "workspace"],
+      "examples": ["List the files at the workspace root."]
+    }
+  }
+}
