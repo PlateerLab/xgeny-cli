@@ -50,7 +50,7 @@ XGENy Intel macOS binary와 installer 검증 범위에는 영향이 없다.
 Version을 올린 변경을 먼저 PR로 merge한 뒤 main head에 tag를 만든다. `main`에는 직접 push하지 않는다.
 
 ```bash
-release_version=0.1.0-rc.1
+release_version=0.1.0-rc.2
 release_tag="v$release_version"
 git fetch origin main
 git tag -a "$release_tag" origin/main -m "XGENy $release_version"
@@ -86,7 +86,9 @@ Read-only assemble job은 검증된 target artifact와 installer·고지를 조�
 하나의 allow-listed bundle로 전달한다. Checkout이나 repository script를 실행하지 않는 publish job은
 bundle의 exact file set과 checksum, 원격 `main`, annotated/lightweight tag의 peeled commit 및 trusted
 workflow commit이 여전히 같은지 policy gate에서 확인하고, attestation 뒤 `gh release create` 직전에도
-원격 `main`과 tag를 다시 조회한다. 관리자가 immutable releases 활성화 후 설정하는 repository variable이
+원격 `main`과 tag를 다시 조회한다. Publisher는 Git checkout 문맥에 의존하지 않도록
+`--repo "$GITHUB_REPOSITORY"`를 명시하며 `--verify-tag`로 원격 tag 존재를 다시 확인한다. 관리자가
+immutable releases 활성화 후 설정하는 repository variable이
 exact `true`가 아니면 게시를 fail-closed로 중단한다. GitHub 설정 조회에는 Administration
 권한이 필요하므로 고권한 PAT를 workflow secret으로 추가하지 않는다. 반면 공개 repository의 active
 ruleset은 workflow가 API로 읽어 exact include/exclude, 빈 bypass actor와 update/deletion rule을 직접
@@ -127,3 +129,6 @@ gh attestation verify PATH_TO_ASSET --repo PlateerLab/xgeny-cli
 Release가 실패하면 기존 tag나 asset을 교체해 재사용하지 않는다. 원인을 수정하고 version을 올린 새
 tag로 게시한다. 자동 update, downgrade와 실행 중 self-replacement는 signed update metadata와 rollback
 정책을 별도로 설계하기 전까지 추가하지 않는다.
+
+`v0.1.0-rc.1`은 Release API 호출 전 publisher의 repository-context 해석 실패로 GitHub Release와
+게시 asset 없이 폐기된 tag다. 보호된 tag를 이동·삭제·재사용하지 않고 `v0.1.0-rc.2`부터 이어간다.
