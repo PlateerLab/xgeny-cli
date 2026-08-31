@@ -37,6 +37,9 @@ jobs:
       - name: Check third-party license notices
         run: sh scripts/check-third-party-licenses.sh --check
 
+      - name: Check release publisher context
+        run: sh scripts/check-release-workflow.sh
+
       - name: Build release workspace
         run: cargo build --workspace --release --locked
 

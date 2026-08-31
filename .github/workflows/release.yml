@@ -103,6 +103,9 @@ jobs:
       - name: Check third-party license notices
         run: sh scripts/check-third-party-licenses.sh --check
 
+      - name: Check release publisher context
+        run: sh scripts/check-release-workflow.sh
+
   build:
     name: Build / ${{ matrix.target }}
     needs: quality
@@ -499,6 +502,7 @@ jobs:
             release_flags+=(--latest)
           fi
           gh release create "$RELEASE_TAG" release/* \
+            --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --generate-notes \
             --title "XGENy ${RELEASE_TAG#v}" \
