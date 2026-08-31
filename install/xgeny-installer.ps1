@@ -16,12 +16,23 @@ function Fail([string]$Message) {
     throw "xgeny installer: $Message"
 }
 
-function Assert-UserOwnedPath([string]$Path, [string]$Kind) {
+function Assert-CurrentIdentityOwnedPath([string]$Path, [string]$Kind) {
     $Acl = Get-Acl -LiteralPath $Path
-    $CurrentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
     $OwnerSid = $Acl.GetOwner([System.Security.Principal.SecurityIdentifier])
-    if ($null -eq $CurrentSid -or $OwnerSid.Value -ne $CurrentSid.Value) {
-        Fail "$Kind must be owned by the current user"
+    $AllowedOwnerSids = @()
+    $CurrentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    try {
+        if ($null -ne $CurrentIdentity.User) {
+            $AllowedOwnerSids += $CurrentIdentity.User.Value
+        }
+        if ($null -ne $CurrentIdentity.Owner) {
+            $AllowedOwnerSids += $CurrentIdentity.Owner.Value
+        }
+    } finally {
+        $CurrentIdentity.Dispose()
+    }
+    if ($AllowedOwnerSids.Count -eq 0 -or $AllowedOwnerSids -notcontains $OwnerSid.Value) {
+        Fail "$Kind must be owned by the current Windows security context"
     }
 
     $BroadSids = @("S-1-1-0", "S-1-5-11", "S-1-5-32-545")
@@ -252,7 +263,7 @@ if (-not $DirectoryItem.PSIsContainer) {
 if (($DirectoryItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
     Fail "install directory must not be a reparse point"
 }
-Assert-UserOwnedPath $InstallDir "install directory"
+Assert-CurrentIdentityOwnedPath $InstallDir "install directory"
 
 $Target = Join-Path $InstallDir "xgeny.exe"
 if (Test-Path -LiteralPath $Target) {
@@ -263,7 +274,7 @@ if (Test-Path -LiteralPath $Target) {
     if (($TargetItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
         Fail "existing destination must not be a reparse point"
     }
-    Assert-UserOwnedPath $Target "existing destination"
+    Assert-CurrentIdentityOwnedPath $Target "existing destination"
 }
 
 $Nonce = [Guid]::NewGuid().ToString("N")
@@ -317,7 +328,7 @@ try {
     if (($InstalledItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
         Fail "installed destination must not be a reparse point"
     }
-    Assert-UserOwnedPath $Target "installed destination"
+    Assert-CurrentIdentityOwnedPath $Target "installed destination"
     $InstalledDigest = (Get-FileHash -Algorithm SHA256 -LiteralPath $Target).Hash.ToLowerInvariant()
     if ($InstalledDigest -ne $ExpectedDigests[0]) {
         Fail "installed binary digest changed during replacement"
