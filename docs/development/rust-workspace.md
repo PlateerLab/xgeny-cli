@@ -4,11 +4,12 @@
 
 ## 범위
 
-현재 워크스페이스는 다음 아홉 crate로 구성된다.
+현재 워크스페이스는 다음 열 개 crate로 구성된다.
 
 ```text
 crates/
   xgeny-adapter-reference/ publish하지 않는 preopened-handle conformance 기준
+  xgeny-adapter-filesystem/ capability-confined workspace read-text 제품 adapter
   xgeny-domain/       I/O 없는 정본 Rust 프로토콜 타입
   xgeny-protocol/     bundled/offline schema·fixture·digest 검증
   xgeny-workgraph/    model-free RunEvent 상태 전이·재생 실험
@@ -16,10 +17,10 @@ crates/
   xgeny-policy/       concrete resource 해석 경계와 순수 정책 교집합
   xgeny-runtime/      durable effect 실행·복구와 Capability Registry·Router 기본형
   xgeny-provider-openai/ OpenAI-compatible 단일 요청 planner leaf adapter
-  xgeny-cli/          xgeny 실행 파일, protocol check와 binary command 미노출 bounded driver library
+  xgeny-cli/          protocol check와 public local run/resume를 제공하는 실행 파일·driver library
 ```
 
-`xgeny-workgraph`, `xgeny-local-store`, `xgeny-runtime`의 durable effect, invocation material, Direct Executor, Core verification, VerifiedRunIndex, Persistent dependency frontier, bounded AgentLoop와 model-call lifecycle 계약은 ADR-0008·0010·0011·0012·0013·0014·0015·0016 연구 gate를 위한 내부 실험이다. ADR-0018은 내부 ReadOnly profile, Artifact-bearing Core Receipt v2와 기존 구성요소를 조합하는 bounded CLI library driver를 추가했다. ADR-0019는 public protocol v0.1 schema를 바꾸지 않고 event-anchored `ToolOutputRecord`, same-transaction verification snapshot과 SQLite physical schema 7을 추가했다. ADR-0020은 같은 schema와 public protocol을 유지하면서 generation-checked planning snapshot, mandatory exact `toolOutputs`와 PlanningContext/OpenAI prompt v2를 추가했다. ADR-0021은 event-anchored `CompletionOutputRecord`와 SQLite physical schema 8을 추가해 exact 최종 summary를 process 재시작 뒤 모델 재호출 없이 복원한다. Registry와 Router 기본형도 기존 `CapabilityDefinition`·`CapabilityInstance`를 그대로 사용하며 wire 문서를 추가하지 않는다. `xgeny-policy`의 Allow는 provisional 결과로 유지되고, runtime의 Admission 기본형만 exact invocation에서 만든 local one-shot allow를 current Run/Step/action/Instance/material과 결합해 durable intent로 발행한다. Admission은 Receipt용 canonical PolicyDecision ID/digest commitment를 만들지만 reusable `Grant`나 조회 가능한 `PolicyDecision` wire document를 저장하지 않는다. `xgeny-adapter-reference`는 public runtime port를 실제 preopened 임시 파일 I/O와 read-only verifier로 검증하지만 `publish = false`인 비제품 기준이다. `xgeny-provider-openai`는 Core가 역의존하지 않는 leaf crate로 model/tokenizer/prompt/schema profile과 단일 HTTP request를 구현한다. 사용자 workspace용 파일·process 제품 adapter, 승인 UI, MCP, Connector, XGEN 원격 연동, `InvocationPlan` wire 투영 또는 사용자용 resume 명령은 아직 구현하지 않는다.
+`xgeny-workgraph`, `xgeny-local-store`, `xgeny-runtime`의 durable effect, invocation material, Direct Executor, Core verification, VerifiedRunIndex, Persistent dependency frontier, bounded AgentLoop와 model-call lifecycle 계약은 ADR-0008·0010·0011·0012·0013·0014·0015·0016 연구 gate를 위한 내부 실험이다. ADR-0018은 내부 ReadOnly profile, Artifact-bearing Core Receipt v2와 기존 구성요소를 조합하는 bounded CLI library driver를 추가했다. ADR-0019는 public protocol v0.1 schema를 바꾸지 않고 event-anchored `ToolOutputRecord`, same-transaction verification snapshot과 SQLite physical schema 7을 추가했다. ADR-0020은 같은 schema와 public protocol을 유지하면서 generation-checked planning snapshot, mandatory exact `toolOutputs`와 PlanningContext/OpenAI prompt v2를 추가했다. ADR-0021은 event-anchored `CompletionOutputRecord`와 SQLite physical schema 8을 추가해 exact 최종 summary를 process 재시작 뒤 모델 재호출 없이 복원한다. Registry와 Router 기본형도 기존 `CapabilityDefinition`·`CapabilityInstance`를 그대로 사용하며 wire 문서를 추가하지 않는다. `xgeny-policy`의 Allow는 provisional 결과로 유지되고, runtime의 Admission 기본형만 exact invocation에서 만든 local one-shot allow를 current Run/Step/action/Instance/material과 결합해 durable intent로 발행한다. Admission은 Receipt용 canonical PolicyDecision ID/digest commitment를 만들지만 reusable `Grant`나 조회 가능한 `PolicyDecision` wire document를 저장하지 않는다. `xgeny-adapter-reference`는 public runtime port를 실제 preopened 임시 파일 I/O와 read-only verifier로 검증하지만 `publish = false`인 비제품 기준이다. `xgeny-adapter-filesystem`은 allow-list에 한정된 UTF-8 `read-text` 제품 adapter이고, `xgeny-provider-openai`는 Core가 역의존하지 않는 leaf crate로 model/tokenizer/prompt/schema profile과 단일 HTTP request를 구현한다. Public CLI는 현재 `run/resume`을 제공한다. 일반 process·write·network 제품 adapter, interactive 승인 UI, MCP, Connector, XGEN 원격 연동과 `InvocationPlan` wire 투영은 아직 구현하지 않는다.
 
 ## 준비물
 
@@ -27,7 +28,7 @@ crates/
 - [rustup](https://rustup.rs/)
 - 소스에서 전체 workspace를 빌드할 때 필요한 플랫폼 C build toolchain
 
-저장소의 `rust-toolchain.toml`이 Rust 1.98.0과 `rustfmt`, `clippy`를 고정한다. `rusqlite`의 `bundled` 기능이 SQLite C source를 Rust build에 함께 링크하므로 소스 빌드에는 Linux C compiler, macOS Command Line Tools 또는 Windows MSVC Build Tools가 필요하다. 향후 `xgeny-local-store`를 연결한 배포 binary도 최종 사용자에게 SQLite 실행 파일, DB server 또는 daemon 설치를 요구하지 않는다. 현재 `xgeny` 실행 파일에는 이 저장소 후보를 아직 연결하지 않았다. PostgreSQL, MinIO, Docker, Kubernetes, Python, Node.js도 기본 실행 의존성이 아니다.
+저장소의 `rust-toolchain.toml`이 Rust 1.98.0과 `rustfmt`, `clippy`를 고정한다. `rusqlite`의 `bundled` 기능이 SQLite C source를 Rust build에 함께 링크하므로 소스 빌드에는 Linux C compiler, macOS Command Line Tools 또는 Windows MSVC Build Tools가 필요하다. Public `xgeny run/resume` binary는 이 embedded store를 연결하므로 최종 사용자에게 SQLite 실행 파일, DB server 또는 daemon 설치를 요구하지 않는다. PostgreSQL, MinIO, Docker, Kubernetes, Python, Node.js도 기본 실행 의존성이 아니다.
 
 ## 현재 durable slice 검증 범위
 
@@ -63,7 +64,9 @@ crates/
 - bounded CLI library driver의 fake plan→exact approval→execute→verify→completion과 SQLite no-call replay
 - exact UTF-8 `CompletionOutputRecord`의 event/sidecar/projection 원자 commit, schema 7 legacy 호환과 실제 별도 process no-model-recall replay
 
-세부 실행 순서와 재시작 판정은 [Durable effect 실행·복구 수직 슬라이스](durable-effect-runtime.md), Receipt 종결 경계는 [Core Verification과 Execution Receipt](execution-receipt.md), 장기 Run 검증 비용은 [Verified Run Index와 장기 Run 검증](verified-run-index.md), dependency release와 frontier는 [Persistent WorkGraph와 재개 frontier](persistent-workgraph.md), model 호출 예약과 불확정 복구는 [Durable model-call lifecycle](durable-model-call-lifecycle.md), ReadOnly/driver 기반은 [ReadOnly와 bounded CLI driver 기반](read-only-driver-foundation.md), 외부 adapter 범위는 [Preopened Reference Adapter Conformance](reference-adapter-conformance.md)를 따른다. Reference test는 임시 디렉터리의 전용 일반 파일만 사용하며 path sandbox가 아니다. ADR-0020은 typed output의 SQLite 재시작 후 다음 model turn 전달을 fake planner와 loopback OpenAI-compatible HTTP까지 검증하고, ADR-0021은 exact completion summary의 별도 process 재시작 복원을 검증한다. power-loss, filesystem 손상, 사용자 workspace의 실제 권한 경계, 실제 filesystem adapter와 live model의 end-to-end, 설치 패키지와 반복 fault matrix는 아직 통과했다고 주장하지 않는다. SQLite 채택 여부도 ADR-0008의 hardened JSONL 비교와 나머지 gate가 끝난 뒤 확정한다.
+세부 실행 순서와 재시작 판정은 [Durable effect 실행·복구 수직 슬라이스](durable-effect-runtime.md), Receipt 종결 경계는 [Core Verification과 Execution Receipt](execution-receipt.md), 장기 Run 검증 비용은 [Verified Run Index와 장기 Run 검증](verified-run-index.md), dependency release와 frontier는 [Persistent WorkGraph와 재개 frontier](persistent-workgraph.md), model 호출 예약과 불확정 복구는 [Durable model-call lifecycle](durable-model-call-lifecycle.md), ReadOnly/driver 기반은 [ReadOnly와 bounded CLI driver 기반](read-only-driver-foundation.md), 외부 adapter 범위는 [Preopened Reference Adapter Conformance](reference-adapter-conformance.md)를 따른다. Reference test는 임시 디렉터리의 전용 일반 파일만 사용하며 path sandbox가 아니다. ADR-0020은 typed output의 SQLite 재시작 후 다음 model turn 전달을 fake planner와 loopback OpenAI-compatible HTTP까지 검증하고, ADR-0021은 exact completion summary의 별도 process 재시작 복원을 검증한다.
+
+Public CLI는 embedded SQLite와 실제 filesystem `read-text` adapter를 사용하며, loopback model E2E와 별도 opt-in live gate를 둔다. Native installer와 게시 target별 process·installer smoke는 release workflow에서 검증한다. 다만 실제 공개 release 설치 결과, power-loss, filesystem 손상, 지원 표보다 오래된 OS, 일반 workspace sandbox와 반복 fault matrix까지 통과했다고 주장하지 않는다.
 
 ## 현재 Capability Registry 검증 범위
 
@@ -146,6 +149,12 @@ cargo build --locked --release -p xgeny-cli
 
 ## CI와 OS 경계
 
-GitHub Actions는 Linux에서 format과 clippy를 검사하고 Linux, macOS, Windows 각각에서 workspace test, `protocol check`, release build를 수행한다. 따라서 현재 보장하는 것은 세 OS의 **I/O 없는 Registry·Router·Permission Broker·상태 기계, 내장 프로토콜 검증, 격리된 preopened 임시 파일 reference conformance와 CLI 빌드**다.
+GitHub Actions는 Linux에서 format과 clippy를 검사하고 Linux x86-64/ARM64, macOS Intel/Apple Silicon,
+Windows x86-64에서 workspace test, `protocol check`, native release build와 loopback installer smoke를
+수행한다. 따라서 현재 보장하는 것은 이 다섯 target의 **I/O 없는 Registry·Router·Permission
+Broker·상태 기계, 내장 프로토콜 검증, 격리된 실제 workspace read, public run/resume process 회귀와
+checksum 기반 설치 경로**다.
 
-실제 OS 권한 broker, 파일시스템 sandbox, shell/process 실행, 설치 패키지 서명과 배포 E2E는 각각의 기능이 추가될 때 별도 테스트 계층으로 확장한다. CI 통과를 아직 구현하지 않은 통합 기능의 검증으로 해석하지 않는다.
+실제 OS 권한 broker, 일반 shell/process 실행, OS code signing/notarization과 게시된 GitHub Release의
+외부 network 다운로드는 각각의 기능이 추가될 때 별도 테스트 계층으로 확장한다. CI 통과를 아직
+구현하지 않은 통합 기능의 검증으로 해석하지 않는다.

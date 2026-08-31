@@ -1,7 +1,7 @@
 # Durable model-call lifecycle 개발 가이드
 
 - 기준일: 2026-08-30
-- 상태: reservation/recovery 기본형 + 첫 OpenAI-compatible leaf adapter
+- 상태: reservation/recovery 기본형 + OpenAI-compatible leaf adapter + public read-text composition
 - 공개 protocol v0.1 schema 변경: 없음
 - local store schema: 8
 - 정본 결정: [ADR-0016](../adr/0016-durable-model-call-lifecycle.md)
@@ -12,7 +12,7 @@ Bounded `AgentLoop`가 provider-neutral planner port를 호출하기 전에 한 
 
 현재 구현의 보장은 **실제 provider 청구 횟수**가 아니라 보수적인 possible-send 상한이다. Reservation commit 직후 network send 전에 crash할 수 있으므로 예약 수가 실제 outbound/청구 수보다 클 수 있다. 반대로 adapter가 reservation 하나당 outbound request를 최대 한 번만 보내고 hidden retry를 하지 않으면 lifecycle configuration 이후 실제 outbound 수가 그 구간의 durable reservation 수를 넘지는 않는다. Legacy Run의 configuration 이전 호출은 아래 upgrade 경계처럼 이 상한에 포함되지 않는다.
 
-`xgeny-provider-openai`가 immutable model/tokenizer/template profile, strict structured proposal과 retry/redirect 없는 HTTP POST를 이 port에 연결한다. Fake/injected port의 lifecycle·store 회귀와 loopback HTTP contract는 기본 CI에서 함께 실행한다. 실제 tool dispatcher와 사용자용 CLI composition root는 아직 없다.
+`xgeny-provider-openai`가 immutable model/tokenizer/template profile, strict structured proposal과 retry/redirect 없는 HTTP POST를 이 port에 연결한다. Fake/injected port의 lifecycle·store 회귀와 loopback HTTP contract는 기본 CI에서 함께 실행한다. Public `xgeny run/resume`은 이 provider와 allow-list 기반 filesystem `read-text` 하나를 bounded composition으로 연결한다. 범용 tool dispatcher와 interactive 승인 UI는 아직 없다.
 
 ```mermaid
 flowchart LR
@@ -340,8 +340,8 @@ cargo build --workspace --release --locked
 ## 아직 할 수 없는 것
 
 - XGEN Model Gateway와 다중 provider routing
-- 사용자용 provider 설정·credential 입력과 `xgeny run` composition root
-- tool dispatcher와 자동 continuation loop
+- named provider profile, strict structured-generation 사전 검증과 OS credential-store 연동
+- 범용 tool dispatcher와 interactive continuation UI
 - retry/backoff/fallback model과 provider-side hidden retry 검증
 - provider request-status, idempotency와 billing reconciliation
 - 정확한 outbound/청구/token/금액/rate-limit/wall-clock accounting

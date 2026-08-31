@@ -21,7 +21,8 @@ use xgeny_policy::{
     ResourceResolutionFailure, ResourceResolver,
 };
 use xgeny_provider_openai::{
-    BearerCredential, OpenAiPlanner, OpenAiPlannerConfig, OpenAiPlannerConfigError,
+    BearerCredential, OpenAiModelCheckFailure, OpenAiModelChecker, OpenAiPlanner,
+    OpenAiPlannerConfig, OpenAiPlannerConfigError,
 };
 use xgeny_runtime::{
     AgentLoop, AgentLoopQuiescence, AgentLoopTick, CapabilityRegistry, DirectExecutor,
@@ -51,6 +52,7 @@ const MAX_GOAL_BYTES: usize = 16 * 1024;
 const MAX_TICKS: u32 = 1_024;
 const MAX_OUTPUT_TOKENS: u32 = 1_024;
 const MODEL_TIMEOUT: Duration = Duration::from_secs(60);
+const MODEL_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCAL_EXECUTION_PROFILE_DOMAIN: &str = "xgeny.cli.local-execution-profile/v1";
 const ROUTE_PROFILE: &str = "xgeny.cli.exact-read-only-route/v1";
 const MATERIALIZER_PROFILE: &str = "xgeny.cli.allow-file-materializer/v1";
@@ -108,6 +110,73 @@ pub struct LocalResumeRequest {
     pub max_ticks: u32,
 }
 
+/// One explicit, non-durable model-catalog connectivity check.
+pub struct ModelCheckRequest {
+    pub base_url: String,
+    pub model: String,
+    pub tokenizer: String,
+}
+
+/// Stable, redacted failure classes returned by `xgeny model check`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelCheckError {
+    Configuration,
+    InvalidBaseUrl,
+    InvalidBasePath,
+    InvalidModel,
+    InvalidTokenizer,
+    InvalidCredential,
+    InsecureCredentialTransport,
+    InsecureEndpointTransport,
+    AuthenticationRejected,
+    RateLimited,
+    Timeout,
+    RequestRejected,
+    Unavailable,
+    InvalidResponse,
+    ModelNotAdvertised,
+}
+
+impl ModelCheckError {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Configuration => "configuration_invalid",
+            Self::InvalidBaseUrl => "base_url_invalid",
+            Self::InvalidBasePath => "base_url_must_end_in_v1",
+            Self::InvalidModel => "model_invalid",
+            Self::InvalidTokenizer => "tokenizer_invalid",
+            Self::InvalidCredential => "api_key_invalid",
+            Self::InsecureCredentialTransport => "api_key_requires_https",
+            Self::InsecureEndpointTransport => "plaintext_endpoint_must_be_loopback",
+            Self::AuthenticationRejected => "authentication_rejected",
+            Self::RateLimited => "rate_limited",
+            Self::Timeout => "timeout",
+            Self::RequestRejected => "request_rejected",
+            Self::Unavailable => "provider_unavailable",
+            Self::InvalidResponse => "invalid_model_catalog",
+            Self::ModelNotAdvertised => "model_not_advertised",
+        }
+    }
+
+    #[must_use]
+    pub const fn exit_code(self) -> u8 {
+        match self {
+            Self::Configuration
+            | Self::InvalidBaseUrl
+            | Self::InvalidBasePath
+            | Self::InvalidModel
+            | Self::InvalidTokenizer
+            | Self::InvalidCredential
+            | Self::InsecureCredentialTransport
+            | Self::InsecureEndpointTransport => 64,
+            Self::InvalidResponse | Self::ModelNotAdvertised => 65,
+            Self::AuthenticationRejected => 77,
+            Self::RateLimited | Self::Timeout | Self::RequestRejected | Self::Unavailable => 69,
+        }
+    }
+}
+
 /// Stable, path-free result returned to the binary presentation layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalCommandResult {
@@ -127,6 +196,31 @@ pub enum LocalCommandResult {
         run_id: String,
         reason: RecoveryReason,
     },
+}
+
+/// Check catalog access and exact model advertisement without Run state.
+///
+/// This sends exactly one `GET /v1/models`. It does not send a prompt or inference request and
+/// never opens a workspace or local Run store. Any authentication enforced only by the inference
+/// endpoint remains unverified until the first `run`.
+///
+/// # Errors
+///
+/// Returns only stable, redacted configuration, transport, status, and response classes.
+pub fn check_openai_model(request: ModelCheckRequest) -> Result<(), ModelCheckError> {
+    let ModelCheckRequest {
+        base_url,
+        model,
+        tokenizer,
+    } = request;
+    let config = OpenAiPlannerConfig::new(&base_url, DEFAULT_PLANNER_ID, &model, &tokenizer)
+        .and_then(|config| config.with_timeout(MODEL_CHECK_TIMEOUT))
+        .map_err(map_model_check_config)?;
+    let credential = provider_credential(&config).map_err(map_model_check_config)?;
+    OpenAiModelChecker::new(config, credential)
+        .map_err(map_model_check_config)?
+        .check()
+        .map_err(map_model_check_failure)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,6 +377,7 @@ where
         ManifestBudget::default(),
     )
     .map_err(|_| PublicRunError::Configuration)?;
+    let planner = remote_planner(config)?;
     let state_root = discover_state_root().map_err(|_| PublicRunError::Configuration)?;
     let layout = RunLayout::create(&state_root, manifest.run_id()).map_err(map_layout_create)?;
     layout
@@ -298,7 +393,7 @@ where
         &lease,
         &manifest,
         &workspace,
-        Some(config),
+        Some(planner),
         catalog,
         request.allow_read,
         request.max_ticks,
@@ -402,7 +497,7 @@ pub fn resume_local(request: LocalResumeRequest) -> Result<LocalCommandResult, P
     if !manifest.remote_model_egress() {
         return Err(PublicRunError::Configuration);
     }
-    let config = if request.allow_remote_model_egress {
+    let planner = if request.allow_remote_model_egress {
         let base_url = request.base_url.ok_or(PublicRunError::Configuration)?;
         let config = planner_config(
             &base_url,
@@ -413,7 +508,7 @@ pub fn resume_local(request: LocalResumeRequest) -> Result<LocalCommandResult, P
         if manifest.request_profile_digest() != config.request_profile_digest() {
             return Err(PublicRunError::Configuration);
         }
-        Some(config)
+        Some(remote_planner(config)?)
     } else {
         None
     };
@@ -424,7 +519,7 @@ pub fn resume_local(request: LocalResumeRequest) -> Result<LocalCommandResult, P
         &lease,
         &manifest,
         &workspace,
-        config,
+        planner,
         catalog,
         request.allow_read,
         request.max_ticks,
@@ -455,21 +550,14 @@ fn continue_incomplete(
     lease: &LocalRunLease,
     manifest: &RunManifest,
     workspace: &WorkspaceRoot,
-    config: Option<OpenAiPlannerConfig>,
+    planner: Option<OpenAiPlanner>,
     catalog: AllowFileCatalog,
     allow_read: bool,
     max_ticks: u32,
 ) -> Result<LocalCommandResult, PublicRunError> {
-    let model_egress_allowed = config.is_some();
-    let mut planner = if let Some(config) = config {
-        let credential = env::var("XGENY_OPENAI_API_KEY")
-            .ok()
-            .map(|value| BearerCredential::new(&value))
-            .transpose()
-            .map_err(|_| PublicRunError::Configuration)?;
-        LocalPlanner::Remote(Box::new(
-            OpenAiPlanner::new(config, credential).map_err(map_provider_config)?,
-        ))
+    let model_egress_allowed = planner.is_some();
+    let mut planner = if let Some(planner) = planner {
+        LocalPlanner::Remote(Box::new(planner))
     } else {
         LocalPlanner::Disabled {
             planner_id: manifest.planner_id().to_owned(),
@@ -824,8 +912,64 @@ fn planner_config(
         .map_err(map_provider_config)
 }
 
+fn remote_planner(config: OpenAiPlannerConfig) -> Result<OpenAiPlanner, PublicRunError> {
+    let credential = provider_credential(&config).map_err(map_provider_config)?;
+    OpenAiPlanner::new(config, credential).map_err(map_provider_config)
+}
+
+fn provider_credential(
+    config: &OpenAiPlannerConfig,
+) -> Result<Option<BearerCredential>, OpenAiPlannerConfigError> {
+    let credential = if config.accepts_bearer_credential() {
+        match env::var("XGENY_OPENAI_API_KEY") {
+            Ok(value) => Some(BearerCredential::new(&value)?),
+            Err(env::VarError::NotPresent) => None,
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err(OpenAiPlannerConfigError::InvalidCredential);
+            }
+        }
+    } else {
+        None
+    };
+    Ok(credential)
+}
+
 fn map_provider_config(_error: OpenAiPlannerConfigError) -> PublicRunError {
     PublicRunError::Configuration
+}
+
+fn map_model_check_failure(error: OpenAiModelCheckFailure) -> ModelCheckError {
+    match error {
+        OpenAiModelCheckFailure::AuthenticationRejected => ModelCheckError::AuthenticationRejected,
+        OpenAiModelCheckFailure::RateLimited => ModelCheckError::RateLimited,
+        OpenAiModelCheckFailure::Timeout => ModelCheckError::Timeout,
+        OpenAiModelCheckFailure::RequestRejected => ModelCheckError::RequestRejected,
+        OpenAiModelCheckFailure::Unavailable => ModelCheckError::Unavailable,
+        OpenAiModelCheckFailure::InvalidResponse => ModelCheckError::InvalidResponse,
+        OpenAiModelCheckFailure::ModelNotAdvertised => ModelCheckError::ModelNotAdvertised,
+    }
+}
+
+fn map_model_check_config(error: OpenAiPlannerConfigError) -> ModelCheckError {
+    match error {
+        OpenAiPlannerConfigError::InvalidBaseUrl => ModelCheckError::InvalidBaseUrl,
+        OpenAiPlannerConfigError::InvalidBasePath => ModelCheckError::InvalidBasePath,
+        OpenAiPlannerConfigError::InvalidProfileField("model") => ModelCheckError::InvalidModel,
+        OpenAiPlannerConfigError::InvalidProfileField("tokenizer") => {
+            ModelCheckError::InvalidTokenizer
+        }
+        OpenAiPlannerConfigError::InvalidCredential => ModelCheckError::InvalidCredential,
+        OpenAiPlannerConfigError::InsecureCredentialTransport => {
+            ModelCheckError::InsecureCredentialTransport
+        }
+        OpenAiPlannerConfigError::InsecureEndpointTransport => {
+            ModelCheckError::InsecureEndpointTransport
+        }
+        OpenAiPlannerConfigError::InvalidPlannerId
+        | OpenAiPlannerConfigError::InvalidProfileField(_)
+        | OpenAiPlannerConfigError::InvalidLimit(_)
+        | OpenAiPlannerConfigError::ProfileDigest => ModelCheckError::Configuration,
+    }
 }
 
 fn validate_goal(goal: &str) -> Result<(), PublicRunError> {

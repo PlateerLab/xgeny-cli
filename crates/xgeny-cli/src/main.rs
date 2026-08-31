@@ -1,12 +1,19 @@
-use std::io::Write as _;
+use std::io::{ErrorKind, Write as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 use xgeny_cli::{
-    LocalCommandResult, LocalResumeRequest, LocalRunRequest, PublicRunError, resume_local,
-    run_local_with_started,
+    LocalCommandResult, LocalResumeRequest, LocalRunRequest, ModelCheckError, ModelCheckRequest,
+    PublicRunError, check_openai_model, resume_local, run_local_with_started,
 };
+
+const PROJECT_LICENSE: &str = include_str!("../../../LICENSE");
+const CARGO_DEPENDENCY_NOTICES: &str = include_str!("../../../THIRD_PARTY_LICENSES.txt");
+const RUST_LIBRARY_NOTICES: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/RUST_COPYRIGHT_LIBRARY.html"));
+const MUSL_RUNTIME_NOTICES: &str = include_str!("../licenses/musl-1.2.5-COPYRIGHT");
+const LLVM_LIBUNWIND_NOTICES: &str = include_str!("../licenses/llvm-libunwind-52ed14f-LICENSE.TXT");
 
 #[derive(Debug, Parser)]
 #[command(
@@ -21,10 +28,17 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Print licenses and notices embedded in this binary.
+    Licenses,
     /// Inspect and validate bundled protocol contracts.
     Protocol {
         #[command(subcommand)]
         command: ProtocolCommand,
+    },
+    /// Check access to an OpenAI-compatible model catalog without creating Run state.
+    Model {
+        #[command(subcommand)]
+        command: ModelCommand,
     },
     /// Start a bounded local Run using one OpenAI-compatible model and read-text capability.
     Run(RunArgs),
@@ -38,22 +52,47 @@ enum ProtocolCommand {
     Check,
 }
 
+#[derive(Debug, Subcommand)]
+enum ModelCommand {
+    /// Check catalog access and exact model advertisement with one GET.
+    Check(ModelCheckArgs),
+}
+
 #[derive(Debug, Args)]
+#[command(
+    after_long_help = "HTTPS authentication: set XGENY_OPENAI_API_KEY. There is no --api-key option; inject the value through a secret manager/current process environment and do not type the literal into shell history."
+)]
+struct ModelCheckArgs {
+    /// OpenAI-compatible API base URL ending in /v1.
+    #[arg(long, env = "XGENY_OPENAI_BASE_URL", hide_env_values = true)]
+    base_url: String,
+    /// Exact served model identifier expected in GET /v1/models.
+    #[arg(long, env = "XGENY_OPENAI_MODEL", hide_env_values = true)]
+    model: String,
+    /// Tokenizer/profile identifier validated for a later run; defaults to the model ID.
+    #[arg(long, env = "XGENY_OPENAI_TOKENIZER", hide_env_values = true)]
+    tokenizer: Option<String>,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    after_long_help = "HTTPS authentication: set XGENY_OPENAI_API_KEY. Credentials are ignored for loopback HTTP and cannot be passed as a command-line argument."
+)]
 struct RunArgs {
     /// Goal sent to the bounded planner.
     goal: String,
     /// Workspace root opened as the local filesystem capability.
-    #[arg(long)]
+    #[arg(long, default_value = ".")]
     workspace: PathBuf,
     /// OpenAI-compatible API base URL ending in /v1.
-    #[arg(long)]
+    #[arg(long, env = "XGENY_OPENAI_BASE_URL", hide_env_values = true)]
     base_url: String,
     /// Served model identifier.
-    #[arg(long)]
+    #[arg(long, env = "XGENY_OPENAI_MODEL", hide_env_values = true)]
     model: String,
-    /// Tokenizer/profile identifier committed for restart validation.
-    #[arg(long)]
-    tokenizer: String,
+    /// Tokenizer/profile identifier committed for restart validation; defaults to the model ID.
+    #[arg(long, env = "XGENY_OPENAI_TOKENIZER", hide_env_values = true)]
+    tokenizer: Option<String>,
     /// Stable non-secret planner identity.
     #[arg(long, default_value = "xgeny.cli.openai")]
     planner_id: String,
@@ -72,14 +111,17 @@ struct RunArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(
+    after_long_help = "HTTPS authentication for an incomplete Run: set XGENY_OPENAI_API_KEY. Credentials are ignored for loopback HTTP."
+)]
 struct ResumeArgs {
     /// Durable Run identifier printed by `xgeny run`.
     run_id: String,
     /// Original physical workspace root; unnecessary for completed replay.
-    #[arg(long)]
+    #[arg(long, default_value = ".")]
     workspace: Option<PathBuf>,
     /// Current OpenAI-compatible base URL; unnecessary for completed replay.
-    #[arg(long)]
+    #[arg(long, env = "XGENY_OPENAI_BASE_URL", hide_env_values = true)]
     base_url: Option<String>,
     /// Same allow-file catalog supplied to the original Run.
     #[arg(long = "allow-file")]
@@ -98,6 +140,7 @@ struct ResumeArgs {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
+        Command::Licenses => print_licenses(),
         Command::Protocol {
             command: ProtocolCommand::Check,
         } => match xgeny_protocol::check_bundled_protocol() {
@@ -118,21 +161,42 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Command::Run(args) => present(run_local_with_started(
-            LocalRunRequest {
-                goal: args.goal,
-                workspace: args.workspace,
+        Command::Model {
+            command: ModelCommand::Check(args),
+        } => {
+            let tokenizer = args.tokenizer.unwrap_or_else(|| args.model.clone());
+            match check_openai_model(ModelCheckRequest {
                 base_url: args.base_url,
-                planner_id: args.planner_id,
                 model: args.model,
-                tokenizer: args.tokenizer,
-                allow_files: args.allow_files,
-                allow_remote_model_egress: args.allow_remote_model_egress,
-                allow_read: args.allow_read,
-                max_ticks: args.max_ticks,
-            },
-            |run_id| eprintln!("XGENY_STARTED run_id={run_id}"),
-        )),
+                tokenizer,
+            }) {
+                Ok(()) => {
+                    println!("XGENy model check: PASS");
+                    println!("  model catalog: exact model advertised");
+                    println!("  inference requests: 0");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => present_model_check_error(error),
+            }
+        }
+        Command::Run(args) => {
+            let tokenizer = args.tokenizer.unwrap_or_else(|| args.model.clone());
+            present(run_local_with_started(
+                LocalRunRequest {
+                    goal: args.goal,
+                    workspace: args.workspace,
+                    base_url: args.base_url,
+                    planner_id: args.planner_id,
+                    model: args.model,
+                    tokenizer,
+                    allow_files: args.allow_files,
+                    allow_remote_model_egress: args.allow_remote_model_egress,
+                    allow_read: args.allow_read,
+                    max_ticks: args.max_ticks,
+                },
+                |run_id| eprintln!("XGENY_STARTED run_id={run_id}"),
+            ))
+        }
         Command::Resume(args) => present(resume_local(LocalResumeRequest {
             run_id: args.run_id,
             workspace: args.workspace,
@@ -143,6 +207,36 @@ fn main() -> ExitCode {
             max_ticks: args.max_ticks,
         })),
     }
+}
+
+fn present_model_check_error(error: ModelCheckError) -> ExitCode {
+    eprintln!("XGENy model check: FAIL");
+    eprintln!("  reason={}", error.code());
+    ExitCode::from(error.exit_code())
+}
+
+fn print_licenses() -> ExitCode {
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    for (title, contents) in [
+        ("XGENy project license", PROJECT_LICENSE),
+        ("Cargo dependency notices", CARGO_DEPENDENCY_NOTICES),
+        ("Rust standard library notices", RUST_LIBRARY_NOTICES),
+        ("musl C runtime notices", MUSL_RUNTIME_NOTICES),
+        ("LLVM libunwind notices", LLVM_LIBUNWIND_NOTICES),
+    ] {
+        let result = writeln!(output, "===== {title} =====")
+            .and_then(|()| output.write_all(contents.as_bytes()))
+            .and_then(|()| writeln!(output));
+        if let Err(error) = result {
+            if error.kind() == ErrorKind::BrokenPipe {
+                return ExitCode::SUCCESS;
+            }
+            eprintln!("XGENY_ERROR code={}", PublicRunError::Internal.code());
+            return ExitCode::from(PublicRunError::Internal.exit_code());
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 fn present(result: Result<LocalCommandResult, PublicRunError>) -> ExitCode {

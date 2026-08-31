@@ -13,9 +13,12 @@
 - test-only fake planner/adapter로 approval pending/deny 무효과, IntentCommitted·Validating SQLite 재개, 완료와 no-call replay를 검증한다.
 - `xgeny-adapter-filesystem`이 root-bound resolver, component별 no-follow, 64 KiB strict UTF-8 read와 durable-output-only verifier를 제공한다. 실제 SQLite driver 회귀는 파일을 한 번 읽어 다음 planning turn에 전달하고 원본 삭제·재open 뒤 추가 file/model/verifier 호출 없이 completion을 복원한다.
 
-## 아직 사용자에게 제공하지 않는 것
+## 현재 공개 범위 밖
 
-`xgeny` binary에는 아직 `run/resume` 명령이 없고 실제 model provider와 제품 filesystem adapter를 한 public composition으로 연결하지 않았다. 승인 UI와 local-output model egress 결정도 연결되지 않았다. 따라서 library driver의 실제 파일 회귀를 “Claude Code/Codex와 같은 사용자용 CLI 완성” 또는 “untrusted plugin/host 전체 sandbox”로 설명하면 안 된다.
+Public `xgeny run/resume`은 실제 model provider와 제품 filesystem `read-text` adapter를 한 bounded
+composition으로 연결한다. 다만 승인은 invocation flag이고 interactive UI, 일반 process/write/network
+도구와 plugin sandbox는 아직 없다. 따라서 이 수직 slice를 “Claude Code/Codex와 같은 사용자용 CLI
+완성” 또는 “untrusted plugin/host 전체 sandbox”로 설명하면 안 된다.
 
 ## Driver 정지 조건
 

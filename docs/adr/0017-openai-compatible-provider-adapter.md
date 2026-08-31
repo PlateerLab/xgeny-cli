@@ -48,6 +48,12 @@ SSH tunnel 주소, API URL, bearer credential, raw prompt/context/response는 di
 
 Adapter는 `/v1/chat/completions`에 non-streaming POST 하나만 보낸다. `plan()` 안에서 `/v1/models`, health check, repair request 또는 fallback provider를 호출하지 않는다.
 
+사용자가 직접 실행하는 `xgeny model check`는 이 durable lifecycle 밖에서 bounded
+`GET /v1/models` 하나로 catalog 접근·exact model 광고와 그 endpoint가 강제한 인증만 확인한다.
+Prompt/inference와 Run state는 만들지 않으며 `run` 또는 `resume`이 자동 호출하지 않는다. 따라서
+catalog PASS가 Chat Completions의 인증·권한이나 strict structured generation 호환성을 뜻하지 않고,
+catalog 실패도 이미 생성된 Run을 변경하지 않는다.
+
 동기식 `ureq` client는 다음 경계를 고정한다.
 
 - transport: adapter 코드의 명시적 `send` 한 번
@@ -157,6 +163,7 @@ XGENy PlanningContext
 - one reservation → one POST → one accepted Plan
 - provider raw response/error body의 journal/projection 비노출
 - request 전달 뒤 connection loss에서도 두 번째 connection 0회
+- user-invoked model catalog GET 1회, inference/Run state 0과 exact model 광고 확인
 - Context hard limit/deep schema에서 reservation과 provider call 0회
 - Linux, macOS, Windows hermetic workspace tests
 - opt-in `go50902` Qwen3.8 PlanAccepted smoke

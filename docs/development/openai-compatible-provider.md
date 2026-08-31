@@ -7,6 +7,7 @@
 - immutable request profile과 digest
 - non-streaming JSON Schema request
 - retry/redirect/proxy/fallback 없는 HTTP POST 최대 1회
+- user-invoked `GET /v1/models` 1회의 non-durable model catalog checker
 - request, response, proposal와 JSON depth hard bound
 - duplicate/unknown field를 거부하는 strict proposal codec
 - configured served model과 response model exact match
@@ -35,6 +36,10 @@ cargo test --workspace --locked
 - raw provider response sentinel 비영속화
 - request 전달 뒤 connection loss에서 transport retry 0회
 - loopback server 종료 뒤 completion replay의 HTTP 재호출 0회
+- catalog check의 exact GET·model ID, inference/state 0과 loopback credential 미전송
+
+HTTPS bearer가 sensitive header로 catalog GET에만 결합되는지는 credential을 노출하지 않는 transport
+test double 단위 테스트로 별도 검증한다. 실제 HTTPS endpoint 전송은 배포 환경의 첫 연결 검증 범위다.
 
 Ignored live test도 모든 OS에서 compile되지만 일반 CI에서는 실행하지 않는다.
 
@@ -57,7 +62,10 @@ cargo test -p xgeny-provider-openai \
   -- --ignored --exact
 ```
 
-Test는 health/model-list preflight를 하지 않는다. 한 durable reservation에 inference POST 외의 요청을 더하지 않기 위해서다. Endpoint나 model이 잘못됐으면 고정 failure로 종료하고 raw response를 출력하지 않는다.
+Live test와 `run`은 health/model-list preflight를 자동 호출하지 않는다. 한 durable reservation에
+inference POST 외의 요청을 더하지 않기 위해서다. 사용자는 그 전에 `xgeny model check`를 별도로 실행할
+수 있지만 PASS는 catalog 광고까지만 뜻한다. Endpoint나 model이 잘못됐으면 고정 failure로 종료하고 raw
+response를 출력하지 않는다.
 
 2026-08-30 검증 환경:
 

@@ -4,11 +4,70 @@ Local-first general-purpose agent CLI and harness.
 
 > 현재 상태: 프로토콜 v0.1 검증, dependency DAG와 Receipt-gated 재개 frontier를 갖춘 model-free WorkGraph, embedded SQLite schema 8 store, effect 실행·복구 조정기, 결정론적 Capability Registry·Router, I/O 없는 Permission Broker, secret-free invocation material 복구, Direct Executor와 Core-owned Execution Receipt 검증 경계, 장기 Run용 VerifiedRunIndex를 실행할 수 있습니다. Provider-neutral bounded AgentLoop는 비신뢰 `PlanProposal`을 검증해 다중 Step DAG와 reconstructable input sidecar를 원자 commit하고 재시작 뒤 한 frontier action씩 이어갑니다. Model call은 provider 호출 전에 보수적인 possible-send slot을 journal에 예약하며 accepted/rejected/Unknown을 재시작 뒤 복원하고, 불확정 호출을 자동 재시도하지 않습니다. 별도 `xgeny-provider-openai` leaf adapter는 OpenAI-compatible Chat Completions의 단일 요청과 strict structured proposal을 이 lifecycle에 연결합니다. 내부 WorkGraph는 planned `ReadOnly`, Core Receipt v2의 bounded Artifact commitment와 event-anchored typed `ToolOutputRecord`를 지원하며, generation-checked `PlanningContext v2`는 SQLite 재시작 뒤 passed Receipt에 결합된 exact tool output을 다음 model turn에 전달합니다. `CompletionOutputRecord`와 schema 8은 exact UTF-8 summary를 원자 저장합니다. Public `xgeny run/resume` prototype은 물리 workspace identity, 별도 model-egress/read 동의, plaintext recipe 없는 allow-file catalog와 create/open-existing store를 결합해 실제 파일 read 뒤 별도 process의 두 번째 model turn 및 provider/workspace 없는 완료 replay를 제공합니다. 기본 CI는 이 흐름과 Reserved→Unknown 무재시도를 실제 child process로 검증합니다. 현재 공개 제품 Capability는 read-text 하나이며 process/write/network adapter, interactive UI와 XGEN compatibility adapter는 후속 범위입니다.
 
+## 설치와 첫 모델 연결
+
+SemVer tag release부터 Linux x86-64/ARM64, macOS Intel/Apple Silicon, Windows x86-64용
+단일 native binary와 checksum 검증 installer를 제공합니다. 최종 사용자는 Rust, Node.js, Python,
+SQLite 실행 파일이나 XGENy state용 별도 daemon을 설치하지 않습니다. 사용할 model endpoint는 로컬 또는
+원격에 별도로 실행 중이어야 합니다. 첫 release 전에는 아래 URL이 존재하지 않습니다.
+
+Linux/macOS:
+
+```bash
+installer=$(mktemp "${TMPDIR:-/tmp}/xgeny-installer.XXXXXX")
+curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 \
+  --connect-timeout 15 --max-time 60 --max-filesize 1048576 -fsSLo "$installer" \
+  https://github.com/PlateerLab/xgeny-cli/releases/latest/download/xgeny-installer.sh
+sh "$installer"
+rm -f "$installer"
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Windows PowerShell:
+
+```powershell
+$installer = Join-Path ([System.IO.Path]::GetTempPath()) "xgeny-installer-$([Guid]::NewGuid().ToString('N')).ps1"
+curl.exe -q --proto "=https" --proto-redir "=https" --tlsv1.2 --connect-timeout 15 --max-time 60 --max-filesize 1048576 -fsSLo $installer "https://github.com/PlateerLab/xgeny-cli/releases/latest/download/xgeny-installer.ps1"
+if ($LASTEXITCODE -ne 0) { throw "XGENy installer download failed" }
+& $installer
+Remove-Item -LiteralPath $installer
+$env:Path = "$env:LOCALAPPDATA\XGENy\bin;$env:Path"
+```
+
+로컬 vLLM처럼 인증이 필요 없는 loopback endpoint는 현재 shell에서 모델 설정만 지정한다.
+`XGENY_OPENAI_TOKENIZER`를 생략하면 model ID를 tokenizer/profile identity로도 사용한다.
+
+```bash
+export XGENY_OPENAI_BASE_URL=http://127.0.0.1:8000/v1
+export XGENY_OPENAI_MODEL=qwen3.8-27b
+
+xgeny model check
+
+xgeny run \
+  --allow-file README.md \
+  --allow-remote-model-egress \
+  --allow-read \
+  'README를 읽고 핵심을 요약해줘.'
+```
+
+`model check`는 명시한 endpoint에 `GET /v1/models` 하나만 보내 exact model ID의 광고 여부를
+확인한다. Prompt나 inference 요청을 보내지 않고 workspace·Run state도 만들지 않는다. PASS는 catalog
+접근과 해당 endpoint가 강제한 인증만 확인한다. Chat Completions의 인증·권한과 strict structured
+output 호환성은 첫 `run`이 검증한다.
+
+`--workspace` 기본값은 현재 디렉터리다. 원격 HTTPS endpoint의 key는 CLI 인자나 파일에 넣지
+않고 실행 session의 `XGENY_OPENAI_API_KEY`로만 전달한다. 현재 호환 경계는 Chat Completions,
+strict JSON Schema response와 응답의 exact model ID를 지원하는 서버다. 설치·검증·삭제와 OS별
+제약은 [시작하기](docs/getting-started.md)를 따른다.
+
+Project, Cargo dependency, Rust standard library, Linux musl과 LLVM libunwind의 배포 고지는
+binary에 포함되어 있어 network나 별도 파일 없이 `xgeny licenses`로 확인할 수 있다.
+
 ## 제품 원칙
 
 - 사용자는 `xgeny` 하나만 설치합니다.
 - SQLite server, PostgreSQL, Qdrant, Docker, Kubernetes, Python, Node.js 또는 별도 데몬을 기본 설치 조건으로 요구하지 않습니다.
-- 사용자·프로젝트 메모리는 검토 가능한 Markdown으로 유지합니다. Run의 물리 저장 형식은 ADR-0008의 3개 OS fault-injection 결과로 확정하며 JSONL export를 항상 제공합니다.
+- 사용자·프로젝트 메모리는 검토 가능한 Markdown으로 유지합니다. Run의 durable state는 embedded SQLite에 저장하며 검토·이관용 JSONL export를 항상 제공합니다.
 - XGEN 서버 없이도 코딩을 포함한 범용 로컬 작업과 세션 재개가 가능해야 합니다.
 - XGENy 코어는 XGEN, Connector, PostgreSQL, MinIO, Kubernetes 또는 XGEN Python 패키지에 의존하지 않습니다.
 - 기존 XGEN 런타임은 실행 의존성이 아니라 의미 계약·회귀 테스트·검증 자산으로 활용합니다.
@@ -61,4 +120,7 @@ cargo run --locked --quiet -p xgeny-cli -- protocol check
 - [Durable Agent Runtime 근거 검토](docs/research/2026-08-28-durable-agent-runtime-evidence.md)
 - [Durable Agent Runtime 평가 프로토콜](docs/research/2026-08-28-runtime-evaluation-protocol.md)
 
-조사 문서에는 agent harness와 XGEN 내부 자산 비교, durable execution·memory 관련 논문 및 구현 감사, 사전등록형 평가 계획이 기록돼 있습니다. 2026-08-27 이후의 제품 경계와 XGEN 연계 결정은 위 아키텍처 정본이 우선하며, 물리 저장소와 effect 복구는 ADR-0008의 연구 gate를 통과하기 전까지 제안 상태입니다.
+조사 문서에는 agent harness와 XGEN 내부 자산 비교, durable execution·memory 관련 논문 및 구현 감사,
+사전등록형 평가 계획이 기록돼 있습니다. 2026-08-27 이후의 제품 경계와 XGEN 연계 결정은 위
+아키텍처 정본이 우선하며, 현재 구현의 보장 범위와 남은 power-loss·filesystem fault gate는 각 ADR과
+개발 문서를 기준으로 판단합니다.

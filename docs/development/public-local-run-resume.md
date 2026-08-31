@@ -7,22 +7,37 @@ planner와 workspace `read-text` 하나다.
 
 SQLite 실행 파일이나 server는 필요 없다. 기본 state 위치 대신 격리된 위치를 쓰려면
 `XGENY_STATE_HOME`을 설정한다. API token이 필요한 HTTPS endpoint만
-`XGENY_OPENAI_API_KEY`를 사용한다. token을 CLI argument로 전달하지 않는다.
+`XGENY_OPENAI_API_KEY`를 사용한다. token을 CLI argument로 전달하지 않는다. 반복 입력을 줄이려면
+base URL, model과 tokenizer identity를 각각 `XGENY_OPENAI_BASE_URL`, `XGENY_OPENAI_MODEL`,
+`XGENY_OPENAI_TOKENIZER`에 둘 수 있다. Tokenizer를 생략하면 model ID를 같은 identity로 사용한다.
+
+처음 연결하는 endpoint는 Run state를 만들기 전에 catalog 조회로 확인할 수 있다.
+
+```bash
+xgeny model check
+```
+
+이 명령 자체가 현재 endpoint로 보내는 `GET /v1/models` 1회의 명시적 사용자 요청이다. Prompt와
+inference는 보내지 않으며 `run`/`resume`이 이를 자동 호출하지 않는다. PASS는 exact model 광고까지만
+뜻하고 strict structured generation은 첫 durable model call이 검증한다.
 
 ```bash
 export XGENY_STATE_HOME=/absolute/private/xgeny-state
+export XGENY_OPENAI_BASE_URL=http://127.0.0.1:18000/v1
+export XGENY_OPENAI_MODEL=qwen3.8-27b
+export XGENY_OPENAI_TOKENIZER=Qwen/Qwen3.8-27B-FP8
 
 xgeny run \
   --workspace /absolute/workspace \
-  --base-url http://127.0.0.1:18000/v1 \
-  --model qwen3.8-27b \
-  --tokenizer Qwen/Qwen3.8-27B-FP8 \
   --planner-id xgeny.live.go50902 \
   --allow-file README.md \
   --allow-remote-model-egress \
   --allow-read \
   'Read the explicitly allowed file and report its exact marker.'
 ```
+
+`--workspace`를 생략하면 현재 directory를 사용한다. Command-line `--base-url`, `--model`,
+`--tokenizer`는 기존 호출과 script 호환을 위해 계속 지원하며 같은 이름의 environment보다 우선한다.
 
 `127.0.0.1`이 SSH tunnel endpoint여도 `--allow-remote-model-egress`가 필요하다. 정상 완료는
 summary만 stdout에 쓰고 Run ID와 상태는 stderr에 쓴다.
@@ -77,11 +92,13 @@ cargo run --locked --quiet -p xgeny-cli -- protocol check
 
 ```bash
 cargo test --locked -p xgeny-cli --test public_run_resume
+cargo test --locked -p xgeny-cli --test environment_onboarding
 ```
 
-이 test는 다음을 실제 child process와 loopback HTTP로 검증한다.
+이 두 test는 다음을 실제 child process와 loopback HTTP로 검증한다.
 
 - egress 미동의 시 state/HTTP 0
+- model check의 catalog GET 1회, inference/state 0과 loopback credential 미전송
 - model Plan → 별도 local-only resume → allow-listed 실제 file read → ToolOutput+Receipt
 - source 삭제 뒤 SQLite reopen → 두 번째 model request에 exact output 전달
 - wrong workspace/catalog의 외부 호출·journal mutation 0

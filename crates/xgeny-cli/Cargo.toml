@@ -35,5 +35,8 @@ xgeny-workgraph = { path = "../xgeny-workgraph" }
 rusqlite.workspace = true
 tempfile.workspace = true
 
+[build-dependencies]
+sha2.workspace = true
+
 [lints]
 workspace = true
