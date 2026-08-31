@@ -1,9 +1,11 @@
 #![doc = "Composition primitives for the local-first `XGENy` CLI."]
 
 mod allow_file;
+mod allow_path;
 mod composition;
 mod driver;
 mod manifest;
+mod material_catalog;
 mod run_layout;
 
 pub use composition::*;

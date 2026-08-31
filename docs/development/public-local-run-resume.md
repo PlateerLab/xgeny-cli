@@ -1,7 +1,8 @@
 # Public local `run/resume` prototype
 
-이 문서는 ADR-0023 구현을 개발·검증하는 최소 운영 절차다. 현재 공개 slice는 OpenAI-compatible
-planner와 workspace `read-text` 하나다.
+이 문서는 ADR-0023과 ADR-0024 구현을 개발·검증하는 최소 운영 절차다. 기존 exact-file mode는
+OpenAI-compatible planner와 workspace `read-text` 하나를 유지한다. Source/main의 opt-in
+workspace discovery mode는 `list-directory`, `stat`, `search-text`, `read-text`를 제공한다.
 
 ## 실행
 
@@ -36,6 +37,22 @@ xgeny run \
   'Read the explicitly allowed file and report its exact marker.'
 ```
 
+프로젝트를 스스로 탐색하게 하려면 directory 권한을 별도로 지정한다.
+
+```bash
+xgeny run \
+  --workspace /absolute/workspace \
+  --planner-id xgeny.live.go50902 \
+  --allow-dir . \
+  --allow-remote-model-egress \
+  --allow-read \
+  'Inspect the workspace and find the implementation relevant to the goal.'
+```
+
+`--allow-dir`가 하나라도 있으면 discovery execution profile과 다중 tool 예산을 사용한다. 없으면
+기존 allow-file profile/digest/예산과 material provider를 그대로 사용한다. `--allow-dir .`은 현재
+workspace root를 뜻하며 workspace 밖 path나 symlink target을 허용하지 않는다.
+
 `--workspace`를 생략하면 현재 directory를 사용한다. Command-line `--base-url`, `--model`,
 `--tokenizer`는 기존 호출과 script 호환을 위해 계속 지원하며 같은 이름의 environment보다 우선한다.
 
@@ -46,13 +63,24 @@ summary만 stdout에 쓰고 Run ID와 상태는 stderr에 쓴다.
 manifest에 저장하거나 동일성 비교하지 않으므로 tunnel port를 바꿀 수 있지만, 변경된 endpoint로
 보낼 때도 flag를 다시 명시해야 한다. Managed endpoint registry와 transport identity pinning은 후속이다.
 
-미완료 Run은 원래 workspace mapping, 현재 endpoint와 같은 allow-file catalog를 다시 제공한다.
+미완료 Run은 원래 workspace mapping, 현재 endpoint와 같은 allow-file/allow-dir catalog를 다시 제공한다.
 
 ```bash
 xgeny resume run-0123456789abcdef0123456789abcdef \
   --workspace /absolute/workspace \
   --base-url http://127.0.0.1:18000/v1 \
   --allow-file README.md \
+  --allow-remote-model-egress \
+  --allow-read
+```
+
+Discovery Run도 원래와 동일한 directory/file catalog를 제공한다.
+
+```bash
+xgeny resume run-0123456789abcdef0123456789abcdef \
+  --workspace /absolute/workspace \
+  --base-url http://127.0.0.1:18000/v1 \
+  --allow-dir . \
   --allow-remote-model-egress \
   --allow-read
 ```
@@ -92,10 +120,11 @@ cargo run --locked --quiet -p xgeny-cli -- protocol check
 
 ```bash
 cargo test --locked -p xgeny-cli --test public_run_resume
+cargo test --locked -p xgeny-cli --test workspace_discovery
 cargo test --locked -p xgeny-cli --test environment_onboarding
 ```
 
-이 두 test는 다음을 실제 child process와 loopback HTTP로 검증한다.
+이 세 test는 다음을 실제 child process와 loopback HTTP로 검증한다.
 
 - egress 미동의 시 state/HTTP 0
 - model check의 catalog GET 1회, inference/state 0과 loopback credential 미전송
@@ -106,6 +135,9 @@ cargo test --locked -p xgeny-cli --test environment_onboarding
 - 응답 전 process 종료 시 Reserved → Unknown, 자동 HTTP retry 0
 - 실제 read 뒤 outcome commit 실패 시 즉시 effect Unknown 분류, offline resume의
   Executing → EffectUnknown 1회와 자동 재실행 0
+- list → search → stat → read 네 observation과 completion의 한-process vertical flow
+- dynamic search recipe의 approval pause → 별도 local-only process 복원/실행 → remote completion
+- completed workspace와 material catalog 삭제 뒤 summary offline replay
 
 ## go50902 public live gate
 
@@ -168,8 +200,10 @@ manifest에, marker는 completion/replay stdout에만 의도적으로 허용된�
 
 ## 보안·운영 메모
 
-- `manifest.json`에는 endpoint, token, root path, allow-file path와 content가 없다.
-- Run DB에는 goal과 성공한 file content가 의도적으로 존재한다. state root를 민감 데이터로 취급한다.
+- `manifest.json`에는 endpoint, token, root path, allow-file/allow-dir path, search query와 content가 없다.
+- Run DB에는 goal과 성공한 tool output이 의도적으로 존재한다. Discovery mode의 private
+  `materials.sqlite3`에는 dynamic path/query recipe가 존재한다. state root 전체를 민감 데이터로
+  취급한다.
 - allow-file은 ambient absolute path가 아니라 workspace-relative portable path만 받는다.
 - Debug/error 출력으로 내부 path나 provider body를 내보내지 않는다.
 - `XGENY_STATE_HOME`은 넓은 기존 경로나 final symlink를 가리키면 안 되며, 기존 directory 권한을
@@ -184,6 +218,8 @@ manifest에, marker는 completion/replay stdout에만 의도적으로 허용된�
   hardening은 현재 프로토타입 범위 밖이다.
 - Manifest의 local execution profile은 capability/instance, adapter 제한, route/materializer와
   approval/policy revision을 묶는다.
+- Core Run store는 schema 8을 유지한다. Discovery recipe는 CLI-owned `materials.sqlite3` schema 1에
+  분리하며 SQLite executable/server를 요구하지 않는다.
 - schema-8 completion sidecar가 없거나 manifest/store binding이 다르면 exit `70`이다.
 - Unknown model/effect는 exit `30`이며 자동 retry하지 않는다.
 - 현재 partial initialization 및 SIGKILL 뒤 preflight scratch cleanup, encrypted state, Windows ACL

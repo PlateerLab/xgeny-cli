@@ -1,8 +1,10 @@
 # Capability-confined filesystem read adapter
 
-`xgeny-adapter-filesystem`은 한 user-selected workspace 안의 bounded UTF-8 일반 파일만 읽는 제품
-leaf adapter다. XGEN, Connector, DB server, MinIO, daemon 또는 특정 model provider가 필요하지
-않는다. SQLite와 마찬가지로 필요한 Rust library code는 최종 binary에 link된다.
+`xgeny-adapter-filesystem`은 한 user-selected workspace 안에서 bounded read/list/stat/search를 수행하는
+제품 leaf adapter다. 이 문서는 그중 exact UTF-8 `read-text` 경계를 다루며 query 계약은
+[workspace filesystem discovery](workspace-filesystem-discovery.md)에 정리한다. XGEN, Connector, DB
+server, MinIO, daemon 또는 특정 model provider가 필요하지 않는다. SQLite와 마찬가지로 필요한 Rust
+library code는 최종 binary에 link된다.
 
 ## Composition
 
@@ -34,7 +36,7 @@ dispatch되지 않는다. Composition은 반드시 `workspace.binding()`으로 �
 형태로 만든다. `WorkspaceId`와 실제 root의 매핑은 해당 durable Run을 재개하는 동안 바뀌면 안
 된다. Public CLI는 이 mapping을 재시작 시 검증해야 한다.
 
-이 adapter는 synchronous one-shot read만 구현한다. 따라서 제품 Instance는 `sync=true`만
+`ReadTextAdapter`는 synchronous one-shot read만 구현한다. 따라서 해당 제품 Instance는 `sync=true`만
 advertise하고 `task`, `cancellable`, `idempotencyQuery`는 모두 `false`여야 한다. Public Definition이
 지원 가능한 상위 집합을 표현하더라도 실제 Instance가 구현하지 않은 기능을 claim하면 adapter와
 verifier가 dispatch material을 거부한다.
@@ -45,9 +47,11 @@ verifier가 dispatch material을 거부한다.
 `workspace:primary/README.md` 형태로 만들며 이미 canonical인 token에 다시 적용해도 같은 값을
 반환한다. Adapter에는 이 canonical token만 도달한다.
 
-다음 형태는 모든 OS에서 거부한다.
+ADR-0024 이후 resolver는 list/stat/search를 위해 `.`을 `workspace:primary` root token으로 허용한다.
+`read-text`는 regular file만 읽으므로 root token 실행은 실패한다. 그 외 다음 형태는 모든 OS에서
+거부한다.
 
-- absolute, drive, UNC, parent traversal, `.`, empty component
+- absolute, drive, UNC, parent traversal, empty component
 - backslash, colon/ADS, NUL/control과 Windows-forbidden punctuation
 - trailing dot/space와 extension 앞 space를 포함한 reserved device spelling
 - 4096-byte path, 255-byte component 또는 256-component 상한 초과

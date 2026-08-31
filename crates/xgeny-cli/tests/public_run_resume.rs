@@ -253,6 +253,7 @@ fn separate_processes_read_once_continue_with_exact_output_and_replay_offline() 
         .expect("first planner request should arrive");
     let first_context = planning_context(&first_request);
     assert_eq!(first_context["toolOutputs"], json!([]));
+    assert!(first_context.get("planningConstraints").is_none());
     assert!(!String::from_utf8_lossy(&first_request).contains(FILE_MARKER));
 
     let local_only = xgeny(&state_root)

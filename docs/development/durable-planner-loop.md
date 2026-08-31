@@ -209,6 +209,12 @@ Context membership 목록 자체는 durable event에 저장하지 않으므로 r
 
 `context_digest`는 profile, Run/head binding, 선택된 item과 omission 결과를 domain-separated RFC 8785/SHA-256로 commit한다. SHA-256은 기밀화가 아니다. `PlanningContext` serialization은 digest input payload를 내보내고 digest 자신을 self-include하지 않으므로 adapter는 `context_digest()` companion 값을 사용해야 한다. Credential, raw invocation argument, presigned URL, hidden reasoning과 전체 transcript는 구조적 context allowlist에 포함하지 않는다. ADR-0020의 v2 profile은 예외적으로 passed Core Receipt와 exact durable record에 결합된 bounded tool output만 별도 mandatory `toolOutputs` section에 넣는다.
 
+ADR-0024 이후 composition root는 bounded `planningConstraints`를 optional provider-bound field로 넣을 수
+있다. Empty collection은 직렬화하지 않아 기존 v2 payload를 보존하고, non-empty collection은 context와
+request digest에 포함된다. 이 값은 planner 후보를 좁히는 정보일 뿐 authority grant가 아니므로 실제
+adapter/policy/admission 경계를 대체하지 않는다. 재시작 안정성이 필요한 host는 constraint를 자신의
+durable, integrity-checked configuration에서 동일하게 재구성해야 한다.
+
 이 allowlist는 content DLP가 아니다. 허용 필드인 goal, 기존 Step objective, Capability summary/schema 안에 secret이 있으면 Core가 자동 탐지·삭제하지 않는다. 실제 외부 provider adapter를 붙이는 composition root가 secret-free 입력과 sensitivity/egress policy를 보장해야 한다.
 
 Model-call identifier도 같은 경계다. `planner_id` validator는 길이와 ASCII `[A-Za-z0-9._-]`만 검사하고 secret/token-like content는 판별하지 않는다. Trusted composition root가 registry의 stable non-secret ID를 공급해야 하며 raw prompt/response/error/credential을 identifier 또는 ad-hoc digest field로 우회 저장하면 안 된다. `request_profile_digest`의 SHA-256 shape 검증 역시 입력 provenance나 confidentiality 검증이 아니다.

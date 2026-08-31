@@ -1,6 +1,7 @@
 #![doc = "Capability-confined local filesystem adapters for `XGENy`."]
 
 mod path;
+mod query;
 mod read_text;
 mod root_identity;
 
@@ -13,6 +14,12 @@ use thiserror::Error;
 use xgeny_domain::InstanceBinding;
 use xgeny_policy::{ResourceResolutionFailure, ResourceResolver};
 
+pub use query::{
+    FilesystemQueryAdapter, FilesystemQueryVerifier, MAX_DIRECTORY_SCAN_ENTRIES,
+    MAX_LIST_DIRECTORY_ENTRIES, MAX_QUERY_OUTPUT_CANONICAL_BYTES, MAX_SEARCH_FILE_BYTES,
+    MAX_SEARCH_MATCHES, MAX_SEARCH_PREVIEW_BYTES, MAX_SEARCH_QUERY_BYTES,
+    MAX_SEARCH_QUERY_UNICODE_SCALARS, MAX_SEARCH_TOTAL_BYTES, MAX_SEARCH_VISITED_ENTRIES,
+};
 pub use read_text::{
     MAX_READ_TEXT_BYTES, ReadTextAdapter, ReadTextLimits, ReadTextLimitsError, ReadTextVerifier,
 };
@@ -24,6 +31,24 @@ pub const READ_TEXT_CAPABILITY_ID: &str = "xgeny.fs/read-text";
 pub const READ_TEXT_CONTRACT_VERSION: &str = "1.0.0";
 /// Exact operation name used in a root-bound local Instance binding.
 pub const READ_TEXT_OPERATION_REF: &str = "readText";
+/// Exact public Capability identifier for one-level directory observation.
+pub const LIST_DIRECTORY_CAPABILITY_ID: &str = "xgeny.fs/list-directory";
+/// Exact immutable list-directory contract version.
+pub const LIST_DIRECTORY_CONTRACT_VERSION: &str = "1.0.0";
+/// Exact operation name used in the root-bound list Instance.
+pub const LIST_DIRECTORY_OPERATION_REF: &str = "listDirectory";
+/// Exact public Capability identifier for path metadata observation.
+pub const STAT_CAPABILITY_ID: &str = "xgeny.fs/stat";
+/// Exact immutable stat contract version.
+pub const STAT_CONTRACT_VERSION: &str = "1.0.0";
+/// Exact operation name used in the root-bound stat Instance.
+pub const STAT_OPERATION_REF: &str = "stat";
+/// Exact public Capability identifier for recursive literal text search.
+pub const SEARCH_TEXT_CAPABILITY_ID: &str = "xgeny.fs/search-text";
+/// Exact immutable search-text contract version.
+pub const SEARCH_TEXT_CONTRACT_VERSION: &str = "1.0.0";
+/// Exact operation name used in the root-bound search Instance.
+pub const SEARCH_TEXT_OPERATION_REF: &str = "searchText";
 /// Resource scope accepted by the workspace resolver.
 pub const FILESYSTEM_READ_SCOPE: &str = "filesystem.read";
 
@@ -119,7 +144,7 @@ impl WorkspaceRoot {
     /// Return the exact root-bound Instance binding required by this adapter and verifier.
     #[must_use]
     pub fn binding(&self) -> InstanceBinding {
-        workspace_binding(&self.workspace_id)
+        workspace_binding(&self.workspace_id, READ_TEXT_OPERATION_REF)
     }
 
     /// Commit the physical directory identity obtained from this exact preopened capability.
@@ -140,6 +165,42 @@ impl WorkspaceRoot {
     #[must_use]
     pub fn read_text_adapter(&self, limits: ReadTextLimits) -> ReadTextAdapter {
         ReadTextAdapter::new(self.clone(), limits)
+    }
+
+    /// Return the exact root-bound binding for the list-directory adapter.
+    #[must_use]
+    pub fn list_directory_binding(&self) -> InstanceBinding {
+        workspace_binding(&self.workspace_id, LIST_DIRECTORY_OPERATION_REF)
+    }
+
+    /// Return the exact root-bound binding for the stat adapter.
+    #[must_use]
+    pub fn stat_binding(&self) -> InstanceBinding {
+        workspace_binding(&self.workspace_id, STAT_OPERATION_REF)
+    }
+
+    /// Return the exact root-bound binding for the search-text adapter.
+    #[must_use]
+    pub fn search_text_binding(&self) -> InstanceBinding {
+        workspace_binding(&self.workspace_id, SEARCH_TEXT_OPERATION_REF)
+    }
+
+    /// Construct the bounded one-level directory adapter.
+    #[must_use]
+    pub fn list_directory_adapter(&self) -> FilesystemQueryAdapter {
+        FilesystemQueryAdapter::list_directory(self.clone())
+    }
+
+    /// Construct the bounded path metadata adapter.
+    #[must_use]
+    pub fn stat_adapter(&self) -> FilesystemQueryAdapter {
+        FilesystemQueryAdapter::stat(self.clone())
+    }
+
+    /// Construct the bounded recursive literal text search adapter.
+    #[must_use]
+    pub fn search_text_adapter(&self) -> FilesystemQueryAdapter {
+        FilesystemQueryAdapter::search_text(self.clone())
     }
 }
 
@@ -181,10 +242,10 @@ impl fmt::Debug for WorkspaceResourceResolver {
     }
 }
 
-fn workspace_binding(workspace_id: &WorkspaceId) -> InstanceBinding {
+fn workspace_binding(workspace_id: &WorkspaceId, operation_ref: &str) -> InstanceBinding {
     InstanceBinding {
         binding_ref: format!("{WORKSPACE_BINDING_PREFIX}{}", workspace_id.as_str()),
-        operation_ref: Some(READ_TEXT_OPERATION_REF.to_owned()),
+        operation_ref: Some(operation_ref.to_owned()),
         protocol_version: None,
     }
 }

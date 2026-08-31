@@ -182,6 +182,9 @@ jobs:
           cargo test --locked --release -p xgeny-cli \
             --test environment_onboarding \
             --target "${{ matrix.target }}"
+          cargo test --locked --release -p xgeny-cli \
+            --test workspace_discovery \
+            --target "${{ matrix.target }}"
 
       - name: Audit Unix native dependencies
         if: runner.os != 'Windows'

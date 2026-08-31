@@ -1,4 +1,7 @@
-use std::process::{Command, Stdio};
+use std::process::Command;
+
+#[cfg(unix)]
+use std::process::Stdio;
 
 use tempfile::tempdir;
 
@@ -17,7 +20,7 @@ fn protocol_check_succeeds_and_reports_conformance_scope() {
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
     assert!(stdout.contains("XGENy protocol v0.1: PASS"));
     assert!(stdout.contains("schemas: 9"));
-    assert!(stdout.contains("fixtures: 20 (11 valid, 9 invalid)"));
+    assert!(stdout.contains("fixtures: 23 (14 valid, 9 invalid)"));
     assert!(stdout.contains("reference resolution: bundled/offline"));
 }
 
@@ -109,6 +112,22 @@ fn environment_backed_run_arguments_reach_explicit_egress_consent_gate() {
 }
 
 #[test]
+fn run_requires_an_explicit_file_or_directory_scope() {
+    let output = xgeny()
+        .env("XGENY_OPENAI_BASE_URL", "http://127.0.0.1:18000/v1")
+        .env("XGENY_OPENAI_MODEL", "test-model")
+        .args(["run", "test goal"])
+        .output()
+        .expect("xgeny should reject a scope-free run at argument parsing");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    assert!(stderr.contains("--allow-file"));
+    assert!(stderr.contains("--allow-dir"));
+}
+
+#[test]
 fn run_help_names_environment_contract_without_exposing_values() {
     let sentinel = "SENSITIVE-MODEL-SETTING-MUST-NOT-APPEAR";
     let output = xgeny()
@@ -125,6 +144,8 @@ fn run_help_names_environment_contract_without_exposing_values() {
     assert!(stdout.contains("XGENY_OPENAI_MODEL"));
     assert!(stdout.contains("XGENY_OPENAI_TOKENIZER"));
     assert!(stdout.contains("XGENY_OPENAI_API_KEY"));
+    assert!(stdout.contains("--allow-file"));
+    assert!(stdout.contains("--allow-dir"));
     assert!(!stdout.contains(sentinel));
 }
 

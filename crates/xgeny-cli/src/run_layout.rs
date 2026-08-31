@@ -11,6 +11,7 @@ use crate::manifest::{RunManifest, valid_run_id};
 const RUNS_DIRECTORY: &str = "runs";
 const MANIFEST_FILE: &str = "manifest.json";
 const DATABASE_FILE: &str = "run.sqlite3";
+const MATERIAL_CATALOG_FILE: &str = "materials.sqlite3";
 const LEASE_FILE: &str = "run.lock";
 const MAX_MANIFEST_FILE_BYTES: u64 = 64 * 1024;
 
@@ -106,6 +107,10 @@ impl RunLayout {
 
     pub(crate) fn lease_path(&self) -> PathBuf {
         self.directory.join(LEASE_FILE)
+    }
+
+    pub(crate) fn material_catalog_path(&self) -> PathBuf {
+        self.directory.join(MATERIAL_CATALOG_FILE)
     }
 
     fn manifest_path(&self) -> PathBuf {
@@ -393,6 +398,11 @@ mod tests {
         );
         assert!(layout.database_path().ends_with(DATABASE_FILE));
         assert!(layout.lease_path().ends_with(LEASE_FILE));
+        assert!(
+            layout
+                .material_catalog_path()
+                .ends_with(MATERIAL_CATALOG_FILE)
+        );
     }
 
     #[cfg(unix)]

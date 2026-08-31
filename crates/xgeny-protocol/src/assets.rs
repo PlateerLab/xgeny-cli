@@ -56,8 +56,20 @@ pub(crate) const FIXTURE_MANIFEST: &str =
 
 pub(crate) const FIXTURES: &[Asset] = &[
     asset!(
+        "valid/capability-definition.fs-list-directory.json",
+        "../../../protocol/fixtures/v1alpha1/valid/capability-definition.fs-list-directory.json"
+    ),
+    asset!(
         "valid/capability-definition.fs-read-text.json",
         "../../../protocol/fixtures/v1alpha1/valid/capability-definition.fs-read-text.json"
+    ),
+    asset!(
+        "valid/capability-definition.fs-search-text.json",
+        "../../../protocol/fixtures/v1alpha1/valid/capability-definition.fs-search-text.json"
+    ),
+    asset!(
+        "valid/capability-definition.fs-stat.json",
+        "../../../protocol/fixtures/v1alpha1/valid/capability-definition.fs-stat.json"
     ),
     asset!(
         "valid/capability-instance.local-fs.json",
