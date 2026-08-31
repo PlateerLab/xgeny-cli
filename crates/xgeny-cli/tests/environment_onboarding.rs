@@ -45,6 +45,9 @@ impl CatalogServer {
                 }
             };
             stream
+                .set_nonblocking(false)
+                .expect("catalog stream should become blocking");
+            stream
                 .set_read_timeout(Some(TIMEOUT))
                 .expect("request timeout should configure");
             let request = read_http_headers(&mut stream);
@@ -85,6 +88,9 @@ impl CompletionServer {
                     Err(error) => panic!("planner accept failed: {error}"),
                 }
             };
+            stream
+                .set_nonblocking(false)
+                .expect("planner stream should become blocking");
             stream
                 .set_read_timeout(Some(TIMEOUT))
                 .expect("request timeout should configure");
