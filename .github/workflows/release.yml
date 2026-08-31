@@ -491,15 +491,39 @@ jobs:
           test "$(git -C "$publish_repo" rev-parse refs/remotes/origin/release-main)" = "$RELEASE_SHA"
           test "$(git -C "$publish_repo" rev-parse "$publish_ref^{commit}")" = "$RELEASE_SHA"
           release_flags=()
+          expected_prerelease=false
           if [[ "$RELEASE_TAG" == *-* ]]; then
-            release_flags+=(--prerelease)
+            release_flags+=(--prerelease --latest=false)
+            expected_prerelease=true
+          else
+            release_flags+=(--latest)
           fi
           gh release create "$RELEASE_TAG" release/* \
             --verify-tag \
             --generate-notes \
             --title "XGENy ${RELEASE_TAG#v}" \
             "${release_flags[@]}"
-          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.immutable')" = "true"
+          created_release="$RUNNER_TEMP/xgeny-created-release.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > "$created_release"
+          jq -e \
+            --arg release_tag "$RELEASE_TAG" \
+            --argjson expected_prerelease "$expected_prerelease" '
+              .tag_name == $release_tag and
+              .draft == false and
+              .prerelease == $expected_prerelease and
+              .immutable == true
+            ' "$created_release" >/dev/null
+          if [[ "$expected_prerelease" == "false" ]]; then
+            latest_ok=false
+            for _ in {1..12}; do
+              if [[ "$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name' 2>/dev/null || true)" == "$RELEASE_TAG" ]]; then
+                latest_ok=true
+                break
+              fi
+              sleep 5
+            done
+            test "$latest_ok" = "true"
+          fi
           post_publish_repo="$RUNNER_TEMP/xgeny-release-post-verification"
           mkdir "$post_publish_repo"
           git -C "$post_publish_repo" init --quiet

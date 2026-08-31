@@ -23,7 +23,8 @@ Linux binary는 musl target, Windows binary는 static CRT로 빌드한다. macOS
 ## 설치
 
 Installer를 먼저 파일로 받은 뒤 검토·실행한다. Installer는 shell profile이나 user PATH를 자동으로
-수정하지 않고 관리자 권한을 요청하지 않는다.
+수정하지 않고 관리자 권한을 요청하지 않는다. 현재 첫 배포는 `v0.1.0-rc.1` prerelease이므로 stable
+release만 가리키는 `releases/latest` 대신 아래 exact tag를 사용한다.
 
 Linux/macOS:
 
@@ -31,8 +32,8 @@ Linux/macOS:
 installer=$(mktemp "${TMPDIR:-/tmp}/xgeny-installer.XXXXXX")
 curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 \
   --connect-timeout 15 --max-time 60 --max-filesize 1048576 -fsSLo "$installer" \
-  https://github.com/PlateerLab/xgeny-cli/releases/latest/download/xgeny-installer.sh
-sh "$installer"
+  https://github.com/PlateerLab/xgeny-cli/releases/download/v0.1.0-rc.1/xgeny-installer.sh
+sh "$installer" --version v0.1.0-rc.1
 rm -f "$installer"
 export PATH="$HOME/.local/bin:$PATH"
 ```
@@ -41,9 +42,9 @@ Windows PowerShell:
 
 ```powershell
 $installer = Join-Path ([System.IO.Path]::GetTempPath()) "xgeny-installer-$([Guid]::NewGuid().ToString('N')).ps1"
-curl.exe -q --proto "=https" --proto-redir "=https" --tlsv1.2 --connect-timeout 15 --max-time 60 --max-filesize 1048576 -fsSLo $installer "https://github.com/PlateerLab/xgeny-cli/releases/latest/download/xgeny-installer.ps1"
+curl.exe -q --proto "=https" --proto-redir "=https" --tlsv1.2 --connect-timeout 15 --max-time 60 --max-filesize 1048576 -fsSLo $installer "https://github.com/PlateerLab/xgeny-cli/releases/download/v0.1.0-rc.1/xgeny-installer.ps1"
 if ($LASTEXITCODE -ne 0) { throw "XGENy installer download failed" }
-& $installer
+& $installer -Version v0.1.0-rc.1
 Remove-Item -LiteralPath $installer
 $env:Path = "$env:LOCALAPPDATA\XGENy\bin;$env:Path"
 ```
@@ -76,16 +77,16 @@ xgeny licenses
 installer=$(mktemp "${TMPDIR:-/tmp}/xgeny-installer.XXXXXX")
 curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 \
   --connect-timeout 15 --max-time 60 --max-filesize 1048576 -fsSLo "$installer" \
-  https://github.com/PlateerLab/xgeny-cli/releases/download/v0.1.0/xgeny-installer.sh
-sh "$installer" --version v0.1.0
+  https://github.com/PlateerLab/xgeny-cli/releases/download/v0.1.0-rc.1/xgeny-installer.sh
+sh "$installer" --version v0.1.0-rc.1
 rm -f "$installer"
 ```
 
 ```powershell
 $installer = Join-Path ([System.IO.Path]::GetTempPath()) "xgeny-installer-$([Guid]::NewGuid().ToString('N')).ps1"
-curl.exe -q --proto "=https" --proto-redir "=https" --tlsv1.2 --connect-timeout 15 --max-time 60 --max-filesize 1048576 -fsSLo $installer "https://github.com/PlateerLab/xgeny-cli/releases/download/v0.1.0/xgeny-installer.ps1"
+curl.exe -q --proto "=https" --proto-redir "=https" --tlsv1.2 --connect-timeout 15 --max-time 60 --max-filesize 1048576 -fsSLo $installer "https://github.com/PlateerLab/xgeny-cli/releases/download/v0.1.0-rc.1/xgeny-installer.ps1"
 if ($LASTEXITCODE -ne 0) { throw "XGENy installer download failed" }
-& $installer -Version v0.1.0
+& $installer -Version v0.1.0-rc.1
 Remove-Item -LiteralPath $installer
 ```
 

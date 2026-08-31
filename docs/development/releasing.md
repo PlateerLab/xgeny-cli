@@ -50,9 +50,11 @@ XGENy Intel macOS binary와 installer 검증 범위에는 영향이 없다.
 Version을 올린 변경을 먼저 PR로 merge한 뒤 main head에 tag를 만든다. `main`에는 직접 push하지 않는다.
 
 ```bash
+release_version=0.1.0-rc.1
+release_tag="v$release_version"
 git fetch origin main
-git tag -a v0.1.0 origin/main -m 'XGENy 0.1.0'
-git push origin v0.1.0
+git tag -a "$release_tag" origin/main -m "XGENy $release_version"
+git push origin "$release_tag"
 ```
 
 ## Workflow gate
@@ -89,8 +91,10 @@ exact `true`가 아니면 게시를 fail-closed로 중단한다. GitHub 설정 �
 권한이 필요하므로 고권한 PAT를 workflow secret으로 추가하지 않는다. 반면 공개 repository의 active
 ruleset은 workflow가 API로 읽어 exact include/exclude, 빈 bypass actor와 update/deletion rule을 직접
 검증한다. API가 bypass actor를 반환하면 빈 배열만 허용하고, 권한 때문에 숨겨지는 경우에는 별도
-관리자 acknowledgement를 요구한다. 게시 직후에는 일반 release 조회로 `immutable=true`와 잠긴 tag의
-peeled commit을 다시 확인한다. 이 사후검사가 실패하면 이미 게시된 release의 이상을 알리는 것이므로,
+관리자 acknowledgement를 요구한다. 게시할 때 prerelease는 명시적으로 latest에서 제외하고 stable은
+latest로 지정한다. 게시 직후에는 일반 release 조회로 exact tag, draft/prerelease 분류,
+`immutable=true`, stable의 latest 해석과 잠긴 tag의 peeled commit을 다시 확인한다. 이 사후검사가
+실패하면 이미 게시된 release의 이상을 알리는 것이므로,
 사전 ruleset과 관리자 확인을 대신하지 않는다.
 
 Quality, build와 assemble job은 repository read 권한만 가진다. 모든 target과 assembly가 통과한 뒤
