@@ -8,6 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use tempfile::tempdir;
 use xgeny_local_store::{RunStore, SqliteRunStore};
 
@@ -278,6 +279,100 @@ fn atomic_write_requires_separate_approval_and_survives_process_resume() {
     );
 }
 
+#[test]
+fn exact_patch_requires_write_approval_and_survives_process_resume() {
+    let fixture = tempdir().expect("test directory should exist");
+    let state_root = fixture.path().join("state");
+    let workspace = fixture.path().join("workspace");
+    fs::create_dir_all(workspace.join("src")).expect("workspace should create");
+    let source = "pub fn answer() -> u32 {\n    41\n}\n";
+    fs::write(workspace.join("src/lib.rs"), source).expect("source should write");
+    let expected_digest = test_sha256_digest(source.as_bytes());
+    let server = SequentialServer::spawn_responses(vec![
+        plan_response(
+            "patch_source",
+            "Patch one exact source fragment",
+            "xgeny.fs/apply-patch",
+            &json!({
+                "path": "src/lib.rs",
+                "expectedDigest": expected_digest,
+                "edits": [{
+                    "oldText": "pub fn answer() -> u32 {\n    41\n}",
+                    "newText": "pub fn answer() -> u32 {\n    42\n}"
+                }]
+            }),
+        ),
+        completion_response(),
+    ]);
+
+    let first = bounded_output(xgeny(&state_root).args([
+        "run",
+        "--workspace",
+        path_text(&workspace),
+        "--base-url",
+        &server.base_url,
+        "--model",
+        MODEL,
+        "--tokenizer",
+        TOKENIZER,
+        "--allow-dir",
+        "src",
+        "--allow-remote-model-egress",
+        "Update the answer while preserving the rest of the file.",
+    ]))
+    .expect("unapproved patch should pause");
+    assert_eq!(first.status.code(), Some(10), "{}", stderr(&first));
+    assert!(stderr(&first).contains("reason=write_approval_required"));
+    assert_eq!(
+        fs::read_to_string(workspace.join("src/lib.rs")).unwrap(),
+        source
+    );
+    let run_id = extract_run_id(&stderr(&first));
+
+    let local = bounded_output(xgeny(&state_root).args([
+        "resume",
+        &run_id,
+        "--workspace",
+        path_text(&workspace),
+        "--allow-dir",
+        "src",
+        "--allow-write",
+    ]))
+    .expect("approved local patch should execute without model access");
+    assert_eq!(local.status.code(), Some(10), "{}", stderr(&local));
+    assert!(stderr(&local).contains("reason=remote_model_egress_consent_required"));
+    assert_eq!(
+        fs::read_to_string(workspace.join("src/lib.rs")).unwrap(),
+        "pub fn answer() -> u32 {\n    42\n}\n"
+    );
+
+    let completion = bounded_output(xgeny(&state_root).args([
+        "resume",
+        &run_id,
+        "--workspace",
+        path_text(&workspace),
+        "--base-url",
+        &server.base_url,
+        "--allow-dir",
+        "src",
+        "--allow-write",
+        "--allow-remote-model-egress",
+    ]))
+    .expect("remote continuation should complete");
+    assert_eq!(completion.status.code(), Some(0), "{}", stderr(&completion));
+
+    let _first_request = server.requests.recv_timeout(TEST_TIMEOUT).unwrap();
+    let completion_request = server.requests.recv_timeout(TEST_TIMEOUT).unwrap();
+    server.handle.join().expect("provider server should finish");
+    let context = planning_context(&completion_request);
+    let output = tool_output(&context, "xgeny.fs/apply-patch");
+    assert_eq!(output["path"], "workspace:primary/src/lib.rs");
+    assert_eq!(output["changed"], true);
+    assert_eq!(output["editCount"], 1);
+    assert!(output.get("content").is_none());
+    assert!(output.get("edits").is_none());
+}
+
 fn assert_resume_scope_and_material_failures(
     state_root: &Path,
     workspace: &Path,
@@ -372,13 +467,14 @@ fn public_cli_discovers_searches_stats_reads_and_replays_offline() {
     assert!(first_system_prompt.contains("return exactly one Step"));
     assert!(first_system_prompt.contains("cannot refer to future tool outputs"));
     assert!(first_system_prompt.contains("always set dependsOn to an empty array"));
-    assert_eq!(first["capabilities"].as_array().unwrap().len(), 5);
+    assert_eq!(first["capabilities"].as_array().unwrap().len(), 6);
     assert_eq!(first["toolOutputs"], json!([]));
     assert!(capability_ids(&first).contains(&"xgeny.fs/list-directory"));
     assert!(capability_ids(&first).contains(&"xgeny.fs/search-text"));
     assert!(capability_ids(&first).contains(&"xgeny.fs/stat"));
     assert!(capability_ids(&first).contains(&"xgeny.fs/read-text"));
     assert!(capability_ids(&first).contains(&"xgeny.fs/write-atomic"));
+    assert!(capability_ids(&first).contains(&"xgeny.fs/apply-patch"));
     let path_description = capability(&first, "xgeny.fs/list-directory")["inputSchema"]
         ["properties"]["path"]["description"]
         .as_str()
@@ -660,4 +756,14 @@ fn stderr(output: &Output) -> String {
 
 fn path_text(path: &Path) -> &str {
     path.to_str().expect("test paths should be UTF-8")
+}
+
+fn test_sha256_digest(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    format!("sha256:{encoded}")
 }

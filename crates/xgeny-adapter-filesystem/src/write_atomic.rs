@@ -1,11 +1,6 @@
-use std::fmt::Write as _;
-use std::io::{ErrorKind, Read as _, Write as _};
 use std::sync::Arc;
 
-#[cfg(unix)]
-use cap_fs_ext::OpenOptionsMaybeDirExt as _;
-use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsSyncExt as _};
-use cap_std::fs::{Dir, File, OpenOptions, Permissions};
+use cap_std::fs::Dir;
 use serde_json::{Value, json};
 use xgeny_domain::{InstanceFeatures, VerificationResult, VerificationStrategy};
 use xgeny_runtime::{
@@ -18,13 +13,13 @@ use xgeny_runtime::{
 };
 use xgeny_workgraph::EffectClass;
 
+use crate::atomic_commit::{AtomicCommitFailure, MAX_ATOMIC_TEXT_BYTES, commit_atomic};
 use crate::path::{RelativePath, parse_canonical};
 use crate::read_text::{ReadTextLimits, read_text, sha256_digest};
 use crate::{WRITE_ATOMIC_CAPABILITY_ID, WRITE_ATOMIC_CONTRACT_VERSION, WorkspaceRoot};
 
 /// Hard UTF-8 byte ceiling for one atomic write.
-pub const MAX_WRITE_ATOMIC_BYTES: usize = 64 * 1024;
-const TEMP_CREATE_ATTEMPTS: usize = 8;
+pub const MAX_WRITE_ATOMIC_BYTES: usize = MAX_ATOMIC_TEXT_BYTES;
 
 #[derive(Clone)]
 pub struct WriteAtomicAdapter {
@@ -192,7 +187,7 @@ impl std::fmt::Debug for PreparedWriteAtomic {
 
 impl PreparedAdapterInvocation for PreparedWriteAtomic {
     fn execute(self: Box<Self>) -> AdapterExecutionObservation {
-        match write_atomic(
+        match commit_atomic(
             &self.directory,
             &self.relative_path,
             &self.content,
@@ -209,15 +204,11 @@ impl PreparedAdapterInvocation for PreparedWriteAtomic {
                     "changed": changed,
                 })),
             },
-            Err(
-                WriteFailure::CommitRenameUnknown
-                | WriteFailure::CommitSyncUnknown
-                | WriteFailure::CommitVerifyUnknown,
-            ) => AdapterExecutionObservation::Unknown {
+            Err(failure) if failure.outcome_is_unknown() => AdapterExecutionObservation::Unknown {
                 reason: AdapterExecutionUnknownReason::TransportOutcomeUnknown,
             },
             Err(failure) => AdapterExecutionObservation::Failed {
-                evidence_digest: AdapterEvidenceDigest::new(failure.evidence_digest())
+                evidence_digest: AdapterEvidenceDigest::new(write_failure_digest(failure))
                     .expect("a SHA-256 digest is canonical"),
             },
         }
@@ -230,32 +221,8 @@ struct InspectedOutput {
     byte_size: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WriteFailure {
-    OpenParent,
-    InspectTarget,
-    Conflict,
-    CreateTemporary,
-    WriteTemporary,
-    CommitRenameUnknown,
-    CommitSyncUnknown,
-    CommitVerifyUnknown,
-}
-
-impl WriteFailure {
-    fn evidence_digest(self) -> String {
-        let code = match self {
-            Self::OpenParent => "open-parent",
-            Self::InspectTarget => "inspect-target",
-            Self::Conflict => "precondition-conflict",
-            Self::CreateTemporary => "create-temporary",
-            Self::WriteTemporary => "write-temporary",
-            Self::CommitRenameUnknown => "commit-rename-unknown",
-            Self::CommitSyncUnknown => "commit-sync-unknown",
-            Self::CommitVerifyUnknown => "commit-verify-unknown",
-        };
-        sha256_digest(format!("xgeny.fs/write-atomic/failure/v1/{code}").as_bytes())
-    }
+fn write_failure_digest(failure: AtomicCommitFailure) -> String {
+    sha256_digest(format!("xgeny.fs/write-atomic/failure/v1/{}", failure.code()).as_bytes())
 }
 
 fn verify_contract(
@@ -387,193 +354,6 @@ fn inspect_output(
     })
 }
 
-fn write_atomic(
-    root: &Dir,
-    relative_path: &RelativePath,
-    content: &[u8],
-    expected_digest: Option<&str>,
-    desired_digest: &str,
-) -> Result<bool, WriteFailure> {
-    let (parent, leaf) = open_parent(root, relative_path)?;
-    let initial = inspect_target(&parent, &leaf)?;
-    if initial
-        .as_ref()
-        .is_some_and(|target| target.digest == desired_digest)
-    {
-        return Ok(false);
-    }
-    verify_precondition(initial.as_ref(), expected_digest)?;
-    let (temporary_name, mut temporary) = create_temporary(&parent)?;
-    if let Some(target) = &initial {
-        temporary
-            .set_permissions(target.permissions.clone())
-            .map_err(|_| WriteFailure::WriteTemporary)?;
-    }
-    if temporary.write_all(content).is_err() || temporary.sync_all().is_err() {
-        drop(temporary);
-        let _ = parent.remove_file(&temporary_name);
-        return Err(WriteFailure::WriteTemporary);
-    }
-    drop(temporary);
-
-    let current = match inspect_target(&parent, &leaf) {
-        Ok(current) => current,
-        Err(error) => {
-            let _ = parent.remove_file(&temporary_name);
-            return Err(error);
-        }
-    };
-    if current
-        .as_ref()
-        .is_some_and(|target| target.digest == desired_digest)
-    {
-        let _ = parent.remove_file(&temporary_name);
-        return Ok(false);
-    }
-    if let Err(error) = verify_same_observation(initial.as_ref(), current.as_ref()) {
-        let _ = parent.remove_file(&temporary_name);
-        return Err(error);
-    }
-    if parent.rename(&temporary_name, &parent, &leaf).is_err() {
-        let _ = parent.remove_file(&temporary_name);
-        return Err(WriteFailure::CommitRenameUnknown);
-    }
-    if !sync_parent(&parent) {
-        return Err(WriteFailure::CommitSyncUnknown);
-    }
-    let committed =
-        inspect_target(&parent, &leaf).map_err(|_| WriteFailure::CommitVerifyUnknown)?;
-    if committed.as_ref().map(|target| target.digest.as_str()) != Some(desired_digest) {
-        return Err(WriteFailure::CommitVerifyUnknown);
-    }
-    Ok(true)
-}
-
-struct TargetObservation {
-    digest: String,
-    permissions: Permissions,
-}
-
-fn open_parent(root: &Dir, path: &RelativePath) -> Result<(Dir, String), WriteFailure> {
-    let (leaf, parents) = path
-        .components()
-        .split_last()
-        .ok_or(WriteFailure::OpenParent)?;
-    let mut directory = root.try_clone().map_err(|_| WriteFailure::OpenParent)?;
-    for component in parents {
-        directory = directory
-            .open_dir_nofollow(component)
-            .map_err(|_| WriteFailure::OpenParent)?;
-        if is_windows_reparse_point(
-            &directory
-                .dir_metadata()
-                .map_err(|_| WriteFailure::OpenParent)?,
-        ) {
-            return Err(WriteFailure::OpenParent);
-        }
-    }
-    Ok((directory, leaf.clone()))
-}
-
-fn inspect_target(parent: &Dir, leaf: &str) -> Result<Option<TargetObservation>, WriteFailure> {
-    let mut options = OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No).nonblock(true);
-    let mut file = match parent.open_with(leaf, &options) {
-        Ok(file) => file,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(WriteFailure::InspectTarget),
-    };
-    let metadata = file.metadata().map_err(|_| WriteFailure::InspectTarget)?;
-    if !metadata.is_file() || is_windows_reparse_point(&metadata) {
-        return Err(WriteFailure::InspectTarget);
-    }
-    let mut bytes = Vec::with_capacity(
-        usize::try_from(metadata.len())
-            .unwrap_or(MAX_WRITE_ATOMIC_BYTES)
-            .min(MAX_WRITE_ATOMIC_BYTES)
-            .saturating_add(1),
-    );
-    std::io::Read::by_ref(&mut file)
-        .take(u64::try_from(MAX_WRITE_ATOMIC_BYTES).expect("usize fits u64") + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| WriteFailure::InspectTarget)?;
-    if bytes.len() > MAX_WRITE_ATOMIC_BYTES {
-        return Err(WriteFailure::InspectTarget);
-    }
-    Ok(Some(TargetObservation {
-        digest: sha256_digest(&bytes),
-        permissions: metadata.permissions(),
-    }))
-}
-
-fn verify_precondition(
-    target: Option<&TargetObservation>,
-    expected_digest: Option<&str>,
-) -> Result<(), WriteFailure> {
-    match (target, expected_digest) {
-        (None, None) => Ok(()),
-        (Some(target), Some(expected)) if target.digest == expected => Ok(()),
-        _ => Err(WriteFailure::Conflict),
-    }
-}
-
-fn verify_same_observation(
-    initial: Option<&TargetObservation>,
-    current: Option<&TargetObservation>,
-) -> Result<(), WriteFailure> {
-    match (initial, current) {
-        (None, None) => Ok(()),
-        (Some(initial), Some(current))
-            if initial.digest == current.digest && initial.permissions == current.permissions =>
-        {
-            Ok(())
-        }
-        _ => Err(WriteFailure::Conflict),
-    }
-}
-
-fn create_temporary(parent: &Dir) -> Result<(String, File), WriteFailure> {
-    for _ in 0..TEMP_CREATE_ATTEMPTS {
-        let mut random = [0_u8; 16];
-        getrandom::fill(&mut random).map_err(|_| WriteFailure::CreateTemporary)?;
-        let mut encoded = String::with_capacity(32);
-        for byte in random {
-            write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
-        }
-        let name = format!(".xgeny-write-{encoded}.tmp");
-        let mut options = OpenOptions::new();
-        options
-            .write(true)
-            .create_new(true)
-            .follow(FollowSymlinks::No)
-            .sync(false);
-        match parent.open_with(&name, &options) {
-            Ok(file) => return Ok((name, file)),
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-            Err(_) => return Err(WriteFailure::CreateTemporary),
-        }
-    }
-    Err(WriteFailure::CreateTemporary)
-}
-
-#[cfg(unix)]
-fn sync_parent(parent: &Dir) -> bool {
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .maybe_dir(true)
-        .follow(FollowSymlinks::No);
-    parent
-        .open_with(".", &options)
-        .and_then(|directory| directory.sync_all())
-        .is_ok()
-}
-
-#[cfg(not(unix))]
-const fn sync_parent(_parent: &Dir) -> bool {
-    true
-}
-
 fn canonical_digest(value: &str) -> bool {
     value.strip_prefix("sha256:").is_some_and(|hex| {
         hex.len() == 64
@@ -583,23 +363,8 @@ fn canonical_digest(value: &str) -> bool {
     })
 }
 
-#[cfg(windows)]
-fn is_windows_reparse_point(metadata: &cap_std::fs::Metadata) -> bool {
-    use cap_std::fs::MetadataExt as _;
-
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(windows))]
-const fn is_windows_reparse_point(_metadata: &cap_std::fs::Metadata) -> bool {
-    false
-}
-
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use tempfile::{TempDir, tempdir};
 
     use super::*;
@@ -607,7 +372,7 @@ mod tests {
 
     struct Fixture {
         root: WorkspaceRoot,
-        directory: TempDir,
+        _directory: TempDir,
     }
 
     impl Fixture {
@@ -616,191 +381,11 @@ mod tests {
             let root =
                 WorkspaceRoot::open_ambient(directory.path(), WorkspaceId::new("fixture").unwrap())
                     .unwrap();
-            Self { root, directory }
+            Self {
+                root,
+                _directory: directory,
+            }
         }
-
-        fn relative(&self, path: &str) -> RelativePath {
-            parse_canonical(
-                &self.root.workspace_id,
-                &format!("workspace:fixture/{path}"),
-            )
-            .unwrap()
-        }
-
-        fn write(
-            &self,
-            path: &str,
-            content: &str,
-            expected: Option<&str>,
-        ) -> Result<bool, WriteFailure> {
-            write_atomic(
-                &self.root.directory,
-                &self.relative(path),
-                content.as_bytes(),
-                expected,
-                &sha256_digest(content.as_bytes()),
-            )
-        }
-    }
-
-    #[test]
-    fn creates_and_replaces_without_exposing_partial_content() {
-        let fixture = Fixture::new();
-        assert!(fixture.write("new.txt", "first", None).unwrap());
-        let first_digest = sha256_digest(b"first");
-        assert!(
-            fixture
-                .write("new.txt", "second", Some(&first_digest))
-                .unwrap()
-        );
-        assert_eq!(
-            fs::read_to_string(fixture.directory.path().join("new.txt")).unwrap(),
-            "second"
-        );
-        assert!(
-            fs::read_dir(fixture.directory.path())
-                .unwrap()
-                .all(|entry| !entry
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".xgeny-write-"))
-        );
-    }
-
-    #[test]
-    fn stale_digest_and_create_collision_do_not_mutate_target() {
-        let fixture = Fixture::new();
-        fs::write(fixture.directory.path().join("target.txt"), "user edit").unwrap();
-        assert_eq!(
-            fixture.write("target.txt", "model edit", Some(&sha256_digest(b"old"))),
-            Err(WriteFailure::Conflict)
-        );
-        assert_eq!(
-            fixture.write("target.txt", "model edit", None),
-            Err(WriteFailure::Conflict)
-        );
-        assert_eq!(
-            fs::read_to_string(fixture.directory.path().join("target.txt")).unwrap(),
-            "user edit"
-        );
-    }
-
-    #[test]
-    fn exact_desired_bytes_are_an_idempotent_success() {
-        let fixture = Fixture::new();
-        fs::write(fixture.directory.path().join("target.txt"), "desired").unwrap();
-        assert!(
-            !fixture
-                .write("target.txt", "desired", Some(&sha256_digest(b"stale")))
-                .unwrap()
-        );
-        assert_eq!(
-            fs::read_to_string(fixture.directory.path().join("target.txt")).unwrap(),
-            "desired"
-        );
-    }
-
-    #[test]
-    fn permission_drift_is_a_conflict_even_when_content_is_unchanged() {
-        let fixture = Fixture::new();
-        fs::write(fixture.directory.path().join("target.txt"), "same").unwrap();
-        let initial = inspect_target(&fixture.root.directory, "target.txt")
-            .unwrap()
-            .unwrap();
-        let mut permissions = initial.permissions.clone();
-        permissions.set_readonly(!permissions.readonly());
-        let current = TargetObservation {
-            digest: initial.digest.clone(),
-            permissions,
-        };
-        assert_eq!(
-            verify_same_observation(Some(&initial), Some(&current)),
-            Err(WriteFailure::Conflict)
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn replacement_preserves_existing_unix_permission_bits() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let fixture = Fixture::new();
-        let target = fixture.directory.path().join("script.sh");
-        fs::write(&target, "old\n").unwrap();
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o751)).unwrap();
-        assert!(
-            fixture
-                .write("script.sh", "new\n", Some(&sha256_digest(b"old\n")))
-                .unwrap()
-        );
-        assert_eq!(
-            fs::metadata(target).unwrap().permissions().mode() & 0o777,
-            0o751
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn symlink_leaf_and_parent_never_write_outside_workspace() {
-        use std::os::unix::fs::symlink;
-
-        let fixture = Fixture::new();
-        let outside = tempdir().unwrap();
-        fs::write(outside.path().join("secret.txt"), "outside").unwrap();
-        symlink(
-            outside.path().join("secret.txt"),
-            fixture.directory.path().join("leaf.txt"),
-        )
-        .unwrap();
-        symlink(outside.path(), fixture.directory.path().join("linked")).unwrap();
-        assert!(fixture.write("leaf.txt", "changed", None).is_err());
-        assert!(
-            fixture
-                .write(
-                    "linked/secret.txt",
-                    "changed",
-                    Some(&sha256_digest(b"outside"))
-                )
-                .is_err()
-        );
-        assert_eq!(
-            fs::read_to_string(outside.path().join("secret.txt")).unwrap(),
-            "outside"
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_junction_parent_never_writes_outside_workspace() {
-        use std::process::Command;
-
-        let fixture = Fixture::new();
-        let outside = tempdir().unwrap();
-        fs::write(outside.path().join("secret.txt"), "outside").unwrap();
-        let junction = fixture.directory.path().join("junction");
-        let status = Command::new("cmd")
-            .args(["/C", "mklink", "/J"])
-            .arg(&junction)
-            .arg(outside.path())
-            .status()
-            .expect("junction command should run");
-        assert!(status.success(), "junction fixture must be available in CI");
-
-        assert!(
-            fixture
-                .write(
-                    "junction/secret.txt",
-                    "changed",
-                    Some(&sha256_digest(b"outside"))
-                )
-                .is_err()
-        );
-        assert_eq!(
-            fs::read_to_string(outside.path().join("secret.txt")).unwrap(),
-            "outside"
-        );
-        fs::remove_dir(&junction).expect("junction should remove without following it");
     }
 
     #[test]

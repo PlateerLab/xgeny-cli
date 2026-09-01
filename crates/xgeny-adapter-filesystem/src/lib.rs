@@ -1,5 +1,7 @@
 #![doc = "Capability-confined local filesystem adapters for `XGENy`."]
 
+mod apply_patch;
+mod atomic_commit;
 mod path;
 mod query;
 mod read_text;
@@ -15,6 +17,9 @@ use thiserror::Error;
 use xgeny_domain::InstanceBinding;
 use xgeny_policy::{ResourceResolutionFailure, ResourceResolver};
 
+pub use apply_patch::{
+    ApplyPatchAdapter, ApplyPatchVerifier, MAX_APPLY_PATCH_BYTES, MAX_APPLY_PATCH_EDITS,
+};
 pub use query::{
     FilesystemQueryAdapter, FilesystemQueryVerifier, MAX_DIRECTORY_SCAN_ENTRIES,
     MAX_LIST_DIRECTORY_ENTRIES, MAX_QUERY_OUTPUT_CANONICAL_BYTES, MAX_SEARCH_FILE_BYTES,
@@ -33,6 +38,12 @@ pub const READ_TEXT_CAPABILITY_ID: &str = "xgeny.fs/read-text";
 pub const READ_TEXT_CONTRACT_VERSION: &str = "1.0.0";
 /// Exact operation name used in a root-bound local Instance binding.
 pub const READ_TEXT_OPERATION_REF: &str = "readText";
+/// Exact public Capability identifier for strict single-file contextual patching.
+pub const APPLY_PATCH_CAPABILITY_ID: &str = "xgeny.fs/apply-patch";
+/// Exact immutable apply-patch contract version.
+pub const APPLY_PATCH_CONTRACT_VERSION: &str = "1.0.0";
+/// Exact operation name used in the root-bound patch Instance.
+pub const APPLY_PATCH_OPERATION_REF: &str = "applyPatch";
 /// Exact public Capability identifier for one-level directory observation.
 pub const LIST_DIRECTORY_CAPABILITY_ID: &str = "xgeny.fs/list-directory";
 /// Exact immutable list-directory contract version.
@@ -201,6 +212,12 @@ impl WorkspaceRoot {
         workspace_binding(&self.workspace_id, WRITE_ATOMIC_OPERATION_REF)
     }
 
+    /// Return the exact root-bound binding for strict contextual patches.
+    #[must_use]
+    pub fn apply_patch_binding(&self) -> InstanceBinding {
+        workspace_binding(&self.workspace_id, APPLY_PATCH_OPERATION_REF)
+    }
+
     /// Construct the bounded one-level directory adapter.
     #[must_use]
     pub fn list_directory_adapter(&self) -> FilesystemQueryAdapter {
@@ -223,6 +240,12 @@ impl WorkspaceRoot {
     #[must_use]
     pub fn write_atomic_adapter(&self) -> WriteAtomicAdapter {
         WriteAtomicAdapter::new(self.clone())
+    }
+
+    /// Construct the bounded strict contextual patch adapter.
+    #[must_use]
+    pub fn apply_patch_adapter(&self) -> ApplyPatchAdapter {
+        ApplyPatchAdapter::new(self.clone())
     }
 }
 
