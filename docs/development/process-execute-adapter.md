@@ -82,6 +82,11 @@ Composition root는 다음 항목을 같은 exact binding으로 Core에 등록�
 - stdout/stderr는 UTF-8 변환 뒤에도 각각 32 KiB 이하만 durable output에 보존한다.
 - Adapter와 verifier `Debug`에는 path, argv, env value, raw output을 넣지 않는다.
 
+Process가 실제로 출력한 compiler/test 진단은 private Run store의 ToolOutput에 원문으로 남는다. 이 출력은
+workspace 절대경로나 source snippet을 포함할 수 있으므로 state root는 공유·게시 가능한 로그가 아니다.
+CLI status/completion 출력과 manifest에는 raw ToolOutput을 복제하지 않으며 endpoint, state root와
+executable host path도 process observation으로 저장하지 않는다.
+
 이 경계는 command injection과 accidental path escape를 줄이는 capability boundary이지 OS sandbox가
 아니다. 허용된 `cargo test`, Python, Node 같은 executable은 project code와 자체 child process를
 사용자 계정 권한으로 실행할 수 있다. Host catalog는 신뢰한 개발 도구만 넣고 credential-bearing 환경을
@@ -122,3 +127,9 @@ workspace test에서 실행한다. CLI integration test는 loopback model을 사
 검증한다. 별도 fault test는 실제 child가 durable marker를 한 번 만든 직후 SQLite outcome commit을
 실패시킨다. 첫 재개는 남은 `Executing`을 `EffectUnknown`으로 바꾸고, 동일 executable과 새
 `--allow-execute`를 다시 주어도 marker count, journal과 Receipt가 변하지 않아야 한다.
+
+실제 모델 기반 수직 검증은
+[Qwen coding loop live gate](public-local-run-resume.md#qwen-coding-loop-live-gate)를 따른다. 이 gate는
+Qwen이 workspace 검색과 읽기, 두 번의 patch, 실패한 test 결과 해석, 재검증과 build를 shell 없이
+연결하는지 확인한다. 일반 CI는 test를 compile하고 실제 go50902 실행은 별도 explicit confirmation을
+요구한다.

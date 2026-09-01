@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
@@ -18,6 +18,7 @@ use xgeny_workgraph::{
 
 const LIVE_CONFIRMATION: &str = "xgeny-go50902-public-cli-v1";
 const WORKSPACE_LIVE_CONFIRMATION: &str = "xgeny-go50902-workspace-discovery-v1";
+const CODING_LIVE_CONFIRMATION: &str = "xgeny-go50902-coding-loop-v1";
 const MODEL: &str = "qwen3.8-27b";
 const TOKENIZER: &str = "Qwen/Qwen3.8-27B-FP8";
 const PLANNER_ID: &str = "xgeny.live.go50902";
@@ -26,6 +27,8 @@ const MAX_KNOWN_HOSTS_BYTES: u64 = 64 * 1024;
 const SSH_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const XGENY_PROCESS_TIMEOUT: Duration = Duration::from_secs(420);
 const WORKSPACE_SEARCH_KEY: &str = "XGENY_WORKSPACE_LIVE_TARGET";
+const CODING_SEARCH_KEY: &str = "XGENY_RC3_CODING_TARGET";
+const CODING_COMPLETION: &str = "XGENY-RC3-QWEN-CODING-PASS";
 
 struct TunnelGuard {
     child: Option<Child>,
@@ -581,6 +584,488 @@ fn public_cli_workspace_discovery_and_offline_replay() {
     );
 }
 
+#[test]
+#[ignore = "requires explicit go50902 SSH, cargo path, and remote-model consent"]
+#[allow(clippy::too_many_lines)]
+fn public_cli_qwen_edits_fixes_and_reverifies_rust_project() {
+    require_live_confirmation(CODING_LIVE_CONFIRMATION);
+    let base_url = required_env("XGENY_LIVE_OPENAI_BASE_URL");
+    let local_address = loopback_address(&base_url);
+    let cargo_path = PathBuf::from(required_env("XGENY_LIVE_CARGO_PATH"));
+    require(
+        cargo_path.is_absolute() && cargo_path.is_file(),
+        "live cargo path must be an absolute file",
+    );
+
+    let fixture = tempdir().unwrap_or_else(|_| panic!("live fixture could not be created"));
+    let known_hosts = snapshot_known_hosts(fixture.path());
+    let state_root = fixture.path().join("state");
+    let workspace = fixture.path().join("workspace");
+    fs::create_dir_all(workspace.join("src"))
+        .unwrap_or_else(|_| panic!("live coding source directory could not be created"));
+    fs::create_dir(workspace.join("tests"))
+        .unwrap_or_else(|_| panic!("live coding test directory could not be created"));
+
+    let locator = format!("{CODING_SEARCH_KEY}_{}", random_hex());
+    let original_source =
+        format!("// {locator}\npub fn release_candidate_value() -> u32 {{\n    40\n}}\n");
+    let stage_one_source =
+        format!("// {locator}\npub fn release_candidate_value() -> u32 {{\n    41\n}}\n");
+    let final_source =
+        format!("// {locator}\npub fn release_candidate_value() -> u32 {{\n    42\n}}\n");
+    fs::write(
+        workspace.join("Cargo.toml"),
+        b"[package]\nname = \"xgeny-rc3-live-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap_or_else(|_| panic!("live coding Cargo manifest could not be written"));
+    fs::write(workspace.join("src/lib.rs"), original_source.as_bytes())
+        .unwrap_or_else(|_| panic!("live coding source could not be written"));
+    fs::write(
+        workspace.join("tests/acceptance.rs"),
+        b"use xgeny_rc3_live_fixture::release_candidate_value;\n\n#[test]\nfn release_candidate_value_is_ready() {\n    assert_eq!(release_candidate_value(), 42);\n}\n",
+    )
+    .unwrap_or_else(|_| panic!("live coding acceptance test could not be written"));
+
+    let goal = coding_goal(&locator);
+    require(
+        !coding_goal_discloses_acceptance(&goal, &locator),
+        "live coding goal must not reveal the acceptance value or test path",
+    );
+    let executable_spec = format!("cargo={}", path_text(&cargo_path));
+
+    let mut tunnel = TunnelGuard::start(local_address, &known_hosts);
+    let completion = run_redacted(
+        xgeny(&state_root)
+            .arg("run")
+            .arg("--workspace")
+            .arg(&workspace)
+            .arg("--base-url")
+            .arg(&base_url)
+            .arg("--model")
+            .arg(MODEL)
+            .arg("--tokenizer")
+            .arg(TOKENIZER)
+            .arg("--planner-id")
+            .arg(PLANNER_ID)
+            .arg("--allow-dir")
+            .arg(".")
+            .arg("--allow-executable")
+            .arg(&executable_spec)
+            .arg("--allow-read")
+            .arg("--allow-write")
+            .arg("--allow-execute")
+            .arg("--allow-remote-model-egress")
+            .arg("--max-ticks")
+            .arg("256")
+            .arg(&goal),
+        "qwen coding loop",
+    );
+    require_coding_completion(&completion, &state_root);
+    require(
+        completion.stdout == CODING_COMPLETION.as_bytes(),
+        "live coding completion was not the exact acceptance summary",
+    );
+    require_contains(
+        &completion.stderr,
+        b"XGENY_COMPLETED",
+        "live coding loop did not report completion",
+    );
+    let run_id = extract_run_id(&completion.stderr);
+    tunnel.stop();
+    require(
+        tunnel.is_stopped(),
+        "live coding tunnel must stop before durable verification",
+    );
+    require(
+        fs::read_to_string(workspace.join("src/lib.rs")).is_ok_and(|source| source == final_source),
+        "live coding source did not contain the verified correction",
+    );
+    require(
+        final_source != original_source && final_source != stage_one_source,
+        "live coding fixture stages must remain distinct",
+    );
+
+    let run_directory = state_root.join("runs").join(&run_id);
+    let database = run_directory.join("run.sqlite3");
+    let material_catalog = run_directory.join("materials.sqlite3");
+    let store = SqliteRunStore::open_existing_read_only(&database)
+        .unwrap_or_else(|_| panic!("live coding store could not reopen"));
+    let before_replay = store
+        .load()
+        .unwrap_or_else(|_| panic!("live coding snapshot could not load"))
+        .unwrap_or_else(|| panic!("live coding snapshot was missing"));
+    verify_durable_coding_result(&store, &before_replay, &material_catalog, &locator);
+    drop(store);
+
+    let workspace_text = path_text(&workspace);
+    let state_text = path_text(&state_root);
+    let cargo_text = path_text(&cargo_path);
+    let manifest = fs::read(run_directory.join("manifest.json"))
+        .unwrap_or_else(|_| panic!("live coding manifest could not be read"));
+    for forbidden in [
+        base_url.as_bytes(),
+        workspace_text.as_bytes(),
+        state_text.as_bytes(),
+        cargo_text.as_bytes(),
+        locator.as_bytes(),
+    ] {
+        require(
+            !contains_bytes(&manifest, forbidden),
+            "live coding manifest retained a forbidden runtime value",
+        );
+    }
+
+    fs::remove_dir_all(&workspace)
+        .unwrap_or_else(|_| panic!("live coding workspace could not be removed"));
+    fs::remove_file(&material_catalog)
+        .unwrap_or_else(|_| panic!("live coding material catalog could not be removed"));
+    require(
+        !workspace.exists() && !material_catalog.exists(),
+        "live coding inputs must be absent before offline replay",
+    );
+    let replay = run_redacted(
+        xgeny(&state_root).arg("resume").arg(&run_id),
+        "coding offline replay",
+    );
+    require_exit(&replay, 0, "coding offline replay");
+    require(
+        replay.stdout == completion.stdout,
+        "live coding offline replay did not byte-match completion",
+    );
+    let after_replay = SqliteRunStore::open_existing_read_only(&database)
+        .unwrap_or_else(|_| panic!("live coding store could not reopen after replay"))
+        .load()
+        .unwrap_or_else(|_| panic!("live coding snapshot could not load after replay"))
+        .unwrap_or_else(|| panic!("live coding snapshot was missing after replay"));
+    require(
+        before_replay.state == after_replay.state && before_replay.records == after_replay.records,
+        "live coding offline replay mutated the durable journal",
+    );
+
+    for observed in [&completion, &replay] {
+        for forbidden in [
+            base_url.as_bytes(),
+            workspace_text.as_bytes(),
+            state_text.as_bytes(),
+            cargo_text.as_bytes(),
+            locator.as_bytes(),
+        ] {
+            require_output_absent(observed, forbidden);
+        }
+    }
+    // Compiler diagnostics can legitimately retain the workspace path inside
+    // private durable ToolOutput. Endpoint, state, and executable host paths
+    // are not process observations and must remain absent from the Run files.
+    for forbidden in [
+        base_url.as_bytes(),
+        state_text.as_bytes(),
+        cargo_text.as_bytes(),
+    ] {
+        require_run_directory_absent(&run_directory, forbidden);
+    }
+    fs::remove_dir_all(&state_root)
+        .unwrap_or_else(|_| panic!("temporary live coding state could not be removed"));
+    require(
+        !state_root.exists(),
+        "temporary live coding state must be removed after verification",
+    );
+}
+
+#[allow(clippy::too_many_lines)]
+fn verify_durable_coding_result(
+    store: &SqliteRunStore,
+    snapshot: &xgeny_local_store::RunSnapshot,
+    material_catalog: &Path,
+    locator: &str,
+) {
+    let calls = snapshot
+        .state
+        .agent_loop
+        .as_ref()
+        .and_then(|agent| agent.model_calls.as_ref())
+        .unwrap_or_else(|| panic!("live coding model-call lifecycle was missing"));
+    assert_eq!(
+        (
+            calls.reserved_calls,
+            calls.settled_calls,
+            calls.unknown_calls,
+            calls.active_call.is_none(),
+        ),
+        (8, 8, 0, true),
+        "live coding model-call lifecycle was not exactly 8/8/0 with no active call",
+    );
+    require(
+        snapshot.state.steps.len() == 7
+            && snapshot.state.steps.values().all(|step| {
+                step.status == StepStatus::Completed
+                    && step.attempts == 1
+                    && step.execution_receipt_id.is_some()
+                    && step.execution_receipt_digest.is_some()
+            }),
+        "live coding Steps were not exactly seven once-executed Receipt completions",
+    );
+    require(
+        store
+            .load_execution_receipts()
+            .unwrap_or_else(|_| panic!("live coding Receipts could not load"))
+            .len()
+            == 7,
+        "live coding Run did not contain exactly seven Receipts",
+    );
+
+    let mut completed = Vec::new();
+    for record in &snapshot.records {
+        let RunEventBody::EffectSucceeded {
+            step_id, effect_id, ..
+        } = &record.event.body
+        else {
+            continue;
+        };
+        let step = snapshot
+            .state
+            .steps
+            .get(step_id)
+            .unwrap_or_else(|| panic!("live coding completed Step was missing"));
+        let intent = step
+            .intent
+            .as_ref()
+            .unwrap_or_else(|| panic!("live coding completed intent was missing"));
+        require(
+            intent.effect_id == *effect_id,
+            "live coding effect identity did not match its Step",
+        );
+        let output = store
+            .load_tool_output(effect_id)
+            .unwrap_or_else(|_| panic!("live coding ToolOutput could not load"))
+            .unwrap_or_else(|| panic!("live coding ToolOutput was missing"));
+        completed.push((
+            step_id.clone(),
+            intent.invocation.capability_id.clone(),
+            output,
+        ));
+    }
+    let expected_capabilities = [
+        "xgeny.fs/search-text",
+        "xgeny.fs/read-text",
+        "xgeny.fs/apply-patch",
+        "xgeny.process/execute",
+        "xgeny.fs/apply-patch",
+        "xgeny.process/execute",
+        "xgeny.process/execute",
+    ];
+    let completed_capabilities = completed
+        .iter()
+        .map(|(_, capability, _)| capability.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        completed_capabilities, expected_capabilities,
+        "live coding capability order did not match the seven-Step contract",
+    );
+    for (_, capability, output) in &completed {
+        assert_eq!(
+            output.capability_id(),
+            capability,
+            "live coding ToolOutput capability did not match its Step intent",
+        );
+    }
+    require(
+        completed[0].2.output()["matches"]
+            .as_array()
+            .is_some_and(|matches| {
+                matches.iter().any(|candidate| {
+                    candidate["path"] == "src/lib.rs"
+                        && candidate["preview"]
+                            .as_str()
+                            .is_some_and(|preview| preview.contains(locator))
+                })
+            }),
+        "live coding search did not locate the controlled source",
+    );
+    require(
+        completed[1].2.output()["content"]
+            .as_str()
+            .is_some_and(|content| content.contains(locator) && content.contains("    40")),
+        "live coding read did not observe the original controlled source",
+    );
+    require(
+        completed[2].2.output()["changed"] == true && completed[4].2.output()["changed"] == true,
+        "live coding patches did not both report a real change",
+    );
+
+    let process_outputs = [&completed[3].2, &completed[5].2, &completed[6].2];
+    require(
+        process_outputs.iter().all(|output| {
+            output.output()["outcome"] == "exited"
+                && output.output()["stdoutTruncated"] == false
+                && output.output()["stderrTruncated"] == false
+        }),
+        "live coding process results were not complete exited observations",
+    );
+    require(
+        process_outputs[0].output()["success"] == false
+            && process_outputs[0].output()["exitCode"].as_i64().is_some(),
+        "live coding first cargo test did not produce a durable nonzero result",
+    );
+    let failed_test_output = format!(
+        "{}\n{}",
+        process_outputs[0].output()["stdout"].as_str().unwrap_or(""),
+        process_outputs[0].output()["stderr"].as_str().unwrap_or("")
+    );
+    require(
+        failed_test_output.contains("41") && failed_test_output.contains("42"),
+        "live coding failed test output did not expose the correction evidence",
+    );
+    require(
+        process_outputs[1].output()["success"] == true
+            && process_outputs[2].output()["success"] == true,
+        "live coding re-test and build were not both successful",
+    );
+
+    let process_recipes = load_process_recipes(material_catalog);
+    let process_step_ids = [&completed[3].0, &completed[5].0, &completed[6].0];
+    let expected_args = [
+        ["test", "--offline"].as_slice(),
+        ["test", "--offline"].as_slice(),
+        ["build", "--offline"].as_slice(),
+    ];
+    require(
+        process_recipes.len() == 3
+            && process_step_ids
+                .iter()
+                .zip(expected_args)
+                .all(|(step_id, expected)| {
+                    process_recipes
+                        .get(*step_id)
+                        .is_some_and(|actual| actual == expected)
+                }),
+        "live coding private process recipes did not preserve test/test/build argv order",
+    );
+
+    let accepted_plans = snapshot
+        .records
+        .iter()
+        .filter_map(|record| {
+            if let RunEventBody::PlanAccepted { steps, .. } = &record.event.body {
+                Some(steps)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    require(
+        accepted_plans.len() == 7
+            && accepted_plans
+                .iter()
+                .all(|steps| steps.len() == 1 && steps[0].depends_on.is_empty()),
+        "live coding Plans were not seven sequential single-Step plans",
+    );
+    for (actual, expected, message) in [
+        (
+            count_events(&snapshot.records, |body| {
+                matches!(body, RunEventBody::ModelCallReserved { .. })
+            }),
+            8,
+            "live coding reservation count was not eight",
+        ),
+        (
+            count_events(&snapshot.records, |body| {
+                matches!(body, RunEventBody::EffectExecutionStarted { .. })
+            }),
+            7,
+            "live coding effect start count was not seven",
+        ),
+        (
+            count_events(&snapshot.records, |body| {
+                matches!(
+                    body,
+                    RunEventBody::VerificationRecorded {
+                        disposition: VerificationDisposition::Passed,
+                        ..
+                    }
+                )
+            }),
+            7,
+            "live coding passed verification count was not seven",
+        ),
+        (
+            count_events(&snapshot.records, |body| {
+                matches!(body, RunEventBody::CompletionCandidateRecorded { .. })
+            }),
+            1,
+            "live coding completion count was not one",
+        ),
+    ] {
+        require(actual == expected, message);
+    }
+    require(
+        count_events(&snapshot.records, |body| {
+            matches!(
+                body,
+                RunEventBody::ModelCallBecameUnknown { .. }
+                    | RunEventBody::ModelCallSettled { .. }
+                    | RunEventBody::StepPlanned { .. }
+                    | RunEventBody::InvocationMaterialUnavailable { .. }
+                    | RunEventBody::EffectFailed { .. }
+                    | RunEventBody::EffectBecameUnknown { .. }
+                    | RunEventBody::ReconciliationStarted { .. }
+                    | RunEventBody::ReconciliationResolved { .. }
+                    | RunEventBody::ManualInterventionRequired { .. }
+                    | RunEventBody::VerificationPassed { .. }
+                    | RunEventBody::VerificationFailed { .. }
+                    | RunEventBody::VerificationRecorded {
+                        disposition: VerificationDisposition::Failed
+                            | VerificationDisposition::Inconclusive,
+                        ..
+                    }
+            )
+        }) == 0,
+        "live coding journal contained a failure, uncertainty, or legacy transition",
+    );
+}
+
+fn load_process_recipes(material_catalog: &Path) -> BTreeMap<String, Vec<String>> {
+    let connection = rusqlite::Connection::open_with_flags(
+        material_catalog,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap_or_else(|_| panic!("live coding material catalog could not open read-only"));
+    let mut statement = connection
+        .prepare("SELECT record FROM material_recipe")
+        .unwrap_or_else(|_| panic!("live coding material records could not be queried"));
+    let rows = statement
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .unwrap_or_else(|_| panic!("live coding material query could not execute"));
+    let mut process = BTreeMap::new();
+    for row in rows {
+        let bytes = row.unwrap_or_else(|_| panic!("live coding material row could not load"));
+        let record: serde_json::Value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| panic!("live coding material row was not valid JSON"));
+        if record["domain"] != "xgeny.cli.process-recipe/v1" {
+            continue;
+        }
+        let step_id = record["stepId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("live coding process recipe Step was missing"))
+            .to_owned();
+        let args = record["arguments"]["args"]
+            .as_array()
+            .unwrap_or_else(|| panic!("live coding process recipe argv was missing"))
+            .iter()
+            .map(|argument| {
+                argument
+                    .as_str()
+                    .unwrap_or_else(|| panic!("live coding process argv was not text"))
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        require(
+            process.insert(step_id, args).is_none(),
+            "live coding process recipe Step was duplicated",
+        );
+    }
+    process
+}
+
 #[allow(clippy::too_many_lines)] // Keep every redacted live invariant explicit in one verifier.
 fn verify_durable_workspace_result(
     store: &SqliteRunStore,
@@ -877,6 +1362,188 @@ fn require_workspace_completion(output: &Output, state_root: &Path) {
     require_exit(output, 0, "workspace discovery");
 }
 
+fn require_coding_completion(output: &Output, state_root: &Path) {
+    if output.status.code() == Some(0) {
+        return;
+    }
+    if [
+        b"reason=proposal_rejected".as_slice(),
+        b"reason=model_rejected".as_slice(),
+        b"reason=material_rejected".as_slice(),
+        b"reason=admission_rejected".as_slice(),
+        b"reason=failed_work".as_slice(),
+    ]
+    .iter()
+    .any(|marker| contains_bytes(&output.stderr, marker))
+    {
+        let run_id = extract_run_id(&output.stderr);
+        if let Ok(store) =
+            SqliteRunStore::open_existing_read_only(run_database(state_root, &run_id))
+            && let Ok(Some(snapshot)) = store.load()
+        {
+            panic!(
+                "{}: {}",
+                coding_rejection_reason(&output.stderr),
+                coding_rejection_progress_message(&snapshot)
+            );
+        }
+    }
+    require_exit(output, 0, "qwen coding loop");
+}
+
+fn coding_rejection_reason(stderr: &[u8]) -> &'static str {
+    for (marker, reason) in [
+        (
+            b"reason=proposal_rejected".as_slice(),
+            "live coding proposal contract rejected",
+        ),
+        (
+            b"reason=model_rejected".as_slice(),
+            "live coding provider response rejected",
+        ),
+        (
+            b"reason=material_rejected".as_slice(),
+            "live coding invocation material rejected",
+        ),
+        (
+            b"reason=admission_rejected".as_slice(),
+            "live coding invocation admission rejected",
+        ),
+        (
+            b"reason=failed_work".as_slice(),
+            "live coding WorkGraph entered failed work",
+        ),
+    ] {
+        if contains_bytes(stderr, marker) {
+            return reason;
+        }
+    }
+    "live coding run returned an unclassified rejection"
+}
+
+fn coding_rejection_progress_message(snapshot: &xgeny_local_store::RunSnapshot) -> &'static str {
+    let completed = snapshot
+        .records
+        .iter()
+        .filter_map(|record| {
+            let RunEventBody::EffectSucceeded { step_id, .. } = &record.event.body else {
+                return None;
+            };
+            snapshot
+                .state
+                .steps
+                .get(step_id)
+                .and_then(|step| step.intent.as_ref())
+                .map(|intent| intent.invocation.capability_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    coding_rejection_progress_for(&completed)
+}
+
+fn coding_goal_discloses_acceptance(goal: &str, locator: &str) -> bool {
+    let without_locator = goal.replace(locator, "<locator>");
+    without_locator.contains("42") || without_locator.contains("acceptance.rs")
+}
+
+fn coding_goal(locator: &str) -> String {
+    format!(
+        "Complete this controlled Rust coding task using exactly seven tool Steps in this order. Return exactly one concrete tool Step in each planning response, with no dependencies, and do not include a later Step until the predecessor's durable ToolOutput is visible. (1) Call xgeny.fs/search-text from '.' with the literal query '{locator}' to locate the source. (2) Call xgeny.fs/read-text on that matching source file. Do not list or read tests and do not guess their expectation. (3) Call xgeny.fs/apply-patch with the read digest to change only the returned value 40 to the deliberately incomplete value 41. (4) Call xgeny.process/execute with executable 'cargo', args [\"test\",\"--offline\"], cwd '.', empty env, timeoutMs 120000, and maxOutputBytes 32768. This test must be allowed to fail and its exact durable output is the only authority for the next correction. (5) After observing that failure, call xgeny.fs/apply-patch with the current digest to change only 41 to the value required by the failed assertion. (6) Call the same cargo test command again and require success=true. (7) Call xgeny.process/execute with executable 'cargo', args [\"build\",\"--offline\"], cwd '.', empty env, timeoutMs 120000, and maxOutputBytes 32768 and require success=true. Only after all seven Steps finish in that order, return exactly '{CODING_COMPLETION}' as the summary, with no prefix, suffix, Markdown, quotation marks, or explanation."
+    )
+}
+
+#[test]
+fn coding_goal_acceptance_check_ignores_random_locator_content_only() {
+    let locator = "XGENY_RC3_CODING_TARGET_42abcdef";
+    assert!(!coding_goal_discloses_acceptance(
+        &format!("search for '{locator}', then fix from durable test output"),
+        locator,
+    ));
+    assert!(coding_goal_discloses_acceptance(
+        &format!("search for '{locator}', then change the value to 42"),
+        locator,
+    ));
+    assert!(coding_goal_discloses_acceptance(
+        &format!("search for '{locator}', then read acceptance.rs"),
+        locator,
+    ));
+}
+
+#[test]
+fn coding_goal_requires_one_observation_bound_step_per_turn() {
+    let locator = "XGENY_RC3_CODING_TARGET_abcdef";
+    let goal = coding_goal(locator);
+    assert!(goal.contains("exactly one concrete tool Step in each planning response"));
+    assert!(goal.contains("with no dependencies"));
+    assert!(goal.contains("predecessor's durable ToolOutput is visible"));
+    assert!(!coding_goal_discloses_acceptance(&goal, locator));
+}
+
+fn coding_rejection_progress_for(completed: &[&str]) -> &'static str {
+    let expected = [
+        "xgeny.fs/search-text",
+        "xgeny.fs/read-text",
+        "xgeny.fs/apply-patch",
+        "xgeny.process/execute",
+        "xgeny.fs/apply-patch",
+        "xgeny.process/execute",
+        "xgeny.process/execute",
+    ];
+    if completed.len() > expected.len()
+        || !completed
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| *actual == expected)
+    {
+        return "live coding rejection followed an unexpected capability sequence";
+    }
+    match completed.len() {
+        0 => "live coding proposal was rejected before search completed",
+        1 => "live coding proposal was rejected after search",
+        2 => "live coding proposal was rejected after source read",
+        3 => "live coding proposal was rejected after the first patch",
+        4 => "live coding proposal was rejected after the failing test",
+        5 => "live coding proposal was rejected after the corrective patch",
+        6 => "live coding proposal was rejected after the successful re-test",
+        7 => "live coding completion was rejected after the successful build",
+        _ => "live coding proposal rejection progress was invalid",
+    }
+}
+
+#[test]
+fn coding_rejection_diagnostic_is_stage_specific_and_content_free() {
+    let expected = [
+        "xgeny.fs/search-text",
+        "xgeny.fs/read-text",
+        "xgeny.fs/apply-patch",
+        "xgeny.process/execute",
+        "xgeny.fs/apply-patch",
+        "xgeny.process/execute",
+        "xgeny.process/execute",
+    ];
+    for completed in 0..=expected.len() {
+        let message = coding_rejection_progress_for(&expected[..completed]);
+        assert!(message.starts_with("live coding"));
+        assert!(!message.contains(CODING_SEARCH_KEY));
+        assert!(!message.contains(CODING_COMPLETION));
+    }
+    assert_eq!(
+        coding_rejection_progress_for(&["xgeny.fs/read-text"]),
+        "live coding rejection followed an unexpected capability sequence"
+    );
+    for marker in [
+        b"reason=proposal_rejected".as_slice(),
+        b"reason=model_rejected".as_slice(),
+        b"reason=material_rejected".as_slice(),
+        b"reason=admission_rejected".as_slice(),
+        b"reason=failed_work".as_slice(),
+    ] {
+        let reason = coding_rejection_reason(marker);
+        assert!(reason.starts_with("live coding"));
+        assert!(!reason.contains(CODING_SEARCH_KEY));
+        assert!(!reason.contains(CODING_COMPLETION));
+    }
+}
+
 fn workspace_invalid_response_message(snapshot: &xgeny_local_store::RunSnapshot) -> &'static str {
     let completed = snapshot
         .state
@@ -1047,6 +1714,7 @@ fn xgeny(state_root: &Path) -> Command {
         .env_remove("XGENY_LIVE_CONFIRM")
         .env_remove("XGENY_LIVE_KNOWN_HOSTS_FILE")
         .env_remove("XGENY_LIVE_OPENAI_BASE_URL")
+        .env_remove("XGENY_LIVE_CARGO_PATH")
         .env_remove("XGENY_OPENAI_BASE_URL")
         .env_remove("XGENY_OPENAI_MODEL")
         .env_remove("XGENY_OPENAI_TOKENIZER");
@@ -1210,9 +1878,11 @@ fn classified_exit_message(output: &Output, stage: &'static str) -> &'static str
         "second model turn" => "second model turn returned an unclassified exit status",
         "offline replay" => "offline replay returned an unclassified exit status",
         "workspace discovery" => "workspace discovery returned an unclassified exit status",
+        "qwen coding loop" => "qwen coding loop returned an unclassified exit status",
         "workspace offline replay" => {
             "workspace offline replay returned an unclassified exit status"
         }
+        "coding offline replay" => "coding offline replay returned an unclassified exit status",
         _ => "live child returned an unclassified exit status",
     }
 }
