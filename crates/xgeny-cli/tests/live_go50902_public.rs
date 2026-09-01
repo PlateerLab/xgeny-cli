@@ -1381,10 +1381,44 @@ fn require_coding_completion(output: &Output, state_root: &Path) {
             SqliteRunStore::open_existing_read_only(run_database(state_root, &run_id))
             && let Ok(Some(snapshot)) = store.load()
         {
-            require(false, coding_rejection_progress_message(&snapshot));
+            panic!(
+                "{}: {}",
+                coding_rejection_reason(&output.stderr),
+                coding_rejection_progress_message(&snapshot)
+            );
         }
     }
     require_exit(output, 0, "qwen coding loop");
+}
+
+fn coding_rejection_reason(stderr: &[u8]) -> &'static str {
+    for (marker, reason) in [
+        (
+            b"reason=proposal_rejected".as_slice(),
+            "live coding proposal contract rejected",
+        ),
+        (
+            b"reason=model_rejected".as_slice(),
+            "live coding provider response rejected",
+        ),
+        (
+            b"reason=material_rejected".as_slice(),
+            "live coding invocation material rejected",
+        ),
+        (
+            b"reason=admission_rejected".as_slice(),
+            "live coding invocation admission rejected",
+        ),
+        (
+            b"reason=failed_work".as_slice(),
+            "live coding WorkGraph entered failed work",
+        ),
+    ] {
+        if contains_bytes(stderr, marker) {
+            return reason;
+        }
+    }
+    "live coding run returned an unclassified rejection"
 }
 
 fn coding_rejection_progress_message(snapshot: &xgeny_local_store::RunSnapshot) -> &'static str {
@@ -1496,6 +1530,18 @@ fn coding_rejection_diagnostic_is_stage_specific_and_content_free() {
         coding_rejection_progress_for(&["xgeny.fs/read-text"]),
         "live coding rejection followed an unexpected capability sequence"
     );
+    for marker in [
+        b"reason=proposal_rejected".as_slice(),
+        b"reason=model_rejected".as_slice(),
+        b"reason=material_rejected".as_slice(),
+        b"reason=admission_rejected".as_slice(),
+        b"reason=failed_work".as_slice(),
+    ] {
+        let reason = coding_rejection_reason(marker);
+        assert!(reason.starts_with("live coding"));
+        assert!(!reason.contains(CODING_SEARCH_KEY));
+        assert!(!reason.contains(CODING_COMPLETION));
+    }
 }
 
 fn workspace_invalid_response_message(snapshot: &xgeny_local_store::RunSnapshot) -> &'static str {
