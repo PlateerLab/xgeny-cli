@@ -2,6 +2,7 @@
 
 mod allow_file;
 mod allow_path;
+mod allow_process;
 mod composition;
 mod driver;
 mod manifest;

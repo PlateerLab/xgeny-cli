@@ -16,7 +16,11 @@ use xgeny_adapter_filesystem::{
     MAX_WRITE_ATOMIC_BYTES, READ_TEXT_CAPABILITY_ID, READ_TEXT_CONTRACT_VERSION, ReadTextLimits,
     SEARCH_TEXT_CAPABILITY_ID, SEARCH_TEXT_CONTRACT_VERSION, STAT_CAPABILITY_ID,
     STAT_CONTRACT_VERSION, WRITE_ATOMIC_CAPABILITY_ID, WRITE_ATOMIC_CONTRACT_VERSION, WorkspaceId,
-    WorkspaceRoot,
+    WorkspaceResourceResolver, WorkspaceRoot,
+};
+use xgeny_adapter_process::{
+    MAX_CAPTURE_BYTES, MAX_PROCESS_TIMEOUT_MS, MIN_CAPTURE_BYTES, PROCESS_EXECUTE_CAPABILITY_ID,
+    PROCESS_EXECUTE_CONTRACT_VERSION, PROCESS_EXECUTE_SCOPE, ProcessResourceResolver,
 };
 use xgeny_domain::{
     Architecture, CapabilityDefinitionBody, CapabilityInstanceBody, CapabilityRef, DataBoundary,
@@ -47,13 +51,19 @@ use xgeny_workgraph::{
 
 use crate::allow_file::{ALLOW_FILE_PROVIDER_ID, AllowFileCatalog};
 use crate::allow_path::WorkspaceReadAuthorization;
+use crate::allow_process::{
+    PROCESS_EXECUTABLE_CATALOG_PROFILE, ProcessExecutionAuthorization, ProcessTooling,
+    SAFE_PROCESS_ENVIRONMENT_PROFILE,
+};
 use crate::driver::{
     ApprovalDecision, ApprovalPort, ApprovalPortFailure, DriverOutcome, PlannedRouteFailure,
     PlannedRoutePort, RunDriver,
 };
 use crate::manifest::{ManifestBudget, RunManifest};
 use crate::material_catalog::{
-    MAX_RECIPE_BYTES, RunMaterialCatalog, WORKSPACE_READ_MATERIAL_CATALOG_SCHEMA_VERSION,
+    MAX_RECIPE_BYTES, PROCESS_MATERIAL_PROVIDER_ID, PROCESS_RECIPE_DOMAIN,
+    PROCESS_RECIPE_FORMAT_VERSION, ProcessMaterialProvider, ProcessMaterializer,
+    RunMaterialCatalog, WORKSPACE_READ_MATERIAL_CATALOG_SCHEMA_VERSION,
     WORKSPACE_READ_MATERIAL_PROVIDER_ID, WORKSPACE_READ_RECIPE_DOMAIN,
     WORKSPACE_READ_RECIPE_FORMAT_VERSION, WorkspaceReadMaterialProvider, WorkspaceReadMaterializer,
 };
@@ -81,8 +91,16 @@ const WORKSPACE_ROUTE_PROFILE: &str = "xgeny.cli.workspace-filesystem-route/v3";
 const WORKSPACE_MATERIALIZER_PROFILE: &str = "xgeny.cli.durable-workspace-fs-materializer/v3";
 const WORKSPACE_APPROVAL_PROFILE: &str = "xgeny.cli.workspace-fs-approval/v3";
 const WORKSPACE_PLANNING_CONSTRAINT_PROFILE: &str = "xgeny.cli.workspace-fs-scope-constraint/v3";
+const PROCESS_EXECUTION_PROFILE_DOMAIN: &str = "xgeny.cli.process-execution-profile/v1";
+const PROCESS_ROUTE_PROFILE: &str = "xgeny.cli.process-route/v1";
+const PROCESS_MATERIALIZER_PROFILE: &str = "xgeny.cli.durable-process-materializer/v1";
+const PROCESS_APPROVAL_PROFILE: &str = "xgeny.cli.process-approval/v1";
+const PROCESS_HOST_POLICY_PROFILE: &str = "xgeny.cli.host-process-catalog/v1";
+const USER_EXECUTE_POLICY_PROFILE: &str = "xgeny.cli.explicit-allow-execute-flag/v1";
+const PROCESS_PLANNING_CONSTRAINT_PROFILE: &str = "xgeny.cli.process-catalog-constraint/v1";
 
 /// One new local Run invocation. Remote model transfer and local reads are separate decisions.
+#[allow(clippy::struct_excessive_bools)] // Four independent process-local consent gates.
 pub struct LocalRunRequest {
     pub goal: String,
     pub workspace: PathBuf,
@@ -92,9 +110,11 @@ pub struct LocalRunRequest {
     pub tokenizer: String,
     pub allow_files: Vec<String>,
     pub allow_dirs: Vec<String>,
+    pub allow_executables: Vec<String>,
     pub allow_remote_model_egress: bool,
     pub allow_read: bool,
     pub allow_write: bool,
+    pub allow_execute: bool,
     pub max_ticks: u32,
 }
 
@@ -117,24 +137,29 @@ impl LocalRunRequest {
             tokenizer,
             allow_files,
             allow_dirs: Vec::new(),
+            allow_executables: Vec::new(),
             allow_remote_model_egress: false,
             allow_read: false,
             allow_write: false,
+            allow_execute: false,
             max_ticks: 32,
         }
     }
 }
 
 /// One continuation invocation. Completed Runs intentionally need no provider or workspace fields.
+#[allow(clippy::struct_excessive_bools)] // Four independent process-local consent gates.
 pub struct LocalResumeRequest {
     pub run_id: String,
     pub workspace: Option<PathBuf>,
     pub base_url: Option<String>,
     pub allow_files: Vec<String>,
     pub allow_dirs: Vec<String>,
+    pub allow_executables: Vec<String>,
     pub allow_remote_model_egress: bool,
     pub allow_read: bool,
     pub allow_write: bool,
+    pub allow_execute: bool,
     pub max_ticks: u32,
 }
 
@@ -256,6 +281,7 @@ pub enum PauseReason {
     RemoteModelEgressConsentRequired,
     ReadApprovalRequired,
     WriteApprovalRequired,
+    ExecuteApprovalRequired,
     TickBudgetExhausted,
     Quiescent,
 }
@@ -267,6 +293,7 @@ impl PauseReason {
             Self::RemoteModelEgressConsentRequired => "remote_model_egress_consent_required",
             Self::ReadApprovalRequired => "read_approval_required",
             Self::WriteApprovalRequired => "write_approval_required",
+            Self::ExecuteApprovalRequired => "execute_approval_required",
             Self::TickBudgetExhausted => "tick_budget_exhausted",
             Self::Quiescent => "quiescent",
         }
@@ -410,6 +437,9 @@ where
     F: FnOnce(&str),
 {
     validate_max_ticks(request.max_ticks)?;
+    if request.allow_execute && request.allow_executables.is_empty() {
+        return Err(PublicRunError::Configuration);
+    }
     if !request.allow_remote_model_egress {
         return Ok(LocalCommandResult::Paused {
             run_id: None,
@@ -425,14 +455,22 @@ where
         .physical_identity()
         .map_err(|_| PublicRunError::Configuration)?;
     let catalog = LocalReadCatalog::build(&workspace, &request.allow_files, &request.allow_dirs)?;
+    let process =
+        ProcessTooling::build(&request.workspace, WORKSPACE_ID, &request.allow_executables)
+            .map_err(|_| PublicRunError::Configuration)?;
+    if request.allow_execute && process.is_none() {
+        return Err(PublicRunError::Configuration);
+    }
+    let planning_constraints_required = catalog.workspace_discovery() || process.is_some();
     let config = planner_config(
         &request.base_url,
         &request.planner_id,
         &request.model,
         &request.tokenizer,
-        catalog.workspace_discovery(),
+        planning_constraints_required,
     )?;
-    let local_execution_profile_digest = local_execution_profile_digest(&workspace, &catalog)?;
+    let local_execution_profile_digest =
+        local_execution_profile_digest(&workspace, &catalog, process.as_ref())?;
     let run_id = generate_run_id().map_err(|_| PublicRunError::Internal)?;
     let manifest = RunManifest::new(
         &run_id,
@@ -445,7 +483,7 @@ where
         config.request_profile_digest(),
         catalog.catalog_digest(),
         &local_execution_profile_digest,
-        if catalog.workspace_discovery() {
+        if planning_constraints_required {
             ManifestBudget::workspace_discovery()
         } else {
             ManifestBudget::default()
@@ -458,7 +496,7 @@ where
     layout
         .write_manifest(&manifest)
         .map_err(|_| PublicRunError::Integrity)?;
-    if catalog.workspace_discovery() {
+    if planning_constraints_required {
         RunMaterialCatalog::create(&layout.material_catalog_path(), manifest.run_id())
             .map_err(|_| PublicRunError::Integrity)?;
     }
@@ -474,9 +512,11 @@ where
         &workspace,
         Some(planner),
         catalog,
+        process.as_ref(),
         &layout.material_catalog_path(),
         request.allow_read,
         request.allow_write,
+        request.allow_execute,
         request.max_ticks,
     )
 }
@@ -568,8 +608,13 @@ pub fn resume_local(request: LocalResumeRequest) -> Result<LocalCommandResult, P
         return Err(PublicRunError::Configuration);
     }
     let catalog = LocalReadCatalog::build(&workspace, &request.allow_files, &request.allow_dirs)?;
+    let process = ProcessTooling::build(&workspace_path, WORKSPACE_ID, &request.allow_executables)
+        .map_err(|_| PublicRunError::Configuration)?;
+    if request.allow_execute && process.is_none() {
+        return Err(PublicRunError::Configuration);
+    }
     if manifest.local_execution_profile_digest()
-        != local_execution_profile_digest(&workspace, &catalog)?
+        != local_execution_profile_digest(&workspace, &catalog, process.as_ref())?
     {
         return Err(PublicRunError::Configuration);
     }
@@ -586,7 +631,7 @@ pub fn resume_local(request: LocalResumeRequest) -> Result<LocalCommandResult, P
             manifest.planner_id(),
             manifest.model(),
             manifest.tokenizer(),
-            catalog.workspace_discovery(),
+            catalog.workspace_discovery() || process.is_some(),
         )?;
         if manifest.request_profile_digest() != config.request_profile_digest() {
             return Err(PublicRunError::Configuration);
@@ -604,9 +649,11 @@ pub fn resume_local(request: LocalResumeRequest) -> Result<LocalCommandResult, P
         &workspace,
         planner,
         catalog,
+        process.as_ref(),
         &layout.material_catalog_path(),
         request.allow_read,
         request.allow_write,
+        request.allow_execute,
         request.max_ticks,
     )
 }
@@ -646,6 +693,29 @@ impl PlanMaterializer for LocalReadMaterializer {
     }
 }
 
+struct LocalMaterializer {
+    filesystem: LocalReadMaterializer,
+    process: Option<ProcessMaterializer>,
+}
+
+impl PlanMaterializer for LocalMaterializer {
+    fn materialize(
+        &mut self,
+        request: PlanMaterializationRequest<'_>,
+    ) -> Result<ReconstructableMaterialReference, PlanMaterializerFailure> {
+        if request.capability().capability_id == PROCESS_EXECUTE_CAPABILITY_ID
+            && request.capability().contract_version == PROCESS_EXECUTE_CONTRACT_VERSION
+        {
+            return self
+                .process
+                .as_mut()
+                .ok_or(PlanMaterializerFailure::Rejected)?
+                .materialize(request);
+        }
+        self.filesystem.materialize(request)
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn continue_incomplete(
     store: &mut SqliteRunStore,
@@ -654,9 +724,11 @@ fn continue_incomplete(
     workspace: &WorkspaceRoot,
     planner: Option<OpenAiPlanner>,
     catalog: LocalReadCatalog,
+    process: Option<&ProcessTooling>,
     material_catalog_path: &Path,
     allow_read: bool,
     allow_write: bool,
+    allow_execute: bool,
     max_ticks: u32,
 ) -> Result<LocalCommandResult, PublicRunError> {
     let model_egress_allowed = planner.is_some();
@@ -668,22 +740,36 @@ fn continue_incomplete(
             request_profile_digest: manifest.request_profile_digest().to_owned(),
         }
     };
-    let LocalFilesystemProduct {
+    let LocalToolProduct {
         capabilities,
         mut adapters,
         mut verifiers,
         mut route,
-    } = local_filesystem_product(workspace, &catalog)?;
-    let planning_constraint = catalog
+    } = local_tool_product(workspace, &catalog, process)?;
+    let mut planning_constraints = catalog
         .workspace_authorization()
         .map(|authorization| {
             PlanningConstraint::new("workspace.fs-scope", authorization.planner_scope_hint())
         })
         .transpose()
-        .map_err(|_| PublicRunError::Internal)?;
-    let resolver = workspace.resolver();
+        .map_err(|_| PublicRunError::Internal)?
+        .into_iter()
+        .collect::<Vec<_>>();
+    if let Some(process) = process {
+        planning_constraints.push(
+            PlanningConstraint::new(
+                "process.executable-catalog",
+                process.authorization().planner_scope_hint(),
+            )
+            .map_err(|_| PublicRunError::Internal)?,
+        );
+    }
+    let resolver = LocalResourceResolver {
+        filesystem: workspace.resolver(),
+        process: process.map(|process| process.workspace().resolver()),
+    };
     let mut providers = MaterialProviderRegistry::new();
-    let (mut materializer, approval_catalog) = match catalog {
+    let (filesystem_materializer, approval_catalog) = match catalog {
         LocalReadCatalog::ExactFiles(catalog) => {
             let materializer = LocalReadMaterializer::ExactFiles(catalog.clone());
             providers
@@ -711,11 +797,37 @@ fn continue_incomplete(
             (materializer, ApprovalCatalog::Workspace(authorization))
         }
     };
-    let mut approvals = ExplicitFilesystemApproval {
+    let process_materializer = if let Some(process) = process {
+        let materializer_catalog =
+            RunMaterialCatalog::open_existing(material_catalog_path, manifest.run_id())
+                .map_err(|_| PublicRunError::Integrity)?;
+        let provider_catalog =
+            RunMaterialCatalog::open_existing(material_catalog_path, manifest.run_id())
+                .map_err(|_| PublicRunError::Integrity)?;
+        providers
+            .register(
+                PROCESS_MATERIAL_PROVIDER_ID,
+                ProcessMaterialProvider::new(process.workspace().clone(), provider_catalog),
+            )
+            .map_err(|_| PublicRunError::Internal)?;
+        Some(ProcessMaterializer::new(
+            process.workspace().clone(),
+            materializer_catalog,
+        ))
+    } else {
+        None
+    };
+    let mut materializer = LocalMaterializer {
+        filesystem: filesystem_materializer,
+        process: process_materializer,
+    };
+    let mut approvals = ExplicitLocalApproval {
         allow_read,
         allow_write,
+        allow_execute,
         run_id: manifest.run_id().to_owned(),
         catalog: approval_catalog,
+        process: process.map(|process| process.authorization().clone()),
     };
     let mut events = HostEventFactory;
     let mut loop_runtime = AgentLoop::with_model_call_budget(
@@ -728,9 +840,9 @@ fn continue_incomplete(
             .model_calls()
             .map_err(|_| PublicRunError::Integrity)?,
     );
-    if let Some(constraint) = planning_constraint {
+    if !planning_constraints.is_empty() {
         loop_runtime = loop_runtime
-            .with_planning_constraints(vec![constraint])
+            .with_planning_constraints(planning_constraints)
             .map_err(|_| PublicRunError::Internal)?;
     }
     let driver = RunDriver::new(
@@ -1180,6 +1292,13 @@ fn map_driver_outcome(
             run_id: Some(run_id),
             reason: PauseReason::WriteApprovalRequired,
         },
+        DriverOutcome::ApprovalPending {
+            effect_class: EffectClass::NonIdempotent,
+            ..
+        } => LocalCommandResult::Paused {
+            run_id: Some(run_id),
+            reason: PauseReason::ExecuteApprovalRequired,
+        },
         DriverOutcome::CompletionCandidate { output: None, .. }
         | DriverOutcome::ApprovalPending { .. } => {
             return Err(PublicRunError::Integrity);
@@ -1245,7 +1364,7 @@ fn map_driver_outcome(
     })
 }
 
-struct LocalFilesystemProduct {
+struct LocalToolProduct {
     capabilities: CapabilityRegistry,
     adapters: EffectAdapterRegistry,
     verifiers: EffectVerifierRegistry,
@@ -1307,7 +1426,70 @@ struct DiscoveryLimitsDescriptor {
     query_output_canonical_bytes: usize,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProcessExecutionProfileDescriptor<'a> {
+    domain: &'static str,
+    filesystem_profile_digest: &'a str,
+    definition: &'a CapabilityDefinitionBody,
+    instance: &'a CapabilityInstanceBody,
+    executable_authorization_digest: &'a str,
+    executable_catalog_profile: &'static str,
+    environment_profile: &'static str,
+    minimum_capture_bytes: usize,
+    maximum_capture_bytes: usize,
+    maximum_timeout_ms: u64,
+    route_profile: &'static str,
+    materializer_profile: &'static str,
+    material_provider_id: &'static str,
+    material_catalog_schema_version: i64,
+    material_recipe_domain: &'static str,
+    material_recipe_format_version: u32,
+    material_recipe_max_bytes: usize,
+    planning_constraint_profile: &'static str,
+    approval_profile: &'static str,
+    host_policy_profile: &'static str,
+    user_execute_policy_profile: &'static str,
+}
+
 fn local_execution_profile_digest(
+    workspace: &WorkspaceRoot,
+    catalog: &LocalReadCatalog,
+    process: Option<&ProcessTooling>,
+) -> Result<String, PublicRunError> {
+    let filesystem_profile_digest = filesystem_execution_profile_digest(workspace, catalog)?;
+    let Some(process) = process else {
+        return Ok(filesystem_profile_digest);
+    };
+    let (definition, instance) = process_spec(process.workspace())?;
+    let canonical = serde_jcs::to_vec(&ProcessExecutionProfileDescriptor {
+        domain: PROCESS_EXECUTION_PROFILE_DOMAIN,
+        filesystem_profile_digest: &filesystem_profile_digest,
+        definition: &definition,
+        instance: &instance,
+        executable_authorization_digest: process.authorization().catalog_digest(),
+        executable_catalog_profile: PROCESS_EXECUTABLE_CATALOG_PROFILE,
+        environment_profile: SAFE_PROCESS_ENVIRONMENT_PROFILE,
+        minimum_capture_bytes: MIN_CAPTURE_BYTES,
+        maximum_capture_bytes: MAX_CAPTURE_BYTES,
+        maximum_timeout_ms: MAX_PROCESS_TIMEOUT_MS,
+        route_profile: PROCESS_ROUTE_PROFILE,
+        materializer_profile: PROCESS_MATERIALIZER_PROFILE,
+        material_provider_id: PROCESS_MATERIAL_PROVIDER_ID,
+        material_catalog_schema_version: WORKSPACE_READ_MATERIAL_CATALOG_SCHEMA_VERSION,
+        material_recipe_domain: PROCESS_RECIPE_DOMAIN,
+        material_recipe_format_version: PROCESS_RECIPE_FORMAT_VERSION,
+        material_recipe_max_bytes: MAX_RECIPE_BYTES,
+        planning_constraint_profile: PROCESS_PLANNING_CONSTRAINT_PROFILE,
+        approval_profile: PROCESS_APPROVAL_PROFILE,
+        host_policy_profile: PROCESS_HOST_POLICY_PROFILE,
+        user_execute_policy_profile: USER_EXECUTE_POLICY_PROFILE,
+    })
+    .map_err(|_| PublicRunError::Internal)?;
+    Ok(sha256_digest(&canonical))
+}
+
+fn filesystem_execution_profile_digest(
     workspace: &WorkspaceRoot,
     catalog: &LocalReadCatalog,
 ) -> Result<String, PublicRunError> {
@@ -1380,6 +1562,20 @@ fn read_text_spec(
         READ_TEXT_CAPABILITY_ID,
         READ_TEXT_CONTRACT_VERSION,
         "local.fs.builtin.v1",
+        workspace.binding(),
+    )
+}
+
+fn process_spec(
+    workspace: &xgeny_adapter_process::ProcessWorkspace,
+) -> Result<(CapabilityDefinitionBody, CapabilityInstanceBody), PublicRunError> {
+    filesystem_spec(
+        include_str!(
+            "../../../protocol/fixtures/v1alpha1/valid/capability-definition.process-execute.json"
+        ),
+        PROCESS_EXECUTE_CAPABILITY_ID,
+        PROCESS_EXECUTE_CONTRACT_VERSION,
+        "local.process.execute.builtin.v1",
         workspace.binding(),
     )
 }
@@ -1477,16 +1673,20 @@ fn workspace_discovery_specs(
     ])
 }
 
-fn local_filesystem_product(
+fn local_tool_product(
     workspace: &WorkspaceRoot,
     catalog: &LocalReadCatalog,
-) -> Result<LocalFilesystemProduct, PublicRunError> {
+    process: Option<&ProcessTooling>,
+) -> Result<LocalToolProduct, PublicRunError> {
     let workspace_discovery = catalog.workspace_discovery();
-    let specs = if workspace_discovery {
+    let mut specs = if workspace_discovery {
         workspace_discovery_specs(workspace)?
     } else {
         vec![read_text_spec(workspace)?]
     };
+    if let Some(process) = process {
+        specs.push(process_spec(process.workspace())?);
+    }
     let mut capabilities = CapabilityRegistry::new();
     let mut routes = Vec::with_capacity(specs.len());
     for (definition, instance) in specs {
@@ -1554,12 +1754,40 @@ fn local_filesystem_product(
             .register(&workspace.apply_patch_binding(), patch_verifier)
             .map_err(|_| PublicRunError::Internal)?;
     }
-    Ok(LocalFilesystemProduct {
+    if let Some(process) = process {
+        let process_adapter = process.workspace().adapter();
+        let process_verifier = process_adapter.verifier();
+        adapters
+            .register(&process.workspace().binding(), process_adapter)
+            .map_err(|_| PublicRunError::Internal)?;
+        verifiers
+            .register(&process.workspace().binding(), process_verifier)
+            .map_err(|_| PublicRunError::Internal)?;
+    }
+    Ok(LocalToolProduct {
         capabilities,
         adapters,
         verifiers,
         route: ExactLocalRoute { routes },
     })
+}
+
+struct LocalResourceResolver {
+    filesystem: WorkspaceResourceResolver,
+    process: Option<ProcessResourceResolver>,
+}
+
+impl ResourceResolver for LocalResourceResolver {
+    fn resolve(&self, scope: &str, resource: &str) -> Result<String, ResourceResolutionFailure> {
+        if scope == PROCESS_EXECUTE_SCOPE {
+            return self
+                .process
+                .as_ref()
+                .ok_or(ResourceResolutionFailure::UnsupportedScope)?
+                .resolve(scope, resource);
+        }
+        self.filesystem.resolve(scope, resource)
+    }
 }
 
 struct ExactLocalRoute {
@@ -1577,11 +1805,13 @@ impl PlannedRoutePort for ExactLocalRoute {
             .get(step_id)
             .and_then(|step| step.planned_invocation.as_ref())
             .ok_or(PlannedRouteFailure::Rejected)?;
-        let write = (planned.capability_id() == WRITE_ATOMIC_CAPABILITY_ID
+        let once = (planned.capability_id() == WRITE_ATOMIC_CAPABILITY_ID
             && planned.contract_version() == WRITE_ATOMIC_CONTRACT_VERSION)
             || (planned.capability_id() == APPLY_PATCH_CAPABILITY_ID
-                && planned.contract_version() == APPLY_PATCH_CONTRACT_VERSION);
-        let expected_profile = if write {
+                && planned.contract_version() == APPLY_PATCH_CONTRACT_VERSION)
+            || (planned.capability_id() == PROCESS_EXECUTE_CAPABILITY_ID
+                && planned.contract_version() == PROCESS_EXECUTE_CONTRACT_VERSION);
+        let expected_profile = if once {
             PlannedExecutionProfile::LocalSyncOnceV1
         } else {
             PlannedExecutionProfile::LocalSyncReadOnlyV1
@@ -1606,7 +1836,7 @@ impl PlannedRoutePort for ExactLocalRoute {
             required_features: RequiredRouteFeatures {
                 execution_style: xgeny_domain::ExecutionStyle::Sync,
                 cancellation: false,
-                idempotency_key: write,
+                idempotency_key: once,
                 idempotency_query: false,
             },
             allowed_trust_levels: vec![TrustLevel::Verified],
@@ -1633,30 +1863,28 @@ impl ApprovalCatalog {
     }
 }
 
-struct ExplicitFilesystemApproval {
+struct ExplicitLocalApproval {
     allow_read: bool,
     allow_write: bool,
+    allow_execute: bool,
     run_id: String,
     catalog: ApprovalCatalog,
+    process: Option<ProcessExecutionAuthorization>,
 }
 
-impl ApprovalPort for ExplicitFilesystemApproval {
+impl ApprovalPort for ExplicitLocalApproval {
     fn decide(
         &mut self,
         request: &ResolvedPermissionRequest,
     ) -> Result<ApprovalDecision, ApprovalPortFailure> {
-        let Some(user_policy_profile) = self.authorized_action_profile(request) else {
+        let Some((host_policy_profile, user_policy_profile, approved)) =
+            self.authorized_action_profiles(request)
+        else {
             return Ok(ApprovalDecision::Denied);
-        };
-        let approved = match request.effect_class() {
-            EffectClass::ReadOnly => self.allow_read,
-            EffectClass::Idempotent => self.allow_write,
-            _ => false,
         };
         if !approved {
             return Ok(ApprovalDecision::Pending);
         }
-        let host_policy_profile = self.catalog.host_policy_profile();
         let allowance = || {
             PolicyAllowance::from_trusted_evaluation(
                 request.requested_scopes().iter().cloned(),
@@ -1687,11 +1915,14 @@ impl ApprovalPort for ExplicitFilesystemApproval {
     }
 }
 
-impl ExplicitFilesystemApproval {
-    fn authorized_action_profile(
+impl ExplicitLocalApproval {
+    fn authorized_action_profiles(
         &self,
         request: &ResolvedPermissionRequest,
-    ) -> Option<&'static str> {
+    ) -> Option<(&'static str, &'static str, bool)> {
+        if request.effect_class() == EffectClass::NonIdempotent {
+            return self.authorized_process_profiles(request);
+        }
         let expected_scope = match request.effect_class() {
             EffectClass::ReadOnly => FILESYSTEM_READ_SCOPE,
             EffectClass::Idempotent => FILESYSTEM_WRITE_SCOPE,
@@ -1724,11 +1955,41 @@ impl ExplicitFilesystemApproval {
                     }
             })
             && request.critical_actions().is_empty();
-        exact.then_some(match request.effect_class() {
-            EffectClass::ReadOnly => USER_READ_POLICY_PROFILE,
-            EffectClass::Idempotent => USER_WRITE_POLICY_PROFILE,
-            _ => return None,
+        exact.then(|| {
+            let (user_profile, approved) = match request.effect_class() {
+                EffectClass::ReadOnly => (USER_READ_POLICY_PROFILE, self.allow_read),
+                EffectClass::Idempotent => (USER_WRITE_POLICY_PROFILE, self.allow_write),
+                _ => unreachable!("effect class was closed above"),
+            };
+            (self.catalog.host_policy_profile(), user_profile, approved)
         })
+    }
+
+    fn authorized_process_profiles(
+        &self,
+        request: &ResolvedPermissionRequest,
+    ) -> Option<(&'static str, &'static str, bool)> {
+        let authorization = self.process.as_ref()?;
+        let exact = request.run_id() == self.run_id
+            && request.requested_lifetime() == GrantLifetime::Once
+            && request.requested_scopes().len() == 1
+            && request
+                .requested_scopes()
+                .first()
+                .is_some_and(|scope| scope == PROCESS_EXECUTE_SCOPE)
+            && request.resources().len() == 1
+            && request.resources().first().is_some_and(|resource| {
+                resource.scope() == PROCESS_EXECUTE_SCOPE
+                    && authorization.authorizes_resource(resource.canonical_resource())
+            })
+            && request.capability().capability_id == PROCESS_EXECUTE_CAPABILITY_ID
+            && request.capability().contract_version == PROCESS_EXECUTE_CONTRACT_VERSION
+            && request.critical_actions().is_empty();
+        exact.then_some((
+            PROCESS_HOST_POLICY_PROFILE,
+            USER_EXECUTE_POLICY_PROFILE,
+            self.allow_execute,
+        ))
     }
 }
 
@@ -1811,9 +2072,11 @@ mod tests {
             tokenizer: "tokenizer".to_owned(),
             allow_files: vec!["README.md".to_owned()],
             allow_dirs: Vec::new(),
+            allow_executables: Vec::new(),
             allow_remote_model_egress: false,
             allow_read: true,
             allow_write: false,
+            allow_execute: false,
             max_ticks: 32,
         };
         assert_eq!(
@@ -1835,7 +2098,7 @@ mod tests {
                 .unwrap();
         let exact_catalog =
             LocalReadCatalog::build(&workspace, &["README.md".to_owned()], &[]).unwrap();
-        let product = local_filesystem_product(&workspace, &exact_catalog).unwrap();
+        let product = local_tool_product(&workspace, &exact_catalog, None).unwrap();
         assert_eq!(product.capabilities.definitions().count(), 1);
         assert!(
             product
@@ -1848,13 +2111,13 @@ mod tests {
 
         let discovery_catalog =
             LocalReadCatalog::build(&workspace, &[], &[".".to_owned()]).unwrap();
-        let discovery = local_filesystem_product(&workspace, &discovery_catalog).unwrap();
+        let discovery = local_tool_product(&workspace, &discovery_catalog, None).unwrap();
         assert_eq!(discovery.capabilities.definitions().count(), 6);
         assert_eq!(discovery.capabilities.instances().count(), 6);
         assert_eq!(discovery.adapters.len(), 6);
         assert!(format!("{:?}", discovery.verifiers).contains("verifier_count: 6"));
         let scoped_catalog = LocalReadCatalog::build(&workspace, &[], &["src".to_owned()]).unwrap();
-        let scoped = local_filesystem_product(&workspace, &scoped_catalog).unwrap();
+        let scoped = local_tool_product(&workspace, &scoped_catalog, None).unwrap();
         let root_definitions = discovery
             .capabilities
             .definitions()
@@ -1867,8 +2130,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(root_definitions, scoped_definitions);
         assert_eq!(
-            local_execution_profile_digest(&workspace, &discovery_catalog).unwrap(),
-            local_execution_profile_digest(&workspace, &scoped_catalog).unwrap()
+            local_execution_profile_digest(&workspace, &discovery_catalog, None).unwrap(),
+            local_execution_profile_digest(&workspace, &scoped_catalog, None).unwrap()
         );
         assert_ne!(
             discovery_catalog
@@ -1880,6 +2143,27 @@ mod tests {
                 .unwrap()
                 .catalog_digest()
         );
+
+        let executable = std::env::current_exe().unwrap();
+        let process_specification = format!("test-helper={}", executable.display());
+        let process =
+            ProcessTooling::build(directory.path(), WORKSPACE_ID, [&process_specification])
+                .unwrap()
+                .unwrap();
+        let process_product =
+            local_tool_product(&workspace, &discovery_catalog, Some(&process)).unwrap();
+        assert_eq!(process_product.capabilities.definitions().count(), 7);
+        assert_eq!(process_product.capabilities.instances().count(), 7);
+        assert_eq!(process_product.adapters.len(), 7);
+        assert!(format!("{:?}", process_product.verifiers).contains("verifier_count: 7"));
+        assert_eq!(
+            filesystem_execution_profile_digest(&workspace, &discovery_catalog).unwrap(),
+            local_execution_profile_digest(&workspace, &discovery_catalog, None).unwrap()
+        );
+        assert_ne!(
+            local_execution_profile_digest(&workspace, &discovery_catalog, None).unwrap(),
+            local_execution_profile_digest(&workspace, &discovery_catalog, Some(&process)).unwrap()
+        );
     }
 
     #[test]
@@ -1890,11 +2174,13 @@ mod tests {
             WorkspaceRoot::open_ambient(directory.path(), WorkspaceId::new(WORKSPACE_ID).unwrap())
                 .unwrap();
         let catalog = AllowFileCatalog::new(&workspace.resolver(), ["README.md"]).unwrap();
-        let mut approval = ExplicitFilesystemApproval {
+        let mut approval = ExplicitLocalApproval {
             allow_read: true,
             allow_write: false,
+            allow_execute: false,
             run_id: "run-0123456789abcdef0123456789abcdef".to_owned(),
             catalog: ApprovalCatalog::ExactFiles(catalog),
+            process: None,
         };
         let ProtocolDocument::CapabilityDefinition(definition) =
             serde_json::from_str(include_str!(
@@ -1984,6 +2270,83 @@ mod tests {
             .unwrap();
         assert!(matches!(
             approval.decide(critical.permission_request()).unwrap(),
+            ApprovalDecision::Denied
+        ));
+    }
+
+    #[test]
+    fn execute_flag_approves_only_the_exact_process_catalog_request_shape() {
+        let directory = tempdir().unwrap();
+        fs::write(directory.path().join("README.md"), "fixture").unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let specification = format!("test-helper={}", executable.display());
+        let process = ProcessTooling::build(directory.path(), WORKSPACE_ID, [&specification])
+            .unwrap()
+            .unwrap();
+        let filesystem_workspace =
+            WorkspaceRoot::open_ambient(directory.path(), WorkspaceId::new(WORKSPACE_ID).unwrap())
+                .unwrap();
+        let filesystem_catalog =
+            AllowFileCatalog::new(&filesystem_workspace.resolver(), ["README.md"]).unwrap();
+        let mut approval = ExplicitLocalApproval {
+            allow_read: false,
+            allow_write: false,
+            allow_execute: false,
+            run_id: "run-0123456789abcdef0123456789abcdef".to_owned(),
+            catalog: ApprovalCatalog::ExactFiles(filesystem_catalog),
+            process: Some(process.authorization().clone()),
+        };
+        let ProtocolDocument::CapabilityDefinition(definition) =
+            serde_json::from_str(include_str!(
+                "../../../protocol/fixtures/v1alpha1/valid/capability-definition.process-execute.json"
+            ))
+            .unwrap()
+        else {
+            panic!("fixture must be a CapabilityDefinition");
+        };
+        let resolver = PermissionRequestResolver::new(process.workspace().resolver());
+        let arguments = json!({
+            "executable": "test-helper",
+            "args": [],
+            "cwd": ".",
+            "env": {},
+            "timeoutMs": 30000,
+            "maxOutputBytes": 32768
+        });
+        let exact = resolver
+            .resolve_invocation(
+                "request-1",
+                "run-0123456789abcdef0123456789abcdef",
+                "step-1",
+                &definition,
+                &arguments,
+                GrantLifetime::Once,
+            )
+            .unwrap();
+        assert!(matches!(
+            approval.decide(exact.permission_request()).unwrap(),
+            ApprovalDecision::Pending
+        ));
+        approval.allow_execute = true;
+        assert!(matches!(
+            approval.decide(exact.permission_request()).unwrap(),
+            ApprovalDecision::Approved(_)
+        ));
+
+        let wrong_lifetime = resolver
+            .resolve_invocation(
+                "request-2",
+                "run-0123456789abcdef0123456789abcdef",
+                "step-1",
+                &definition,
+                &arguments,
+                GrantLifetime::Run,
+            )
+            .unwrap();
+        assert!(matches!(
+            approval
+                .decide(wrong_lifetime.permission_request())
+                .unwrap(),
             ApprovalDecision::Denied
         ));
     }

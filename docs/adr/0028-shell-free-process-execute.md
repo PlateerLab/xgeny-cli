@@ -44,10 +44,13 @@ truncation flag와 `durationMs`를 가진 exact object다. Non-zero exit와 time
 ### 2. 실행 파일 경로와 기본 환경은 host가 소유한다
 
 Model은 ambient path나 `PATH` lookup 결과를 전달하지 않는다. Composition root가 OS-executable file을
-portable logical ID에 연결한 `ExecutableCatalog`를 만든다. Catalog 생성 시 path를 canonicalize하고
-regular executable 여부와 content SHA-256을 고정하며, prepare 직전에 같은 file을 다시 검사한다.
+portable logical ID에 연결한 `ExecutableCatalog`를 만든다. Catalog 생성 시 launch path, canonical
+target과 content SHA-256을 고정하며, prepare 직전에 같은 alias/target/file을 다시 검사한다.
 Unix에서는 execute bit가 있는 regular file(명시적 shebang script 포함), Windows에서는 `.exe`와 `.com`만
 허용한다. Cataloged shebang은 OS loader가 해석하지만 shell command 문자열을 구성하거나 전달하지 않는다.
+Rustup의 `cargo -> rustup`처럼 `argv[0]` alias가 동작을 결정하는 multicall executable을 위해 spawn에는
+검증된 launch alias를 보존한다. Launch path 자체는 digest로 binding에 묶여 다른 alias로 조용히 바뀌지
+않는다.
 정규화된 invocation resource는 `process:<workspace>/executables/<logical-id>`이고 실제 host path는
 journal, material, Receipt와 `Debug`에 들어가지 않는다.
 
@@ -87,9 +90,16 @@ agent loop가 무기한 기다리지 않는다.
 
 ### 5. 실행 승인은 filesystem read/write와 분리한다
 
-Capability scope는 `process.execute`다. 후속 CLI composition은 `--allow-dir`이나 `--allow-write`가
-있다는 이유로 process를 허용하지 않고, 별도 실행 opt-in과 executable allow-list가 함께 있을 때만
-Instance와 policy allowance를 구성한다. 실행 승인 UI가 없더라도 deny-by-default를 유지한다.
+Capability scope는 `process.execute`다. CLI composition은 반복 가능한
+`--allow-executable ID=ABSOLUTE_PATH`로 top-level executable catalog를 만들고, 별도
+`--allow-execute`가 있을 때만 exact one-shot process request를 승인한다. `--allow-dir`,
+`--allow-read`, `--allow-write`는 process 권한으로 승격되지 않는다. Catalog만 주고 실행 승인을 주지
+않으면 plan과 material을 durable하게 보존한 뒤 `execute_approval_required`로 pause한다.
+
+Planner constraint에는 logical ID만 전달한다. 실제 path, content digest와 safe child-environment snapshot은
+local Instance binding에 결합하고 local execution profile에 포함한다. 미완료 Run 재개는 원래와 동일한
+executable content/catalog, workspace와 safe environment가 아니면 `configuration_mismatch`로 닫는다.
+`--allow-execute`만 주고 catalog를 생략하는 새 Run도 configuration 오류다.
 
 Process는 `NonIdempotent`, `durableToolOutput=true`, `SinkGuarantee::None` 의미를 사용한다. Durable
 idempotency key는 identity이지 replay 허가가 아니다. `Executing` 상태에서 재시작하면 adapter를 다시
@@ -106,6 +116,8 @@ prepare/execute하지 않고 `EffectUnknown`으로 닫는다. Exact output bundl
 - timeout 뒤 descendant가 지연 marker를 만들지 못함
 - protected environment override와 material/path/환경의 `Debug` 노출 거부
 - exact output shape/evidence digest verifier 검증
+- CLI plan → 실행 승인 pause → 별도 process 재개 → durable output → 다음 model turn과 단일 Receipt
+- 변경된 executable catalog로 재개 실패와 완료된 process의 no-replay
 - Linux x86-64/ARM64, macOS Intel/Apple Silicon, Windows x86-64의 workspace test
 - ADR-0027의 SQLite crash/lost-ack no-replay 회귀 suite 유지
 

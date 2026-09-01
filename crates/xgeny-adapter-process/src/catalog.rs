@@ -28,14 +28,17 @@ pub struct ExecutableCatalog {
 
 #[derive(Clone)]
 pub(crate) struct ExecutableEntry {
-    path: Arc<PathBuf>,
+    launch_path: Arc<PathBuf>,
+    target_path: Arc<PathBuf>,
+    launch_digest: String,
     digest: String,
 }
 
 impl ExecutableCatalog {
     /// Snapshot a set of host-resolved OS-executable files under portable logical identifiers.
     ///
-    /// Paths are canonicalized and the executable content digest is retained. Invocation material
+    /// The launch path and its canonical target/content are pinned. The launch alias is retained
+    /// because multicall tools such as rustup select behavior from argv[0]. Invocation material
     /// contains only the logical identifier; the ambient path never enters a Run journal.
     ///
     /// # Errors
@@ -54,17 +57,22 @@ impl ExecutableCatalog {
             }
             let logical_id = logical_id.into();
             validate_executable_id(&logical_id)?;
-            let path = std::fs::canonicalize(path).map_err(|_| ExecutableCatalogError)?;
-            let metadata = std::fs::metadata(&path).map_err(|_| ExecutableCatalogError)?;
-            if !metadata.is_file() || !platform_executable(&path, &metadata) {
+            let launch_path = std::path::absolute(path).map_err(|_| ExecutableCatalogError)?;
+            let target_path =
+                std::fs::canonicalize(&launch_path).map_err(|_| ExecutableCatalogError)?;
+            let metadata = std::fs::metadata(&target_path).map_err(|_| ExecutableCatalogError)?;
+            if !metadata.is_file() || !platform_executable(&launch_path, &metadata) {
                 return Err(ExecutableCatalogError);
             }
-            let digest = executable_digest(&path)?;
+            let launch_digest = launch_path_digest(&launch_path);
+            let digest = executable_digest(&target_path)?;
             if catalog
                 .insert(
                     logical_id,
                     ExecutableEntry {
-                        path: Arc::new(path),
+                        launch_path: Arc::new(launch_path),
+                        target_path: Arc::new(target_path),
+                        launch_digest,
                         digest,
                     },
                 )
@@ -108,15 +116,20 @@ impl ExecutableCatalog {
 
 impl ExecutableEntry {
     pub(crate) fn verified_path(&self) -> Result<PathBuf, ExecutableCatalogError> {
-        let metadata = std::fs::metadata(self.path.as_ref()).map_err(|_| ExecutableCatalogError)?;
-        if !metadata.is_file() || !platform_executable(self.path.as_ref(), &metadata) {
+        let observed_target =
+            std::fs::canonicalize(self.launch_path.as_ref()).map_err(|_| ExecutableCatalogError)?;
+        if observed_target != *self.target_path {
             return Err(ExecutableCatalogError);
         }
-        let observed = executable_digest(self.path.as_ref())?;
+        let metadata = std::fs::metadata(&observed_target).map_err(|_| ExecutableCatalogError)?;
+        if !metadata.is_file() || !platform_executable(self.launch_path.as_ref(), &metadata) {
+            return Err(ExecutableCatalogError);
+        }
+        let observed = executable_digest(&observed_target)?;
         if observed != self.digest {
             return Err(ExecutableCatalogError);
         }
-        Ok(self.path.as_ref().clone())
+        Ok(self.launch_path.as_ref().clone())
     }
 }
 
@@ -322,11 +335,50 @@ fn executable_digest(path: &Path) -> Result<String, ExecutableCatalogError> {
 fn catalog_digest(
     entries: &BTreeMap<String, ExecutableEntry>,
 ) -> Result<String, ExecutableCatalogError> {
-    let values: BTreeMap<&str, &str> = entries
+    let values: BTreeMap<&str, CatalogEntryDigest<'_>> = entries
         .iter()
-        .map(|(id, entry)| (id.as_str(), entry.digest.as_str()))
+        .map(|(id, entry)| {
+            (
+                id.as_str(),
+                CatalogEntryDigest {
+                    launch_digest: &entry.launch_digest,
+                    content_digest: &entry.digest,
+                },
+            )
+        })
         .collect();
     digest_map(&values).map_err(|_| ExecutableCatalogError)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogEntryDigest<'a> {
+    launch_digest: &'a str,
+    content_digest: &'a str,
+}
+
+#[cfg(unix)]
+fn launch_path_digest(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    sha256_digest(path.as_os_str().as_bytes())
+}
+
+#[cfg(windows)]
+fn launch_path_digest(path: &Path) -> String {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let bytes = path
+        .as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    sha256_digest(&bytes)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn launch_path_digest(path: &Path) -> String {
+    sha256_digest(path.to_string_lossy().as_bytes())
 }
 
 fn digest_map<T: serde::Serialize>(value: &T) -> Result<String, serde_json::Error> {
@@ -471,6 +523,31 @@ mod tests {
 
         std::fs::write(&executable, b"different executable bytes").unwrap();
         assert!(catalog.entry("tool").unwrap().verified_path().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_alias_is_launch_preserved_digest_bound_and_retarget_checked() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = std::env::current_exe().unwrap();
+        let first_alias = directory.path().join("cargo");
+        let second_alias = directory.path().join("rustc");
+        symlink(&target, &first_alias).unwrap();
+        symlink(&target, &second_alias).unwrap();
+        let first = ExecutableCatalog::from_paths([("tool", &first_alias)]).unwrap();
+        let second = ExecutableCatalog::from_paths([("tool", &second_alias)]).unwrap();
+
+        assert_eq!(
+            first.entry("tool").unwrap().verified_path().unwrap(),
+            std::path::absolute(&first_alias).unwrap()
+        );
+        assert_ne!(first.digest, second.digest);
+
+        std::fs::remove_file(&first_alias).unwrap();
+        symlink("/definitely/not/the/catalogued-target", &first_alias).unwrap();
+        assert!(first.entry("tool").unwrap().verified_path().is_err());
     }
 
     #[cfg(unix)]

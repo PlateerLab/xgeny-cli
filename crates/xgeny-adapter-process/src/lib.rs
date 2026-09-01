@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use cap_std::fs::Dir;
+use serde_json::Value;
 use thiserror::Error;
 use xgeny_domain::InstanceBinding;
 use xgeny_runtime::{
@@ -147,6 +148,15 @@ impl ProcessWorkspace {
         ProcessExecuteAdapter {
             workspace: self.clone(),
         }
+    }
+
+    /// Revalidate normalized process material without starting a process.
+    ///
+    /// Hosts use this before persisting reconstructable invocation material. The result is closed
+    /// and does not expose which path, argument, or environment check failed.
+    #[must_use]
+    pub fn accepts_normalized_material(&self, arguments: &Value) -> bool {
+        execution::accepts_normalized_material(arguments, self)
     }
 }
 

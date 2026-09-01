@@ -147,7 +147,30 @@ fn run_help_names_environment_contract_without_exposing_values() {
     assert!(stdout.contains("--allow-file"));
     assert!(stdout.contains("--allow-dir"));
     assert!(stdout.contains("--allow-write"));
+    assert!(stdout.contains("--allow-executable"));
+    assert!(stdout.contains("--allow-execute"));
     assert!(!stdout.contains(sentinel));
+}
+
+#[test]
+fn execute_approval_without_an_executable_catalog_is_rejected() {
+    let output = xgeny()
+        .env("XGENY_OPENAI_BASE_URL", "http://127.0.0.1:18000/v1")
+        .env("XGENY_OPENAI_MODEL", "test-model")
+        .args([
+            "run",
+            "--allow-file",
+            "README.md",
+            "--allow-execute",
+            "test goal",
+        ])
+        .output()
+        .expect("xgeny should reject execution approval without a catalog");
+
+    assert_eq!(output.status.code(), Some(64));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    assert!(stderr.contains("code=configuration_mismatch"));
 }
 
 #[test]

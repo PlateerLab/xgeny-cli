@@ -212,6 +212,40 @@ xgeny run \
 directory 밖의 exact file만 `--allow-file Cargo.toml`로 추가한다. 미완료 재개에는 원래와 동일한
 `--allow-dir`/`--allow-file` 집합을 다시 제공해야 한다.
 
+이 변경을 포함한 source build에서는 test/build용 executable도 absolute path로 명시할 수 있다. 경로를
+model에 보내지는 않으며 logical ID만 planning constraint에 노출한다.
+
+```bash
+xgeny run \
+  --workspace . \
+  --allow-dir . \
+  --allow-executable cargo="$(command -v cargo)" \
+  --allow-remote-model-egress \
+  --allow-read \
+  --allow-write \
+  '프로젝트를 탐색하고 수정한 뒤 테스트해줘.'
+```
+
+Process 실행은 file read/write와 별도 승인이다. `--allow-execute`가 없으면 실제 실행 전에
+`execute_approval_required`로 pause하며, 동일한 scope와 executable catalog를 다시 제공해 승인한다.
+
+```bash
+xgeny resume run-0123456789abcdef0123456789abcdef \
+  --workspace . \
+  --allow-dir . \
+  --allow-executable cargo="$(command -v cargo)" \
+  --allow-read \
+  --allow-write \
+  --allow-execute
+```
+
+실행은 shell을 사용하지 않지만 OS sandbox도 아니다. 허용한 compiler, package manager, interpreter와
+그 하위 process는 현재 사용자 권한으로 project code를 실행할 수 있다. CLI는 ambient 환경 전체를
+상속하지 않고 제한된 host 환경만 전달하며 API key와 proxy/클라우드 credential은 child에 전달하지
+않는다. Top-level executable catalog는 해당 도구가 실행하는 하위 프로그램의 allow-list가 아니다.
+미완료 재개 시 executable 내용, workspace 또는 safe environment binding이 달라지면 자동 대체나 재실행
+없이 `configuration_mismatch`로 닫는다.
+
 상태가 pause되면 stderr의 `run_id`를 사용한다. 미완료 Run은 workspace와 원래 사용한 동일한
 allow-file/allow-dir catalog를 다시 제공하고 필요한 동의를 명시한다. Base URL은 위 environment에서
 다시 읽는다.
@@ -231,9 +265,9 @@ xgeny resume run-0123456789abcdef0123456789abcdef
 ```
 
 상세 재개 절차는 [Public local run/resume prototype](development/public-local-run-resume.md)을 따른다.
-현재 배포된 RC2 capability는 allow-list 기반 UTF-8 file read 하나다. Source/main은 workspace
-discovery와 bounded atomic text write까지 제공한다. 일반 shell/process, patch, browser와 MCP는 후속
-범위이므로 현 상태를 Claude Code/Codex 전체 기능과 동일하다고 해석하지 않는다. Discovery 경계는
+현재 배포된 RC2 capability는 allow-list 기반 UTF-8 file read 하나다. 이 변경을 포함한 source는 workspace
+discovery, bounded atomic text write/patch와 명시적 shell-free process 실행을 제공한다. Browser와 MCP는
+후속 범위이므로 현 상태를 Claude Code/Codex 전체 기능과 동일하다고 해석하지 않는다. Discovery 경계는
 [Workspace filesystem discovery](development/workspace-filesystem-discovery.md), write 경계는
 [Workspace atomic write](development/workspace-atomic-write.md)를 따른다.
 

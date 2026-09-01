@@ -46,6 +46,10 @@ pub(crate) fn parse_prepared(
     Ok(Box::new(parse_arguments(arguments, workspace)?))
 }
 
+pub(crate) fn accepts_normalized_material(arguments: &Value, workspace: &ProcessWorkspace) -> bool {
+    parse_arguments(arguments, workspace).is_ok()
+}
+
 fn parse_arguments(
     arguments: &Value,
     workspace: &ProcessWorkspace,
@@ -524,6 +528,45 @@ mod tests {
         assert!(!marker.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn catalogued_symlink_proxy_preserves_argv_zero_alias() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().expect("temporary workspace should exist");
+        let alias = directory.path().join("cargo-proxy");
+        symlink(std::env::current_exe().unwrap(), &alias).unwrap();
+        let catalog = ExecutableCatalog::from_paths([("proxy", &alias)]).unwrap();
+        let workspace = ProcessWorkspace::open_ambient(
+            directory.path(),
+            ProcessWorkspaceId::new("fixture").unwrap(),
+            catalog,
+            ProcessEnvironment::empty(),
+        )
+        .unwrap();
+        let executable = workspace
+            .resolver()
+            .resolve(PROCESS_EXECUTE_SCOPE, "proxy")
+            .unwrap();
+        let arguments = json!({
+            "executable": executable,
+            "args": ["execution::tests::process_child_helper", "--exact", "--nocapture", "--test-threads=1"],
+            "cwd": ".",
+            "env": {"XGENY_PROCESS_TEST_MODE": "print-argv-zero"},
+            "timeoutMs": 5_000,
+            "maxOutputBytes": MIN_CAPTURE_BYTES,
+        });
+
+        let output = run_process(&parse_arguments(&arguments, &workspace).unwrap()).unwrap();
+        assert_eq!(output["outcome"], "exited");
+        assert!(
+            output["stdout"]
+                .as_str()
+                .unwrap()
+                .contains("argv-zero=cargo-proxy")
+        );
+    }
+
     #[test]
     fn nonzero_exit_and_bounded_streams_are_durable_result_data() {
         let fixture = Fixture::new();
@@ -689,6 +732,17 @@ mod tests {
                     std::path::Path::new("cwd-marker").is_file(),
                     std::env::var("XGENY_PROCESS_TEST_VALUE").unwrap()
                 );
+            }
+            "print-argv-zero" => {
+                let argv_zero = std::env::args_os()
+                    .next()
+                    .and_then(|path| {
+                        std::path::PathBuf::from(path)
+                            .file_name()
+                            .map(std::ffi::OsStr::to_os_string)
+                    })
+                    .expect("argv zero should have a file name");
+                println!("argv-zero={}", argv_zero.to_string_lossy());
             }
             other => panic!("unexpected helper mode: {other}"),
         }

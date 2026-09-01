@@ -1,8 +1,36 @@
 # Process execute adapter
 
-`xgeny-adapter-process`는 `xgeny.process/execute@1.0.0`의 shell-free local adapter다. 아직 CLI가
-자동으로 등록하는 public tool은 아니며, host composition이 workspace, executable catalog와 환경을
-명시적으로 제공해야 한다.
+`xgeny-adapter-process`는 `xgeny.process/execute@1.0.0`의 shell-free local adapter다. Public CLI는
+사용자가 executable catalog를 명시한 Run에서만 이 tool을 등록한다. 다른 host composition도 workspace,
+executable catalog와 환경을 명시적으로 제공해야 한다.
+
+## Public CLI composition
+
+```bash
+xgeny run \
+  --workspace . \
+  --allow-dir . \
+  --allow-executable cargo="$(command -v cargo)" \
+  --allow-remote-model-egress \
+  --allow-read \
+  '프로젝트를 살펴보고 테스트해줘.'
+```
+
+이 호출에서 model이 `cargo` 실행을 계획해도 `--allow-execute`가 없으므로 process 시작 전에
+`execute_approval_required`로 pause한다. 출력된 Run ID를 사용해 로컬 실행만 별도로 승인할 수 있다.
+
+```bash
+xgeny resume run-0123456789abcdef0123456789abcdef \
+  --workspace . \
+  --allow-dir . \
+  --allow-executable cargo="$(command -v cargo)" \
+  --allow-read \
+  --allow-execute
+```
+
+미완료 재개에는 원래와 같은 allow-file/allow-dir와 executable catalog가 필요하다. 실행 뒤 다음 model
+turn이 필요하면 같은 인자에 `--base-url`과 `--allow-remote-model-egress`를 추가한다. Windows에서는
+`--allow-executable cargo=C:\\absolute\\path\\cargo.exe`처럼 absolute `.exe`/`.com`을 지정한다.
 
 ## Host composition
 
@@ -46,6 +74,7 @@ Composition root는 다음 항목을 같은 exact binding으로 Core에 등록�
 ## 보안 경계
 
 - Model은 executable path를 지정하거나 PATH 검색을 요청하지 못한다.
+- Executable symlink/proxy는 canonical target/content를 재검사하면서 launch alias와 `argv[0]`를 보존한다.
 - Model env는 host snapshot key, PATH/home/system/temp/toolchain/loader key를 덮어쓰지 못한다.
 - cwd는 workspace-relative existing directory이며 symlink/reparse traversal을 거부한다.
 - argv는 shell을 거치지 않는다.
@@ -82,4 +111,6 @@ cargo run --quiet -p xgeny-cli -- protocol check
 ```
 
 Platform-specific process group, Job Object, path와 executable 판단은 Linux, macOS, Windows CI의
-workspace test에서 실행한다. 실제 CLI approval/catalog/model loop는 별도 vertical slice에서 검증한다.
+workspace test에서 실행한다. CLI integration test는 loopback model을 사용해 catalog-only 승인 pause,
+변경된 catalog의 재개 거부, 별도 실행 승인, durable output의 다음 model turn 전달과 단일 Receipt를
+검증한다.
