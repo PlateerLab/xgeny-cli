@@ -784,12 +784,15 @@ fn verify_durable_coding_result(
         .as_ref()
         .and_then(|agent| agent.model_calls.as_ref())
         .unwrap_or_else(|| panic!("live coding model-call lifecycle was missing"));
-    require(
-        calls.reserved_calls == 8
-            && calls.settled_calls == 8
-            && calls.unknown_calls == 0
-            && calls.active_call.is_none(),
-        "live coding model-call lifecycle was not exactly 8/8/0",
+    assert_eq!(
+        (
+            calls.reserved_calls,
+            calls.settled_calls,
+            calls.unknown_calls,
+            calls.active_call.is_none(),
+        ),
+        (8, 8, 0, true),
+        "live coding model-call lifecycle was not exactly 8/8/0 with no active call",
     );
     require(
         snapshot.state.steps.len() == 7
