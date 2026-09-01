@@ -1157,10 +1157,20 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 License: Apache License 2.0
 
 Used by:
+- windows-collections 0.3.2 (https://github.com/microsoft/windows-rs)
+- windows-core 0.62.2 (https://github.com/microsoft/windows-rs)
+- windows-future 0.3.2 (https://github.com/microsoft/windows-rs)
+- windows-implement 0.60.2 (https://github.com/microsoft/windows-rs)
+- windows-interface 0.59.3 (https://github.com/microsoft/windows-rs)
 - windows-link 0.2.1 (https://github.com/microsoft/windows-rs)
+- windows-numerics 0.3.1 (https://github.com/microsoft/windows-rs)
+- windows-result 0.4.1 (https://github.com/microsoft/windows-rs)
+- windows-strings 0.5.1 (https://github.com/microsoft/windows-rs)
 - windows-sys 0.52.0 (https://github.com/microsoft/windows-rs)
 - windows-sys 0.61.2 (https://github.com/microsoft/windows-rs)
 - windows-targets 0.52.6 (https://github.com/microsoft/windows-rs)
+- windows-threading 0.2.1 (https://github.com/microsoft/windows-rs)
+- windows 0.62.2 (https://github.com/microsoft/windows-rs)
 - windows_x86_64_msvc 0.52.6 (https://github.com/microsoft/windows-rs)
 
                                  Apache License
@@ -3290,6 +3300,7 @@ Used by:
 - httparse 1.10.1 (https://github.com/seanmonstar/httparse)
 - idna 1.1.0 (https://github.com/servo/rust-url/)
 - idna_adapter 1.2.2 (https://github.com/hsivonen/idna_adapter)
+- indexmap 2.14.1 (https://github.com/indexmap-rs/indexmap)
 - io-extras 0.19.0 (https://github.com/sunfishcode/io-extras)
 - io-lifetimes 2.0.4 (https://github.com/sunfishcode/io-lifetimes)
 - io-lifetimes 3.0.1 (https://github.com/sunfishcode/io-lifetimes)
@@ -5112,6 +5123,7 @@ License: Apache License 2.0
 
 Used by:
 - xgeny-adapter-filesystem 0.1.0-rc.2 (https://github.com/PlateerLab/xgeny-cli)
+- xgeny-adapter-process 0.1.0-rc.2 (https://github.com/PlateerLab/xgeny-cli)
 - xgeny-adapter-reference 0.1.0-rc.2 (https://github.com/PlateerLab/xgeny-cli)
 - xgeny-domain 0.1.0-rc.2 (https://github.com/PlateerLab/xgeny-cli)
 - xgeny-local-store 0.1.0-rc.2 (https://github.com/PlateerLab/xgeny-cli)
@@ -5126,6 +5138,7 @@ Used by:
 - num-cmp 0.1.0 (https://github.com/lifthrasiir/num-cmp)
 - num-conv 0.2.2 (https://github.com/jhpratt/num-conv)
 - proc-macro2 1.0.107 (https://github.com/dtolnay/proc-macro2)
+- process-wrap 10.0.0 (https://github.com/watchexec/process-wrap)
 - quote 1.0.47 (https://github.com/dtolnay/quote)
 - ref-cast-impl 1.0.27 (https://github.com/dtolnay/ref-cast)
 - ref-cast 1.0.27 (https://github.com/dtolnay/ref-cast)
@@ -5897,6 +5910,40 @@ third-party/chromium/LICENSE.
 License: MIT License
 
 Used by:
+- cfg_aliases 0.2.2 (https://github.com/katharostech/cfg_aliases)
+
+# 3rd Party Notices
+
+The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::target_cfg!`] macro which is under the following license:
+
+[`tectonic_cfg_support::target_cfg!`]: https://github.com/tectonic-typesetting/tectonic/blob/f2439b936470ad27bdf92882064bc4702ee01899/cfg_support/src/lib.rs#L166
+
+    tectonic_cfg_support is licensed under the MIT License.
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the “Software”), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+---
+
+
+================================================================================
+License: MIT License
+
+Used by:
 - libsqlite3-sys 0.38.2 (https://github.com/rusqlite/rusqlite)
 - rusqlite 0.40.2 (https://github.com/rusqlite/rusqlite)
 
@@ -6054,6 +6101,23 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+
+================================================================================
+License: MIT License
+
+Used by:
+- cfg_aliases 0.2.2 (https://github.com/katharostech/cfg_aliases)
+
+MIT License
+
+Copyright (c) 2020 Katharos Technology
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
@@ -6241,6 +6305,35 @@ Used by:
 The MIT License (MIT)
 
 Copyright (c) 2015 Andrew Gallant
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+
+================================================================================
+License: MIT License
+
+Used by:
+- nix 0.31.3 (https://github.com/nix-rust/nix)
+
+The MIT License (MIT)
+
+Copyright (c) 2015 Carl Lerche + nix-rust Authors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

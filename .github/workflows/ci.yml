@@ -109,6 +109,9 @@ jobs:
       - name: Lint platform-specific filesystem adapter
         run: cargo clippy --locked -p xgeny-adapter-filesystem --all-targets -- -D warnings
 
+      - name: Lint platform-specific process adapter
+        run: cargo clippy --locked -p xgeny-adapter-process --all-targets -- -D warnings
+
       - name: Check bundled protocol
         run: cargo run --locked --quiet -p xgeny-cli -- protocol check
 
