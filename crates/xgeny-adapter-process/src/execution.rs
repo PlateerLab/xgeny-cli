@@ -595,6 +595,7 @@ mod tests {
         let fixture = Fixture::new();
         let nested = fixture.directory.path().join("nested");
         fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("cwd-marker"), b"expected cwd").unwrap();
         let mut arguments = fixture.arguments(Some("print-context"), MAX_CAPTURE_BYTES, 5_000);
         arguments["cwd"] = Value::String("nested".to_owned());
         arguments["env"]["XGENY_PROCESS_TEST_VALUE"] = Value::String("EXPLICIT-VALUE".to_owned());
@@ -603,7 +604,7 @@ mod tests {
         let stdout = output["stdout"].as_str().unwrap();
         assert_eq!(output["success"], true);
         assert!(stdout.contains("EXPLICIT-VALUE"));
-        assert!(stdout.contains(&nested.to_string_lossy().into_owned()));
+        assert!(stdout.contains("cwd-marker=true"));
     }
 
     #[cfg(unix)]
@@ -684,8 +685,8 @@ mod tests {
             }
             "print-context" => {
                 println!(
-                    "cwd={} env={}",
-                    std::env::current_dir().unwrap().display(),
+                    "cwd-marker={} env={}",
+                    std::path::Path::new("cwd-marker").is_file(),
                     std::env::var("XGENY_PROCESS_TEST_VALUE").unwrap()
                 );
             }
