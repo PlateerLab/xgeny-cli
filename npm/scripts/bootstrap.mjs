@@ -15,7 +15,7 @@ import path from 'node:path';
 import {
   distributionMetadata,
   nodeEngine,
-  npmCommand,
+  npmInvocation,
   repoRoot,
   repositoryUrl,
 } from './config.mjs';
@@ -72,13 +72,23 @@ async function pack(outputDirectory, name, specification, outputName) {
       'utf8',
     );
     await copyFile(path.join(repoRoot, 'LICENSE'), path.join(stage, 'LICENSE'));
+    const npm = npmInvocation([
+      'pack',
+      stage,
+      '--json',
+      '--ignore-scripts',
+      '--pack-destination',
+      packed,
+    ]);
     const result = spawnSync(
-      npmCommand(),
-      ['pack', stage, '--json', '--ignore-scripts', '--pack-destination', packed],
+      npm.command,
+      npm.args,
       { encoding: 'utf8', env: { ...process.env, npm_config_audit: 'false', npm_config_fund: 'false' } },
     );
     if (result.status !== 0) {
-      throw new Error(`npm pack failed: ${result.stderr.trim() || 'no diagnostic'}`);
+      throw new Error(
+        `npm pack failed: ${result.stderr?.trim() || result.error?.message || 'no diagnostic'}`,
+      );
     }
     const [report] = JSON.parse(result.stdout);
     assert.equal(report.id, `${name}@${bootstrapVersion}`);

@@ -7,7 +7,7 @@ import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 
-import { npmCommand } from './config.mjs';
+import { npmInvocation } from './config.mjs';
 import { verifyRelease } from './verify-release.mjs';
 
 function parseArguments(argv) {
@@ -23,7 +23,8 @@ function parseArguments(argv) {
 }
 
 async function run(arguments_, { allow404 = false } = {}) {
-  const child = spawn(npmCommand(), arguments_, {
+  const npm = npmInvocation(arguments_);
+  const child = spawn(npm.command, npm.args, {
     shell: false,
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,

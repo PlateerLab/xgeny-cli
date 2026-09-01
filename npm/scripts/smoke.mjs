@@ -16,7 +16,7 @@ import { once } from 'node:events';
 
 import {
   distributionMetadata,
-  npmCommand,
+  npmInvocation,
   platformPackageJson,
 } from './config.mjs';
 
@@ -178,31 +178,25 @@ async function main() {
       npm_config_fund: 'false',
       npm_config_update_notifier: 'false',
     };
-    await run(
-      npmCommand(),
-      [
-        'install',
-        '--global',
-        '--prefix',
-        installRoot,
-        '--ignore-scripts',
-        '--no-audit',
-        '--no-fund',
-        '--loglevel=error',
-        `${launcher.name}@${version}`,
-      ],
-      { env: npmEnvironment },
-    );
+    const install = npmInvocation([
+      'install',
+      '--global',
+      '--prefix',
+      installRoot,
+      '--ignore-scripts',
+      '--no-audit',
+      '--no-fund',
+      '--loglevel=error',
+      `${launcher.name}@${version}`,
+    ]);
+    await run(install.command, install.args, { env: npmEnvironment });
     server.close();
     await once(server, 'close');
     server = null;
 
     assert.deepEqual(new Set(requestedTarballs), new Set([launcher.name, specification.packageName]));
-    const rootResult = await run(
-      npmCommand(),
-      ['root', '--global', '--prefix', installRoot],
-      { env: npmEnvironment },
-    );
+    const root = npmInvocation(['root', '--global', '--prefix', installRoot]);
+    const rootResult = await run(root.command, root.args, { env: npmEnvironment });
     const globalRoot = rootResult.stdout.trim();
     const installedLauncher = path.join(globalRoot, '@xgen', 'cli', 'package.json');
     const launcherEntry = await lstat(installedLauncher);

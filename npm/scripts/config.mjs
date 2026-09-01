@@ -62,6 +62,27 @@ export function platformPackageJson(specification, version) {
   };
 }
 
-export function npmCommand() {
-  return process.platform === 'win32' ? 'npm.cmd' : 'npm';
+export function npmInvocation(
+  arguments_,
+  {
+    platform = process.platform,
+    nodeExecutable = process.execPath,
+    npmExecPath = process.env.npm_execpath,
+  } = {},
+) {
+  assert(Array.isArray(arguments_), 'npm arguments must be an array');
+  if (npmExecPath) {
+    return { command: nodeExecutable, args: [npmExecPath, ...arguments_] };
+  }
+  if (platform === 'win32') {
+    const npmCli = path.win32.join(
+      path.win32.dirname(nodeExecutable),
+      'node_modules',
+      'npm',
+      'bin',
+      'npm-cli.js',
+    );
+    return { command: nodeExecutable, args: [npmCli, ...arguments_] };
+  }
+  return { command: 'npm', args: [...arguments_] };
 }

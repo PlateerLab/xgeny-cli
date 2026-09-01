@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import {
   distributionMetadata,
   launcherRoot,
-  npmCommand,
+  npmInvocation,
   platformPackageJson,
   repoRoot,
 } from './config.mjs';
@@ -102,9 +102,18 @@ export function normalizeDryRunReport(parsed) {
 }
 
 async function dryRun(tarball, distTag) {
+  const npm = npmInvocation([
+    'publish',
+    '--dry-run',
+    '--ignore-scripts',
+    '--tag',
+    distTag,
+    '--json',
+    tarball,
+  ]);
   const result = await run(
-    npmCommand(),
-    ['publish', '--dry-run', '--ignore-scripts', '--tag', distTag, '--json', tarball],
+    npm.command,
+    npm.args,
     { env: { ...process.env, npm_config_audit: 'false', npm_config_fund: 'false' } },
   );
   return normalizeDryRunReport(JSON.parse(result.stdout.toString('utf8')));

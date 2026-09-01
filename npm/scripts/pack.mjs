@@ -18,7 +18,7 @@ import path from 'node:path';
 import {
   distributionMetadata,
   launcherRoot,
-  npmCommand,
+  npmInvocation,
   platformPackageJson,
   repoRoot,
 } from './config.mjs';
@@ -115,13 +115,23 @@ async function main() {
       await stagePlatform(stage, specification, version, path.resolve(options.binary));
     }
 
+    const npm = npmInvocation([
+      'pack',
+      stage,
+      '--json',
+      '--ignore-scripts',
+      '--pack-destination',
+      packed,
+    ]);
     const result = spawnSync(
-      npmCommand(),
-      ['pack', stage, '--json', '--ignore-scripts', '--pack-destination', packed],
+      npm.command,
+      npm.args,
       { encoding: 'utf8', env: { ...process.env, npm_config_audit: 'false', npm_config_fund: 'false' } },
     );
     if (result.status !== 0) {
-      throw new Error(`npm pack failed: ${result.stderr.trim() || 'no diagnostic'}`);
+      throw new Error(
+        `npm pack failed: ${result.stderr?.trim() || result.error?.message || 'no diagnostic'}`,
+      );
     }
     const reports = JSON.parse(result.stdout);
     assert.equal(reports.length, 1, 'npm pack must produce one package');
