@@ -51,7 +51,27 @@ node npm/scripts/bootstrap.mjs --output-dir "$bootstrap_dir"
    - repository: `xgeny-cli`
    - workflow filename: `release.yml`
    - environment: 사용하지 않음
-7. Package settings에서 write token을 추가하지 않았는지 확인하고 bootstrap version을 deprecated 처리한다.
+   - allowed actions: `npm publish`만 선택하고 `npm stage publish`는 선택하지 않음
+   2026-05-20 이후 생성하는 Trusted Publisher는 allowed action을 하나 이상 명시해야 한다. 현재 release
+   workflow는 직접 `npm publish`를 호출하므로 여섯 package 모두 위 선택이 같아야 한다.
+
+   npm CLI 11.5.1 이상을 쓰면 npmjs.com의 동일 설정을 아래처럼 적용하고 즉시 다시 읽어 확인할 수 있다.
+   이전 CLI를 유지해야 하면 package settings 화면에서 같은 값을 직접 설정한다.
+
+```bash
+trusted_packages='@xgen/cli-linux-x64-musl @xgen/cli-linux-arm64-musl @xgen/cli-darwin-x64 @xgen/cli-darwin-arm64 @xgen/cli-win32-x64 @xgen/cli'
+for package in $trusted_packages; do
+  npm trust github "$package" \
+    --repository PlateerLab/xgeny-cli \
+    --file release.yml \
+    --allow-publish
+  npm trust list "$package" --json
+done
+```
+
+7. Package settings의 Publishing access를 `Require two-factor authentication and disallow tokens`로
+   설정하고 write token을 추가하지 않았는지 확인한 뒤 bootstrap version을 deprecated 처리한다.
+   이 설정은 GitHub OIDC Trusted Publisher를 막지 않는다.
    Package 자체는 unpublish하지 않는다.
 8. GitHub repository variable `XGENY_NPM_PUBLISH_ENABLED=true`를 설정한다. 이 값은 여섯 package의
    소유권과 Trusted Publisher 설정을 사람이 확인했다는 fail-closed acknowledgement다.

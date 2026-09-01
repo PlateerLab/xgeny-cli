@@ -54,7 +54,8 @@ OIDC를 사용한다. 이 job만 `id-token: write`를 가지며 npm password나 
 
 npm은 아직 존재하지 않는 package에 Trusted Publisher를 미리 연결할 수 없다. 그래서 실행 파일이 없는
 `0.0.0-bootstrap.0` tarball 여섯 개를 사람이 검토한 뒤 npm 2FA로 한 번 게시한다. 그 다음 각 package의
-Trusted Publisher를 repository `PlateerLab/xgeny-cli`, workflow `release.yml`에 연결하고
+Trusted Publisher를 repository `PlateerLab/xgeny-cli`, workflow `release.yml`, environment 없음,
+allowed action `npm publish`에 연결한다. Publishing access는 2FA를 요구하고 token publish를 금지한 뒤
 `XGENY_NPM_PUBLISH_ENABLED=true`를 설정한다. Scope 또는 package 소유권을 확인할 수 없으면 release하지
 않고 package 이름 계약부터 다시 결정한다.
 

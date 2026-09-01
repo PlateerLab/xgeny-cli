@@ -31,8 +31,10 @@ binary를 감싸는 선택형 설치 채널이며 제품 runtime을 다시 구�
   `XGENY_RELEASE_RULESET_NO_BYPASS=true`를 설정한다. Read-only ruleset API는 bypass 목록을 숨길 수 있다.
 - npm의 `@xgen` scope에 여섯 package를 게시할 권한, 계정 2FA와 recovery 수단을 확인한다. 실행 파일이
   없는 bootstrap version을 먼저 게시한 뒤 각 package의 Trusted Publisher를 repository
-  `PlateerLab/xgeny-cli`, workflow `release.yml`로 설정한다. 장기 npm token은 만들거나 GitHub secret에
-  저장하지 않는다. 전체 절차는 [npm 배포와 Trusted Publishing](npm-distribution.md)을 따른다.
+  `PlateerLab/xgeny-cli`, workflow `release.yml`, environment 없음, allowed action `npm publish`로 설정한다.
+  Publishing access는 `Require two-factor authentication and disallow tokens`로 제한한다. 장기 npm
+  token은 만들거나 GitHub secret에 저장하지 않는다. 전체 절차는
+  [npm 배포와 Trusted Publishing](npm-distribution.md)을 따른다.
 - 여섯 package의 Trusted Publisher 설정을 확인한 뒤 repository variable
   `XGENY_NPM_PUBLISH_ENABLED=true`를 둔다. 값이 없거나 exact `true`가 아니면 native build 전에 release가
   fail-closed한다.
