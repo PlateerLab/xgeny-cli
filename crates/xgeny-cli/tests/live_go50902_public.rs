@@ -630,7 +630,7 @@ fn public_cli_qwen_edits_fixes_and_reverifies_rust_project() {
         "Complete this controlled Rust coding task using exactly seven tool Steps in this order. (1) Call xgeny.fs/search-text from '.' with the literal query '{locator}' to locate the source. (2) Call xgeny.fs/read-text on that matching source file. Do not list or read tests and do not guess their expectation. (3) Call xgeny.fs/apply-patch with the read digest to change only the returned value 40 to the deliberately incomplete value 41. (4) Call xgeny.process/execute with executable 'cargo', args [\"test\",\"--offline\"], cwd '.', empty env, timeoutMs 120000, and maxOutputBytes 32768. This test must be allowed to fail and its exact durable output is the only authority for the next correction. (5) After observing that failure, call xgeny.fs/apply-patch with the current digest to change only 41 to the value required by the failed assertion. (6) Call the same cargo test command again and require success=true. (7) Call xgeny.process/execute with executable 'cargo', args [\"build\",\"--offline\"], cwd '.', empty env, timeoutMs 120000, and maxOutputBytes 32768 and require success=true. Only after all seven Steps finish in that order, return exactly '{CODING_COMPLETION}' as the summary, with no prefix, suffix, Markdown, quotation marks, or explanation."
     );
     require(
-        !goal.contains("42") && !goal.contains("acceptance.rs"),
+        !coding_goal_discloses_acceptance(&goal, &locator),
         "live coding goal must not reveal the acceptance value or test path",
     );
     let executable_spec = format!("cargo={}", path_text(&cargo_path));
@@ -1398,6 +1398,28 @@ fn coding_rejection_progress_message(snapshot: &xgeny_local_store::RunSnapshot) 
         })
         .collect::<Vec<_>>();
     coding_rejection_progress_for(&completed)
+}
+
+fn coding_goal_discloses_acceptance(goal: &str, locator: &str) -> bool {
+    let without_locator = goal.replace(locator, "<locator>");
+    without_locator.contains("42") || without_locator.contains("acceptance.rs")
+}
+
+#[test]
+fn coding_goal_acceptance_check_ignores_random_locator_content_only() {
+    let locator = "XGENY_RC3_CODING_TARGET_42abcdef";
+    assert!(!coding_goal_discloses_acceptance(
+        &format!("search for '{locator}', then fix from durable test output"),
+        locator,
+    ));
+    assert!(coding_goal_discloses_acceptance(
+        &format!("search for '{locator}', then change the value to 42"),
+        locator,
+    ));
+    assert!(coding_goal_discloses_acceptance(
+        &format!("search for '{locator}', then read acceptance.rs"),
+        locator,
+    ));
 }
 
 fn coding_rejection_progress_for(completed: &[&str]) -> &'static str {
