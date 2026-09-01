@@ -97,8 +97,10 @@ Publish 이전에는 다음을 다시 확인한다.
 10. 최종 asset allow-list, `sha256sum -c`, 조립된 Linux fixture installer smoke와 GitHub artifact attestation
 11. GitHub 게시 뒤 npm OIDC Trusted Publishing으로 platform package 다섯 개와 launcher 순차 게시,
     provenance·SRI·dist-tag 검증
-12. 게시 뒤 다섯 target에서 GitHub public exact-tag 및 exact npm version 설치, stable release의
-    `releases/latest/download` bootstrap과 내부 `latest` 해석, state 미생성
+12. 게시 뒤 다섯 target에서 GitHub public exact-tag 및 exact npm version 설치, 대화형 `/status`/`/exit`,
+    동일 version 재설치·제거, stable release의 `releases/latest/download` bootstrap과 내부 `latest`
+    해석
+13. 게시된 artifact만 사용한 Rust/Node.js/Python 제한 파일럿과 비민감 집계 결과 검토
 
 Read-only assemble job은 검증된 target artifact와 installer·고지를 조립하고 checksum을 확인한 뒤
 하나의 allow-listed bundle로 전달한다. Checkout이나 repository script를 실행하지 않는 publish job은

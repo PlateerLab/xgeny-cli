@@ -132,6 +132,9 @@ jobs:
           sh scripts/check-release-workflow.sh
           sh scripts/check-npm-distribution-workflow.sh
 
+      - name: Check RC3 public documentation
+        run: sh scripts/check-rc3-public-docs.sh
+
   build:
     name: Build / ${{ matrix.target }}
     needs: quality
