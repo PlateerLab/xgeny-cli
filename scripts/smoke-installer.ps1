@@ -10,7 +10,6 @@ $ErrorActionPreference = "Stop"
 $SemVerTagPattern = '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?$'
 
 function Invoke-InteractiveSmoke([string]$Executable) {
-    $Encoding = [System.Text.UTF8Encoding]::new($false)
     $StartInfo = [System.Diagnostics.ProcessStartInfo]::new()
     $StartInfo.FileName = $Executable
     $StartInfo.UseShellExecute = $false
@@ -18,9 +17,6 @@ function Invoke-InteractiveSmoke([string]$Executable) {
     $StartInfo.RedirectStandardInput = $true
     $StartInfo.RedirectStandardOutput = $true
     $StartInfo.RedirectStandardError = $true
-    $StartInfo.StandardInputEncoding = $Encoding
-    $StartInfo.StandardOutputEncoding = $Encoding
-    $StartInfo.StandardErrorEncoding = $Encoding
 
     $Process = [System.Diagnostics.Process]::new()
     $Process.StartInfo = $StartInfo
