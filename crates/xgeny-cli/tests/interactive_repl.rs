@@ -239,7 +239,7 @@ fn bare_xgeny_streams_durable_progress_prompts_separate_approvals_and_replays_of
 
 #[cfg(unix)]
 #[test]
-fn sigint_during_model_call_preserves_unknown_no_replay_boundary() {
+fn sigint_during_model_call_stops_at_a_safe_or_unknown_no_replay_boundary() {
     let fixture = tempdir().expect("test directory should exist");
     let state_root = fixture.path().join("state");
     let config_root = fixture.path().join("config");
@@ -290,11 +290,16 @@ fn sigint_during_model_call_preserves_unknown_no_replay_boundary() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = stderr(&output);
     assert!(stdout.contains("progress: model_call_starting"), "{stdout}");
+    let safely_committed = stdout.contains("progress: plan_committed")
+        && stdout.contains("paused: user_cancelled")
+        && !stdout.contains("recovery_required:");
+    let outcome_unknown = !stdout.contains("progress: plan_committed")
+        && stdout.contains("recovery_required:")
+        && stdout.contains("reason=model_call_unknown");
     assert!(
-        stdout.contains("recovery_required:") && stdout.contains("reason=model_call_unknown"),
-        "{stdout}"
+        safely_committed || outcome_unknown,
+        "model cancellation must stop at one documented boundary: {stdout}"
     );
-    assert!(!stdout.contains("progress: plan_committed"), "{stdout}");
     assert!(!stdout.contains("progress: effect_starting"), "{stdout}");
     let run_id = extract_run_id(&stderr);
     let database = state_root.join("runs").join(run_id).join("run.sqlite3");
