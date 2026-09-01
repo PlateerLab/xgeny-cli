@@ -9,6 +9,41 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $SemVerTagPattern = '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?$'
 
+function Invoke-InteractiveSmoke([string]$Executable) {
+    $Encoding = [System.Text.UTF8Encoding]::new($false)
+    $StartInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $StartInfo.FileName = $Executable
+    $StartInfo.UseShellExecute = $false
+    $StartInfo.CreateNoWindow = $true
+    $StartInfo.RedirectStandardInput = $true
+    $StartInfo.RedirectStandardOutput = $true
+    $StartInfo.RedirectStandardError = $true
+    $StartInfo.StandardInputEncoding = $Encoding
+    $StartInfo.StandardOutputEncoding = $Encoding
+    $StartInfo.StandardErrorEncoding = $Encoding
+
+    $Process = [System.Diagnostics.Process]::new()
+    $Process.StartInfo = $StartInfo
+    try {
+        if (-not $Process.Start()) {
+            throw "failed to start installed binary"
+        }
+        $Process.StandardInput.WriteLine("/status")
+        $Process.StandardInput.WriteLine("/exit")
+        $Process.StandardInput.Close()
+        $StandardOutputTask = $Process.StandardOutput.ReadToEndAsync()
+        $StandardErrorTask = $Process.StandardError.ReadToEndAsync()
+        $Process.WaitForExit()
+        return [PSCustomObject]@{
+            ExitCode = $Process.ExitCode
+            StandardOutput = $StandardOutputTask.GetAwaiter().GetResult()
+            StandardError = $StandardErrorTask.GetAwaiter().GetResult()
+        }
+    } finally {
+        $Process.Dispose()
+    }
+}
+
 $Binary = (Resolve-Path -LiteralPath $Binary).Path
 $Installer = (Resolve-Path -LiteralPath $Installer).Path
 $ReportedVersion = (& $Binary --version | Out-String).Trim()
@@ -161,12 +196,12 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "installed protocol check failed"
     }
-    $InteractiveOutput = (@("/status", "/exit") | & $Installed | Out-String)
+    $InteractiveResult = Invoke-InteractiveSmoke $Installed
     if (
-        $LASTEXITCODE -ne 0 -or
-        -not $InteractiveOutput.Contains("XGENy Developer Preview") -or
-        -not $InteractiveOutput.Contains("status: idle") -or
-        -not $InteractiveOutput.Contains("bye")
+        $InteractiveResult.ExitCode -ne 0 -or
+        -not $InteractiveResult.StandardOutput.Contains("XGENy Developer Preview") -or
+        -not $InteractiveResult.StandardOutput.Contains("status: idle") -or
+        -not $InteractiveResult.StandardOutput.Contains("bye")
     ) {
         throw "installed interactive smoke failed"
     }
