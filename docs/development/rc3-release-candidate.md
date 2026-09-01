@@ -88,6 +88,11 @@ GitHub PR에서는 Quality/Linux와 Linux x86-64/ARM64, macOS Intel/Apple Silico
 clippy, protocol check, native dependency audit, release binary staging, installer smoke와 npm pack/global
 install smoke를 수행한다.
 
+실제 게시물의 Rust/Node.js/Python 제한 사용자 검증은
+[RC3 Developer Preview 파일럿](rc3-developer-preview-pilot.md)의 사전 고정 matrix, 개인정보 경계와
+합격 조건을 따른다. 파일럿 중 prompt, source, endpoint, credential과 원문 tool/model output은 결과
+기록에 남기지 않는다.
+
 ## 알려진 한계
 
 - `process.execute`는 command injection을 줄이는 capability boundary이지 OS sandbox가 아니다. 허용한

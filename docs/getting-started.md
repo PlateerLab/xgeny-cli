@@ -9,6 +9,25 @@ Node.js, SQLite 실행 파일, Docker 또는 XGENy state용 별도 daemon이 필
 launcher용 Node.js 22.14 이상이 필요하다. 사용할 model endpoint 자체는 로컬 또는 원격에 별도로 실행
 중이어야 한다.
 
+## 5분 빠른 시작
+
+먼저 사용할 OpenAI-compatible endpoint URL, served model ID와 필요한 경우 API key를 준비한다. Node.js
+22.14 이상이 있는 지원 OS에서는 아래 순서가 가장 짧다.
+
+```bash
+npm install --global --include=optional @xgen/cli@0.1.0-rc.3
+xgeny --version
+xgeny model setup
+xgeny model check --compatibility
+cd my-project
+xgeny
+```
+
+대화형 화면에서 `/status`로 선택 model과 idle 상태를 확인하고, 작은 읽기 전용 작업으로 첫 승인을
+확인한 뒤 `/exit`으로 종료한다. Model egress와 file read는 서로 다른 승인이다. Node.js를 설치하지
+않으려면 아래 checksum installer를 사용한 뒤 `xgeny model setup`부터 같은 순서로 진행한다. API key를
+명령행 인자, shell history 또는 일반 설정 파일에 넣지 않는다.
+
 ## 게시 target과 CI 검증 OS
 
 | CI runner OS | Architecture | Release asset |
@@ -325,9 +344,54 @@ RC3는 workspace discovery, bounded atomic text write/patch와 명시적 shell-f
 [Workspace filesystem discovery](development/workspace-filesystem-discovery.md), write 경계는
 [Workspace atomic write](development/workspace-atomic-write.md)를 따른다.
 
+## 업데이트와 RC2 rollback
+
+npm 설치본은 새 exact version을 다시 설치해 업데이트한다. `next`는 시간이 지나면 다른 prerelease를
+가리킬 수 있으므로 파일럿과 장애 재현에는 사용하지 않는다.
+
+```bash
+npm install --global --include=optional @xgen/cli@0.1.0-rc.3
+xgeny --version
+```
+
+Native 설치본은 위 installer를 같은 install directory에 exact tag로 다시 실행한다. Installer는 새
+binary의 checksum, version과 protocol을 먼저 확인하고 성공한 파일만 같은 directory rename으로 교체한다.
+실행 중인 `xgeny`를 교체하지 말고 모든 session을 종료한 뒤 업데이트한다.
+
+RC3 npm package만 문제가 있고 같은 RC3 GitHub Release가 정상이라면 npm 설치본을 제거하고 exact RC3
+native installer로 전환할 수 있다. 두 채널은 같은 release binary를 담으므로 이는 제품 version
+rollback이 아니라 설치 채널 전환이다.
+
+제품 version을 RC2로 되돌려야 하면 기존 RC3 binary와 state를 지우거나 덮어쓰지 말고 RC2를 별도
+user-owned directory에 설치한다. RC3가 만든 Run을 RC2로 열거나 resume하는 것은 지원하지 않는다.
+RC2에서 시작해 아직 model egress가 필요한 Run은 원래 RC2 binary로 마치고, 새 작업은 RC3에서 새 Run으로
+시작한다. 완료된 RC2 Run은 RC3에서 offline replay할 수 있다.
+
+```bash
+rollback_dir="$HOME/.local/xgeny-rc2/bin"
+installer=$(mktemp "${TMPDIR:-/tmp}/xgeny-installer.XXXXXX")
+curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 \
+  --connect-timeout 15 --max-time 60 --max-filesize 1048576 -fsSLo "$installer" \
+  https://github.com/PlateerLab/xgeny-cli/releases/download/v0.1.0-rc.2/xgeny-installer.sh
+sh "$installer" --version v0.1.0-rc.2 --install-dir "$rollback_dir"
+rm -f "$installer"
+"$rollback_dir/xgeny" --version
+```
+
+Immutable GitHub Release나 npm version에 치명적 문제가 있으면 기존 tag나 package를 이동·교체·재사용하지
+않는다. 수정은 더 높은 새 version으로 게시하고, 영향을 받은 exact version과 우회 방법을 release note에
+남긴다.
+
 ## 삭제
 
-Installer는 runtime state를 삭제하지 않는다. Binary만 제거하려면 설치한 exact regular file을 지운다.
+npm 설치본은 launcher와 현재 platform package를 함께 제거한다.
+
+```bash
+npm uninstall --global @xgen/cli
+```
+
+Native installer는 runtime state를 삭제하지 않는다. Binary만 제거하려면 설치한 exact regular file을
+지운다.
 
 ```bash
 rm "$HOME/.local/bin/xgeny"
@@ -340,3 +404,34 @@ Remove-Item -LiteralPath "$env:LOCALAPPDATA\XGENy\bin\xgeny.exe"
 Run state는 별도로 보존된다. Linux는 `$XDG_STATE_HOME/xgeny` 또는 `$HOME/.local/state/xgeny`,
 macOS는 `$HOME/Library/Application Support/XGENy`, Windows는 `%LOCALAPPDATA%\XGENy`를 사용한다.
 State 삭제는 Run 기록과 durable recovery 정보를 잃으므로 uninstall에 자동 포함하지 않는다.
+
+## 문제 해결과 지원 정보
+
+| 증상 | 확인과 조치 |
+| --- | --- |
+| `xgeny: command not found` | npm global bin 또는 native install directory가 현재 `PATH`에 있는지 확인하고 새 terminal에서 다시 실행한다. |
+| `unsupported_platform` 또는 platform package 없음 | 지원 OS/architecture와 Node.js version을 확인하고 `--omit=optional` 없이 exact package를 재설치한다. |
+| Installer가 destination을 거부 | 관리자 공용 경로 대신 user-owned directory를 사용하고 symbolic link/reparse point나 broadly writable directory를 제거하지 말고 다른 빈 경로를 선택한다. |
+| PowerShell에서 installer 차단 | Script를 먼저 검토한다. 현재 process 한정 execution-policy 예외는 조직 정책이 허용할 때만 사용한다. SmartScreen 경고는 RC3에 Authenticode가 없기 때문이다. |
+| `credential_store_unavailable` | 평문 저장 fallback은 없다. Secret manager 출력을 `--token-stdin`이나 현재 process의 `XGENY_OPENAI_API_KEY`로 전달한다. |
+| `model_not_advertised` 또는 compatibility 실패 | URL이 `/v1`로 끝나는지, exact served model ID와 strict JSON Schema Chat Completions 지원을 확인한다. Redirect나 자동 retry에 의존하지 않는다. |
+| `configuration_mismatch` | 원래 workspace, file/directory scope, executable와 model profile binding으로 resume한다. 자동 대체하지 말고 필요하면 새 Run을 시작한다. |
+| `model_call_unknown` 또는 `effect_outcome_unknown` | 불확정 작업을 자동 반복하지 않는다. `/status`와 `/resume`의 고정 진단을 확인하고 외부 상태를 별도로 검증한다. |
+
+지원 요청에는 `xgeny --version`, OS/architecture, 설치 채널, 종료 코드와 고정된 오류 코드만 우선 제공한다.
+API key, endpoint 전체 URL, prompt, model 원문 응답, source, process stdout/stderr, state DB와 Run ID는 공개
+issue에 첨부하지 않는다. 일반 버그는
+[GitHub Issues](https://github.com/PlateerLab/xgeny-cli/issues), 보안 취약점은 공개 issue가 아닌
+[비공개 취약점 신고](https://github.com/PlateerLab/xgeny-cli/security/advisories/new)를 사용한다. 재현용
+project는 민감정보가 없는 최소 fixture로 새로 만든다. 세부 범위는 [보안 정책](../SECURITY.md)을 따른다.
+
+## 보안 경계
+
+- XGENy는 model egress, read, write와 execute를 독립적으로 승인한다. 한 승인이 다른 권한을 포함하지 않는다.
+- `process.execute`는 shell injection을 줄이지만 OS sandbox가 아니다. 허용한 compiler, package manager와
+  child process는 현재 사용자 권한으로 project code를 실행한다.
+- Run state에는 goal과 bounded tool output이 포함될 수 있으므로 state root 전체를 민감 데이터로 취급한다.
+- SQLite는 binary에 내장된 local library다. SQLite server나 별도 database 설치가 필요하지 않다.
+- 전송 여부가 불확정한 model/effect는 Unknown으로 보존하며 자동 replay하지 않는다.
+- macOS/Windows RC3 binary에는 OS code signing/notarization이 없다. Checksum과 GitHub attestation은
+  전송 무결성과 build provenance를 확인하지만 OS publisher 서명을 대신하지 않는다.

@@ -4,6 +4,10 @@
 사용자는 Node.js가 필요 없고, npm 경로를 고른 사용자는 Node.js 22.14 이상이 필요하다. 두 경로는 같은
 release binary를 실행한다.
 
+이 package 이름은 설치 entrypoint를 뜻하며 화면 구현을 뜻하지 않는다. 현재 가벼운 REPL이나 향후 같은
+`xgeny` binary에 포함될 TUI는 동일한 `@xgen/cli`로 배포할 수 있다. TUI를 별도 제품·release cadence로
+분리할 때만 별도 package naming ADR을 먼저 작성한다.
+
 ## Package 구성
 
 | Package | 대상 |
@@ -96,7 +100,8 @@ npm test --prefix npm
 sh scripts/check-npm-distribution-workflow.sh
 ```
 
-각 platform CI는 release binary를 platform tarball에 넣고 loopback registry에서 `npm install -g`를
-수행한다. Release assemble은 여섯 tarball의 file allow-list, 고지와 raw binary byte parity를 확인한다.
+각 platform CI는 release binary를 platform tarball에 넣고 loopback registry에서 `npm install -g`,
+대화형 `/status`/`/exit`, 동일 version 재설치와 `npm uninstall -g`를 수행한다. Release assemble은 여섯
+tarball의 file allow-list, 고지와 raw binary byte parity를 확인한다.
 로컬이나 PR에서는 실제 npm publish, package bootstrap, Trusted Publisher 변경과 release tag 생성을
 수행하지 않는다.

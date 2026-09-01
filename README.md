@@ -85,7 +85,8 @@ Process는 shell 없이 실행되지만 별도 `--allow-execute` 전에는
 code를 실행하므로 이는 sandbox가 아니다. 승인·재개 예시는 [시작하기](docs/getting-started.md)를 따른다.
 
 RC3의 포함 범위와 알려진 한계는 [Developer Preview RC3 후보](docs/development/rc3-release-candidate.md)에
-정리되어 있다.
+정리되어 있다. 일반 문제는 GitHub Issues, 민감한 취약점은 [보안 정책](SECURITY.md)의 비공개 신고
+경로를 사용한다.
 
 대화형 모드는 현재 디렉터리 전체를 workspace catalog로 열되 실제 read/write/execute와 model egress를
 각각 별도로 승인한다. `/model`, `/status`, `/permissions`, `/resume`, `/clear`, `/exit`을 지원하며 줄 끝
@@ -168,7 +169,8 @@ cargo run --locked --quiet -p xgeny-cli -- protocol check
 상세한 로컬·CI 검증 범위는 [Rust 워크스페이스 개발 환경](docs/development/rust-workspace.md)을 참고합니다. Router의 fail-closed filter, ranking과 권한 경계는 [결정론적 Capability Router 기본형](docs/development/deterministic-router.md), 재시작 전 실행 인자 경계는 [Recoverable Invocation Material 기본형](docs/development/recoverable-invocation-material.md), exact adapter 실행 경계는 [Direct Executor 기본형](docs/development/direct-executor.md), 검증과 Receipt 종결은 [Core Verification과 Execution Receipt 기본형](docs/development/execution-receipt.md), 장기 Run 검증 비용은 [Verified Run Index와 장기 Run 검증](docs/development/verified-run-index.md), dependency와 재개 순서는 [Persistent WorkGraph와 재개 frontier](docs/development/persistent-workgraph.md), 계획 수락·예산·재시작 계약은 [Durable Planner와 bounded AgentLoop](docs/development/durable-planner-loop.md), provider 호출 전 예약·불확정 복구 경계는 [Durable model-call lifecycle](docs/development/durable-model-call-lifecycle.md), 첫 실제 모델 연결은 [OpenAI-compatible Provider Adapter](docs/development/openai-compatible-provider.md), ReadOnly와 CLI 조합 기반은 [ReadOnly와 bounded CLI driver 기반](docs/development/read-only-driver-foundation.md), 제품 workspace read 경계는 [Capability-confined filesystem read adapter](docs/development/filesystem-read-adapter.md), 프로젝트 탐색과 dynamic material 재개는 [Workspace filesystem discovery](docs/development/workspace-filesystem-discovery.md), whole-file mutation은 [Workspace atomic write](docs/development/workspace-atomic-write.md), strict small edit는 [Workspace apply patch](docs/development/workspace-apply-patch.md), 공개 명령과 process 재개 절차는 [Public local run/resume prototype](docs/development/public-local-run-resume.md), 실제 OS I/O를 쓰는 비제품 기준은 [Preopened Reference Adapter Conformance](docs/development/reference-adapter-conformance.md), 기능 개발 순서와 테스트 계층·완료 기준은 [XGENy 개발 방법론과 테스트 전략](docs/development/engineering-method.md)을 따릅니다.
 
 Bare 명령의 입력, 승인, 진행 event와 Ctrl+C 의미는 [대화형 REPL](docs/development/interactive-repl.md)을
-따릅니다.
+따릅니다. 실제 게시물의 Rust/Node.js/Python 제한 검증 절차와 비민감 결과 형식은
+[RC3 Developer Preview 파일럿](docs/development/rc3-developer-preview-pilot.md)을 따릅니다.
 
 ## Research
 
