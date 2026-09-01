@@ -795,7 +795,7 @@ fn verify_receipt_provenance(intent: &EffectIntent) -> Result<(), DirectExecutor
         (provenance.profile_version.as_str(), intent.effect_class),
         (
             CORE_RECEIPT_PROFILE_V2,
-            xgeny_workgraph::EffectClass::ReadOnly
+            xgeny_workgraph::EffectClass::ReadOnly | xgeny_workgraph::EffectClass::Idempotent
         ) | (
             CORE_RECEIPT_PROFILE_V1,
             xgeny_workgraph::EffectClass::Reversible
@@ -806,14 +806,20 @@ fn verify_receipt_provenance(intent: &EffectIntent) -> Result<(), DirectExecutor
     if !profile_matches_effect {
         return Err(DirectExecutorError::UnsupportedReceiptProfile);
     }
-    let output_profile_matches_effect = match intent.effect_class {
-        xgeny_workgraph::EffectClass::ReadOnly => {
-            provenance.tool_output_profile.as_deref() == Some(TOOL_OUTPUT_PROFILE_V1)
-        }
-        xgeny_workgraph::EffectClass::Reversible
-        | xgeny_workgraph::EffectClass::Idempotent
-        | xgeny_workgraph::EffectClass::NonIdempotent => provenance.tool_output_profile.is_none(),
-    };
+    let output_profile_matches_effect =
+        match (intent.effect_class, provenance.profile_version.as_str()) {
+            (
+                xgeny_workgraph::EffectClass::ReadOnly | xgeny_workgraph::EffectClass::Idempotent,
+                CORE_RECEIPT_PROFILE_V2,
+            ) => provenance.tool_output_profile.as_deref() == Some(TOOL_OUTPUT_PROFILE_V1),
+            (
+                xgeny_workgraph::EffectClass::Reversible
+                | xgeny_workgraph::EffectClass::Idempotent
+                | xgeny_workgraph::EffectClass::NonIdempotent,
+                CORE_RECEIPT_PROFILE_V1,
+            ) => provenance.tool_output_profile.is_none(),
+            _ => false,
+        };
     if !output_profile_matches_effect {
         return Err(DirectExecutorError::UnsupportedToolOutputProfile);
     }

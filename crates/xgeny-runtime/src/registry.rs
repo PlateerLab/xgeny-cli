@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 use xgeny_domain::{
     API_VERSION_V1ALPHA1, CapabilityDefinitionBody, CapabilityInstanceBody, CapabilityRef,
-    ExecutionStyle,
+    EffectClass, ExecutionStyle,
 };
 
 /// Deterministic in-memory catalog of schema-conformant Capability documents.
@@ -153,6 +153,16 @@ fn validate_definition(definition: &CapabilityDefinitionBody) -> Result<(), Regi
             max_timeout_ms: execution.max_timeout_ms,
         });
     }
+    if execution.durable_tool_output
+        && !matches!(
+            definition.spec.effect.class,
+            EffectClass::ReadOnly | EffectClass::Idempotent
+        )
+    {
+        return Err(RegistryError::UnsupportedDurableToolOutputEffect {
+            capability_id: definition.metadata.id.clone(),
+        });
+    }
     Ok(())
 }
 
@@ -236,6 +246,10 @@ pub enum RegistryError {
         default_timeout_ms: u64,
         max_timeout_ms: u64,
     },
+    #[error(
+        "Capability Definition `{capability_id}` requests durable tool output for an unsupported effect class"
+    )]
+    UnsupportedDurableToolOutputEffect { capability_id: String },
     #[error(
         "Capability Definition `{capability_id}` contract version `{contract_version}` is already registered"
     )]

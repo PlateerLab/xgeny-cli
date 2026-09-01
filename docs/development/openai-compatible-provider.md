@@ -97,7 +97,7 @@ response를 출력하지 않는다.
 ADR-0022/0023에서 사용자용 `xgeny run/resume`, capability-confined filesystem read와 별도
 model-egress/read 동의가 이 adapter에 연결됐다. 기본 CI는 loopback provider를 사용해 첫 model Plan,
 별도 process의 local read, durable ToolOutput의 두 번째 model turn 전달과 offline completion replay를
-검증한다. 실제 go50902/Qwen을 이용한 같은 2-turn public CLI 증명, process/write/network Capability와
+검증한다. 실제 go50902/Qwen을 이용한 같은 2-turn public CLI 증명, process/patch/network Capability와
 XGEN Model Gateway는 별도 live/후속 slice다. 현재 rustls trust는 public web PKI 기준이므로 사내
 CA/custom trust root가 필요한 HTTPS provider 구성도 후속 설계 범위다.
 

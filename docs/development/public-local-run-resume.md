@@ -1,8 +1,9 @@
 # Public local `run/resume` prototype
 
-이 문서는 ADR-0023과 ADR-0024 구현을 개발·검증하는 최소 운영 절차다. 기존 exact-file mode는
+이 문서는 ADR-0023과 ADR-0024 구현을 개발·검증하는 최소 운영 절차다. ADR-0025의 mutation 명령과
+별도 `--allow-write` 재개 절차는 [Workspace atomic write](workspace-atomic-write.md)를 따른다. 기존 exact-file mode는
 OpenAI-compatible planner와 workspace `read-text` 하나를 유지한다. Source/main의 opt-in
-workspace discovery mode는 `list-directory`, `stat`, `search-text`, `read-text`를 제공한다.
+workspace mode는 `list-directory`, `stat`, `search-text`, `read-text`, `write-atomic`을 제공한다.
 
 ## 실행
 

@@ -690,16 +690,17 @@ fn build_receipt_provenance(
     instance: &CapabilityInstanceBody,
     definition: &CapabilityDefinitionBody,
 ) -> ReceiptProvenance {
+    let durable_tool_output = definition.spec.effect.class == DomainEffectClass::ReadOnly
+        || (definition.spec.effect.class == DomainEffectClass::Idempotent
+            && definition.spec.execution.durable_tool_output);
     ReceiptProvenance {
-        profile_version: match definition.spec.effect.class {
-            DomainEffectClass::ReadOnly => CORE_RECEIPT_PROFILE_V2,
-            DomainEffectClass::Idempotent
-            | DomainEffectClass::Compensatable
-            | DomainEffectClass::NonIdempotent
-            | DomainEffectClass::Unknown => CORE_RECEIPT_PROFILE_V1,
+        profile_version: if durable_tool_output {
+            CORE_RECEIPT_PROFILE_V2
+        } else {
+            CORE_RECEIPT_PROFILE_V1
         }
         .to_owned(),
-        tool_output_profile: (definition.spec.effect.class == DomainEffectClass::ReadOnly)
+        tool_output_profile: durable_tool_output
             .then(|| xgeny_workgraph::TOOL_OUTPUT_PROFILE_V1.to_owned()),
         invocation_id: content_id("invocation", effect_identity_digest),
         plan_id: planned_plan_id

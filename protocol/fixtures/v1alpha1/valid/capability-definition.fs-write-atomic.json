@@ -1,0 +1,67 @@
+{
+  "apiVersion": "xgeny.io/v1alpha1",
+  "kind": "CapabilityDefinition",
+  "metadata": {
+    "id": "xgeny.fs/write-atomic",
+    "contractVersion": "1.0.0",
+    "displayName": "Write text file atomically",
+    "labels": {
+      "xgeny.io/pack": "core-os"
+    }
+  },
+  "spec": {
+    "summary": "Create or replace one UTF-8 text file without exposing partial content.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "required": ["path", "content", "expectedDigest"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "content": {"type": "string", "maxLength": 65536},
+        "expectedDigest": {
+          "oneOf": [
+            {"type": "null"},
+            {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "required": ["path", "digest", "byteSize", "changed"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+        "byteSize": {"type": "integer", "minimum": 0, "maximum": 65536},
+        "changed": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "effect": {
+      "class": "idempotent",
+      "resourceSelectors": [
+        {"scope": "filesystem.write", "argumentPointer": "/path"}
+      ],
+      "criticalActions": []
+    },
+    "requiredCapabilities": [],
+    "execution": {
+      "styles": ["sync"],
+      "cancellable": false,
+      "idempotencyKeySupported": true,
+      "durableToolOutput": true,
+      "defaultTimeoutMs": 30000,
+      "maxTimeoutMs": 120000
+    },
+    "verification": [
+      {"strategy": "output_schema", "required": true},
+      {"strategy": "postcondition", "required": true, "description": "The confined target still contains the exact committed digest when Core verifies it."}
+    ],
+    "discovery": {
+      "keywords": ["file", "write", "atomic", "text"],
+      "examples": ["Create src/main.rs, but do not overwrite a user edit made after it was read."]
+    }
+  }
+}

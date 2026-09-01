@@ -1,6 +1,7 @@
 # Workspace filesystem discovery
 
-이 문서는 source/main의 workspace read-only discovery 구현과 회귀 절차다. 최신 배포 prerelease
+이 문서는 source/main의 workspace read-only discovery 구현과 회귀 절차다. Directory mode에 추가된
+별도 승인형 mutation은 [Workspace atomic write](workspace-atomic-write.md)를 따른다. 최신 배포 prerelease
 `v0.1.0-rc.2`는 exact `--allow-file` read만 포함하므로, `--allow-dir`는 이 변경을 포함한 다음 release
 artifact부터 사용할 수 있다.
 
@@ -27,7 +28,8 @@ xgeny run \
   '프로젝트 구조를 확인하고 관련 구현을 찾아 설명해줘.'
 ```
 
-`--allow-dir .`은 선택한 workspace root 전체를 네 read-only Capability로 관찰하도록 허용한다.
+`--allow-dir .`은 선택한 workspace root 전체를 네 read-only Capability로 관찰할 후보 경계를 제공한다.
+같은 mode에서 `write-atomic`도 광고되지만 실제 mutation은 별도 `--allow-write`가 있어야 한다.
 Planner는 immutable input schema에서 `.` 규칙을 받고, 별도 `planningConstraints`에서 caller가 허용한
 directory/file 목록을 받는다. Constrained provider prompt는 이를 후보 제한으로 따르되 권한으로
 간주하지 않는다. 또한 미래 observation을 placeholder로 참조하지 않고, 현재 context에서 argument가
@@ -40,6 +42,7 @@ directory/file 목록을 받는다. Constrained provider prompt는 이를 후보
 | `xgeny.fs/stat@1.0.0` | regular file size 또는 directory kind |
 | `xgeny.fs/search-text@1.0.0` | directory 아래 case-sensitive literal UTF-8 검색 |
 | `xgeny.fs/read-text@1.0.0` | bounded UTF-8 file content 읽기 |
+| `xgeny.fs/write-atomic@1.0.0` | 별도 승인 아래 UTF-8 file create/atomic replace |
 
 더 좁은 범위는 directory를 반복 지정하고 필요한 exact file만 추가한다.
 
@@ -81,12 +84,12 @@ runs/<run-id>/
 ```
 
 `run.sqlite3`는 Core journal/WorkGraph/Receipt/tool output을 보유하고 schema 8을 유지한다.
-`materials.sqlite3` schema 1은 모델이 선택한 dynamic path와 search query를 opaque digest reference로
-복원하기 위한 CLI-owned recipe catalog다. 둘 다 binary에 embedded된 SQLite library를 사용하므로
+`materials.sqlite3` schema 1은 모델이 선택한 dynamic path, search query와 write content를 opaque
+digest reference로 복원하기 위한 CLI-owned recipe catalog다. 둘 다 binary에 embedded된 SQLite library를 사용하므로
 SQLite 프로그램이나 server를 설치하지 않는다.
 
-Manifest, WorkGraph event, Receipt와 status output에는 raw path/query가 들어가지 않는다. 하지만 private
-material DB에는 path/query가, Run DB에는 goal과 successful output이 존재하므로 state root를 민감
+Manifest, WorkGraph event, Receipt와 status output에는 raw write content가 들어가지 않는다. 하지만 private
+material DB에는 path/query/content가, Run DB에는 goal과 successful output이 존재하므로 state root를 민감
 데이터로 취급한다. Completed summary replay는 두 DB 중 material catalog와 workspace가 없어도 된다.
 
 ## Limit과 해석
@@ -123,6 +126,10 @@ list -> search -> stat -> read -> completion -> workspace/material 삭제 -> off
 model plan -> approval pause -> process 종료
   -> local-only resume에서 dynamic search material 복원/실행
   -> remote resume에서 durable output 전달 -> completion
+
+write plan -> 별도 write approval pause -> process 종료
+  -> local-only resume에서 content 복원/atomic write
+  -> remote resume에서 content 없는 durable output 전달 -> completion
 ```
 
 실제 Qwen의 structured capability 호출과 동적 경로 continuation은 별도 ignored release test로

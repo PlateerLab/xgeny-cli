@@ -182,6 +182,102 @@ fn dynamic_search_material_survives_process_pause_and_resume() {
     );
 }
 
+#[test]
+fn atomic_write_requires_separate_approval_and_survives_process_resume() {
+    let fixture = tempdir().expect("test directory should exist");
+    let state_root = fixture.path().join("state");
+    let workspace = fixture.path().join("workspace");
+    fs::create_dir_all(workspace.join("src")).expect("workspace should create");
+    let server = SequentialServer::spawn_responses(vec![
+        plan_response(
+            "create_source",
+            "Create one source file atomically",
+            "xgeny.fs/write-atomic",
+            &json!({
+                "path": "src/generated.rs",
+                "content": "pub const GENERATED: bool = true;\n",
+                "expectedDigest": null
+            }),
+        ),
+        completion_response(),
+    ]);
+
+    let first = bounded_output(xgeny(&state_root).args([
+        "run",
+        "--workspace",
+        path_text(&workspace),
+        "--base-url",
+        &server.base_url,
+        "--model",
+        MODEL,
+        "--tokenizer",
+        TOKENIZER,
+        "--allow-dir",
+        "src",
+        "--allow-remote-model-egress",
+        "Create the requested source file.",
+    ]))
+    .expect("unapproved write should pause");
+    assert_eq!(first.status.code(), Some(10), "{}", stderr(&first));
+    assert!(stderr(&first).contains("reason=write_approval_required"));
+    assert!(!workspace.join("src/generated.rs").exists());
+    let run_id = extract_run_id(&stderr(&first));
+
+    let local = bounded_output(xgeny(&state_root).args([
+        "resume",
+        &run_id,
+        "--workspace",
+        path_text(&workspace),
+        "--allow-dir",
+        "src",
+        "--allow-write",
+    ]))
+    .expect("approved local write should execute without model access");
+    assert_eq!(local.status.code(), Some(10), "{}", stderr(&local));
+    assert!(stderr(&local).contains("reason=remote_model_egress_consent_required"));
+    assert_eq!(
+        fs::read_to_string(workspace.join("src/generated.rs")).unwrap(),
+        "pub const GENERATED: bool = true;\n"
+    );
+
+    let completion = bounded_output(xgeny(&state_root).args([
+        "resume",
+        &run_id,
+        "--workspace",
+        path_text(&workspace),
+        "--base-url",
+        &server.base_url,
+        "--allow-dir",
+        "src",
+        "--allow-write",
+        "--allow-remote-model-egress",
+    ]))
+    .expect("remote continuation should complete");
+    assert_eq!(completion.status.code(), Some(0), "{}", stderr(&completion));
+    assert_eq!(String::from_utf8_lossy(&completion.stdout), COMPLETION);
+
+    let _first_request = server.requests.recv_timeout(TEST_TIMEOUT).unwrap();
+    let completion_request = server.requests.recv_timeout(TEST_TIMEOUT).unwrap();
+    server.handle.join().expect("provider server should finish");
+    let context = planning_context(&completion_request);
+    let output = tool_output(&context, "xgeny.fs/write-atomic");
+    assert_eq!(output["path"], "workspace:primary/src/generated.rs");
+    assert_eq!(output["changed"], true);
+    assert_eq!(output["byteSize"], 34);
+    assert!(output.get("content").is_none());
+
+    let material_catalog = state_root
+        .join("runs")
+        .join(&run_id)
+        .join("materials.sqlite3");
+    let material_bytes = fs::read(material_catalog).unwrap();
+    assert!(
+        material_bytes
+            .windows(b"GENERATED".len())
+            .any(|bytes| bytes == b"GENERATED")
+    );
+}
+
 fn assert_resume_scope_and_material_failures(
     state_root: &Path,
     workspace: &Path,
@@ -276,12 +372,13 @@ fn public_cli_discovers_searches_stats_reads_and_replays_offline() {
     assert!(first_system_prompt.contains("return exactly one Step"));
     assert!(first_system_prompt.contains("cannot refer to future tool outputs"));
     assert!(first_system_prompt.contains("always set dependsOn to an empty array"));
-    assert_eq!(first["capabilities"].as_array().unwrap().len(), 4);
+    assert_eq!(first["capabilities"].as_array().unwrap().len(), 5);
     assert_eq!(first["toolOutputs"], json!([]));
     assert!(capability_ids(&first).contains(&"xgeny.fs/list-directory"));
     assert!(capability_ids(&first).contains(&"xgeny.fs/search-text"));
     assert!(capability_ids(&first).contains(&"xgeny.fs/stat"));
     assert!(capability_ids(&first).contains(&"xgeny.fs/read-text"));
+    assert!(capability_ids(&first).contains(&"xgeny.fs/write-atomic"));
     let path_description = capability(&first, "xgeny.fs/list-directory")["inputSchema"]
         ["properties"]["path"]["description"]
         .as_str()
@@ -292,7 +389,7 @@ fn public_cli_discovers_searches_stats_reads_and_replays_offline() {
         .as_array()
         .expect("workspace scope should be supplied outside immutable definitions");
     assert_eq!(constraints.len(), 1);
-    assert_eq!(constraints[0]["constraintId"], "workspace.read-scope");
+    assert_eq!(constraints[0]["constraintId"], "workspace.fs-scope");
     assert!(
         constraints[0]["description"]
             .as_str()

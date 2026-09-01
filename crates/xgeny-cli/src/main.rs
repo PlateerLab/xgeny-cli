@@ -40,7 +40,7 @@ enum Command {
         #[command(subcommand)]
         command: ModelCommand,
     },
-    /// Start a bounded local Run using one OpenAI-compatible model and read-only filesystem capabilities.
+    /// Start a bounded local Run using one OpenAI-compatible model and confined filesystem capabilities.
     Run(RunArgs),
     /// Continue an existing Run, or replay its durable completion without model access.
     Resume(ResumeArgs),
@@ -114,6 +114,9 @@ struct RunArgs {
     /// Approve each one-shot read-only action selected within the declared file/directory scope.
     #[arg(long)]
     allow_read: bool,
+    /// Approve each one-shot atomic file write selected within an allow-dir scope.
+    #[arg(long)]
+    allow_write: bool,
     /// Bound work performed by this process invocation.
     #[arg(long, default_value_t = 32)]
     max_ticks: u32,
@@ -144,6 +147,9 @@ struct ResumeArgs {
     /// Approve each one-shot read-only action selected within the declared file/directory scope.
     #[arg(long)]
     allow_read: bool,
+    /// Approve each one-shot atomic file write selected within an allow-dir scope.
+    #[arg(long)]
+    allow_write: bool,
     /// Bound work performed by this process invocation.
     #[arg(long, default_value_t = 32)]
     max_ticks: u32,
@@ -205,6 +211,7 @@ fn main() -> ExitCode {
                     allow_dirs: args.allow_dirs,
                     allow_remote_model_egress: args.allow_remote_model_egress,
                     allow_read: args.allow_read,
+                    allow_write: args.allow_write,
                     max_ticks: args.max_ticks,
                 },
                 |run_id| eprintln!("XGENY_STARTED run_id={run_id}"),
@@ -218,6 +225,7 @@ fn main() -> ExitCode {
             allow_dirs: args.allow_dirs,
             allow_remote_model_egress: args.allow_remote_model_egress,
             allow_read: args.allow_read,
+            allow_write: args.allow_write,
             max_ticks: args.max_ticks,
         })),
     }

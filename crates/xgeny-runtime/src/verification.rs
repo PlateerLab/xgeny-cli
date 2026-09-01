@@ -578,30 +578,10 @@ fn verify_step(
             effect_id: intent.effect_id.clone(),
         }
     })?;
-    let profile_matches_effect = matches!(
-        (provenance.profile_version.as_str(), intent.effect_class),
-        (
-            CORE_RECEIPT_PROFILE_V2,
-            xgeny_workgraph::EffectClass::ReadOnly
-        ) | (
-            CORE_RECEIPT_PROFILE_V1,
-            xgeny_workgraph::EffectClass::Reversible
-                | xgeny_workgraph::EffectClass::Idempotent
-                | xgeny_workgraph::EffectClass::NonIdempotent
-        )
-    );
-    if !profile_matches_effect {
+    if !receipt_profile_matches_effect(intent, provenance) {
         return Err(VerificationRunnerError::UnsupportedReceiptProfile);
     }
-    let output_profile_matches_effect = match intent.effect_class {
-        xgeny_workgraph::EffectClass::ReadOnly => {
-            provenance.tool_output_profile.as_deref() == Some(TOOL_OUTPUT_PROFILE_V1)
-        }
-        xgeny_workgraph::EffectClass::Reversible
-        | xgeny_workgraph::EffectClass::Idempotent
-        | xgeny_workgraph::EffectClass::NonIdempotent => provenance.tool_output_profile.is_none(),
-    };
-    if !output_profile_matches_effect {
+    if !tool_output_profile_matches_effect(intent, provenance) {
         return Err(VerificationRunnerError::UnsupportedToolOutputProfile);
     }
     if provenance.input_summary != CORE_RECEIPT_INPUT_SUMMARY_V1 {
@@ -667,6 +647,40 @@ fn verify_step(
         disposition,
         verification,
     })
+}
+
+fn receipt_profile_matches_effect(intent: &EffectIntent, provenance: &ReceiptProvenance) -> bool {
+    matches!(
+        (provenance.profile_version.as_str(), intent.effect_class),
+        (
+            CORE_RECEIPT_PROFILE_V2,
+            xgeny_workgraph::EffectClass::ReadOnly | xgeny_workgraph::EffectClass::Idempotent
+        ) | (
+            CORE_RECEIPT_PROFILE_V1,
+            xgeny_workgraph::EffectClass::Reversible
+                | xgeny_workgraph::EffectClass::Idempotent
+                | xgeny_workgraph::EffectClass::NonIdempotent
+        )
+    )
+}
+
+fn tool_output_profile_matches_effect(
+    intent: &EffectIntent,
+    provenance: &ReceiptProvenance,
+) -> bool {
+    match (intent.effect_class, provenance.profile_version.as_str()) {
+        (
+            xgeny_workgraph::EffectClass::ReadOnly | xgeny_workgraph::EffectClass::Idempotent,
+            CORE_RECEIPT_PROFILE_V2,
+        ) => provenance.tool_output_profile.as_deref() == Some(TOOL_OUTPUT_PROFILE_V1),
+        (
+            xgeny_workgraph::EffectClass::Reversible
+            | xgeny_workgraph::EffectClass::Idempotent
+            | xgeny_workgraph::EffectClass::NonIdempotent,
+            CORE_RECEIPT_PROFILE_V1,
+        ) => provenance.tool_output_profile.is_none(),
+        _ => false,
+    }
 }
 
 fn build_execution_receipt(
@@ -758,8 +772,10 @@ fn verify_report_profile(
     let valid = match provenance.profile_version.as_str() {
         CORE_RECEIPT_PROFILE_V1 => report.artifacts().is_empty(),
         CORE_RECEIPT_PROFILE_V2 => {
-            intent.effect_class == xgeny_workgraph::EffectClass::ReadOnly
-                && !report.artifacts().is_empty()
+            matches!(
+                intent.effect_class,
+                xgeny_workgraph::EffectClass::ReadOnly | xgeny_workgraph::EffectClass::Idempotent
+            ) && !report.artifacts().is_empty()
         }
         _ => false,
     };
