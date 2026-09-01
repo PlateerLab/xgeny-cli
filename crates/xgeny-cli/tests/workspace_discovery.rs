@@ -1175,7 +1175,10 @@ fn system_prompt(request: &[u8]) -> String {
 
 fn accept_with_timeout(listener: &TcpListener) -> io::Result<TcpStream> {
     listener.set_nonblocking(true)?;
-    let deadline = Instant::now() + TEST_TIMEOUT;
+    // A sequential fixture can wait for an approved process invocation between model turns.
+    // Match the outer child-process deadline so a loaded CI runner cannot close the mock provider
+    // while the bounded CLI process is still legitimately running.
+    let deadline = Instant::now() + PROCESS_TIMEOUT;
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
