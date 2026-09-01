@@ -156,7 +156,7 @@ fn validate_definition(definition: &CapabilityDefinitionBody) -> Result<(), Regi
     if execution.durable_tool_output
         && !matches!(
             definition.spec.effect.class,
-            EffectClass::ReadOnly | EffectClass::Idempotent
+            EffectClass::ReadOnly | EffectClass::Idempotent | EffectClass::NonIdempotent
         )
     {
         return Err(RegistryError::UnsupportedDurableToolOutputEffect {

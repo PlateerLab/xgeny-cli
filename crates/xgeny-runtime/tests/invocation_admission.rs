@@ -194,6 +194,13 @@ fn definition_fixture() -> CapabilityDefinitionBody {
     *definition
 }
 
+fn non_idempotent_durable_output_definition_fixture() -> CapabilityDefinitionBody {
+    let mut definition = definition_fixture();
+    definition.spec.effect.class = EffectClass::NonIdempotent;
+    definition.spec.execution.durable_tool_output = true;
+    definition
+}
+
 fn capability(definition: &CapabilityDefinitionBody) -> CapabilityRef {
     CapabilityRef {
         capability_id: definition.metadata.id.clone(),
@@ -1004,6 +1011,61 @@ fn exact_arguments_are_resolved_authorized_and_atomically_committed() {
     );
     assert!(!format!("{material:?}").contains(SECRET_SENTINEL));
     assert!(!format!("{material:?}").contains(CANONICAL_PATH));
+}
+
+#[test]
+fn non_idempotent_durable_output_issues_v2_provenance_without_changing_retry_semantics() {
+    let definition = non_idempotent_durable_output_definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, [instance]);
+    let resolver = CanonicalResolver::default();
+    let mut store = MemoryRunStore::new();
+    seed(&mut store, RUN_ID, STEP_ID);
+    let (_directory, lease) = acquire_lease(RUN_ID);
+
+    let pending = prepare(
+        &store,
+        &lease,
+        &registry,
+        &resolver,
+        &definition,
+        arguments(RAW_ALIAS, SECRET_SENTINEL),
+    )
+    .expect("non-idempotent durable-output invocation should prepare");
+    let inputs = allow_inputs(pending.permission_request());
+    let outcome = InvocationAdmission::new()
+        .authorize_and_commit(
+            pending,
+            &inputs,
+            &registry,
+            &mut store,
+            &mut DeterministicEvents,
+            &lease,
+        )
+        .expect("non-idempotent durable-output invocation should authorize");
+    let AdmissionOutcome::Authorized(admitted) = outcome else {
+        panic!("invocation should be authorized")
+    };
+    let intent = admitted.commit().state.steps[STEP_ID]
+        .intent
+        .as_ref()
+        .expect("intent should be durable");
+    let provenance = intent
+        .receipt_provenance
+        .as_ref()
+        .expect("Receipt provenance should be committed");
+
+    assert_eq!(
+        intent.effect_class,
+        xgeny_workgraph::EffectClass::NonIdempotent
+    );
+    assert!(intent.idempotency_key.is_some());
+    assert_eq!(provenance.profile_version, "xgeny.core-receipt/v2");
+    assert_eq!(
+        provenance.tool_output_profile.as_deref(),
+        Some(xgeny_workgraph::TOOL_OUTPUT_PROFILE_V1)
+    );
+    assert_eq!(intent.sink_guarantee, xgeny_workgraph::SinkGuarantee::None);
 }
 
 #[test]

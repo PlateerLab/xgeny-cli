@@ -1014,7 +1014,7 @@ fn required_tool_output_provenance(
 ) -> Result<&ReceiptProvenance, ToolOutputError> {
     if !matches!(
         intent.effect_class,
-        EffectClass::ReadOnly | EffectClass::Idempotent
+        EffectClass::ReadOnly | EffectClass::Idempotent | EffectClass::NonIdempotent
     ) {
         return Err(ToolOutputError::UnsupportedEffectClass);
     }
@@ -4544,7 +4544,7 @@ fn validate_tool_output_profile(intent: &EffectIntent) -> Result<(), TransitionE
         && (profile != TOOL_OUTPUT_PROFILE_V1
             || !matches!(
                 intent.effect_class,
-                EffectClass::ReadOnly | EffectClass::Idempotent
+                EffectClass::ReadOnly | EffectClass::Idempotent | EffectClass::NonIdempotent
             ))
     {
         return Err(TransitionError::UnsupportedToolOutputProfile {
@@ -5365,6 +5365,72 @@ mod tests {
             record.verify_for(RUN_ID, "step-material", &intent, 1, &other_evidence),
             Err(ToolOutputError::BindingMismatch("evidence_digest"))
         ));
+    }
+
+    #[test]
+    fn non_idempotent_output_is_durable_but_does_not_become_replayable() {
+        let mut records = Vec::new();
+        let planned = planned_state(&mut records);
+        let mut intent = read_only_receipt_intent(&planned, Some(TOOL_OUTPUT_PROFILE_V1));
+        intent.effect_class = EffectClass::NonIdempotent;
+        intent.idempotency_key = Some("stable-observation-key".to_owned());
+        let committed = append(
+            &mut records,
+            Some(&planned),
+            event(
+                "non-idempotent-output-intent",
+                RunEventBody::EffectIntentCommitted {
+                    step_id: "step-material".to_owned(),
+                    intent: Box::new(intent.clone()),
+                },
+            ),
+        );
+        let started = append(
+            &mut records,
+            Some(&committed),
+            event(
+                "non-idempotent-output-started",
+                RunEventBody::EffectExecutionStarted {
+                    step_id: "step-material".to_owned(),
+                    effect_id: intent.effect_id.clone(),
+                },
+            ),
+        );
+        let evidence_digest = format!("sha256:{}", "e".repeat(64));
+        let output = ToolOutputRecord::new(
+            RUN_ID,
+            "step-material",
+            &intent,
+            1,
+            &evidence_digest,
+            serde_json::json!({"stdout": "checked", "exitCode": 0}),
+        )
+        .expect("non-idempotent observation should bind to durable output");
+        let succeeded = append(
+            &mut records,
+            Some(&started),
+            event(
+                "non-idempotent-output-succeeded",
+                RunEventBody::EffectSucceeded {
+                    step_id: "step-material".to_owned(),
+                    effect_id: intent.effect_id.clone(),
+                    evidence_digest,
+                    output_record_digest: Some(output.record_digest().to_owned()),
+                },
+            ),
+        );
+
+        assert_eq!(
+            succeeded.steps["step-material"].status,
+            StepStatus::Validating
+        );
+        assert_eq!(
+            succeeded.steps["step-material"]
+                .output_record_digest
+                .as_deref(),
+            Some(output.record_digest())
+        );
+        assert_eq!(intent.sink_guarantee, SinkGuarantee::None);
     }
 
     #[test]

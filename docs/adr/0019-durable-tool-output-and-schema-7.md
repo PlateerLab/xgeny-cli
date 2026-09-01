@@ -6,6 +6,8 @@
 - 공개 protocol v0.1 schema 변경: 없음
 - local store schema: 6에서 7로 변경
 
+> 후속 변경: [ADR-0027](0027-non-idempotent-durable-tool-output.md)은 같은 schema 7/8 sidecar를 `durableToolOutput=true`인 `NonIdempotent` effect에도 확장한다. 이 확장은 output 보존 의미만 추가하며 no-blind-retry 규칙은 바꾸지 않는다.
+
 ## 문맥
 
 [ADR-0018](0018-read-only-artifact-and-cli-driver-foundation.md)은 planned `ReadOnly` 실행과 Core Receipt v2를 도입했지만, adapter가 관찰한 typed JSON 본문은 durable state에 남기지 않았다. `EffectSucceeded`와 Receipt에는 digest만 있었고, verifier는 외부 대상을 다시 읽거나 별도 in-memory 값에 의존해야 했다. 프로세스가 종료되면 다음 planning turn에 전달할 정확한 tool output도 복원할 수 없었다.

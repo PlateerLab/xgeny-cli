@@ -17,21 +17,36 @@ fn definition() -> CapabilityDefinitionBody {
 }
 
 #[test]
-fn durable_tool_output_is_limited_to_read_only_or_idempotent_effects() {
-    let mut valid = definition();
-    valid.spec.effect.class = EffectClass::Idempotent;
-    valid.spec.execution.durable_tool_output = true;
-    CapabilityRegistry::new()
-        .register_schema_validated_definition(valid)
-        .expect("idempotent durable output should register");
+fn durable_tool_output_accepts_supported_effects_and_rejects_unimplemented_profiles() {
+    for (index, effect_class) in [
+        EffectClass::ReadOnly,
+        EffectClass::Idempotent,
+        EffectClass::NonIdempotent,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut valid = renamed_definition(&format!("example/durable-output-{index}"), "1.0.0");
+        valid.spec.effect.class = effect_class;
+        valid.spec.execution.durable_tool_output = true;
+        CapabilityRegistry::new()
+            .register_schema_validated_definition(valid)
+            .expect("supported durable output effect should register");
+    }
 
-    let mut invalid = renamed_definition("example/non-idempotent-output", "1.0.0");
-    invalid.spec.effect.class = EffectClass::NonIdempotent;
-    invalid.spec.execution.durable_tool_output = true;
-    assert!(matches!(
-        CapabilityRegistry::new().register_schema_validated_definition(invalid),
-        Err(RegistryError::UnsupportedDurableToolOutputEffect { .. })
-    ));
+    for (index, effect_class) in [EffectClass::Compensatable, EffectClass::Unknown]
+        .into_iter()
+        .enumerate()
+    {
+        let mut invalid =
+            renamed_definition(&format!("example/unsupported-output-{index}"), "1.0.0");
+        invalid.spec.effect.class = effect_class;
+        invalid.spec.execution.durable_tool_output = true;
+        assert!(matches!(
+            CapabilityRegistry::new().register_schema_validated_definition(invalid),
+            Err(RegistryError::UnsupportedDurableToolOutputEffect { .. })
+        ));
+    }
 }
 
 fn instance() -> CapabilityInstanceBody {

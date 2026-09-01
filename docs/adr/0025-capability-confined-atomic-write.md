@@ -88,7 +88,7 @@ CAS primitive가 없다. 따라서 hostile concurrent writer에 대한 lock이�
 typed output이 필요하므로 `CapabilityExecution.durableToolOutput` optional boolean을 추가한다.
 
 - field가 없거나 `false`인 기존 Definition의 wire/digest와 v1 Receipt 동작은 그대로다.
-- `Idempotent + durableToolOutput=true`만 Core Receipt v2와 bounded tool-output sidecar를 사용한다.
+- 이 ADR의 atomic-write 경로는 `Idempotent + durableToolOutput=true`로 Core Receipt v2와 bounded tool-output sidecar를 사용한다. 후속 [ADR-0027](0027-non-idempotent-durable-tool-output.md)은 같은 output 보존 profile을 opt-in `NonIdempotent`에도 확장하되 replay 의미는 확장하지 않는다.
 - WorkGraph, memory/SQLite store, Direct Executor와 verifier는 v1 idempotent replay도 계속 허용한다.
 - `write-atomic` Definition만 현재 이 flag를 켠다.
 
@@ -120,7 +120,7 @@ cleanup 규칙을 먼저 설계한 뒤 추가한다.
 - temporary file cleanup, 기존 permission 보존과 post-commit digest 확인
 - Unix leaf/intermediate symlink 탈출 거부
 - Windows junction/reparse parent 탈출 거부
-- protocol valid fixture offline schema/Rust round-trip과 non-idempotent durable-output invalid fixture
+- protocol valid fixture offline schema/Rust round-trip과 unsupported durable-output effect invalid fixture
 - `durableToolOutput` opt-in과 legacy idempotent v1 Receipt 회귀
 - 별도 `--allow-write`, allow-dir component containment과 exact-file 비승격
 - public child-process `plan → write approval pause → local-only resume/write → remote resume/completion`

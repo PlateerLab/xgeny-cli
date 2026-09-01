@@ -143,7 +143,9 @@
           "then": {
             "properties": {
               "effect": {
-                "properties": {"class": {"enum": ["read_only", "idempotent"]}}
+                "properties": {
+                  "class": {"enum": ["read_only", "idempotent", "non_idempotent"]}
+                }
               }
             }
           }

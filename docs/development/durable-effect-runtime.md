@@ -42,6 +42,8 @@ canonical Run lease 획득
 
 idempotency key가 있다는 사실만으로 query 가능성이나 중복 제거를 가정하지 않는다. 현재 runtime은 deduplicate-only sink도 자동 재실행하지 않는다. 실행되지 않았다는 query evidence가 있을 때만 같은 intent를 다시 실행하며, durable attempt 상한과 기존 authorization consumption을 그대로 적용한다.
 
+`durableToolOutput=true`인 NonIdempotent effect도 같은 표를 따른다. Output bundle 또는 Receipt commit acknowledgement가 유실됐지만 transaction이 실제 commit된 경우에는 재시작한 store가 `Validating` 또는 terminal state를 복원하고 effect를 다시 호출하지 않는다. 반대로 Started 뒤 exact output commit 여부가 불명확하면 output을 얻기 위한 재실행 없이 `EffectUnknown`/manual로 닫힌다. 상세 profile 계약은 [ADR-0027](../adr/0027-non-idempotent-durable-tool-output.md)을 따른다.
+
 ## 동시 실행 경계
 
 `LocalRunLease`는 Rust 표준 library의 exclusive file lock을 사용한다. 같은 Run의 모든 local runtime은 Run directory의 동일한 canonical `run.lock` 경로를 사용해야 한다. lock은 advisory이므로 이를 무시하는 별도 process를 막는 sandbox가 아니며, network filesystem 동작은 아직 보장하지 않는다.

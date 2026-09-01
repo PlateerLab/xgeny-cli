@@ -86,11 +86,13 @@ semantic action은 의도적으로 Run·Step·Instance와 독립적이다. 같�
 
 | 경로 | 허용 effect/profile | route key feature | 발행 key/Receipt profile |
 |---|---|---:|---|
-| legacy `StepPlanned` 직접 Admission | `Idempotent` 또는 `NonIdempotent` | 필수 | non-empty / `xgeny.core-receipt/v1` |
-| accepted planned invocation | `LocalSyncOnceV1` + `Idempotent`/`NonIdempotent` | 필수 | non-empty / v1 |
+| legacy `StepPlanned` 직접 Admission | `Idempotent` 또는 `NonIdempotent` | 필수 | non-empty / 기본 v1, `durableToolOutput=true`면 v2 + tool output v1 |
+| accepted planned invocation | `LocalSyncOnceV1` + `Idempotent`/`NonIdempotent` | 필수 | non-empty / 기본 v1, opt-in durable output이면 v2 |
 | accepted planned invocation | `LocalSyncReadOnlyV1` + `ReadOnly` | `false`(요구하지 않음) | `None` / `xgeny.core-receipt/v2` |
 
 ReadOnly Definition은 idempotency-key 지원을 선언해도 되지만 planned ReadOnly route와 intent는 그 feature를 사용하지 않는다. `ReadOnly`는 accepted planned-invocation binding이 있을 때만 지원한다. Legacy/unplanned 직접 경로의 ReadOnly는 route feature의 우연한 조합에 맡기지 않고 resolver 호출 전에 `UnplannedReadOnlyUnsupported`로 명시적으로 닫는다. `Compensatable`, `Unknown`, Device/Remote placement, managed lease, critical approval도 의미를 축약 변환하지 않고 fail-closed한다. 특히 managed policy는 expiry·revocation witness가 없으므로 provisional 평가 결과가 있더라도 권한을 발행하지 않는다. 원격 실행은 실제 executor provenance 계약 없이 local host ID/platform과 섞어 기록하지 않는다.
+
+`NonIdempotent + durableToolOutput=true`의 v2는 결과 보존 profile일 뿐 재시도 허가가 아니다. Effect class, one-shot authorization, non-empty idempotency key와 `SinkGuarantee::None`은 유지되며 실행 시작 뒤 불확정 결과는 ADR-0027의 no-replay 규칙으로 복구한다.
 
 ## durable·runtime 방어
 
