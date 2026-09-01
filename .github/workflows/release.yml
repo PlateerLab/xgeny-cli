@@ -680,12 +680,31 @@ jobs:
           XGENY_INSTALL_DIR="$test_root/install" \
           XGENY_STATE_HOME="$test_root/state" \
             sh "$installer" --version "$RELEASE_TAG" >/dev/null
-          test "$("$test_root/install/${{ matrix.executable }}" --version)" = "xgeny ${RELEASE_TAG#v}"
-          "$test_root/install/${{ matrix.executable }}" licenses > "$test_root/licenses.txt"
+          installed="$test_root/install/${{ matrix.executable }}"
+          test "$("$installed" --version)" = "xgeny ${RELEASE_TAG#v}"
+          "$installed" licenses > "$test_root/licenses.txt"
           grep -Fq 'XGENy CLI Third-Party License Notices' "$test_root/licenses.txt"
           grep -Fq 'Copyright notices for The Rust Standard Library' "$test_root/licenses.txt"
           grep -Fq '===== musl C runtime notices =====' "$test_root/licenses.txt"
           grep -Fq '===== LLVM libunwind notices =====' "$test_root/licenses.txt"
+          test ! -e "$test_root/state"
+
+          printf '/status\n/exit\n' \
+            | HOME="$test_root/home" \
+              XGENY_STATE_HOME="$test_root/state" \
+                "$installed" > "$test_root/repl.txt"
+          grep -Fq 'XGENy Developer Preview' "$test_root/repl.txt"
+          grep -Fq 'status: idle' "$test_root/repl.txt"
+          grep -Fq 'bye' "$test_root/repl.txt"
+          test ! -e "$test_root/state"
+
+          HOME="$test_root/home" \
+          XGENY_INSTALL_DIR="$test_root/install" \
+          XGENY_STATE_HOME="$test_root/state" \
+            sh "$installer" --version "$RELEASE_TAG" >/dev/null
+          test -f "$installed" && test ! -L "$installed"
+          test "$("$installed" --version)" = "xgeny ${RELEASE_TAG#v}"
+          test "$(find "$test_root/install" -mindepth 1 -maxdepth 1 | wc -l)" -eq 1
           test ! -e "$test_root/state"
 
           if [[ "$VERIFY_LATEST" == "true" && "$RELEASE_TAG" != *-* ]]; then
@@ -709,6 +728,10 @@ jobs:
             test "$latest_ok" = "true"
             test ! -e "$test_root/state"
           fi
+
+          rm -f "$installed"
+          test ! -e "$installed"
+          test "$(find "$test_root/install" -mindepth 1 -maxdepth 1 | wc -l)" -eq 0
 
       - name: Install exact published release on Windows
         if: runner.os == 'Windows'
@@ -750,6 +773,36 @@ jobs:
               if (Test-Path -LiteralPath $StateRoot) {
                   throw "published install created runtime state"
               }
+              $ReplOutput = (@("/status", "/exit") | & $Installed | Out-String)
+              $ReplExitCode = $LASTEXITCODE
+              if (
+                  $ReplExitCode -ne 0 -or
+                  -not $ReplOutput.Contains("XGENy Developer Preview") -or
+                  -not $ReplOutput.Contains("status: idle") -or
+                  -not $ReplOutput.Contains("bye")
+              ) {
+                  throw "published interactive lifecycle smoke failed"
+              }
+              if (Test-Path -LiteralPath $StateRoot) {
+                  throw "published interactive smoke created runtime state"
+              }
+              & $Installer -Version $Tag -InstallDir $InstallRoot | Out-Null
+              $InstallEntries = @(Get-ChildItem -Force -LiteralPath $InstallRoot)
+              if (
+                  $InstallEntries.Count -ne 1 -or
+                  $InstallEntries[0].Name -ne "${{ matrix.executable }}" -or
+                  $InstallEntries[0].PSIsContainer -or
+                  ($InstallEntries[0].Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+              ) {
+                  throw "published reinstall left an unexpected install layout"
+              }
+              $ReinstalledVersion = (& $Installed --version | Out-String).Trim()
+              if ($LASTEXITCODE -ne 0 -or $ReinstalledVersion -ne "xgeny $($Tag.Substring(1))") {
+                  throw "published reinstall produced the wrong version"
+              }
+              if (Test-Path -LiteralPath $StateRoot) {
+                  throw "published reinstall created runtime state"
+              }
               $LicenseOutput = (& $Installed licenses | Out-String)
               if (
                   $LASTEXITCODE -ne 0 -or
@@ -784,6 +837,13 @@ jobs:
                   if (Test-Path -LiteralPath $StateRoot) {
                       throw "latest install created runtime state"
                   }
+              }
+              Remove-Item -Force -LiteralPath $Installed
+              if (Test-Path -LiteralPath $Installed) {
+                  throw "published binary removal failed"
+              }
+              if (@(Get-ChildItem -Force -LiteralPath $InstallRoot).Count -ne 0) {
+                  throw "published binary removal left install artifacts"
               }
           } finally {
               $env:XGENY_STATE_HOME = $PreviousState
@@ -970,6 +1030,35 @@ jobs:
           grep -Fq 'XGENy CLI Third-Party License Notices' "$test_root/licenses.txt"
           test ! -e "$test_root/state"
 
+          printf '/status\n/exit\n' \
+            | HOME="$test_root/home" \
+              XGENY_STATE_HOME="$test_root/state" \
+                "$test_root/install/bin/xgeny" > "$test_root/repl.txt"
+          grep -Fq 'XGENy Developer Preview' "$test_root/repl.txt"
+          grep -Fq 'status: idle' "$test_root/repl.txt"
+          grep -Fq 'bye' "$test_root/repl.txt"
+          test ! -e "$test_root/state"
+
+          HOME="$test_root/home" \
+          npm_config_cache="$test_root/cache" \
+            npm install --global --prefix "$test_root/install" \
+              --include=optional --ignore-scripts --no-audit --no-fund \
+              --registry=https://registry.npmjs.org/ \
+              "@xgen/cli@$version"
+          test -f "$global_root/@xgen/cli/package.json"
+          test -f "$global_root/@xgen/$PLATFORM_PACKAGE/package.json"
+          test "$(HOME="$test_root/home" XGENY_STATE_HOME="$test_root/state" \
+            "$test_root/install/bin/xgeny" --version)" = "xgeny $version"
+          test ! -e "$test_root/state"
+
+          HOME="$test_root/home" \
+          npm_config_cache="$test_root/cache" \
+            npm uninstall --global --prefix "$test_root/install" \
+              --ignore-scripts --no-audit --no-fund '@xgen/cli'
+          test ! -e "$global_root/@xgen/cli"
+          test ! -e "$global_root/@xgen/$PLATFORM_PACKAGE"
+          test ! -e "$test_root/install/bin/xgeny"
+
       - name: Install and verify exact npm package on Windows
         if: runner.os == 'Windows'
         env:
@@ -1023,6 +1112,53 @@ jobs:
               }
               if (Test-Path -LiteralPath $StateRoot) {
                   throw "npm install or verification created runtime state"
+              }
+              $ReplOutput = (@("/status", "/exit") | & $Shim | Out-String)
+              $ReplExitCode = $LASTEXITCODE
+              if (
+                  $ReplExitCode -ne 0 -or
+                  -not $ReplOutput.Contains("XGENy Developer Preview") -or
+                  -not $ReplOutput.Contains("status: idle") -or
+                  -not $ReplOutput.Contains("bye")
+              ) {
+                  throw "npm-installed interactive lifecycle smoke failed"
+              }
+              if (Test-Path -LiteralPath $StateRoot) {
+                  throw "npm-installed interactive smoke created runtime state"
+              }
+
+              & npm.cmd install --global --prefix $InstallRoot `
+                --include=optional --ignore-scripts --no-audit --no-fund `
+                --registry=https://registry.npmjs.org/ `
+                "@xgen/cli@$Version"
+              if ($LASTEXITCODE -ne 0) { throw "npm reinstall failed" }
+              $Reinstalled = (& $Shim --version | Out-String).Trim()
+              if ($LASTEXITCODE -ne 0 -or $Reinstalled -ne "xgeny $Version") {
+                  throw "npm reinstall produced the wrong version"
+              }
+              if (
+                  -not (Test-Path -LiteralPath (Join-Path $GlobalRoot "@xgen/cli/package.json")) -or
+                  -not (Test-Path -LiteralPath (Join-Path $GlobalRoot "@xgen/$env:PLATFORM_PACKAGE/package.json"))
+              ) {
+                  throw "npm reinstall is missing an exact package"
+              }
+              if (Test-Path -LiteralPath $StateRoot) {
+                  throw "npm reinstall created runtime state"
+              }
+
+              & npm.cmd uninstall --global --prefix $InstallRoot `
+                --ignore-scripts --no-audit --no-fund "@xgen/cli"
+              if ($LASTEXITCODE -ne 0) { throw "npm uninstall failed" }
+              if (
+                  (Test-Path -LiteralPath (Join-Path $GlobalRoot "@xgen/cli")) -or
+                  (Test-Path -LiteralPath (Join-Path $GlobalRoot "@xgen/$env:PLATFORM_PACKAGE"))
+              ) {
+                  throw "npm uninstall left package artifacts"
+              }
+              foreach ($ShimName in @("xgeny", "xgeny.cmd", "xgeny.ps1")) {
+                  if (Test-Path -LiteralPath (Join-Path $InstallRoot $ShimName)) {
+                      throw "npm uninstall left an executable shim"
+                  }
               }
           } finally {
               $env:HOME = $PreviousHome

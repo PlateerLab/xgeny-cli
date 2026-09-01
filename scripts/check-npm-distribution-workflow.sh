@@ -10,16 +10,21 @@ if [ "$#" -gt 1 ]; then
 fi
 workflow=${1:-"$repo_root/.github/workflows/release.yml"}
 
-python3 - "$workflow" "$repo_root/npm/scripts/publish.mjs" <<'PY'
+python3 - \
+    "$workflow" \
+    "$repo_root/npm/scripts/publish.mjs" \
+    "$repo_root/npm/scripts/smoke.mjs" <<'PY'
 from pathlib import Path
 import re
 import sys
 
 workflow = Path(sys.argv[1])
 publisher = Path(sys.argv[2])
+smoke = Path(sys.argv[3])
 lines = workflow.read_text(encoding="utf-8").splitlines()
 text = "\n".join(lines)
 publisher_text = publisher.read_text(encoding="utf-8")
+smoke_text = smoke.read_text(encoding="utf-8")
 
 
 def fail(message: str) -> None:
@@ -86,6 +91,11 @@ for fragment in (
     "--include=optional --ignore-scripts",
     '"@xgen/cli@$version"',
     '"@xgen/cli@$Version"',
+    "printf '/status\\n/exit\\n'",
+    "status: idle",
+    'npm uninstall --global --prefix "$test_root/install"',
+    "& npm.cmd uninstall --global --prefix $InstallRoot",
+    "npm uninstall left package artifacts",
 ):
     if fragment not in verify_job:
         fail(f"published npm verification is missing: {fragment}")
@@ -102,6 +112,19 @@ for fragment in (
 ):
     if fragment not in publisher_text:
         fail(f"npm publisher is missing required safety contract: {fragment}")
+
+for fragment in (
+    "const uninstall = npmInvocation([",
+    "await assert.rejects(lstat(installedLauncher)",
+    "await assert.rejects(lstat(installedPlatform)",
+    "npm install/reinstall/remove smoke: PASS",
+):
+    if fragment not in smoke_text:
+        fail(f"npm package smoke is missing lifecycle verification: {fragment}")
+
+install_invocation = "await run(install.command, install.args, { env: npmEnvironment });"
+if smoke_text.count(install_invocation) != 2:
+    fail("npm package smoke must install the exact package twice")
 
 print("npm release workflow contract: PASS")
 PY

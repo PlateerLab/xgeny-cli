@@ -194,9 +194,6 @@ async function main() {
       `${launcher.name}@${version}`,
     ]);
     await run(install.command, install.args, { env: npmEnvironment });
-    server.close();
-    await once(server, 'close');
-    server = null;
 
     assert.deepEqual(new Set(requestedTarballs), new Set([launcher.name, specification.packageName]));
     const root = npmInvocation(['root', '--global', '--prefix', installRoot]);
@@ -251,8 +248,37 @@ async function main() {
     assert.match(interactiveResult.stdout, /status: idle/);
     assert.match(interactiveResult.stdout, /bye/);
     await assert.rejects(lstat(state), (error) => error.code === 'ENOENT');
+
+    await run(install.command, install.args, { env: npmEnvironment });
+    assert.equal(JSON.parse(await readFile(installedLauncher, 'utf8')).version, version);
+    assert.equal(JSON.parse(await readFile(installedPlatform, 'utf8')).version, version);
+    await assert.rejects(lstat(state), (error) => error.code === 'ENOENT');
+
+    server.close();
+    await once(server, 'close');
+    server = null;
+
+    const uninstall = npmInvocation([
+      'uninstall',
+      '--global',
+      '--prefix',
+      installRoot,
+      '--ignore-scripts',
+      '--no-audit',
+      '--no-fund',
+      launcher.name,
+    ]);
+    await run(uninstall.command, uninstall.args, { env: npmEnvironment });
+    await assert.rejects(lstat(installedLauncher), (error) => error.code === 'ENOENT');
+    await assert.rejects(lstat(installedPlatform), (error) => error.code === 'ENOENT');
+    const installedShims = process.platform === 'win32'
+      ? ['xgeny', 'xgeny.cmd', 'xgeny.ps1'].map((name) => path.join(installRoot, name))
+      : [path.join(installRoot, 'bin', 'xgeny')];
+    for (const installedShim of installedShims) {
+      await assert.rejects(lstat(installedShim), (error) => error.code === 'ENOENT');
+    }
     console.log(
-      `npm global install smoke: PASS (${launcher.name} -> ${specification.packageName} ${version})`,
+      `npm install/reinstall/remove smoke: PASS (${launcher.name} -> ${specification.packageName} ${version})`,
     );
   } finally {
     if (server) {

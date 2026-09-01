@@ -136,5 +136,34 @@ if actual_invocation != expected_invocation:
         "the classified release flags"
     )
 
+verify_starts = [index for index, line in enumerate(lines) if line == "  verify-published:"]
+if len(verify_starts) != 1:
+    raise SystemExit(
+        f"{workflow}: expected one verify-published job, found {len(verify_starts)}"
+    )
+verify_start = verify_starts[0]
+verify_end = next(
+    (
+        index
+        for index in range(verify_start + 1, len(lines))
+        if lines[index] == "  publish-npm:"
+    ),
+    len(lines),
+)
+verify_job = "\n".join(lines[verify_start:verify_end])
+for fragment in (
+    "printf '/status\\n/exit\\n'",
+    "status: idle",
+    'sh "$installer" --version "$RELEASE_TAG"',
+    'rm -f "$installed"',
+    '$ReplOutput = (@("/status", "/exit")',
+    "published reinstall produced the wrong version",
+    "Remove-Item -Force -LiteralPath $Installed",
+):
+    if fragment not in verify_job:
+        raise SystemExit(
+            f"{workflow}: published native lifecycle verification is missing: {fragment}"
+        )
+
 print("release publisher context contract: PASS")
 PY
