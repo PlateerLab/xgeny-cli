@@ -240,6 +240,10 @@ settled model call, 일곱 Receipt, process argv `test/test/build`, 처음 한 �
 reconciliation은 0이어야 한다. Tunnel을 닫은 뒤 workspace와 private material catalog를 삭제해도 완료
 summary가 byte-exact하게 replay되고 journal이 변하지 않아야 한다.
 
+Goal은 각 planning 응답에 dependency 없는 concrete Step 하나만 반환하고 직전 durable ToolOutput을 보기
+전에 다음 Step을 포함하지 않도록 명시한다. 따라서 서로 독립적으로 보이는 재-test와 build도 한 Plan으로
+묶지 않으며, 일곱 action turn 뒤 별도 completion turn까지 총 여덟 model call을 검증한다.
+
 이 live gate도 `--nocapture`, `--show-output`, shell tracing 또는 `tee` 없이 clean test implementation
 commit에서 실행한다. 일반 CI는 외부 endpoint나 SSH 없이 ignored test를 compile한다.
 
