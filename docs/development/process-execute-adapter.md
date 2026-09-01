@@ -113,4 +113,6 @@ cargo run --quiet -p xgeny-cli -- protocol check
 Platform-specific process group, Job Object, path와 executable 판단은 Linux, macOS, Windows CI의
 workspace test에서 실행한다. CLI integration test는 loopback model을 사용해 catalog-only 승인 pause,
 변경된 catalog의 재개 거부, 별도 실행 승인, durable output의 다음 model turn 전달과 단일 Receipt를
-검증한다.
+검증한다. 별도 fault test는 실제 child가 durable marker를 한 번 만든 직후 SQLite outcome commit을
+실패시킨다. 첫 재개는 남은 `Executing`을 `EffectUnknown`으로 바꾸고, 동일 executable과 새
+`--allow-execute`를 다시 주어도 marker count, journal과 Receipt가 변하지 않아야 한다.

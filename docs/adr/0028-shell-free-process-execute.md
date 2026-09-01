@@ -118,6 +118,8 @@ prepare/execute하지 않고 `EffectUnknown`으로 닫는다. Exact output bundl
 - exact output shape/evidence digest verifier 검증
 - CLI plan → 실행 승인 pause → 별도 process 재개 → durable output → 다음 model turn과 단일 Receipt
 - 변경된 executable catalog로 재개 실패와 완료된 process의 no-replay
+- 실제 process 적용 뒤 outcome/output transaction commit 실패 → `Executing` cold resume →
+  `EffectUnknown`; 반복 재개·재승인에도 외부 marker 1회, start event 1개, Receipt 0개 유지
 - Linux x86-64/ARM64, macOS Intel/Apple Silicon, Windows x86-64의 workspace test
 - ADR-0027의 SQLite crash/lost-ack no-replay 회귀 suite 유지
 
