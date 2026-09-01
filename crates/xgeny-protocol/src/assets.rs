@@ -84,6 +84,10 @@ pub(crate) const FIXTURES: &[Asset] = &[
         "../../../protocol/fixtures/v1alpha1/valid/capability-definition.non-idempotent-durable-output.json"
     ),
     asset!(
+        "valid/capability-definition.process-execute.json",
+        "../../../protocol/fixtures/v1alpha1/valid/capability-definition.process-execute.json"
+    ),
+    asset!(
         "valid/capability-instance.local-fs.json",
         "../../../protocol/fixtures/v1alpha1/valid/capability-instance.local-fs.json"
     ),

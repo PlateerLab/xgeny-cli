@@ -1,0 +1,100 @@
+{
+  "apiVersion": "xgeny.io/v1alpha1",
+  "kind": "CapabilityDefinition",
+  "metadata": {
+    "id": "xgeny.process/execute",
+    "contractVersion": "1.0.0",
+    "displayName": "Execute a bounded local process",
+    "labels": {
+      "xgeny.io/pack": "core-os"
+    }
+  },
+  "spec": {
+    "summary": "Execute one explicitly granted native executable without a shell and return bounded output.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "required": ["executable", "args", "cwd", "env", "timeoutMs", "maxOutputBytes"],
+      "properties": {
+        "executable": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 224,
+          "pattern": "^(?:[a-z0-9][a-z0-9._+-]{0,127}|process:[a-z0-9][a-z0-9._-]{0,63}/executables/[a-z0-9][a-z0-9._+-]{0,127})$"
+        },
+        "args": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {"type": "string", "maxLength": 4096}
+        },
+        "cwd": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "env": {
+          "type": "object",
+          "maxProperties": 64,
+          "propertyNames": {"pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$"},
+          "additionalProperties": {"type": "string", "maxLength": 4096}
+        },
+        "timeoutMs": {"type": "integer", "minimum": 100, "maximum": 600000},
+        "maxOutputBytes": {"type": "integer", "minimum": 1024, "maximum": 32768}
+      },
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "required": [
+        "outcome",
+        "success",
+        "exitCode",
+        "stdout",
+        "stderr",
+        "stdoutTruncated",
+        "stderrTruncated",
+        "durationMs"
+      ],
+      "properties": {
+        "outcome": {"type": "string", "enum": ["exited", "timed_out", "launch_failed"]},
+        "success": {"type": "boolean"},
+        "exitCode": {
+          "oneOf": [
+            {"type": "null"},
+            {"type": "integer", "minimum": -2147483648, "maximum": 2147483647}
+          ]
+        },
+        "stdout": {"type": "string", "maxLength": 32768},
+        "stderr": {"type": "string", "maxLength": 32768},
+        "stdoutTruncated": {"type": "boolean"},
+        "stderrTruncated": {"type": "boolean"},
+        "durationMs": {"type": "integer", "minimum": 0, "maximum": 660000}
+      },
+      "additionalProperties": false
+    },
+    "effect": {
+      "class": "non_idempotent",
+      "resourceSelectors": [
+        {"scope": "process.execute", "argumentPointer": "/executable"}
+      ],
+      "criticalActions": []
+    },
+    "requiredCapabilities": [],
+    "execution": {
+      "styles": ["sync"],
+      "cancellable": false,
+      "idempotencyKeySupported": true,
+      "durableToolOutput": true,
+      "defaultTimeoutMs": 120000,
+      "maxTimeoutMs": 600000
+    },
+    "verification": [
+      {
+        "strategy": "output_schema",
+        "required": true,
+        "description": "Core validates the exact bounded process-result document committed by the adapter."
+      }
+    ],
+    "discovery": {
+      "keywords": ["process", "command", "test", "build", "lint"],
+      "examples": ["Run the project test executable with explicit arguments and inspect its bounded result."]
+    }
+  }
+}
