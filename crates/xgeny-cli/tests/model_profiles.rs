@@ -40,6 +40,9 @@ impl ModelServer {
                     }
                 };
                 stream
+                    .set_nonblocking(false)
+                    .expect("accepted model stream should become blocking");
+                stream
                     .set_read_timeout(Some(TIMEOUT))
                     .expect("read timeout should configure");
                 let request = read_http_request(&mut stream);

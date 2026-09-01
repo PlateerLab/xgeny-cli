@@ -30,6 +30,7 @@ script는 필요하지 않다. Model endpoint와 사용자가 실행하려는 co
 | 영역 | RC3 후보의 보장 |
 | --- | --- |
 | 모델 연결 | OpenAI-compatible Chat Completions, exact model ID, strict structured proposal, 별도 egress 동의 |
+| 대화형 UX | bare `xgeny` REPL, multiline, durable progress, 명령·승인·재개, bounded 직전-result context |
 | 파일 관찰 | exact file read 또는 bounded directory list/stat/literal search/read |
 | 파일 변경 | digest-bound `write-atomic`과 strict contextual `apply-patch`, 별도 write 동의 |
 | process | host-catalogued executable, shell 없는 cwd/argv/env, timeout, stdout/stderr byte limit, 별도 execute 동의 |
@@ -97,6 +98,10 @@ install smoke를 수행한다.
   두 실행은 연속 성공했지만 모델 변동성이 0이라는 의미는 아니다. 자동 무제한 retry는 제공하지 않는다.
 - macOS notarization과 Windows Authenticode가 없어 Gatekeeper/SmartScreen 경고가 나타날 수 있다.
 - Browser/TUI, MCP, 장기 사용자 메모리, XGEN/Connector adapter와 범용 network tool은 RC3 범위가 아니다.
+- REPL은 strict planner token을 직접 표시하지 않는다. Redacted durable lifecycle만 실시간 출력하고 최종
+  summary는 completion 검증 뒤 표시한다. 자유 형식 token streaming과 전체 transcript memory는 범위가 아니다.
+- Ctrl+C는 safe boundary에서 cooperative pause한다. 이미 전송된 model/effect 결과가 불확정하면
+  `model_call_unknown`/`effect_outcome_unknown`을 보존하며 자동 replay하지 않는다.
 - XGEN, Connector, PostgreSQL, MinIO, Kubernetes와 XGEN Python package는 core 실행 의존성이 아니다.
 
 ## 게시 경계

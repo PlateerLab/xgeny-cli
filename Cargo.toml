@@ -25,6 +25,7 @@ repository = "https://github.com/PlateerLab/xgeny-cli"
 cap-fs-ext = "4.0.3"
 cap-std = "4.0.3"
 clap = { version = "4.6.6", features = ["derive", "env"] }
+ctrlc = "3.5.1"
 getrandom = "0.3.4"
 jsonschema = { version = "0.52.0", default-features = false }
 keyring = { version = "4.2.0", default-features = false, features = ["v1"] }

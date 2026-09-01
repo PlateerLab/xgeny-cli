@@ -9,6 +9,49 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $SemVerTagPattern = '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?$'
 
+function Invoke-InteractiveSmoke([string]$Executable) {
+    $StartInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $StartInfo.FileName = $Executable
+    $StartInfo.UseShellExecute = $false
+    $StartInfo.CreateNoWindow = $true
+    $StartInfo.RedirectStandardInput = $true
+    $StartInfo.RedirectStandardOutput = $true
+    $StartInfo.RedirectStandardError = $true
+
+    $Process = [System.Diagnostics.Process]::new()
+    $Process.StartInfo = $StartInfo
+    $StandardOutputBuffer = [System.IO.MemoryStream]::new()
+    $StandardErrorBuffer = [System.IO.MemoryStream]::new()
+    try {
+        $Started = $Process.Start()
+        if (-not $Started) {
+            throw "failed to start installed binary"
+        }
+        $StandardOutputTask = $Process.StandardOutput.BaseStream.CopyToAsync($StandardOutputBuffer)
+        $StandardErrorTask = $Process.StandardError.BaseStream.CopyToAsync($StandardErrorBuffer)
+        $StandardInputBytes = [System.Text.Encoding]::ASCII.GetBytes("/status`n/exit`n")
+        [void]$Process.StandardInput.BaseStream.Write(
+            $StandardInputBytes,
+            0,
+            $StandardInputBytes.Length
+        )
+        [void]$Process.StandardInput.BaseStream.Flush()
+        [void]$Process.StandardInput.Close()
+        [void]$Process.WaitForExit()
+        [void]$StandardOutputTask.GetAwaiter().GetResult()
+        [void]$StandardErrorTask.GetAwaiter().GetResult()
+        return [PSCustomObject]@{
+            ExitCode = $Process.ExitCode
+            StandardOutput = [System.Text.Encoding]::UTF8.GetString($StandardOutputBuffer.ToArray())
+            StandardError = [System.Text.Encoding]::UTF8.GetString($StandardErrorBuffer.ToArray())
+        }
+    } finally {
+        [void]$StandardOutputBuffer.Dispose()
+        [void]$StandardErrorBuffer.Dispose()
+        [void]$Process.Dispose()
+    }
+}
+
 $Binary = (Resolve-Path -LiteralPath $Binary).Path
 $Installer = (Resolve-Path -LiteralPath $Installer).Path
 $ReportedVersion = (& $Binary --version | Out-String).Trim()
@@ -160,6 +203,26 @@ try {
     & $Installed protocol check | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "installed protocol check failed"
+    }
+    $InteractiveResult = Invoke-InteractiveSmoke $Installed
+    $InteractiveBannerPresent = $InteractiveResult.StandardOutput.Contains("XGENy Developer Preview")
+    $InteractiveStatusPresent = $InteractiveResult.StandardOutput.Contains("status: idle")
+    $InteractiveExitPresent = $InteractiveResult.StandardOutput.Contains("bye")
+    if (
+        $InteractiveResult.ExitCode -ne 0 -or
+        -not $InteractiveBannerPresent -or
+        -not $InteractiveStatusPresent -or
+        -not $InteractiveExitPresent
+    ) {
+        $InteractiveDiagnostic = @(
+            "exit=$($InteractiveResult.ExitCode)",
+            "banner=$InteractiveBannerPresent",
+            "status=$InteractiveStatusPresent",
+            "bye=$InteractiveExitPresent",
+            "stdout_chars=$($InteractiveResult.StandardOutput.Length)",
+            "stderr_chars=$($InteractiveResult.StandardError.Length)"
+        ) -join " "
+        throw "installed interactive smoke failed ($InteractiveDiagnostic)"
     }
     $LicenseOutput = (& $Installed licenses | Out-String)
     if (

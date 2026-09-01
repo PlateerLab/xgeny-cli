@@ -6,14 +6,19 @@ use std::process::ExitCode;
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use url::Url;
 use xgeny_cli::{
-    LocalCommandResult, LocalResumeRequest, LocalRunRequest, ModelCheckError, ModelCheckRequest,
-    ModelCredentialStore, ModelProfile, ModelProfileError, ModelProfileStore,
-    OsModelCredentialStore, PublicRunError, check_openai_compatibility, check_openai_model,
-    list_openai_models, new_credential_reference, resume_local, resume_local_with_model_resolver,
-    run_local_with_started,
+    DriverProgress, DriverProgressControl, LocalCommandResult, LocalProcessSession,
+    LocalResumeRequest, LocalRunRequest, ModelCheckError, ModelCheckRequest, ModelCredentialStore,
+    ModelProfile, ModelProfileError, ModelProfileStore, OsModelCredentialStore, PublicRunError,
+    check_openai_compatibility, check_openai_model, list_openai_models, new_credential_reference,
+    prepare_local_process_session, resume_local, resume_local_with_model_resolver,
+    resume_local_with_model_resolver_and_progress,
+    resume_local_with_process_session_and_model_resolver_progress,
+    run_local_with_process_session_progress, run_local_with_started,
 };
 use xgeny_provider_openai::BearerCredential;
 use zeroize::Zeroizing;
+
+mod repl;
 
 const PROJECT_LICENSE: &str = include_str!("../../../LICENSE");
 const CARGO_DEPENDENCY_NOTICES: &str = include_str!("../../../THIRD_PARTY_LICENSES.txt");
@@ -30,7 +35,7 @@ const LLVM_LIBUNWIND_NOTICES: &str = include_str!("../licenses/llvm-libunwind-52
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -247,10 +252,11 @@ struct ResumeArgs {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::Licenses => print_licenses(),
-        Command::Protocol {
+        None => interactive_command(),
+        Some(Command::Licenses) => print_licenses(),
+        Some(Command::Protocol {
             command: ProtocolCommand::Check,
-        } => match xgeny_protocol::check_bundled_protocol() {
+        }) => match xgeny_protocol::check_bundled_protocol() {
             Ok(report) => {
                 println!("XGENy protocol v0.1: PASS");
                 println!("  schemas: {}", report.schema_count);
@@ -268,9 +274,237 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Command::Model { command } => run_model_command(command),
-        Command::Run(args) => run_command(args),
-        Command::Resume(args) => resume_command(args),
+        Some(Command::Model { command }) => run_model_command(command),
+        Some(Command::Run(args)) => run_command(args),
+        Some(Command::Resume(args)) => resume_command(args),
+    }
+}
+
+const REPL_MAX_TICKS: u32 = 32;
+
+struct InteractiveHost {
+    workspace: PathBuf,
+    executable_specs: Vec<String>,
+    executable_ids: Vec<String>,
+    process_session: Option<LocalProcessSession>,
+}
+
+impl InteractiveHost {
+    fn new() -> Result<Self, repl::ReplFailure> {
+        let workspace = env::current_dir()
+            .map_err(|_| repl::ReplFailure::new(PublicRunError::Configuration.code()))?;
+        let mut executable_specs = Vec::new();
+        let mut executable_ids = Vec::new();
+        for (id, path) in repl::discover_developer_executables() {
+            let Some(path) = path
+                .to_str()
+                .filter(|path| !path.chars().any(char::is_control))
+            else {
+                continue;
+            };
+            executable_specs.push(format!("{id}={path}"));
+            executable_ids.push(id);
+        }
+        Ok(Self {
+            workspace,
+            executable_specs,
+            executable_ids,
+            process_session: None,
+        })
+    }
+
+    fn selected_model_view() -> Result<repl::ModelView, repl::ReplFailure> {
+        select_profile(None)
+            .map_err(|error| repl::ReplFailure::new(error.code()))?
+            .map(|profile| repl_model_view(&profile))
+            .ok_or_else(|| repl::ReplFailure::new("model_configuration_missing"))
+    }
+
+    fn process_session(&mut self) -> Result<LocalProcessSession, repl::ReplFailure> {
+        if self.process_session.is_none() {
+            self.process_session = Some(
+                prepare_local_process_session(&self.workspace, &self.executable_specs)
+                    .map_err(|error| repl::ReplFailure::new(error.code()))?,
+            );
+        }
+        self.process_session
+            .clone()
+            .ok_or_else(|| repl::ReplFailure::new(PublicRunError::Internal.code()))
+    }
+}
+
+impl repl::ReplHost for InteractiveHost {
+    fn model(&mut self) -> Result<repl::ModelView, repl::ReplFailure> {
+        Self::selected_model_view()
+    }
+
+    fn use_model(&mut self, name: &str) -> Result<repl::ModelView, repl::ReplFailure> {
+        try_model_use(name)
+            .map(|profile| repl_model_view(&profile))
+            .map_err(|error| repl::ReplFailure::new(error.code()))
+    }
+
+    fn executable_ids(&self) -> &[String] {
+        &self.executable_ids
+    }
+
+    fn start(
+        &mut self,
+        goal: String,
+        grants: repl::InvocationGrants,
+        progress: &mut dyn FnMut(DriverProgress) -> DriverProgressControl,
+    ) -> Result<LocalCommandResult, repl::ReplFailure> {
+        let model = resolve_model(None, None, None, None, false)
+            .map_err(|error| repl::ReplFailure::new(error.code()))?;
+        let process_session = self.process_session()?;
+        run_local_with_process_session_progress(
+            LocalRunRequest {
+                goal,
+                workspace: self.workspace.clone(),
+                base_url: model.base_url,
+                planner_id: "xgeny.cli.openai".to_owned(),
+                model: model.model,
+                tokenizer: model.tokenizer,
+                credential: model.credential,
+                allow_files: Vec::new(),
+                allow_dirs: vec![".".to_owned()],
+                allow_executables: Vec::new(),
+                allow_remote_model_egress: grants.model,
+                allow_read: grants.read,
+                allow_write: grants.write,
+                allow_execute: grants.execute,
+                max_ticks: REPL_MAX_TICKS,
+            },
+            &process_session,
+            |run_id| eprintln!("XGENY_STARTED run_id={run_id}"),
+            progress,
+        )
+        .map_err(|error| repl::ReplFailure::new(error.code()))
+    }
+
+    fn resume(
+        &mut self,
+        run_id: &str,
+        grants: repl::InvocationGrants,
+        progress: &mut dyn FnMut(DriverProgress) -> DriverProgressControl,
+    ) -> Result<LocalCommandResult, repl::ReplFailure> {
+        let process_session = self.process_session.clone();
+        let request = LocalResumeRequest {
+            run_id: run_id.to_owned(),
+            workspace: Some(self.workspace.clone()),
+            base_url: None,
+            credential: None,
+            allow_files: Vec::new(),
+            allow_dirs: vec![".".to_owned()],
+            allow_executables: if process_session.is_some() {
+                Vec::new()
+            } else {
+                self.executable_specs.clone()
+            },
+            allow_remote_model_egress: grants.model,
+            allow_read: grants.read,
+            allow_write: grants.write,
+            allow_execute: grants.execute,
+            max_ticks: REPL_MAX_TICKS,
+        };
+        let mut resolution_error = None;
+        let result = {
+            let mut resolve = || {
+                if !grants.model {
+                    return Err(PublicRunError::Configuration);
+                }
+                resolve_endpoint(None, None, false)
+                    .map(|resolved| (resolved.base_url, resolved.credential))
+                    .map_err(|error| {
+                        resolution_error = Some(error);
+                        PublicRunError::Configuration
+                    })
+            };
+            if let Some(process_session) = process_session.as_ref() {
+                resume_local_with_process_session_and_model_resolver_progress(
+                    request,
+                    process_session,
+                    &mut resolve,
+                    progress,
+                )
+            } else {
+                resume_local_with_model_resolver_and_progress(request, &mut resolve, progress)
+            }
+        };
+        if let Some(error) = resolution_error {
+            Err(repl::ReplFailure::new(error.code()))
+        } else {
+            result.map_err(|error| repl::ReplFailure::new(error.code()))
+        }
+    }
+}
+
+fn interactive_command() -> ExitCode {
+    let terminal = std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && std::io::stderr().is_terminal();
+    if terminal && let Err(error) = ensure_interactive_model() {
+        return present_model_configuration_error(error);
+    }
+
+    let cancellation = repl::Cancellation::default();
+    let signal_cancellation = cancellation.clone();
+    if ctrlc::set_handler(move || signal_cancellation.request()).is_err() {
+        eprintln!("XGENY_ERROR code={}", PublicRunError::Internal.code());
+        return ExitCode::from(PublicRunError::Internal.exit_code());
+    }
+    let Ok(mut host) = InteractiveHost::new() else {
+        eprintln!("XGENY_ERROR code={}", PublicRunError::Configuration.code());
+        return ExitCode::from(PublicRunError::Configuration.exit_code());
+    };
+    let stdout = std::io::stdout();
+    let mut input = repl::InterruptibleInput::stdin(cancellation.clone());
+    let mut output = stdout.lock();
+    match repl::run(&mut input, &mut output, &mut host, &cancellation) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) if error.kind() == ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(_) => {
+            eprintln!("XGENY_ERROR code={}", PublicRunError::Internal.code());
+            ExitCode::from(PublicRunError::Internal.exit_code())
+        }
+    }
+}
+
+fn ensure_interactive_model() -> Result<(), ModelCliError> {
+    if select_profile(None)?.is_some() {
+        return Ok(());
+    }
+    let (profile, stored) = try_model_setup(ModelSetupArgs {
+        name: "default".to_owned(),
+        base_url: None,
+        model: None,
+        tokenizer: None,
+        token_stdin: false,
+        store_token: false,
+    })?;
+    println!("XGENy model setup: PASS");
+    println!("  profile: {}", profile.name());
+    println!("  model: {}", profile.model());
+    println!(
+        "  authentication: {}",
+        if stored {
+            "secure_store"
+        } else {
+            "external_or_none"
+        }
+    );
+    Ok(())
+}
+
+fn repl_model_view(profile: &ModelProfile) -> repl::ModelView {
+    repl::ModelView {
+        profile: profile.name().to_owned(),
+        model: profile.model().to_owned(),
+        authentication: if profile.has_stored_credential() {
+            "secure_store"
+        } else {
+            "external_or_none"
+        },
     }
 }
 
@@ -622,19 +856,26 @@ fn model_list() -> ExitCode {
 }
 
 fn model_use(name: &str) -> ExitCode {
-    let result = (|| -> Result<(), ModelCliError> {
-        let store = ModelProfileStore::discover()?;
-        let _lock = store.try_lock()?;
-        let mut profiles = store.load()?;
-        profiles.set_active(name)?;
-        store.save(&mut profiles)?;
-        println!("XGENy active model profile: {name}");
-        Ok(())
-    })();
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
+    match try_model_use(name) {
+        Ok(_) => {
+            println!("XGENy active model profile: {name}");
+            ExitCode::SUCCESS
+        }
         Err(error) => present_model_command_error("use", error),
     }
+}
+
+fn try_model_use(name: &str) -> Result<ModelProfile, ModelCliError> {
+    let store = ModelProfileStore::discover()?;
+    let _lock = store.try_lock()?;
+    let mut profiles = store.load()?;
+    profiles.set_active(name)?;
+    let selected = profiles
+        .active()
+        .cloned()
+        .ok_or(ModelProfileError::ProfileNotFound)?;
+    store.save(&mut profiles)?;
+    Ok(selected)
 }
 
 fn model_logout(name: Option<&str>) -> ExitCode {

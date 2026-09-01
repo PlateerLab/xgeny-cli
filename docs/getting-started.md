@@ -199,6 +199,31 @@ xgeny model remove qwen-xgen
 전송 여부가 불확정한 inference transport 실패는 자동 재시도하지 않고 해당 Run을
 `model_call_unknown` recovery 상태로 남길 수 있다.
 
+## 기본 대화형 사용
+
+프로젝트 root에서 `xgeny`만 실행하면 가벼운 REPL이 열린다. TTY에서 active profile이 없으면 URL, 숨김
+API key와 model 선택 온보딩을 먼저 수행한다. Pipe/headless 입력에서는 prompt를 자동으로 열지 않는다.
+
+```bash
+cd my-project
+xgeny
+```
+
+기본값은 model egress, read, write, execute를 각각 `ask`로 묻는다. 현재 directory는 탐색 가능한
+workspace scope지만 승인이 없으면 실제 I/O를 수행하지 않는다. PATH에서 고정 allowlist에 해당하는 공통
+개발 executable을 logical catalog로 발견하되 catalog 등록은 실행 승인이 아니다.
+
+```text
+xgeny> 프로젝트를 탐색하고 실패한 테스트를 수정해줘.
+Allow sending the goal, session context, and tool observations to the model? [y/N] y
+progress: model_call_starting
+```
+
+명령은 `/model`, `/status`, `/permissions`, `/resume`, `/clear`, `/exit`이다. 줄 끝 `\`는 multiline
+continuation이다. 직전 durable completion summary만 다음 goal에 비신뢰 context로 이어지며 `/clear`는
+연결을 제거하지만 Run state를 삭제하지 않는다. 상세 동작과 Ctrl+C 복구 의미는
+[대화형 REPL](development/interactive-repl.md)을 따른다.
+
 ## 첫 실행과 재개
 
 현재 directory를 workspace로 열고 model이 선택할 수 있는 상대 파일을 명시한다. Model egress와 실제

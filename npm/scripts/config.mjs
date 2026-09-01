@@ -99,3 +99,16 @@ export function windowsShimVersionInvocation(
     windowsVerbatimArguments: true,
   };
 }
+
+export function windowsShimInteractiveInvocation(
+  shim,
+  command = process.env.ComSpec ?? 'cmd.exe',
+) {
+  assert.equal(path.win32.isAbsolute(shim), true, 'Windows command shim must be absolute');
+  assert.equal(shim.includes('"'), false, 'Windows command shim must not contain a quote');
+  return {
+    command,
+    args: ['/d', '/s', '/c', `""${shim}""`],
+    windowsVerbatimArguments: true,
+  };
+}

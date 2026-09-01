@@ -111,6 +111,16 @@ run_installer
     || { printf '%s\n' "installed version is wrong" >&2; exit 1; }
 XGENY_STATE_HOME="$unexpected_state" "$installed" protocol check >/dev/null \
     || { printf '%s\n' "installed protocol check failed" >&2; exit 1; }
+repl_output="$test_root/repl.txt"
+printf '/status\n/exit\n' \
+    | XGENY_STATE_HOME="$unexpected_state" "$installed" > "$repl_output" \
+    || { printf '%s\n' "installed interactive smoke failed" >&2; exit 1; }
+grep -Fq 'XGENy Developer Preview' "$repl_output" \
+    || { printf '%s\n' "installed interactive banner is missing" >&2; exit 1; }
+grep -Fq 'status: idle' "$repl_output" \
+    || { printf '%s\n' "installed interactive status is missing" >&2; exit 1; }
+grep -Fq 'bye' "$repl_output" \
+    || { printf '%s\n' "installed interactive exit is missing" >&2; exit 1; }
 licenses_output="$test_root/licenses.txt"
 XGENY_STATE_HOME="$unexpected_state" "$installed" licenses > "$licenses_output" \
     || { printf '%s\n' "installed license notice command failed" >&2; exit 1; }

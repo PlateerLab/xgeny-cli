@@ -110,7 +110,34 @@ pub enum DriverOutcome {
     },
     ModelCallRejected(ModelCallRejectionReason),
     ModelEgressRequired,
+    /// The caller requested a cooperative stop at a durable boundary.
+    Cancelled,
     TickBudgetExhausted,
+}
+
+/// Redacted lifecycle boundaries suitable for an interactive progress stream.
+///
+/// These events never contain prompts, model output, invocation arguments, filesystem paths, or
+/// process output. They describe only work that is about to cross, or has crossed, a durable
+/// runtime boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverProgress {
+    ModelCallStarting,
+    PlanCommitted,
+    ApprovalRequired { effect_class: EffectClass },
+    ActionAuthorized { effect_class: EffectClass },
+    EffectStarting { effect_class: EffectClass },
+    EffectCommitted { effect_class: EffectClass },
+    VerificationStarting,
+    VerificationCommitted,
+    CompletionCommitted,
+}
+
+/// Cooperative control returned by an interactive progress observer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverProgressControl {
+    Continue,
+    Cancel,
 }
 
 /// Provider-neutral bounded coordinator used by CLI composition roots and hermetic tests.
@@ -226,9 +253,72 @@ impl RunDriver {
         RP: PlannedRoutePort,
         AP: ApprovalPort,
     {
+        let mut observer = |_| DriverProgressControl::Continue;
+        self.drive_until_pause_with_model_egress_observed(
+            store,
+            events,
+            lease,
+            capabilities,
+            resolver,
+            planner,
+            materializer,
+            providers,
+            adapters,
+            verifiers,
+            routes,
+            approvals,
+            model_egress_allowed,
+            &mut observer,
+        )
+    }
+
+    /// Drive one bounded continuation while emitting redacted progress at durable boundaries.
+    ///
+    /// Returning [`DriverProgressControl::Cancel`] stops before the next external action whenever
+    /// possible. If a model call or effect is already in flight, its existing lifecycle remains
+    /// authoritative and the observer is consulted only after that operation reaches a durable
+    /// outcome. This preserves the no-replay recovery contract.
+    ///
+    /// # Errors
+    ///
+    /// Has the same fail-closed behavior as [`Self::drive_until_pause_with_model_egress`].
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub fn drive_until_pause_with_model_egress_observed<S, F, L, R, P, M, RP, AP, O>(
+        &self,
+        store: &mut S,
+        events: &mut F,
+        lease: &L,
+        capabilities: &CapabilityRegistry,
+        resolver: &R,
+        planner: &mut P,
+        materializer: &mut M,
+        providers: &mut MaterialProviderRegistry,
+        adapters: &mut EffectAdapterRegistry,
+        verifiers: &mut EffectVerifierRegistry,
+        routes: &mut RP,
+        approvals: &mut AP,
+        model_egress_allowed: bool,
+        observer: &mut O,
+    ) -> Result<DriverOutcome, RunDriverError>
+    where
+        S: RunStore,
+        F: EventFactory,
+        L: RunLease,
+        R: ResourceResolver,
+        P: PlannerPort,
+        M: PlanMaterializer,
+        RP: PlannedRoutePort,
+        AP: ApprovalPort,
+        O: FnMut(DriverProgress) -> DriverProgressControl,
+    {
         for _ in 0..self.max_ticks.get() {
-            if !model_egress_allowed && model_call_may_be_next(store)? {
-                return Ok(DriverOutcome::ModelEgressRequired);
+            if model_call_may_be_next(store)? {
+                if !model_egress_allowed {
+                    return Ok(DriverOutcome::ModelEgressRequired);
+                }
+                if observer(DriverProgress::ModelCallStarting) == DriverProgressControl::Cancel {
+                    return Ok(DriverOutcome::Cancelled);
+                }
             }
             let tick = self.agent_loop.tick(
                 store,
@@ -242,8 +332,12 @@ impl RunDriver {
             match tick {
                 AgentLoopTick::Configured { .. }
                 | AgentLoopTick::ModelCallLifecycleConfigured { .. }
-                | AgentLoopTick::PlanAccepted { .. }
                 | AgentLoopTick::ModelCallAbandoned { .. } => {}
+                AgentLoopTick::PlanAccepted { .. } => {
+                    if observer(DriverProgress::PlanCommitted) == DriverProgressControl::Cancel {
+                        return Ok(DriverOutcome::Cancelled);
+                    }
+                }
                 AgentLoopTick::ActionRequired { action, .. } => match action.action {
                     ContinuationAction::Admit => {
                         let state = store
@@ -260,9 +354,11 @@ impl RunDriver {
                         )?;
                         match approvals.decide(pending.permission_request())? {
                             ApprovalDecision::Pending => {
+                                let effect_class = pending.permission_request().effect_class();
+                                let _ = observer(DriverProgress::ApprovalRequired { effect_class });
                                 return Ok(DriverOutcome::ApprovalPending {
                                     step_id: action.step_id,
-                                    effect_class: pending.permission_request().effect_class(),
+                                    effect_class,
                                 });
                             }
                             ApprovalDecision::Denied => {
@@ -271,6 +367,7 @@ impl RunDriver {
                                 });
                             }
                             ApprovalDecision::Approved(policy_inputs) => {
+                                let effect_class = pending.permission_request().effect_class();
                                 match InvocationAdmission::new().authorize_and_commit(
                                     pending,
                                     &policy_inputs,
@@ -279,7 +376,14 @@ impl RunDriver {
                                     events,
                                     lease,
                                 )? {
-                                    AdmissionOutcome::Authorized(_) => {}
+                                    AdmissionOutcome::Authorized(_) => {
+                                        if observer(DriverProgress::ActionAuthorized {
+                                            effect_class,
+                                        }) == DriverProgressControl::Cancel
+                                        {
+                                            return Ok(DriverOutcome::Cancelled);
+                                        }
+                                    }
                                     AdmissionOutcome::NotAuthorized(outcome) => {
                                         return Ok(DriverOutcome::AdmissionNotAuthorized {
                                             step_id: action.step_id,
@@ -299,6 +403,17 @@ impl RunDriver {
                             .get(&action.step_id)
                             .ok_or_else(|| RunDriverError::StepNotFound(action.step_id.clone()))?
                             .status;
+                        let effect_class = state
+                            .steps
+                            .get(&action.step_id)
+                            .and_then(|step| step.intent.as_ref())
+                            .map(|intent| domain_effect_class(intent.effect_class))
+                            .ok_or_else(|| RunDriverError::StepNotFound(action.step_id.clone()))?;
+                        if observer(DriverProgress::EffectStarting { effect_class })
+                            == DriverProgressControl::Cancel
+                        {
+                            return Ok(DriverOutcome::Cancelled);
+                        }
                         if status == StepStatus::IntentCommitted {
                             let material = InvocationMaterialRecovery::new().recover(
                                 store,
@@ -328,8 +443,18 @@ impl RunDriver {
                                 None,
                             )?;
                         }
+                        if observer(DriverProgress::EffectCommitted { effect_class })
+                            == DriverProgressControl::Cancel
+                        {
+                            return Ok(DriverOutcome::Cancelled);
+                        }
                     }
                     ContinuationAction::Verify => {
+                        if observer(DriverProgress::VerificationStarting)
+                            == DriverProgressControl::Cancel
+                        {
+                            return Ok(DriverOutcome::Cancelled);
+                        }
                         self.verifier.drive_step(
                             store,
                             events,
@@ -338,11 +463,17 @@ impl RunDriver {
                             verifiers,
                             &action.step_id,
                         )?;
+                        if observer(DriverProgress::VerificationCommitted)
+                            == DriverProgressControl::Cancel
+                        {
+                            return Ok(DriverOutcome::Cancelled);
+                        }
                     }
                 },
                 AgentLoopTick::CompletionCandidate {
                     candidate, output, ..
                 } => {
+                    let _ = observer(DriverProgress::CompletionCommitted);
                     return Ok(DriverOutcome::CompletionCandidate { candidate, output });
                 }
                 AgentLoopTick::Quiescent { reason, .. } => {
@@ -368,6 +499,15 @@ impl RunDriver {
             }
         }
         Ok(DriverOutcome::TickBudgetExhausted)
+    }
+}
+
+const fn domain_effect_class(effect_class: xgeny_workgraph::EffectClass) -> EffectClass {
+    match effect_class {
+        xgeny_workgraph::EffectClass::ReadOnly => EffectClass::ReadOnly,
+        xgeny_workgraph::EffectClass::Reversible => EffectClass::Compensatable,
+        xgeny_workgraph::EffectClass::Idempotent => EffectClass::Idempotent,
+        xgeny_workgraph::EffectClass::NonIdempotent => EffectClass::NonIdempotent,
     }
 }
 

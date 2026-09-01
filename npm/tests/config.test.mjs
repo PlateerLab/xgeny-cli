@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   npmInvocation,
+  windowsShimInteractiveInvocation,
   windowsShimVersionInvocation,
 } from '../scripts/config.mjs';
 
@@ -62,6 +63,25 @@ test('Windows command shim invocation preserves cmd outer and path quotes verbat
         '/s',
         '/c',
         '""C:\\Users\\Example User\\install\\xgeny.cmd" --version"',
+      ],
+      windowsVerbatimArguments: true,
+    },
+  );
+});
+
+test('Windows interactive shim invocation keeps the absolute shim as the only command', () => {
+  assert.deepEqual(
+    windowsShimInteractiveInvocation(
+      'C:\\Users\\Example User\\install\\xgeny.cmd',
+      'C:\\Windows\\System32\\cmd.exe',
+    ),
+    {
+      command: 'C:\\Windows\\System32\\cmd.exe',
+      args: [
+        '/d',
+        '/s',
+        '/c',
+        '""C:\\Users\\Example User\\install\\xgeny.cmd""',
       ],
       windowsVerbatimArguments: true,
     },
