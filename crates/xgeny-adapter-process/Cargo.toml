@@ -1,0 +1,30 @@
+[package]
+name = "xgeny-adapter-process"
+description = "Shell-free bounded local process adapter for XGENy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+cap-fs-ext.workspace = true
+cap-std.workspace = true
+process-wrap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_jcs.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+xgeny-domain = { path = "../xgeny-domain" }
+xgeny-policy = { path = "../xgeny-policy" }
+xgeny-runtime = { path = "../xgeny-runtime" }
+xgeny-workgraph = { path = "../xgeny-workgraph" }
+
+[dev-dependencies]
+jsonschema.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

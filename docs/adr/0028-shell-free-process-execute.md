@@ -43,9 +43,11 @@ truncation flag와 `durationMs`를 가진 exact object다. Non-zero exit와 time
 
 ### 2. 실행 파일 경로와 기본 환경은 host가 소유한다
 
-Model은 ambient path나 `PATH` lookup 결과를 전달하지 않는다. Composition root가 native executable을
+Model은 ambient path나 `PATH` lookup 결과를 전달하지 않는다. Composition root가 OS-executable file을
 portable logical ID에 연결한 `ExecutableCatalog`를 만든다. Catalog 생성 시 path를 canonicalize하고
 regular executable 여부와 content SHA-256을 고정하며, prepare 직전에 같은 file을 다시 검사한다.
+Unix에서는 execute bit가 있는 regular file(명시적 shebang script 포함), Windows에서는 `.exe`와 `.com`만
+허용한다. Cataloged shebang은 OS loader가 해석하지만 shell command 문자열을 구성하거나 전달하지 않는다.
 정규화된 invocation resource는 `process:<workspace>/executables/<logical-id>`이고 실제 host path는
 journal, material, Receipt와 `Debug`에 들어가지 않는다.
 
@@ -72,9 +74,13 @@ Unix에서는 새 process group, Windows에서는 Job Object로 top-level proces
 Timeout이면 group/job 전체를 종료하고 leader를 wait한다. Top-level process가 먼저 끝나도 one-shot
 Capability 밖으로 background child가 남지 않도록 group/job을 종료하고 회수한다.
 
-stdout/stderr는 pipe가 아니라 host temporary file로 받는다. Output 상한을 넘기는 child나 stdio를
-상속한 descendant 때문에 parent가 pipe drain/EOF에서 무기한 멈추지 않게 하기 위한 선택이다. 종료
-뒤 각 file에서 `maxOutputBytes + 1`만 읽어 truncation을 판정한다.
+stdout/stderr pipe는 두 host reader가 동시에 계속 drain한다. 각 reader는 처음 `maxOutputBytes`만
+메모리에 보존하고 나머지는 버려 child가 가득 찬 pipe에서 멈추거나 host disk를 무제한 소비하지 않게
+한다. Durable UTF-8 문자열로 바꾼 뒤에도 같은 byte 상한을 지키며, 잘못된 UTF-8의 치환 때문에 상한을
+넘으면 유효한 문자 경계에서 다시 절단한다. Group/job 종료 뒤 bounded grace 안에 EOF가 오지 않으면
+exact output을 추측하지 않고
+`ResponseUnverifiable`로 닫는다. 따라서 scope를 벗어난 detached process가 stdio handle을 유지해도
+agent loop가 무기한 기다리지 않는다.
 
 `process-wrap 10.0.0`의 std ProcessGroup/JobObject wrapper를 사용한다. 우리 workspace의
 `unsafe_code = forbid`를 유지하면서 두 OS의 process-tree primitive를 동일한 adapter 경계에 둔다.
@@ -113,6 +119,6 @@ prepare/execute하지 않고 `EffectUnknown`으로 닫는다. Exact output bundl
 
 ## 결과
 
-Core는 host가 고정한 executable과 workspace 안에서 하나의 bounded native process를 실행하고 결과를
+Core는 host가 고정한 executable과 workspace 안에서 하나의 bounded OS process를 실행하고 결과를
 장기 WorkGraph에 전달할 수 있다. 실제 coding loop의 test/build 기반은 생기지만, 실행 권한과 격리는
 과장하지 않으며 실행 시작 뒤 장애에는 결과를 얻기 위한 blind replay보다 manual recovery를 택한다.
