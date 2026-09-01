@@ -23,31 +23,32 @@ function Invoke-InteractiveSmoke([string]$Executable) {
     $StandardOutputBuffer = [System.IO.MemoryStream]::new()
     $StandardErrorBuffer = [System.IO.MemoryStream]::new()
     try {
-        if (-not $Process.Start()) {
+        $Started = $Process.Start()
+        if (-not $Started) {
             throw "failed to start installed binary"
         }
         $StandardOutputTask = $Process.StandardOutput.BaseStream.CopyToAsync($StandardOutputBuffer)
         $StandardErrorTask = $Process.StandardError.BaseStream.CopyToAsync($StandardErrorBuffer)
         $StandardInputBytes = [System.Text.Encoding]::ASCII.GetBytes("/status`n/exit`n")
-        $Process.StandardInput.BaseStream.Write(
+        [void]$Process.StandardInput.BaseStream.Write(
             $StandardInputBytes,
             0,
             $StandardInputBytes.Length
         )
-        $Process.StandardInput.BaseStream.Flush()
-        $Process.StandardInput.Close()
-        $Process.WaitForExit()
-        $StandardOutputTask.GetAwaiter().GetResult()
-        $StandardErrorTask.GetAwaiter().GetResult()
+        [void]$Process.StandardInput.BaseStream.Flush()
+        [void]$Process.StandardInput.Close()
+        [void]$Process.WaitForExit()
+        [void]$StandardOutputTask.GetAwaiter().GetResult()
+        [void]$StandardErrorTask.GetAwaiter().GetResult()
         return [PSCustomObject]@{
             ExitCode = $Process.ExitCode
             StandardOutput = [System.Text.Encoding]::UTF8.GetString($StandardOutputBuffer.ToArray())
             StandardError = [System.Text.Encoding]::UTF8.GetString($StandardErrorBuffer.ToArray())
         }
     } finally {
-        $StandardOutputBuffer.Dispose()
-        $StandardErrorBuffer.Dispose()
-        $Process.Dispose()
+        [void]$StandardOutputBuffer.Dispose()
+        [void]$StandardErrorBuffer.Dispose()
+        [void]$Process.Dispose()
     }
 }
 
