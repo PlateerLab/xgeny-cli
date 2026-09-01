@@ -161,6 +161,15 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "installed protocol check failed"
     }
+    $InteractiveOutput = (@("/status", "/exit") | & $Installed | Out-String)
+    if (
+        $LASTEXITCODE -ne 0 -or
+        -not $InteractiveOutput.Contains("XGENy Developer Preview") -or
+        -not $InteractiveOutput.Contains("status: idle") -or
+        -not $InteractiveOutput.Contains("bye")
+    ) {
+        throw "installed interactive smoke failed"
+    }
     $LicenseOutput = (& $Installed licenses | Out-String)
     if (
         $LASTEXITCODE -ne 0 -or

@@ -1,4 +1,5 @@
 use std::env;
+use std::fmt;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -57,8 +58,8 @@ use crate::allow_process::{
     SAFE_PROCESS_ENVIRONMENT_PROFILE,
 };
 use crate::driver::{
-    ApprovalDecision, ApprovalPort, ApprovalPortFailure, DriverOutcome, PlannedRouteFailure,
-    PlannedRoutePort, RunDriver,
+    ApprovalDecision, ApprovalPort, ApprovalPortFailure, DriverOutcome, DriverProgress,
+    DriverProgressControl, PlannedRouteFailure, PlannedRoutePort, RunDriver,
 };
 use crate::manifest::{ManifestBudget, RunManifest};
 use crate::material_catalog::{
@@ -165,6 +166,56 @@ pub struct LocalResumeRequest {
     pub allow_write: bool,
     pub allow_execute: bool,
     pub max_ticks: u32,
+}
+
+/// Process executable/environment snapshot reused by one interactive host session.
+///
+/// Construction hashes the selected executable targets and binds them to the physical workspace.
+/// Cloning the value is cheap. The process adapter still revalidates the selected executable
+/// immediately before every launch, so reuse does not turn the snapshot into a path trust bypass.
+#[derive(Clone)]
+pub struct LocalProcessSession {
+    workspace_identity: String,
+    tooling: Option<ProcessTooling>,
+}
+
+impl fmt::Debug for LocalProcessSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocalProcessSession")
+            .field("workspace_identity", &"<redacted>")
+            .field("process_catalog", &self.tooling.is_some())
+            .finish()
+    }
+}
+
+/// Build a reusable, workspace-bound process snapshot for an interactive host.
+///
+/// # Errors
+///
+/// Returns a fixed configuration failure when the workspace or executable catalog is invalid.
+pub fn prepare_local_process_session<I, S>(
+    workspace_path: &Path,
+    executable_specifications: I,
+) -> Result<LocalProcessSession, PublicRunError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let workspace_id = WorkspaceId::new(WORKSPACE_ID).map_err(|_| PublicRunError::Internal)?;
+    let workspace = WorkspaceRoot::open_ambient(workspace_path, workspace_id)
+        .map_err(|_| PublicRunError::Configuration)?;
+    let workspace_identity = workspace
+        .physical_identity()
+        .map_err(|_| PublicRunError::Configuration)?
+        .as_str()
+        .to_owned();
+    let tooling = ProcessTooling::build(workspace_path, WORKSPACE_ID, executable_specifications)
+        .map_err(|_| PublicRunError::Configuration)?;
+    Ok(LocalProcessSession {
+        workspace_identity,
+        tooling,
+    })
 }
 
 /// One explicit, non-durable model-catalog connectivity check.
@@ -329,6 +380,7 @@ pub enum PauseReason {
     ReadApprovalRequired,
     WriteApprovalRequired,
     ExecuteApprovalRequired,
+    UserCancelled,
     TickBudgetExhausted,
     Quiescent,
 }
@@ -341,6 +393,7 @@ impl PauseReason {
             Self::ReadApprovalRequired => "read_approval_required",
             Self::WriteApprovalRequired => "write_approval_required",
             Self::ExecuteApprovalRequired => "execute_approval_required",
+            Self::UserCancelled => "user_cancelled",
             Self::TickBudgetExhausted => "tick_budget_exhausted",
             Self::Quiescent => "quiescent",
         }
@@ -483,8 +536,72 @@ pub fn run_local_with_started<F>(
 where
     F: FnOnce(&str),
 {
+    run_local_with_progress(request, on_started, |_| DriverProgressControl::Continue)
+}
+
+/// Create and drive a new Run while streaming only redacted durable-boundary progress.
+///
+/// The observer can request cooperative cancellation. Cancellation never fabricates an effect
+/// result or replays an uncertain model/tool operation.
+///
+/// # Errors
+///
+/// Returns only a fixed public failure class. Paths, provider bodies, arguments, outputs, and
+/// credentials are never included in progress or the returned error.
+pub fn run_local_with_progress<F, O>(
+    request: LocalRunRequest,
+    on_started: F,
+    on_progress: O,
+) -> Result<LocalCommandResult, PublicRunError>
+where
+    F: FnOnce(&str),
+    O: FnMut(DriverProgress) -> DriverProgressControl,
+{
+    run_local_composed(request, None, on_started, on_progress)
+}
+
+/// Create and drive a new Run with a reusable process snapshot and redacted durable progress.
+///
+/// `request.allow_executables` must be empty because the supplied session is the sole executable
+/// catalog authority.
+///
+/// # Errors
+///
+/// Returns a fixed public failure class on invalid configuration, workspace mismatch, contention,
+/// or corrupt state.
+pub fn run_local_with_process_session_progress<F, O>(
+    request: LocalRunRequest,
+    process_session: &LocalProcessSession,
+    on_started: F,
+    on_progress: O,
+) -> Result<LocalCommandResult, PublicRunError>
+where
+    F: FnOnce(&str),
+    O: FnMut(DriverProgress) -> DriverProgressControl,
+{
+    run_local_composed(request, Some(process_session), on_started, on_progress)
+}
+
+fn run_local_composed<F, O>(
+    request: LocalRunRequest,
+    process_session: Option<&LocalProcessSession>,
+    on_started: F,
+    mut on_progress: O,
+) -> Result<LocalCommandResult, PublicRunError>
+where
+    F: FnOnce(&str),
+    O: FnMut(DriverProgress) -> DriverProgressControl,
+{
     validate_max_ticks(request.max_ticks)?;
-    if request.allow_execute && request.allow_executables.is_empty() {
+    if process_session.is_some() && !request.allow_executables.is_empty() {
+        return Err(PublicRunError::Configuration);
+    }
+    if request.allow_execute
+        && process_session
+            .and_then(|session| session.tooling.as_ref())
+            .is_none()
+        && request.allow_executables.is_empty()
+    {
         return Err(PublicRunError::Configuration);
     }
     if !request.allow_remote_model_egress {
@@ -502,9 +619,12 @@ where
         .physical_identity()
         .map_err(|_| PublicRunError::Configuration)?;
     let catalog = LocalReadCatalog::build(&workspace, &request.allow_files, &request.allow_dirs)?;
-    let process =
-        ProcessTooling::build(&request.workspace, WORKSPACE_ID, &request.allow_executables)
-            .map_err(|_| PublicRunError::Configuration)?;
+    let process = process_tooling(
+        &request.workspace,
+        identity.as_str(),
+        &request.allow_executables,
+        process_session,
+    )?;
     if request.allow_execute && process.is_none() {
         return Err(PublicRunError::Configuration);
     }
@@ -565,6 +685,7 @@ where
         request.allow_write,
         request.allow_execute,
         request.max_ticks,
+        &mut on_progress,
     )
 }
 
@@ -594,6 +715,65 @@ pub fn resume_local_with_model_resolver<F>(
 ) -> Result<LocalCommandResult, PublicRunError>
 where
     F: FnOnce() -> Result<(String, Option<BearerCredential>), PublicRunError>,
+{
+    resume_local_with_model_resolver_and_progress(request, resolve_model, |_| {
+        DriverProgressControl::Continue
+    })
+}
+
+/// Resume a Run with deferred model resolution and redacted durable-boundary progress.
+///
+/// Completed offline replay and recovery-only outcomes still return before resolving credentials.
+///
+/// # Errors
+///
+/// Returns a fixed public failure class on invalid configuration, deferred model resolution,
+/// contention, corrupt state, or observer-safe driver failure.
+#[allow(clippy::too_many_lines)]
+pub fn resume_local_with_model_resolver_and_progress<F, O>(
+    request: LocalResumeRequest,
+    resolve_model: F,
+    on_progress: O,
+) -> Result<LocalCommandResult, PublicRunError>
+where
+    F: FnOnce() -> Result<(String, Option<BearerCredential>), PublicRunError>,
+    O: FnMut(DriverProgress) -> DriverProgressControl,
+{
+    resume_local_composed(request, None, resolve_model, on_progress)
+}
+
+/// Resume a Run with a reusable process snapshot, deferred model resolution, and durable progress.
+///
+/// Offline completion and uncertainty recovery still return before inspecting the process session.
+/// `request.allow_executables` must be empty because the session is the executable authority.
+///
+/// # Errors
+///
+/// Returns a fixed public failure class on invalid configuration, workspace/session mismatch,
+/// deferred model resolution, contention, or corrupt state.
+pub fn resume_local_with_process_session_and_model_resolver_progress<F, O>(
+    request: LocalResumeRequest,
+    process_session: &LocalProcessSession,
+    resolve_model: F,
+    on_progress: O,
+) -> Result<LocalCommandResult, PublicRunError>
+where
+    F: FnOnce() -> Result<(String, Option<BearerCredential>), PublicRunError>,
+    O: FnMut(DriverProgress) -> DriverProgressControl,
+{
+    resume_local_composed(request, Some(process_session), resolve_model, on_progress)
+}
+
+#[allow(clippy::too_many_lines)]
+fn resume_local_composed<F, O>(
+    request: LocalResumeRequest,
+    process_session: Option<&LocalProcessSession>,
+    resolve_model: F,
+    mut on_progress: O,
+) -> Result<LocalCommandResult, PublicRunError>
+where
+    F: FnOnce() -> Result<(String, Option<BearerCredential>), PublicRunError>,
+    O: FnMut(DriverProgress) -> DriverProgressControl,
 {
     validate_max_ticks(request.max_ticks)?;
     let state_root = discover_state_root().map_err(|_| PublicRunError::Configuration)?;
@@ -675,8 +855,15 @@ where
         return Err(PublicRunError::Configuration);
     }
     let catalog = LocalReadCatalog::build(&workspace, &request.allow_files, &request.allow_dirs)?;
-    let process = ProcessTooling::build(&workspace_path, WORKSPACE_ID, &request.allow_executables)
-        .map_err(|_| PublicRunError::Configuration)?;
+    if process_session.is_some() && !request.allow_executables.is_empty() {
+        return Err(PublicRunError::Configuration);
+    }
+    let process = process_tooling(
+        &workspace_path,
+        identity.as_str(),
+        &request.allow_executables,
+        process_session,
+    )?;
     if request.allow_execute && process.is_none() {
         return Err(PublicRunError::Configuration);
     }
@@ -725,7 +912,24 @@ where
         request.allow_write,
         request.allow_execute,
         request.max_ticks,
+        &mut on_progress,
     )
+}
+
+fn process_tooling(
+    workspace_path: &Path,
+    workspace_identity: &str,
+    executable_specifications: &[String],
+    process_session: Option<&LocalProcessSession>,
+) -> Result<Option<ProcessTooling>, PublicRunError> {
+    if let Some(process_session) = process_session {
+        if process_session.workspace_identity != workspace_identity {
+            return Err(PublicRunError::Configuration);
+        }
+        return Ok(process_session.tooling.clone());
+    }
+    ProcessTooling::build(workspace_path, WORKSPACE_ID, executable_specifications)
+        .map_err(|_| PublicRunError::Configuration)
 }
 
 fn reopen_writable_verified(
@@ -800,6 +1004,7 @@ fn continue_incomplete(
     allow_write: bool,
     allow_execute: bool,
     max_ticks: u32,
+    on_progress: &mut impl FnMut(DriverProgress) -> DriverProgressControl,
 ) -> Result<LocalCommandResult, PublicRunError> {
     let model_egress_allowed = planner.is_some();
     let mut planner = if let Some(planner) = planner {
@@ -919,7 +1124,7 @@ fn continue_incomplete(
         loop_runtime,
         NonZeroU32::new(max_ticks).ok_or(PublicRunError::Configuration)?,
     );
-    let Ok(outcome) = driver.drive_until_pause_with_model_egress(
+    let Ok(outcome) = driver.drive_until_pause_with_model_egress_observed(
         store,
         &mut events,
         lease,
@@ -933,6 +1138,7 @@ fn continue_incomplete(
         &mut route,
         &mut approvals,
         model_egress_allowed,
+        on_progress,
     ) else {
         return classify_durable_boundary_after_driver_error(store, manifest);
     };
@@ -1425,6 +1631,10 @@ fn map_driver_outcome(
         DriverOutcome::ModelEgressRequired => LocalCommandResult::Paused {
             run_id: Some(run_id),
             reason: PauseReason::RemoteModelEgressConsentRequired,
+        },
+        DriverOutcome::Cancelled => LocalCommandResult::Paused {
+            run_id: Some(run_id),
+            reason: PauseReason::UserCancelled,
         },
     })
 }
@@ -2190,6 +2400,61 @@ mod tests {
                 reason: PauseReason::RemoteModelEgressConsentRequired,
             }
         );
+    }
+
+    #[test]
+    fn reusable_process_session_is_bound_to_one_physical_workspace() {
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let specification = format!("test-helper={}", executable.display());
+        let session = prepare_local_process_session(first.path(), [&specification]).unwrap();
+        let first_workspace =
+            WorkspaceRoot::open_ambient(first.path(), WorkspaceId::new(WORKSPACE_ID).unwrap())
+                .unwrap();
+        let second_workspace =
+            WorkspaceRoot::open_ambient(second.path(), WorkspaceId::new(WORKSPACE_ID).unwrap())
+                .unwrap();
+        let first_identity = first_workspace.physical_identity().unwrap();
+        let second_identity = second_workspace.physical_identity().unwrap();
+
+        assert!(
+            process_tooling(first.path(), first_identity.as_str(), &[], Some(&session))
+                .unwrap()
+                .is_some()
+        );
+        assert!(matches!(
+            process_tooling(second.path(), second_identity.as_str(), &[], Some(&session)),
+            Err(PublicRunError::Configuration)
+        ));
+        assert!(!format!("{session:?}").contains(first.path().to_string_lossy().as_ref()));
+
+        let ambiguous_request = LocalRunRequest {
+            goal: "do not start".to_owned(),
+            workspace: first.path().to_path_buf(),
+            base_url: "http://127.0.0.1:1/v1".to_owned(),
+            planner_id: DEFAULT_PLANNER_ID.to_owned(),
+            model: "model".to_owned(),
+            tokenizer: "tokenizer".to_owned(),
+            credential: None,
+            allow_files: Vec::new(),
+            allow_dirs: vec![".".to_owned()],
+            allow_executables: vec![specification],
+            allow_remote_model_egress: false,
+            allow_read: false,
+            allow_write: false,
+            allow_execute: false,
+            max_ticks: 32,
+        };
+        assert!(matches!(
+            run_local_with_process_session_progress(
+                ambiguous_request,
+                &session,
+                |_| {},
+                |_| DriverProgressControl::Continue,
+            ),
+            Err(PublicRunError::Configuration)
+        ));
     }
 
     #[test]

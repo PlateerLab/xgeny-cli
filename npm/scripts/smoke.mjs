@@ -18,6 +18,7 @@ import {
   distributionMetadata,
   npmInvocation,
   platformPackageJson,
+  windowsShimInteractiveInvocation,
   windowsShimVersionInvocation,
 } from './config.mjs';
 
@@ -65,13 +66,15 @@ function packument(artifact) {
 }
 
 async function run(command, arguments_, options = {}) {
+  const { input, ...spawnOptions } = options;
   const child = spawn(command, arguments_, {
-    ...options,
+    ...spawnOptions,
     env: options.env ?? process.env,
     shell: false,
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
     windowsHide: true,
   });
+  if (input !== undefined) child.stdin.end(input);
   const stdout = [];
   const stderr = [];
   let outputBytes = 0;
@@ -221,6 +224,7 @@ async function main() {
       XGENY_STATE_HOME: state,
     };
     let versionResult;
+    let interactiveResult;
     if (process.platform === 'win32') {
       const shim = path.join(installRoot, 'xgeny.cmd');
       const invocation = windowsShimVersionInvocation(shim);
@@ -228,11 +232,24 @@ async function main() {
         env: executionEnvironment,
         windowsVerbatimArguments: invocation.windowsVerbatimArguments,
       });
+      const interactive = windowsShimInteractiveInvocation(shim);
+      interactiveResult = await run(interactive.command, interactive.args, {
+        env: executionEnvironment,
+        input: '/status\r\n/exit\r\n',
+        windowsVerbatimArguments: interactive.windowsVerbatimArguments,
+      });
     } else {
       const shim = path.join(installRoot, 'bin', 'xgeny');
       versionResult = await run(shim, ['--version'], { env: executionEnvironment });
+      interactiveResult = await run(shim, [], {
+        env: executionEnvironment,
+        input: '/status\n/exit\n',
+      });
     }
     assert.equal(versionResult.stdout.trim(), `xgeny ${version}`);
+    assert.match(interactiveResult.stdout, /XGENy Developer Preview/);
+    assert.match(interactiveResult.stdout, /status: idle/);
+    assert.match(interactiveResult.stdout, /bye/);
     await assert.rejects(lstat(state), (error) => error.code === 'ENOENT');
     console.log(
       `npm global install smoke: PASS (${launcher.name} -> ${specification.packageName} ${version})`,

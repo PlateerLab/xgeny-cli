@@ -2,7 +2,7 @@
 
 Local-first general-purpose agent CLI and harness.
 
-> 현재 상태: 프로토콜 v0.1 검증, dependency DAG와 Receipt-gated 재개 frontier를 갖춘 model-free WorkGraph, embedded SQLite schema 8 store, effect 실행·복구 조정기, 결정론적 Capability Registry·Router, I/O 없는 Permission Broker, secret-free invocation material 복구, Direct Executor와 Core-owned Execution Receipt 검증 경계, 장기 Run용 VerifiedRunIndex를 실행할 수 있습니다. Provider-neutral bounded AgentLoop는 비신뢰 `PlanProposal`을 검증해 다중 Step DAG와 reconstructable input sidecar를 원자 commit하고 재시작 뒤 한 frontier action씩 이어갑니다. Model call은 provider 호출 전에 보수적인 possible-send slot을 journal에 예약하며 accepted/rejected/Unknown을 재시작 뒤 복원하고, 불확정 호출을 자동 재시도하지 않습니다. 별도 `xgeny-provider-openai` leaf adapter는 OpenAI-compatible Chat Completions의 단일 요청과 strict structured proposal을 이 lifecycle에 연결합니다. 내부 WorkGraph는 planned `ReadOnly`/`Idempotent`/`NonIdempotent`, Core Receipt v2의 bounded Artifact commitment와 event-anchored typed `ToolOutputRecord`를 지원하며, generation-checked `PlanningContext v3`는 Step의 plan journal 순서와 passed Receipt에 결합된 exact ToolOutput의 관찰 순서를 보존해 다음 model turn에 전달합니다. NonIdempotent durable output은 결과만 보존하고 Started 뒤 불확정 effect의 no-replay 의미는 유지합니다. Public `xgeny run/resume`은 기존 exact `--allow-file` mode를 보존하면서, 명시적 `--allow-dir` mode에서 네 read Capability와 `write-atomic`·`apply-patch`로 workspace를 탐색·수정합니다. Host가 등록한 executable은 별도 승인 뒤 shell 없이 bounded cwd·argv·환경·timeout·출력 제한으로 실행하며 결과를 durable하게 보존하고 불확정 실행을 자동 반복하지 않습니다. Dynamic path/query/write/process material은 Run 전용 embedded `materials.sqlite3`에 digest-bound recipe로 저장되어 approval pause 뒤 다른 process에서도 복원됩니다. 모델 프로필은 일반 설정과 OS 보안 credential 저장소를 분리하고 catalog와 실제 strict-JSON inference를 모두 검증합니다. 읽기·쓰기·process 실행·model egress는 각각 별도 flag로 승인합니다. Network tool, 대화형 REPL과 XGEN compatibility adapter는 후속 범위입니다.
+> 현재 상태: 프로토콜 v0.1 검증, dependency DAG와 Receipt-gated 재개 frontier를 갖춘 model-free WorkGraph, embedded SQLite schema 8 store, effect 실행·복구 조정기, 결정론적 Capability Registry·Router, I/O 없는 Permission Broker, secret-free invocation material 복구, Direct Executor와 Core-owned Execution Receipt 검증 경계, 장기 Run용 VerifiedRunIndex를 실행할 수 있습니다. Provider-neutral bounded AgentLoop는 비신뢰 `PlanProposal`을 검증해 다중 Step DAG와 reconstructable input sidecar를 원자 commit하고 재시작 뒤 한 frontier action씩 이어갑니다. Model call은 provider 호출 전에 보수적인 possible-send slot을 journal에 예약하며 accepted/rejected/Unknown을 재시작 뒤 복원하고, 불확정 호출을 자동 재시도하지 않습니다. 별도 `xgeny-provider-openai` leaf adapter는 OpenAI-compatible Chat Completions의 단일 요청과 strict structured proposal을 이 lifecycle에 연결합니다. 내부 WorkGraph는 planned `ReadOnly`/`Idempotent`/`NonIdempotent`, Core Receipt v2의 bounded Artifact commitment와 event-anchored typed `ToolOutputRecord`를 지원하며, generation-checked `PlanningContext v3`는 Step의 plan journal 순서와 passed Receipt에 결합된 exact ToolOutput의 관찰 순서를 보존해 다음 model turn에 전달합니다. NonIdempotent durable output은 결과만 보존하고 Started 뒤 불확정 effect의 no-replay 의미는 유지합니다. Public `xgeny run/resume`은 기존 exact `--allow-file` mode를 보존하면서, 명시적 `--allow-dir` mode에서 네 read Capability와 `write-atomic`·`apply-patch`로 workspace를 탐색·수정합니다. Host가 등록한 executable은 별도 승인 뒤 shell 없이 bounded cwd·argv·환경·timeout·출력 제한으로 실행하며 결과를 durable하게 보존하고 불확정 실행을 자동 반복하지 않습니다. Dynamic path/query/write/process material은 Run 전용 embedded `materials.sqlite3`에 digest-bound recipe로 저장되어 approval pause 뒤 다른 process에서도 복원됩니다. 모델 프로필은 일반 설정과 OS 보안 credential 저장소를 분리하고 catalog와 실제 strict-JSON inference를 모두 검증합니다. Bare `xgeny`는 이 경계 위에서 durable progress를 스트리밍하고 model/read/write/execute를 각각 묻는 가벼운 REPL을 시작합니다. Network tool과 XGEN compatibility adapter는 후속 범위입니다.
 
 ## 설치와 첫 모델 연결
 
@@ -56,6 +56,9 @@ xgeny model setup
 xgeny model list
 xgeny model check --compatibility
 
+# 프로젝트 디렉터리에서 대화형 세션 시작
+xgeny
+
 xgeny run \
   --allow-file README.md \
   --allow-remote-model-egress \
@@ -83,6 +86,12 @@ code를 실행하므로 이는 sandbox가 아니다. 승인·재개 예시는 [�
 
 RC3의 포함 범위와 알려진 한계는 [Developer Preview RC3 후보](docs/development/rc3-release-candidate.md)에
 정리되어 있다.
+
+대화형 모드는 현재 디렉터리 전체를 workspace catalog로 열되 실제 read/write/execute와 model egress를
+각각 별도로 승인한다. `/model`, `/status`, `/permissions`, `/resume`, `/clear`, `/exit`을 지원하며 줄 끝
+`\`로 여러 줄 goal을 입력한다. 직전 durable completion만 다음 goal의 비신뢰 session context로 이어지고
+`/clear`가 이를 끊는다. Model의 strict structured proposal을 그대로 화면에 흘리지 않고, 검증된 최종
+summary 전에는 model call·plan commit·effect·verification 같은 redacted durable progress만 출력한다.
 
 `model check` 기본형은 선택 profile의 endpoint에 `GET /v1/models` 하나만 보내 기존 자동화 계약을
 유지한다. `--compatibility`를 지정하면 strict structured output POST를 한 번 더 보낸다. `model setup`은
@@ -145,6 +154,7 @@ binary에 포함되어 있어 network나 별도 파일 없이 `xgeny licenses`�
 - [ADR-0030: Journal chronology를 보존하는 PlanningContext v3](docs/adr/0030-chronological-planning-context-v3.md)
 - [ADR-0031: npm은 네이티브 XGENy의 무스크립트 배포 계층](docs/adr/0031-npm-native-distribution.md)
 - [ADR-0032: 모델 프로필과 OS 보안 저장소 분리](docs/adr/0032-model-profiles-and-secure-credential-boundary.md)
+- [ADR-0033: 대화형 REPL과 durable progress/cancellation 경계](docs/adr/0033-interactive-repl-durable-progress.md)
 
 ## 개발 및 검증
 
@@ -156,6 +166,9 @@ cargo run --locked --quiet -p xgeny-cli -- protocol check
 ```
 
 상세한 로컬·CI 검증 범위는 [Rust 워크스페이스 개발 환경](docs/development/rust-workspace.md)을 참고합니다. Router의 fail-closed filter, ranking과 권한 경계는 [결정론적 Capability Router 기본형](docs/development/deterministic-router.md), 재시작 전 실행 인자 경계는 [Recoverable Invocation Material 기본형](docs/development/recoverable-invocation-material.md), exact adapter 실행 경계는 [Direct Executor 기본형](docs/development/direct-executor.md), 검증과 Receipt 종결은 [Core Verification과 Execution Receipt 기본형](docs/development/execution-receipt.md), 장기 Run 검증 비용은 [Verified Run Index와 장기 Run 검증](docs/development/verified-run-index.md), dependency와 재개 순서는 [Persistent WorkGraph와 재개 frontier](docs/development/persistent-workgraph.md), 계획 수락·예산·재시작 계약은 [Durable Planner와 bounded AgentLoop](docs/development/durable-planner-loop.md), provider 호출 전 예약·불확정 복구 경계는 [Durable model-call lifecycle](docs/development/durable-model-call-lifecycle.md), 첫 실제 모델 연결은 [OpenAI-compatible Provider Adapter](docs/development/openai-compatible-provider.md), ReadOnly와 CLI 조합 기반은 [ReadOnly와 bounded CLI driver 기반](docs/development/read-only-driver-foundation.md), 제품 workspace read 경계는 [Capability-confined filesystem read adapter](docs/development/filesystem-read-adapter.md), 프로젝트 탐색과 dynamic material 재개는 [Workspace filesystem discovery](docs/development/workspace-filesystem-discovery.md), whole-file mutation은 [Workspace atomic write](docs/development/workspace-atomic-write.md), strict small edit는 [Workspace apply patch](docs/development/workspace-apply-patch.md), 공개 명령과 process 재개 절차는 [Public local run/resume prototype](docs/development/public-local-run-resume.md), 실제 OS I/O를 쓰는 비제품 기준은 [Preopened Reference Adapter Conformance](docs/development/reference-adapter-conformance.md), 기능 개발 순서와 테스트 계층·완료 기준은 [XGENy 개발 방법론과 테스트 전략](docs/development/engineering-method.md)을 따릅니다.
+
+Bare 명령의 입력, 승인, 진행 event와 Ctrl+C 의미는 [대화형 REPL](docs/development/interactive-repl.md)을
+따릅니다.
 
 ## Research
 

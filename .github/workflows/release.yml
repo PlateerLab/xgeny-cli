@@ -223,6 +223,9 @@ jobs:
             --test model_profiles \
             --target "${{ matrix.target }}"
           cargo test --locked --release -p xgeny-cli \
+            --test interactive_repl \
+            --target "${{ matrix.target }}"
+          cargo test --locked --release -p xgeny-cli \
             --test workspace_discovery \
             --target "${{ matrix.target }}"
 

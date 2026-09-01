@@ -15,6 +15,7 @@ path = "src/main.rs"
 cap-fs-ext.workspace = true
 cap-std.workspace = true
 clap.workspace = true
+ctrlc.workspace = true
 getrandom.workspace = true
 keyring.workspace = true
 rpassword.workspace = true

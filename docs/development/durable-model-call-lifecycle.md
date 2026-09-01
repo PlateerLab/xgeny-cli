@@ -12,7 +12,7 @@ Bounded `AgentLoop`가 provider-neutral planner port를 호출하기 전에 한 
 
 현재 구현의 보장은 **실제 provider 청구 횟수**가 아니라 보수적인 possible-send 상한이다. Reservation commit 직후 network send 전에 crash할 수 있으므로 예약 수가 실제 outbound/청구 수보다 클 수 있다. 반대로 adapter가 reservation 하나당 outbound request를 최대 한 번만 보내고 hidden retry를 하지 않으면 lifecycle configuration 이후 실제 outbound 수가 그 구간의 durable reservation 수를 넘지는 않는다. Legacy Run의 configuration 이전 호출은 아래 upgrade 경계처럼 이 상한에 포함되지 않는다.
 
-`xgeny-provider-openai`가 immutable model/tokenizer/template profile, strict structured proposal과 retry/redirect 없는 HTTP POST를 이 port에 연결한다. Fake/injected port의 lifecycle·store 회귀와 loopback HTTP contract는 기본 CI에서 함께 실행한다. Public `xgeny run/resume`은 기존 exact-file `read-text` mode와 opt-in workspace `list/stat/search/read/write-atomic/apply-patch` mode를 bounded composition으로 연결한다. Process/network dispatcher와 interactive 승인 UI는 아직 없다.
+`xgeny-provider-openai`가 immutable model/tokenizer/template profile, strict structured proposal과 retry/redirect 없는 HTTP POST를 이 port에 연결한다. Fake/injected port의 lifecycle·store 회귀와 loopback HTTP contract는 기본 CI에서 함께 실행한다. Public `xgeny run/resume`은 기존 exact-file `read-text` mode와 opt-in workspace `list/stat/search/read/write-atomic/apply-patch` mode를 bounded composition으로 연결한다. 이 문서가 정의한 lifecycle 이후 process dispatcher와 interactive 승인 UI는 ADR-0028·0033에서 같은 composition 위에 추가됐다. Network dispatcher는 아직 없다.
 
 ```mermaid
 flowchart LR

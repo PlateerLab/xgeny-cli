@@ -51,6 +51,7 @@ impl ExecutableCatalog {
         P: AsRef<Path>,
     {
         let mut catalog = BTreeMap::new();
+        let mut target_digests = BTreeMap::<PathBuf, String>::new();
         for (logical_id, path) in entries {
             if catalog.len() == MAX_EXECUTABLES {
                 return Err(ExecutableCatalogError);
@@ -65,7 +66,13 @@ impl ExecutableCatalog {
                 return Err(ExecutableCatalogError);
             }
             let launch_digest = launch_path_digest(&launch_path);
-            let digest = executable_digest(&target_path)?;
+            let digest = if let Some(digest) = target_digests.get(&target_path) {
+                digest.clone()
+            } else {
+                let digest = executable_digest(&target_path)?;
+                target_digests.insert(target_path.clone(), digest.clone());
+                digest
+            };
             if catalog
                 .insert(
                     logical_id,
@@ -538,12 +545,23 @@ mod tests {
         symlink(&target, &second_alias).unwrap();
         let first = ExecutableCatalog::from_paths([("tool", &first_alias)]).unwrap();
         let second = ExecutableCatalog::from_paths([("tool", &second_alias)]).unwrap();
+        let shared =
+            ExecutableCatalog::from_paths([("cargo", &first_alias), ("rustc", &second_alias)])
+                .unwrap();
 
         assert_eq!(
             first.entry("tool").unwrap().verified_path().unwrap(),
             std::path::absolute(&first_alias).unwrap()
         );
         assert_ne!(first.digest, second.digest);
+        assert_eq!(
+            shared.entry("cargo").unwrap().verified_path().unwrap(),
+            std::path::absolute(&first_alias).unwrap()
+        );
+        assert_eq!(
+            shared.entry("rustc").unwrap().verified_path().unwrap(),
+            std::path::absolute(&second_alias).unwrap()
+        );
 
         std::fs::remove_file(&first_alias).unwrap();
         symlink("/definitely/not/the/catalogued-target", &first_alias).unwrap();
