@@ -9,7 +9,6 @@ import {
   rm,
   writeFile,
 } from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 
 import {
@@ -54,7 +53,7 @@ async function pack(outputDirectory, name, specification, outputName) {
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
   }
-  const temporary = await mkdtemp(path.join(os.tmpdir(), 'xgeny-npm-bootstrap.'));
+  const temporary = await mkdtemp(path.join(outputDirectory, '.xgeny-npm-bootstrap.'));
   try {
     const stage = path.join(temporary, 'package');
     const packed = path.join(temporary, 'packed');

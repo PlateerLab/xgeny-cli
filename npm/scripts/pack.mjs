@@ -12,7 +12,6 @@ import {
   rm,
   writeFile,
 } from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 
 import {
@@ -104,7 +103,7 @@ async function main() {
     if (error.code !== 'ENOENT') throw error;
   }
 
-  const temporary = await mkdtemp(path.join(os.tmpdir(), 'xgeny-npm-pack.'));
+  const temporary = await mkdtemp(path.join(outputDirectory, '.xgeny-npm-pack.'));
   try {
     const stage = path.join(temporary, 'package');
     const packed = path.join(temporary, 'packed');
