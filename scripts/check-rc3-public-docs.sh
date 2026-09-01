@@ -19,6 +19,9 @@ candidate = (root / "docs/development/rc3-release-candidate.md").read_text(
     encoding="utf-8"
 )
 security = (root / "SECURITY.md").read_text(encoding="utf-8")
+npm_distribution = (root / "docs/development/npm-distribution.md").read_text(
+    encoding="utf-8"
+)
 
 
 def require(document: str, fragments: tuple[str, ...], label: str) -> None:
@@ -78,6 +81,19 @@ require(
         "## 주요 보안 경계",
     ),
     "SECURITY",
+)
+require(
+    npm_distribution,
+    (
+        "allowed actions",
+        "`npm publish`만 선택",
+        "`npm stage publish`는 선택하지 않음",
+        "npm trust github",
+        "--allow-publish",
+        "npm trust list",
+        "Require two-factor authentication and disallow tokens",
+    ),
+    "npm-distribution",
 )
 
 print("RC3 public documentation contract: PASS")
