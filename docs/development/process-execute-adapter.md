@@ -97,9 +97,15 @@ Composition root는 다음 항목을 같은 exact binding으로 Core에 등록�
 | spawn 전에 launch 실패 | `launch_failed` | catalog/host 상태 점검 |
 | spawn 뒤 outcome 불명확 | 없음, `EffectUnknown` | manual required; blind replay 금지 |
 
+Non-zero test 결과가 Receipt-completed된 뒤 모델이 코드를 수정하면, 같은 executable/argv/cwd/env/timeout을
+다음 turn에 다시 제안할 수 있다. ADR-0029에 따라 Core가 새 Step occurrence와 별도 permission request,
+one-shot grant, effect와 idempotency key를 만든다. 반대로 `Executing`/`EffectUnknown`인 occurrence는
+재승인 flag를 다시 주어도 새 Step으로 자동 대체하거나 같은 process를 replay하지 않는다.
+
 `NonIdempotent + durableToolOutput=true` profile과 SQLite schema 8 no-replay 의미는
 [ADR-0027](../adr/0027-non-idempotent-durable-tool-output.md)을 따른다. OS/process 결정은
-[ADR-0028](../adr/0028-shell-free-process-execute.md)을 따른다.
+[ADR-0028](../adr/0028-shell-free-process-execute.md)을 따르고 반복 action identity는
+[ADR-0029](../adr/0029-core-derived-action-occurrence.md)을 따른다.
 
 ## Local verification
 

@@ -580,7 +580,7 @@ fn unsupported_or_non_concrete_planned_targets_are_rejected() {
 }
 
 #[test]
-fn duplicate_semantic_actions_are_rejected_across_batch_and_prior_plans() {
+fn duplicate_planned_action_identities_are_rejected_across_batch_and_prior_plans() {
     let state = configured_state();
     let proposal_digest = digest('f');
     let (step_a, _) = accepted_step(
@@ -594,7 +594,7 @@ fn duplicate_semantic_actions_are_rejected_across_batch_and_prior_plans() {
     let (step_b, _) = accepted_step(
         RUN_ID,
         "step-b",
-        "same semantic action",
+        "same durable action identity",
         Vec::new(),
         &proposal_digest,
         'a',
@@ -634,7 +634,7 @@ fn duplicate_semantic_actions_are_rejected_across_batch_and_prior_plans() {
     let (replanned, _) = accepted_step(
         RUN_ID,
         "step-c",
-        "same action in a later turn",
+        "same durable action identity in a later turn",
         Vec::new(),
         &second_proposal,
         'a',

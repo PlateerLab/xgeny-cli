@@ -5,7 +5,7 @@
 - 적용 범위: local Run admission, embedded SQLite store, effect 실행 전 복구
 - 공개 protocol v0.1 변경: 없음
 
-> 후속 상태: ADR-0011이 trusted provider registry, exact adapter dispatch와 core-owned consume-once prepared 경계를 구현했다. ADR-0012는 schema 3 journal bytes를 보존한 schema 4 migration과 Receipt sidecar를 추가했다. 이 ADR의 material 저장·복구 결정과 당시 schema 3 선택 기록은 그대로 유지된다.
+> 후속 상태: ADR-0011이 trusted provider registry, exact adapter dispatch와 core-owned consume-once prepared 경계를 구현했다. ADR-0012는 schema 3 journal bytes를 보존한 schema 4 migration과 Receipt sidecar를 추가했다. ADR-0029는 Receipt-completed Step 뒤 새 Core-owned occurrence로 같은 semantic action을 다시 승인할 수 있게 했다. 한 occurrence의 material 복구와 no-replay 결정은 그대로 유지된다.
 
 ## 문맥
 
@@ -133,7 +133,10 @@ MVP reason code는 최소 다음 범주를 구분한다.
 
 반면 required sidecar row 누락, orphan row, record digest mismatch, 다른 effect의 record swap과 지원하지 않는 record format은 정상적인 material 부재가 아니라 store corruption이다. 이 경우 손상된 Run에 새 event를 쓰지 않고 store load 또는 recovery를 거부한다.
 
-Manual 전이는 기존 authorization consumption을 되돌리지 않는다. 현재 effect/grant identity는 같은 Run의 semantic action에 고정되므로 새 Step만 만들어 동일 작업을 재승인할 수도 없다. 다시 실행하려면 사용자가 상태를 확인한 뒤 새 Run에서 admission을 거치거나, 후속 occurrence/replacement protocol이 명시적으로 도입되어야 한다.
+Manual 전이는 기존 authorization consumption을 되돌리지 않는다. ADR-0029 이후에도 manual/unknown인
+occurrence를 새 Step으로 자동 대체하지 않는다. Frontier가 unresolved lifecycle을 먼저 닫으므로 같은
+Run의 새 occurrence는 이전 Step이 Core Receipt-completed되고 다음 model turn에서 다시 제안돼 별도
+permission evaluation을 통과한 경우에만 허용한다.
 
 ### 7. Adapter execution boundary는 후속 ADR로 분리한다
 

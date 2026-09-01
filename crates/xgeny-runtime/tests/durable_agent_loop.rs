@@ -22,8 +22,9 @@ use xgeny_runtime::{
 use xgeny_workgraph::{
     AgentLoopBudget, AgentLoopState, CompletionOutputRecord, ContinuationAction, EventRecord,
     ModelCallBudget, ModelCallLifecycleState, ModelCallRejectionReason, ModelCallSettlement,
-    ModelCallUnknownReason, PlannedExecutionProfile, ReconstructableMaterialReference, RunEvent,
-    RunEventBody, RunState, StepState, StepStatus, apply_record,
+    ModelCallUnknownReason, PlannedExecutionProfile, PlannedInvocationMaterialRecord,
+    ReconstructableMaterialReference, RunEvent, RunEventBody, RunState, StepState, StepStatus,
+    apply_record,
 };
 
 const AUTHORITY: &str = "local:test";
@@ -196,6 +197,7 @@ struct ProjectionStore {
     state: RunState,
     last_body: Option<RunEventBody>,
     completion_output: Option<CompletionOutputRecord>,
+    plan_inputs: BTreeMap<String, PlannedInvocationMaterialRecord>,
 }
 
 struct LegacyCompletionStore {
@@ -227,6 +229,7 @@ impl ProjectionStore {
             state,
             last_body: None,
             completion_output: None,
+            plan_inputs: BTreeMap::new(),
         }
     }
 }
@@ -262,6 +265,26 @@ impl RunStore for ProjectionStore {
             records: Vec::new(),
             state: self.state.clone(),
         }))
+    }
+
+    fn append_with_plan_inputs(
+        &mut self,
+        expected: ExpectedHead,
+        event: RunEvent,
+        inputs: Vec<PlannedInvocationMaterialRecord>,
+    ) -> Result<Commit, StoreError> {
+        let commit = self.append(expected, event)?;
+        for input in inputs {
+            self.plan_inputs.insert(input.step_id().to_owned(), input);
+        }
+        Ok(commit)
+    }
+
+    fn load_planned_invocation(
+        &self,
+        step_id: &str,
+    ) -> Result<Option<PlannedInvocationMaterialRecord>, StoreError> {
+        Ok(self.plan_inputs.get(step_id).cloned())
     }
 
     fn append_with_completion_output(
@@ -1503,8 +1526,8 @@ fn oversized_raw_proposal_is_rejected_before_resolution_or_materialization() {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)] // Covers both batch and cross-turn identity collisions.
-fn duplicate_semantic_actions_in_batch_or_replan_never_materialize() {
+#[allow(clippy::too_many_lines)] // Covers batch rejection and cross-turn occurrence identity.
+fn duplicate_batch_actions_are_rejected_but_a_completed_action_may_recur() {
     let run_id = "run-agent-loop-duplicate-batch";
     let definition = definition_fixture("xgeny.test/duplicate-marker");
     let cap = capability(&definition);
@@ -1573,11 +1596,18 @@ fn duplicate_semantic_actions_in_batch_or_replan_never_materialize() {
     let AgentLoopTick::PlanAccepted { step_ids, .. } = initial else {
         panic!("expected initial plan")
     };
+    let initial_step_id = step_ids[0].clone();
     let mut completed_state = initial_store.load_current().unwrap().unwrap();
     let completed = completed_state
         .steps
-        .get_mut(&step_ids[0])
+        .get_mut(&initial_step_id)
         .expect("planned Step should project");
+    let initial_action_digest = completed
+        .planned_invocation
+        .as_ref()
+        .expect("initial Step should retain its planned invocation")
+        .action_digest()
+        .to_owned();
     completed.status = StepStatus::Completed;
     completed.execution_receipt_id = Some("receipt-duplicate-replan".to_owned());
     completed.execution_receipt_digest = Some(format!("sha256:{}", "d".repeat(64)));
@@ -1600,18 +1630,30 @@ fn duplicate_semantic_actions_in_batch_or_replan_never_materialize() {
             &mut duplicate_planner,
             &mut materializer,
         )
-        .expect("duplicate replan should be classified");
-    assert!(matches!(
-        replan,
-        AgentLoopTick::ProposalRejected {
-            reason: ProposalRejection::DuplicateSemanticAction,
-            ..
-        }
-    ));
-    assert_eq!(materializer.calls, 0);
+        .expect("a completed semantic action should admit a new occurrence");
+    let AgentLoopTick::PlanAccepted { step_ids, .. } = replan else {
+        panic!("expected a new action occurrence")
+    };
+    assert_eq!(step_ids.len(), 1);
+    assert_ne!(step_ids[0], initial_step_id);
+    assert_eq!(materializer.calls, 1);
     let after_replan = replan_store.load_current().unwrap().unwrap();
-    assert_workgraph_unchanged(&completed_state, &after_replan);
-    assert_model_call_counters(&after_replan, 2, 2, 0, 1);
+    assert_eq!(after_replan.steps.len(), 2);
+    assert_eq!(
+        after_replan.steps[&initial_step_id].status,
+        StepStatus::Completed
+    );
+    let repeated = &after_replan.steps[&step_ids[0]];
+    assert_eq!(repeated.status, StepStatus::Planned);
+    assert_ne!(
+        repeated
+            .planned_invocation
+            .as_ref()
+            .expect("repeated Step should retain its planned invocation")
+            .action_digest(),
+        initial_action_digest
+    );
+    assert_model_call_counters(&after_replan, 2, 2, 0, 2);
 }
 
 #[test]
@@ -1726,7 +1768,7 @@ fn read_only_plan_uses_distinct_profile_without_idempotency_support() {
         .expect("accepted Step should retain its binding");
     assert_eq!(
         planned_binding.execution_profile(),
-        PlannedExecutionProfile::LocalSyncReadOnlyV1
+        PlannedExecutionProfile::LocalSyncReadOnlyOccurrenceV1
     );
 }
 

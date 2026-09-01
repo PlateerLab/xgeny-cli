@@ -296,7 +296,7 @@ impl PlannedRoutePort for ExactReadOnlyRoute {
             .get(step_id)
             .and_then(|step| step.planned_invocation.as_ref())
             .ok_or(PlannedRouteFailure::Rejected)?;
-        if planned.execution_profile() != PlannedExecutionProfile::LocalSyncReadOnlyV1 {
+        if planned.execution_profile() != PlannedExecutionProfile::LocalSyncReadOnlyOccurrenceV1 {
             return Err(PlannedRouteFailure::Rejected);
         }
         Ok(RouteRequest {

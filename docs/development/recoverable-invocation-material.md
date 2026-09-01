@@ -187,7 +187,7 @@ Provider error의 원문은 journal reason으로 사용하지 않는다. Error�
 | RFC 8785 canonical size ≤ 1 MiB | manual/거부 |
 | Definition input schema | manual/거부 |
 | Trusted resource resolver | manual/거부 |
-| Canonical semantic action digest | `reference_changed` 또는 recovery 거부 |
+| Canonical semantic action과 profile별 legacy/Run-Step occurrence digest | `reference_changed` 또는 recovery 거부 |
 | Durable intent와 authorization binding | store corruption 또는 recovery 거부 |
 
 Definition, Instance, resource와 action 검증은 최초 admission과 같은 core identity 함수를 사용해야 한다. Admission과 Recovery가 유사한 hash 입력을 각각 구현하지 않는다.
@@ -217,7 +217,10 @@ Durable event에는 free-form provider/OS error 대신 정해진 code만 기록�
 | `credential_binding_changed` | 안정적인 credential identity가 admission 뒤 retarget됨 |
 | `unsupported_material_version` | 지원된 record가 가리키는 provider recipe version을 현재 runtime이 해석할 수 없음 |
 
-이 전이는 sink guarantee나 effect class와 관계없이 external effect를 호출하지 않는다. Authorization use를 환불하지 않으며 자동으로 Planned 상태로 되돌리지 않는다. 현재 같은 Run의 동일 semantic action은 effect/grant identity도 같으므로 별도 Step만 만들어 재승인할 수 없다. 사용자가 다시 시도하려면 상태를 확인한 뒤 새 Run에서 permission evaluation을 거치거나, 향후 명시적인 occurrence/replacement protocol을 사용해야 한다.
+이 전이는 sink guarantee나 effect class와 관계없이 external effect를 호출하지 않는다. Authorization use를
+환불하지 않으며 자동으로 Planned 상태로 되돌리지 않는다. ADR-0029의 occurrence도 현재
+manual/unknown Step을 자동 대체하지 않는다. 같은 Run에서 새 occurrence를 만들려면 이전 Step이 Core
+Receipt-completed되고 다음 model turn에서 다시 제안돼 새 permission evaluation을 통과해야 한다.
 
 Transient provider 장애의 retry/backoff와 장기 `Blocked` 상태는 이 기본형에서 정의하지 않는다. 영구 부재가 확정되지 않은 오류를 성급하게 manual로 기록하지 않고 caller에게 fail-closed error로 반환한다.
 

@@ -111,7 +111,10 @@ impl PendingInvocation {
         &self.permission_request
     }
 
-    /// Instance-independent semantic action identity used for replay convergence.
+    /// Core-owned action identity used for authorization and replay convergence.
+    ///
+    /// Newly planned profiles bind this to the exact Run/Step occurrence. Legacy planned and
+    /// direct invocations retain their canonical semantic identity for restart compatibility.
     #[must_use]
     pub fn action_digest(&self) -> &str {
         &self.action_digest
@@ -303,11 +306,13 @@ impl InvocationAdmission {
             registry,
             resolver,
         )?;
+        let action_digest =
+            planned_action_digest(&state, &request.step_id, &facts.semantic_action_digest)?;
         let plan_id = verify_planned_admission_binding(
             &state,
             &request,
             &facts.definition_digest,
-            &facts.action_digest,
+            &action_digest,
             &facts.material_digest,
         )?;
         let material_retention = match (&plan_id, planned_input.as_ref()) {
@@ -329,7 +334,7 @@ impl InvocationAdmission {
             normalized_arguments: facts.normalized_arguments,
             permission_request: facts.permission_request,
             definition_digest: facts.definition_digest,
-            action_digest: facts.action_digest,
+            action_digest,
             material_digest: facts.material_digest,
             material_retention,
             plan_id,
@@ -479,7 +484,7 @@ pub(crate) struct PreparedInvocationFacts {
     pub(crate) normalized_arguments: Value,
     pub(crate) permission_request: ResolvedPermissionRequest,
     pub(crate) definition_digest: String,
-    pub(crate) action_digest: String,
+    pub(crate) semantic_action_digest: String,
     pub(crate) material_digest: String,
 }
 
@@ -490,7 +495,7 @@ impl fmt::Debug for PreparedInvocationFacts {
             .field("normalized_arguments", &"<redacted>")
             .field("permission_request", &"<resolved/redacted>")
             .field("definition_digest", &self.definition_digest)
-            .field("action_digest", &self.action_digest)
+            .field("semantic_action_digest", &self.semantic_action_digest)
             .field("material_digest", &self.material_digest)
             .finish()
     }
@@ -543,7 +548,7 @@ pub(crate) fn prepare_invocation_facts<R: ResourceResolver>(
     validate_arguments(definition, derived_request.normalized_arguments())?;
 
     let definition_digest = definition_contract_digest(definition)?;
-    let action_digest = semantic_action_digest(
+    let semantic_action_digest = semantic_action_digest(
         capability,
         &definition_digest,
         definition.spec.effect.class,
@@ -555,9 +560,55 @@ pub(crate) fn prepare_invocation_facts<R: ResourceResolver>(
         normalized_arguments: derived_request.normalized_arguments().clone(),
         permission_request: derived_request.permission_request().clone(),
         definition_digest,
-        action_digest,
+        semantic_action_digest,
         material_digest,
     })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlannedActionOccurrenceDigestInput<'a> {
+    domain: &'static str,
+    run_id: &'a str,
+    step_id: &'a str,
+    semantic_action_digest: &'a str,
+}
+
+pub(crate) fn planned_action_occurrence_digest(
+    run_id: &str,
+    step_id: &str,
+    semantic_action_digest: &str,
+) -> Result<String, AdmissionError> {
+    digest_serializable(&PlannedActionOccurrenceDigestInput {
+        domain: "xgeny.planned-action-occurrence/v1",
+        run_id,
+        step_id,
+        semantic_action_digest,
+    })
+}
+
+pub(crate) fn planned_action_digest(
+    state: &RunState,
+    step_id: &str,
+    semantic_action_digest: &str,
+) -> Result<String, AdmissionError> {
+    let profile = state
+        .steps
+        .get(step_id)
+        .ok_or_else(|| AdmissionError::StepNotFound(step_id.to_owned()))?
+        .planned_invocation
+        .as_ref()
+        .map(xgeny_workgraph::PlannedInvocationBinding::execution_profile);
+    match profile {
+        Some(
+            PlannedExecutionProfile::LocalSyncOnceOccurrenceV1
+            | PlannedExecutionProfile::LocalSyncReadOnlyOccurrenceV1,
+        ) => planned_action_occurrence_digest(&state.run_id, step_id, semantic_action_digest),
+        Some(
+            PlannedExecutionProfile::LocalSyncOnceV1 | PlannedExecutionProfile::LocalSyncReadOnlyV1,
+        )
+        | None => Ok(semantic_action_digest.to_owned()),
+    }
 }
 
 struct IssuedEffect {
@@ -951,8 +1002,14 @@ pub(crate) fn verify_planned_route_binding(
         return Ok(());
     };
     let idempotency_feature_matches = match planned.execution_profile() {
-        PlannedExecutionProfile::LocalSyncOnceV1 => route.required_features.idempotency_key,
-        PlannedExecutionProfile::LocalSyncReadOnlyV1 => !route.required_features.idempotency_key,
+        PlannedExecutionProfile::LocalSyncOnceV1
+        | PlannedExecutionProfile::LocalSyncOnceOccurrenceV1 => {
+            route.required_features.idempotency_key
+        }
+        PlannedExecutionProfile::LocalSyncReadOnlyV1
+        | PlannedExecutionProfile::LocalSyncReadOnlyOccurrenceV1 => {
+            !route.required_features.idempotency_key
+        }
     };
     let checks = [
         (
@@ -1011,10 +1068,12 @@ pub(crate) fn verify_planned_definition_binding(
     let profile_matches = matches!(
         (planned.execution_profile(), definition.spec.effect.class),
         (
-            PlannedExecutionProfile::LocalSyncReadOnlyV1,
+            PlannedExecutionProfile::LocalSyncReadOnlyV1
+                | PlannedExecutionProfile::LocalSyncReadOnlyOccurrenceV1,
             DomainEffectClass::ReadOnly
         ) | (
-            PlannedExecutionProfile::LocalSyncOnceV1,
+            PlannedExecutionProfile::LocalSyncOnceV1
+                | PlannedExecutionProfile::LocalSyncOnceOccurrenceV1,
             DomainEffectClass::Idempotent | DomainEffectClass::NonIdempotent
         )
     );

@@ -1811,12 +1811,7 @@ impl PlannedRoutePort for ExactLocalRoute {
                 && planned.contract_version() == APPLY_PATCH_CONTRACT_VERSION)
             || (planned.capability_id() == PROCESS_EXECUTE_CAPABILITY_ID
                 && planned.contract_version() == PROCESS_EXECUTE_CONTRACT_VERSION);
-        let expected_profile = if once {
-            PlannedExecutionProfile::LocalSyncOnceV1
-        } else {
-            PlannedExecutionProfile::LocalSyncReadOnlyV1
-        };
-        if planned.execution_profile() != expected_profile {
+        if !local_profile_matches_effect_kind(once, planned.execution_profile()) {
             return Err(PlannedRouteFailure::Rejected);
         }
         let (capability, instance_id) = self
@@ -1847,6 +1842,21 @@ impl PlannedRoutePort for ExactLocalRoute {
             pinned_instance_id: Some(instance_id.clone()),
         })
     }
+}
+
+fn local_profile_matches_effect_kind(once: bool, profile: PlannedExecutionProfile) -> bool {
+    matches!(
+        (once, profile),
+        (
+            true,
+            PlannedExecutionProfile::LocalSyncOnceV1
+                | PlannedExecutionProfile::LocalSyncOnceOccurrenceV1
+        ) | (
+            false,
+            PlannedExecutionProfile::LocalSyncReadOnlyV1
+                | PlannedExecutionProfile::LocalSyncReadOnlyOccurrenceV1
+        )
+    )
 }
 
 enum ApprovalCatalog {
@@ -2060,6 +2070,34 @@ mod tests {
     use xgeny_policy::PermissionRequestResolver;
 
     use super::*;
+
+    #[test]
+    fn local_route_profile_gate_accepts_new_occurrences_and_legacy_resume_profiles() {
+        assert!(local_profile_matches_effect_kind(
+            true,
+            PlannedExecutionProfile::LocalSyncOnceOccurrenceV1
+        ));
+        assert!(local_profile_matches_effect_kind(
+            true,
+            PlannedExecutionProfile::LocalSyncOnceV1
+        ));
+        assert!(local_profile_matches_effect_kind(
+            false,
+            PlannedExecutionProfile::LocalSyncReadOnlyOccurrenceV1
+        ));
+        assert!(local_profile_matches_effect_kind(
+            false,
+            PlannedExecutionProfile::LocalSyncReadOnlyV1
+        ));
+        assert!(!local_profile_matches_effect_kind(
+            true,
+            PlannedExecutionProfile::LocalSyncReadOnlyOccurrenceV1
+        ));
+        assert!(!local_profile_matches_effect_kind(
+            false,
+            PlannedExecutionProfile::LocalSyncOnceV1
+        ));
+    }
 
     #[test]
     fn no_egress_consent_returns_before_workspace_or_state_access() {
