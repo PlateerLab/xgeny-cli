@@ -59,11 +59,16 @@ prerelease `v0.1.0-rc.2`에는 아직 exact `--allow-file` mode만 있으므로 
 xgeny run \
   --workspace . \
   --allow-dir . \
+  --allow-executable cargo="$(command -v cargo)" \
   --allow-remote-model-egress \
   --allow-read \
   --allow-write \
-  '프로젝트 구조를 확인하고 필요한 파일을 안전하게 수정해줘.'
+  '프로젝트 구조를 확인하고 필요한 파일을 수정한 뒤 테스트해줘.'
 ```
+
+Process는 shell 없이 실행되지만 별도 `--allow-execute` 전에는
+`execute_approval_required`로 pause한다. 허용한 executable과 하위 process는 사용자 OS 권한으로 project
+code를 실행하므로 이는 sandbox가 아니다. 승인·재개 예시는 [시작하기](docs/getting-started.md)를 따른다.
 
 `model check`는 명시한 endpoint에 `GET /v1/models` 하나만 보내 exact model ID의 광고 여부를
 확인한다. Prompt나 inference 요청을 보내지 않고 workspace·Run state도 만들지 않는다. PASS는 catalog

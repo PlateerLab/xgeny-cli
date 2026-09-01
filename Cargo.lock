@@ -1964,6 +1964,7 @@ dependencies = [
  "thiserror",
  "time",
  "xgeny-adapter-filesystem",
+ "xgeny-adapter-process",
  "xgeny-domain",
  "xgeny-local-store",
  "xgeny-policy",

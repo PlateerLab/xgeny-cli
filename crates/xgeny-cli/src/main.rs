@@ -40,7 +40,7 @@ enum Command {
         #[command(subcommand)]
         command: ModelCommand,
     },
-    /// Start a bounded local Run using one OpenAI-compatible model and confined filesystem capabilities.
+    /// Start a bounded local Run with confined filesystem and optional shell-free process capabilities.
     Run(RunArgs),
     /// Continue an existing Run, or replay its durable completion without model access.
     Resume(ResumeArgs),
@@ -75,6 +75,7 @@ struct ModelCheckArgs {
 }
 
 #[derive(Debug, Args)]
+#[allow(clippy::struct_excessive_bools)] // Four independent CLI consent switches.
 #[command(
     group(
         ArgGroup::new("read_scope")
@@ -108,6 +109,9 @@ struct RunArgs {
     /// Relative workspace directory the model may inspect recursively; use '.' for the root.
     #[arg(long = "allow-dir")]
     allow_dirs: Vec<String>,
+    /// Catalog one executable as `LOGICAL_ID=ABSOLUTE_PATH`; repeat for more executables.
+    #[arg(long = "allow-executable", value_name = "ID=ABSOLUTE_PATH")]
+    allow_executables: Vec<String>,
     /// Explicitly allow goal/context/tool output transfer to the remote model boundary.
     #[arg(long)]
     allow_remote_model_egress: bool,
@@ -117,12 +121,16 @@ struct RunArgs {
     /// Approve each one-shot atomic file write selected within an allow-dir scope.
     #[arg(long)]
     allow_write: bool,
+    /// Approve each one-shot process execution selected from the executable catalog.
+    #[arg(long)]
+    allow_execute: bool,
     /// Bound work performed by this process invocation.
     #[arg(long, default_value_t = 32)]
     max_ticks: u32,
 }
 
 #[derive(Debug, Args)]
+#[allow(clippy::struct_excessive_bools)] // Four independent CLI consent switches.
 #[command(
     after_long_help = "HTTPS authentication for an incomplete Run: set XGENY_OPENAI_API_KEY. Credentials are ignored for loopback HTTP."
 )]
@@ -141,6 +149,9 @@ struct ResumeArgs {
     /// Same allow-dir catalog supplied to the original Run.
     #[arg(long = "allow-dir")]
     allow_dirs: Vec<String>,
+    /// Same executable catalog supplied to the original Run.
+    #[arg(long = "allow-executable", value_name = "ID=ABSOLUTE_PATH")]
+    allow_executables: Vec<String>,
     /// Allow a new remote model request to this invocation's supplied --base-url.
     #[arg(long)]
     allow_remote_model_egress: bool,
@@ -150,6 +161,9 @@ struct ResumeArgs {
     /// Approve each one-shot atomic file write selected within an allow-dir scope.
     #[arg(long)]
     allow_write: bool,
+    /// Approve each one-shot process execution selected from the executable catalog.
+    #[arg(long)]
+    allow_execute: bool,
     /// Bound work performed by this process invocation.
     #[arg(long, default_value_t = 32)]
     max_ticks: u32,
@@ -209,9 +223,11 @@ fn main() -> ExitCode {
                     tokenizer,
                     allow_files: args.allow_files,
                     allow_dirs: args.allow_dirs,
+                    allow_executables: args.allow_executables,
                     allow_remote_model_egress: args.allow_remote_model_egress,
                     allow_read: args.allow_read,
                     allow_write: args.allow_write,
+                    allow_execute: args.allow_execute,
                     max_ticks: args.max_ticks,
                 },
                 |run_id| eprintln!("XGENY_STARTED run_id={run_id}"),
@@ -223,9 +239,11 @@ fn main() -> ExitCode {
             base_url: args.base_url,
             allow_files: args.allow_files,
             allow_dirs: args.allow_dirs,
+            allow_executables: args.allow_executables,
             allow_remote_model_egress: args.allow_remote_model_egress,
             allow_read: args.allow_read,
             allow_write: args.allow_write,
+            allow_execute: args.allow_execute,
             max_ticks: args.max_ticks,
         })),
     }

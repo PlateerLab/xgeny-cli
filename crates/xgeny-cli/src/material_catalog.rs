@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use xgeny_adapter_process::{
+    PROCESS_EXECUTE_CAPABILITY_ID, PROCESS_EXECUTE_CONTRACT_VERSION, ProcessWorkspace,
+};
 use xgeny_domain::CapabilityRef;
 use xgeny_runtime::{
     InvocationMaterialProvider, MaterialProviderFailure, PlanMaterializationRequest,
@@ -21,7 +24,21 @@ pub(crate) const WORKSPACE_READ_MATERIAL_PROVIDER_ID: &str = "xgeny.cli.workspac
 pub(crate) const WORKSPACE_READ_MATERIAL_CATALOG_SCHEMA_VERSION: i64 = 1;
 pub(crate) const WORKSPACE_READ_RECIPE_FORMAT_VERSION: u32 = 1;
 pub(crate) const WORKSPACE_READ_RECIPE_DOMAIN: &str = "xgeny.cli.workspace-read-recipe/v1";
+pub(crate) const PROCESS_MATERIAL_PROVIDER_ID: &str = "xgeny.cli.process-material.v1";
+pub(crate) const PROCESS_RECIPE_FORMAT_VERSION: u32 = 1;
+pub(crate) const PROCESS_RECIPE_DOMAIN: &str = "xgeny.cli.process-recipe/v1";
 pub(crate) const MAX_RECIPE_BYTES: usize = 512 * 1024;
+
+const WORKSPACE_RECIPE_PROFILE: RecipeProfile = RecipeProfile {
+    domain: WORKSPACE_READ_RECIPE_DOMAIN,
+    format_version: WORKSPACE_READ_RECIPE_FORMAT_VERSION,
+    provider_id: WORKSPACE_READ_MATERIAL_PROVIDER_ID,
+};
+const PROCESS_RECIPE_PROFILE: RecipeProfile = RecipeProfile {
+    domain: PROCESS_RECIPE_DOMAIN,
+    format_version: PROCESS_RECIPE_FORMAT_VERSION,
+    provider_id: PROCESS_MATERIAL_PROVIDER_ID,
+};
 
 pub(crate) struct RunMaterialCatalog {
     connection: Connection,
@@ -94,12 +111,35 @@ impl RunMaterialCatalog {
         &mut self,
         request: &PlanMaterializationRequest<'_>,
     ) -> Result<ReconstructableMaterialReference, PlanMaterializerFailure> {
+        self.persist_request_with_profile(request, WORKSPACE_RECIPE_PROFILE)
+    }
+
+    fn persist_process_request(
+        &mut self,
+        request: &PlanMaterializationRequest<'_>,
+    ) -> Result<ReconstructableMaterialReference, PlanMaterializerFailure> {
+        self.persist_request_with_profile(request, PROCESS_RECIPE_PROFILE)
+    }
+
+    #[cfg(test)]
+    fn persist_record(
+        &mut self,
+        record: &RecipeRecord,
+    ) -> Result<ReconstructableMaterialReference, PlanMaterializerFailure> {
+        self.persist_record_with_profile(record, WORKSPACE_RECIPE_PROFILE)
+    }
+
+    fn persist_request_with_profile(
+        &mut self,
+        request: &PlanMaterializationRequest<'_>,
+        profile: RecipeProfile,
+    ) -> Result<ReconstructableMaterialReference, PlanMaterializerFailure> {
         if request.run_id() != self.run_id {
             return Err(PlanMaterializerFailure::Rejected);
         }
         let record = RecipeRecord {
-            domain: WORKSPACE_READ_RECIPE_DOMAIN.to_owned(),
-            format_version: WORKSPACE_READ_RECIPE_FORMAT_VERSION,
+            domain: profile.domain.to_owned(),
+            format_version: profile.format_version,
             run_id: request.run_id().to_owned(),
             step_id: request.step_id().to_owned(),
             proposal_digest: request.proposal_digest().to_owned(),
@@ -107,14 +147,15 @@ impl RunMaterialCatalog {
             material_digest: request.material_digest().to_owned(),
             arguments: request.normalized_arguments().clone(),
         };
-        self.persist_record(&record)
+        self.persist_record_with_profile(&record, profile)
     }
 
-    fn persist_record(
+    fn persist_record_with_profile(
         &mut self,
         record: &RecipeRecord,
+        profile: RecipeProfile,
     ) -> Result<ReconstructableMaterialReference, PlanMaterializerFailure> {
-        if record.run_id != self.run_id || !record_shape_valid(record) {
+        if record.run_id != self.run_id || !record_shape_valid(record, profile) {
             return Err(PlanMaterializerFailure::Rejected);
         }
         let canonical =
@@ -149,18 +190,31 @@ impl RunMaterialCatalog {
         transaction
             .commit()
             .map_err(|_| PlanMaterializerFailure::PersistenceFailed)?;
-        ReconstructableMaterialReference::new(
-            WORKSPACE_READ_MATERIAL_PROVIDER_ID,
-            reference_id,
-            revision,
-        )
-        .map_err(|_| PlanMaterializerFailure::PersistenceFailed)
+        ReconstructableMaterialReference::new(profile.provider_id, reference_id, revision)
+            .map_err(|_| PlanMaterializerFailure::PersistenceFailed)
     }
 
     fn reconstruct_record(
         &self,
         reference_id: &str,
         revision: &str,
+    ) -> Result<RecipeRecord, MaterialProviderFailure> {
+        self.reconstruct_record_with_profile(reference_id, revision, WORKSPACE_RECIPE_PROFILE)
+    }
+
+    fn reconstruct_process_record(
+        &self,
+        reference_id: &str,
+        revision: &str,
+    ) -> Result<RecipeRecord, MaterialProviderFailure> {
+        self.reconstruct_record_with_profile(reference_id, revision, PROCESS_RECIPE_PROFILE)
+    }
+
+    fn reconstruct_record_with_profile(
+        &self,
+        reference_id: &str,
+        revision: &str,
+        profile: RecipeProfile,
     ) -> Result<RecipeRecord, MaterialProviderFailure> {
         let stored: Option<(String, Vec<u8>)> = self
             .connection
@@ -187,12 +241,19 @@ impl RunMaterialCatalog {
             || reference_id != format!("recipe-{digest}")
             || revision != format!("sha256-{digest}")
             || record.run_id != self.run_id
-            || !record_shape_valid(&record)
+            || !record_shape_valid(&record, profile)
         {
             return Err(MaterialProviderFailure::RevisionChanged);
         }
         Ok(record)
     }
+}
+
+#[derive(Clone, Copy)]
+struct RecipeProfile {
+    domain: &'static str,
+    format_version: u32,
+    provider_id: &'static str,
 }
 
 impl fmt::Debug for RunMaterialCatalog {
@@ -271,6 +332,66 @@ impl InvocationMaterialProvider for WorkspaceReadMaterialProvider {
     }
 }
 
+pub(crate) struct ProcessMaterializer {
+    workspace: ProcessWorkspace,
+    catalog: RunMaterialCatalog,
+}
+
+impl ProcessMaterializer {
+    pub(crate) const fn new(workspace: ProcessWorkspace, catalog: RunMaterialCatalog) -> Self {
+        Self { workspace, catalog }
+    }
+}
+
+impl PlanMaterializer for ProcessMaterializer {
+    fn materialize(
+        &mut self,
+        request: PlanMaterializationRequest<'_>,
+    ) -> Result<ReconstructableMaterialReference, PlanMaterializerFailure> {
+        if request.capability().capability_id != PROCESS_EXECUTE_CAPABILITY_ID
+            || request.capability().contract_version != PROCESS_EXECUTE_CONTRACT_VERSION
+            || !self
+                .workspace
+                .accepts_normalized_material(request.normalized_arguments())
+        {
+            return Err(PlanMaterializerFailure::Rejected);
+        }
+        self.catalog.persist_process_request(&request)
+    }
+}
+
+pub(crate) struct ProcessMaterialProvider {
+    workspace: ProcessWorkspace,
+    catalog: RunMaterialCatalog,
+}
+
+impl ProcessMaterialProvider {
+    pub(crate) const fn new(workspace: ProcessWorkspace, catalog: RunMaterialCatalog) -> Self {
+        Self { workspace, catalog }
+    }
+}
+
+impl InvocationMaterialProvider for ProcessMaterialProvider {
+    fn reconstruct(
+        &mut self,
+        reference_id: &str,
+        revision: &str,
+    ) -> Result<Value, MaterialProviderFailure> {
+        let record = self
+            .catalog
+            .reconstruct_process_record(reference_id, revision)?;
+        if record.capability.capability_id != PROCESS_EXECUTE_CAPABILITY_ID
+            || record.capability.contract_version != PROCESS_EXECUTE_CONTRACT_VERSION
+            || !self
+                .workspace
+                .accepts_normalized_material(&record.arguments)
+        {
+            return Err(MaterialProviderFailure::RevisionChanged);
+        }
+        Ok(record.arguments)
+    }
+}
+
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunMaterialCatalogError {
     #[error("Run material catalog is unavailable")]
@@ -292,9 +413,9 @@ struct RecipeRecord {
     arguments: Value,
 }
 
-fn record_shape_valid(record: &RecipeRecord) -> bool {
-    record.domain == WORKSPACE_READ_RECIPE_DOMAIN
-        && record.format_version == WORKSPACE_READ_RECIPE_FORMAT_VERSION
+fn record_shape_valid(record: &RecipeRecord, profile: RecipeProfile) -> bool {
+    record.domain == profile.domain
+        && record.format_version == profile.format_version
         && valid_run_id(&record.run_id)
         && valid_identifier(&record.step_id, 256)
         && valid_digest(&record.proposal_digest)
@@ -405,6 +526,22 @@ mod tests {
         }
     }
 
+    fn process_record(arguments: Value) -> RecipeRecord {
+        RecipeRecord {
+            domain: PROCESS_RECIPE_DOMAIN.to_owned(),
+            format_version: PROCESS_RECIPE_FORMAT_VERSION,
+            run_id: RUN_ID.to_owned(),
+            step_id: "step-process-1".to_owned(),
+            proposal_digest: DIGEST.to_owned(),
+            capability: CapabilityRef {
+                capability_id: PROCESS_EXECUTE_CAPABILITY_ID.to_owned(),
+                contract_version: PROCESS_EXECUTE_CONTRACT_VERSION.to_owned(),
+            },
+            material_digest: DIGEST.to_owned(),
+            arguments,
+        }
+    }
+
     #[test]
     fn recipe_reconstructs_after_reopen_without_raw_reference_data() {
         let directory = tempdir().unwrap();
@@ -463,6 +600,41 @@ mod tests {
             .unwrap();
         assert_eq!(
             catalog
+                .reconstruct_record(reference.reference_id(), reference.revision())
+                .unwrap_err(),
+            MaterialProviderFailure::RevisionChanged
+        );
+    }
+
+    #[test]
+    fn process_recipes_are_durable_and_domain_separated() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("materials.sqlite3");
+        RunMaterialCatalog::create(&path, RUN_ID).unwrap();
+        let mut catalog = RunMaterialCatalog::open_existing(&path, RUN_ID).unwrap();
+        let input = process_record(serde_json::json!({
+            "executable": "process:primary/executables/cargo",
+            "args": ["test", "--workspace"],
+            "cwd": ".",
+            "env": {},
+            "timeoutMs": 600_000,
+            "maxOutputBytes": 32768
+        }));
+        let reference = catalog
+            .persist_record_with_profile(&input, PROCESS_RECIPE_PROFILE)
+            .unwrap();
+        assert!(!reference.reference_id().contains("cargo"));
+        drop(catalog);
+
+        let reopened = RunMaterialCatalog::open_existing(&path, RUN_ID).unwrap();
+        assert_eq!(
+            reopened
+                .reconstruct_process_record(reference.reference_id(), reference.revision())
+                .unwrap(),
+            input
+        );
+        assert_eq!(
+            reopened
                 .reconstruct_record(reference.reference_id(), reference.revision())
                 .unwrap_err(),
             MaterialProviderFailure::RevisionChanged

@@ -89,6 +89,162 @@ impl SequentialServer {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn process_execution_requires_separate_approval_and_resumes_without_replay() {
+    let fixture = tempdir().expect("test directory should exist");
+    let state_root = fixture.path().join("state");
+    let workspace = fixture.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace should create");
+    fs::write(workspace.join("README.md"), "process integration fixture\n")
+        .expect("workspace fixture should write");
+    let xgeny_binary = Path::new(env!("CARGO_BIN_EXE_xgeny"));
+    let executable_spec = format!("xgeny={}", path_text(xgeny_binary));
+    let server = SequentialServer::spawn_responses(vec![
+        plan_response(
+            "check_protocol",
+            "Run the bundled protocol checks without a shell",
+            "xgeny.process/execute",
+            &json!({
+                "executable": "xgeny",
+                "args": ["protocol", "check"],
+                "cwd": ".",
+                "env": {},
+                "timeoutMs": 30000,
+                "maxOutputBytes": 32768
+            }),
+        ),
+        completion_response(),
+    ]);
+
+    let first = bounded_output(xgeny(&state_root).args([
+        "run",
+        "--workspace",
+        path_text(&workspace),
+        "--base-url",
+        &server.base_url,
+        "--model",
+        MODEL,
+        "--tokenizer",
+        TOKENIZER,
+        "--allow-dir",
+        ".",
+        "--allow-executable",
+        &executable_spec,
+        "--allow-remote-model-egress",
+        "Run the protocol check and report the result.",
+    ]))
+    .expect("unapproved process should pause");
+    assert_eq!(first.status.code(), Some(10), "{}", stderr(&first));
+    assert!(stderr(&first).contains("reason=execute_approval_required"));
+    let run_id = extract_run_id(&stderr(&first));
+
+    let first_request = server
+        .requests
+        .recv_timeout(TEST_TIMEOUT)
+        .expect("initial planning request should arrive");
+    let first_context = planning_context(&first_request);
+    assert!(capability_ids(&first_context).contains(&"xgeny.process/execute"));
+    let constraints = first_context["planningConstraints"]
+        .as_array()
+        .expect("filesystem and process constraints should be present");
+    assert_eq!(constraints.len(), 2);
+    assert_eq!(constraints[1]["constraintId"], "process.executable-catalog");
+    assert!(
+        constraints[1]["description"]
+            .as_str()
+            .unwrap()
+            .contains("xgeny")
+    );
+    assert!(
+        !constraints[1]["description"]
+            .as_str()
+            .unwrap()
+            .contains(path_text(xgeny_binary))
+    );
+
+    let different_executable = std::env::current_exe().expect("test executable should resolve");
+    let different_specification = format!("xgeny={}", path_text(&different_executable));
+    let mismatch = bounded_output(xgeny(&state_root).args([
+        "resume",
+        &run_id,
+        "--workspace",
+        path_text(&workspace),
+        "--allow-dir",
+        ".",
+        "--allow-executable",
+        &different_specification,
+        "--allow-execute",
+    ]))
+    .expect("changed executable catalog should fail closed");
+    assert_eq!(mismatch.status.code(), Some(64), "{}", stderr(&mismatch));
+    assert!(stderr(&mismatch).contains("code=configuration_mismatch"));
+
+    let local = bounded_output(xgeny(&state_root).args([
+        "resume",
+        &run_id,
+        "--workspace",
+        path_text(&workspace),
+        "--allow-dir",
+        ".",
+        "--allow-executable",
+        &executable_spec,
+        "--allow-execute",
+    ]))
+    .expect("approved process should execute without model access");
+    assert_eq!(local.status.code(), Some(10), "{}", stderr(&local));
+    assert!(stderr(&local).contains("reason=remote_model_egress_consent_required"));
+
+    let completion = bounded_output(xgeny(&state_root).args([
+        "resume",
+        &run_id,
+        "--workspace",
+        path_text(&workspace),
+        "--base-url",
+        &server.base_url,
+        "--allow-dir",
+        ".",
+        "--allow-executable",
+        &executable_spec,
+        "--allow-execute",
+        "--allow-remote-model-egress",
+    ]))
+    .expect("remote continuation should complete");
+    assert_eq!(completion.status.code(), Some(0), "{}", stderr(&completion));
+    assert_eq!(String::from_utf8_lossy(&completion.stdout), COMPLETION);
+
+    let completion_request = server
+        .requests
+        .recv_timeout(TEST_TIMEOUT)
+        .expect("completion request should arrive");
+    server.handle.join().expect("provider server should finish");
+    let completion_context = planning_context(&completion_request);
+    let output = tool_output(&completion_context, "xgeny.process/execute");
+    assert_eq!(output["outcome"], "exited");
+    assert_eq!(output["success"], true);
+    assert!(
+        output["stdout"]
+            .as_str()
+            .expect("process stdout should be text")
+            .contains("XGENy protocol v0.1: PASS")
+    );
+
+    let database = state_root.join("runs").join(&run_id).join("run.sqlite3");
+    let store = SqliteRunStore::open_existing(database).expect("Run store should reopen");
+    let receipts = store
+        .load_execution_receipts()
+        .expect("execution receipts should load");
+    assert_eq!(
+        receipts.len(),
+        1,
+        "completed process must not replay on resume"
+    );
+    assert_eq!(
+        receipts[0].capability.capability_id,
+        "xgeny.process/execute"
+    );
+}
+
+#[test]
 fn dynamic_search_material_survives_process_pause_and_resume() {
     let fixture = tempdir().expect("test directory should exist");
     let state_root = fixture.path().join("state");

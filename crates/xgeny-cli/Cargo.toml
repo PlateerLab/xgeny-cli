@@ -24,6 +24,7 @@ sha2.workspace = true
 thiserror.workspace = true
 time.workspace = true
 xgeny-adapter-filesystem = { path = "../xgeny-adapter-filesystem" }
+xgeny-adapter-process = { path = "../xgeny-adapter-process" }
 xgeny-domain = { path = "../xgeny-domain" }
 xgeny-local-store = { path = "../xgeny-local-store" }
 xgeny-policy = { path = "../xgeny-policy" }

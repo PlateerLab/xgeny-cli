@@ -4,12 +4,13 @@
 
 ## 범위
 
-현재 워크스페이스는 다음 열 개 crate로 구성된다.
+현재 워크스페이스는 다음 열한 개 crate로 구성된다.
 
 ```text
 crates/
   xgeny-adapter-reference/ publish하지 않는 preopened-handle conformance 기준
   xgeny-adapter-filesystem/ capability-confined workspace read/list/stat/search/write/patch 제품 adapter
+  xgeny-adapter-process/ shell-free bounded process execute 제품 adapter
   xgeny-domain/       I/O 없는 정본 Rust 프로토콜 타입
   xgeny-protocol/     bundled/offline schema·fixture·digest 검증
   xgeny-workgraph/    model-free RunEvent 상태 전이·재생 실험
@@ -20,7 +21,7 @@ crates/
   xgeny-cli/          protocol check와 public local run/resume를 제공하는 실행 파일·driver library
 ```
 
-`xgeny-workgraph`, `xgeny-local-store`, `xgeny-runtime`의 durable effect, invocation material, Direct Executor, Core verification, VerifiedRunIndex, Persistent dependency frontier, bounded AgentLoop와 model-call lifecycle 계약은 ADR-0008·0010·0011·0012·0013·0014·0015·0016 연구 gate를 위한 내부 실험이다. ADR-0018은 내부 ReadOnly profile, Artifact-bearing Core Receipt v2와 기존 구성요소를 조합하는 bounded CLI library driver를 추가했다. ADR-0019는 event-anchored `ToolOutputRecord`와 SQLite physical schema 7을 추가했고, ADR-0020·0021은 generation-checked planning context와 durable completion을 schema 8에 연결했다. Registry와 Router는 기존 Definition/Instance를 사용한다. `xgeny-policy`의 Allow는 provisional이며 runtime Admission이 exact invocation의 one-shot authority를 Run/Step/action/Instance/material에 결합한다. `xgeny-adapter-reference`는 비제품 conformance 기준이다. 제품 `xgeny-adapter-filesystem`은 exact-file `read-text`와 opt-in directory `list-directory`·`stat`·`search-text`·`write-atomic`·`apply-patch`를 제공한다. Public CLI는 기존 `--allow-file` profile을 보존하면서 `--allow-dir` discovery와 별도 `--allow-write` atomic mutation을 제공한다. 일반 process·network adapter, interactive 승인 UI, MCP, Connector와 XGEN 원격 연동은 아직 구현하지 않는다.
+`xgeny-workgraph`, `xgeny-local-store`, `xgeny-runtime`의 durable effect, invocation material, Direct Executor, Core verification, VerifiedRunIndex, Persistent dependency frontier, bounded AgentLoop와 model-call lifecycle 계약은 ADR-0008·0010·0011·0012·0013·0014·0015·0016 연구 gate를 위한 내부 실험이다. ADR-0018은 내부 ReadOnly profile, Artifact-bearing Core Receipt v2와 기존 구성요소를 조합하는 bounded CLI library driver를 추가했다. ADR-0019는 event-anchored `ToolOutputRecord`와 SQLite physical schema 7을 추가했고, ADR-0020·0021은 generation-checked planning context와 durable completion을 schema 8에 연결했다. Registry와 Router는 기존 Definition/Instance를 사용한다. `xgeny-policy`의 Allow는 provisional이며 runtime Admission이 exact invocation의 one-shot authority를 Run/Step/action/Instance/material에 결합한다. `xgeny-adapter-reference`는 비제품 conformance 기준이다. 제품 `xgeny-adapter-filesystem`은 exact-file `read-text`와 opt-in directory `list-directory`·`stat`·`search-text`·`write-atomic`·`apply-patch`를 제공한다. `xgeny-adapter-process`는 host-catalogued executable을 shell 없이 bounded 실행한다. Public CLI는 기존 `--allow-file` profile을 보존하면서 `--allow-dir` discovery, 별도 `--allow-write` atomic mutation과 별도 `--allow-execute` process 승인을 제공한다. Network adapter, interactive 승인 UI, MCP, Connector와 XGEN 원격 연동은 아직 구현하지 않는다.
 
 ## 준비물
 
