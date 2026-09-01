@@ -2,10 +2,9 @@ use std::fmt::Write as _;
 use std::io::{ErrorKind, Read as _, Write as _};
 use std::sync::Arc;
 
-use cap_fs_ext::{
-    DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsMaybeDirExt as _,
-    OpenOptionsSyncExt as _,
-};
+#[cfg(unix)]
+use cap_fs_ext::OpenOptionsMaybeDirExt as _;
+use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsSyncExt as _};
 use cap_std::fs::{Dir, File, OpenOptions, Permissions};
 use serde_json::{Value, json};
 use xgeny_domain::{InstanceFeatures, VerificationResult, VerificationStrategy};
@@ -439,7 +438,7 @@ fn write_atomic(
         let _ = parent.remove_file(&temporary_name);
         return Err(WriteFailure::CommitRenameUnknown);
     }
-    if sync_parent(&parent).is_err() {
+    if !sync_parent(&parent) {
         return Err(WriteFailure::CommitSyncUnknown);
     }
     let committed =
@@ -558,18 +557,21 @@ fn create_temporary(parent: &Dir) -> Result<(String, File), WriteFailure> {
 }
 
 #[cfg(unix)]
-fn sync_parent(parent: &Dir) -> std::io::Result<()> {
+fn sync_parent(parent: &Dir) -> bool {
     let mut options = OpenOptions::new();
     options
         .read(true)
         .maybe_dir(true)
         .follow(FollowSymlinks::No);
-    parent.open_with(".", &options)?.sync_all()
+    parent
+        .open_with(".", &options)
+        .and_then(|directory| directory.sync_all())
+        .is_ok()
 }
 
 #[cfg(not(unix))]
-fn sync_parent(_parent: &Dir) -> std::io::Result<()> {
-    Ok(())
+const fn sync_parent(_parent: &Dir) -> bool {
+    true
 }
 
 fn canonical_digest(value: &str) -> bool {
