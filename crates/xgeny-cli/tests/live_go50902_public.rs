@@ -853,15 +853,21 @@ fn verify_durable_coding_result(
         "xgeny.process/execute",
         "xgeny.process/execute",
     ];
-    require(
-        completed.len() == expected_capabilities.len()
-            && completed.iter().zip(expected_capabilities).all(
-                |((_, capability, output), expected)| {
-                    capability == expected && output.capability_id() == expected
-                },
-            ),
+    let completed_capabilities = completed
+        .iter()
+        .map(|(_, capability, _)| capability.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        completed_capabilities, expected_capabilities,
         "live coding capability order did not match the seven-Step contract",
     );
+    for (_, capability, output) in &completed {
+        assert_eq!(
+            output.capability_id(),
+            capability,
+            "live coding ToolOutput capability did not match its Step intent",
+        );
+    }
     require(
         completed[0].2.output()["matches"]
             .as_array()
