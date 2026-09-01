@@ -56,6 +56,10 @@ pub(crate) const FIXTURE_MANIFEST: &str =
 
 pub(crate) const FIXTURES: &[Asset] = &[
     asset!(
+        "valid/capability-definition.fs-apply-patch.json",
+        "../../../protocol/fixtures/v1alpha1/valid/capability-definition.fs-apply-patch.json"
+    ),
+    asset!(
         "valid/capability-definition.fs-list-directory.json",
         "../../../protocol/fixtures/v1alpha1/valid/capability-definition.fs-list-directory.json"
     ),

@@ -20,7 +20,7 @@ fn protocol_check_succeeds_and_reports_conformance_scope() {
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
     assert!(stdout.contains("XGENy protocol v0.1: PASS"));
     assert!(stdout.contains("schemas: 9"));
-    assert!(stdout.contains("fixtures: 25 (15 valid, 10 invalid)"));
+    assert!(stdout.contains("fixtures: 26 (16 valid, 10 invalid)"));
     assert!(stdout.contains("reference resolution: bundled/offline"));
 }
 

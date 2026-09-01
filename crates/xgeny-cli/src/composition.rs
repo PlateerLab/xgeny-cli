@@ -7,14 +7,16 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use xgeny_adapter_filesystem::{
-    FILESYSTEM_READ_SCOPE, FILESYSTEM_WRITE_SCOPE, LIST_DIRECTORY_CAPABILITY_ID,
-    LIST_DIRECTORY_CONTRACT_VERSION, MAX_DIRECTORY_SCAN_ENTRIES, MAX_LIST_DIRECTORY_ENTRIES,
-    MAX_QUERY_OUTPUT_CANONICAL_BYTES, MAX_SEARCH_FILE_BYTES, MAX_SEARCH_MATCHES,
-    MAX_SEARCH_PREVIEW_BYTES, MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_QUERY_UNICODE_SCALARS,
-    MAX_SEARCH_TOTAL_BYTES, MAX_SEARCH_VISITED_ENTRIES, MAX_WRITE_ATOMIC_BYTES,
-    READ_TEXT_CAPABILITY_ID, READ_TEXT_CONTRACT_VERSION, ReadTextLimits, SEARCH_TEXT_CAPABILITY_ID,
-    SEARCH_TEXT_CONTRACT_VERSION, STAT_CAPABILITY_ID, STAT_CONTRACT_VERSION,
-    WRITE_ATOMIC_CAPABILITY_ID, WRITE_ATOMIC_CONTRACT_VERSION, WorkspaceId, WorkspaceRoot,
+    APPLY_PATCH_CAPABILITY_ID, APPLY_PATCH_CONTRACT_VERSION, FILESYSTEM_READ_SCOPE,
+    FILESYSTEM_WRITE_SCOPE, LIST_DIRECTORY_CAPABILITY_ID, LIST_DIRECTORY_CONTRACT_VERSION,
+    MAX_APPLY_PATCH_BYTES, MAX_APPLY_PATCH_EDITS, MAX_DIRECTORY_SCAN_ENTRIES,
+    MAX_LIST_DIRECTORY_ENTRIES, MAX_QUERY_OUTPUT_CANONICAL_BYTES, MAX_SEARCH_FILE_BYTES,
+    MAX_SEARCH_MATCHES, MAX_SEARCH_PREVIEW_BYTES, MAX_SEARCH_QUERY_BYTES,
+    MAX_SEARCH_QUERY_UNICODE_SCALARS, MAX_SEARCH_TOTAL_BYTES, MAX_SEARCH_VISITED_ENTRIES,
+    MAX_WRITE_ATOMIC_BYTES, READ_TEXT_CAPABILITY_ID, READ_TEXT_CONTRACT_VERSION, ReadTextLimits,
+    SEARCH_TEXT_CAPABILITY_ID, SEARCH_TEXT_CONTRACT_VERSION, STAT_CAPABILITY_ID,
+    STAT_CONTRACT_VERSION, WRITE_ATOMIC_CAPABILITY_ID, WRITE_ATOMIC_CONTRACT_VERSION, WorkspaceId,
+    WorkspaceRoot,
 };
 use xgeny_domain::{
     Architecture, CapabilityDefinitionBody, CapabilityInstanceBody, CapabilityRef, DataBoundary,
@@ -67,18 +69,18 @@ const MODEL_TIMEOUT: Duration = Duration::from_secs(60);
 const MODEL_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCAL_EXECUTION_PROFILE_DOMAIN: &str = "xgeny.cli.local-execution-profile/v1";
 const WORKSPACE_DISCOVERY_PROFILE_DOMAIN: &str =
-    "xgeny.cli.workspace-filesystem-execution-profile/v2";
+    "xgeny.cli.workspace-filesystem-execution-profile/v3";
 const ROUTE_PROFILE: &str = "xgeny.cli.exact-read-only-route/v1";
 const MATERIALIZER_PROFILE: &str = "xgeny.cli.allow-file-materializer/v1";
 const APPROVAL_PROFILE: &str = "xgeny.cli.exact-catalog-read-approval/v1";
 const HOST_POLICY_PROFILE: &str = "xgeny.cli.host-exact-catalog-read/v1";
-const WORKSPACE_HOST_POLICY_PROFILE: &str = "xgeny.cli.host-workspace-descendant-fs/v2";
+const WORKSPACE_HOST_POLICY_PROFILE: &str = "xgeny.cli.host-workspace-descendant-fs/v3";
 const USER_READ_POLICY_PROFILE: &str = "xgeny.cli.explicit-allow-read-flag/v1";
 const USER_WRITE_POLICY_PROFILE: &str = "xgeny.cli.explicit-allow-write-flag/v1";
-const WORKSPACE_ROUTE_PROFILE: &str = "xgeny.cli.workspace-filesystem-route/v2";
-const WORKSPACE_MATERIALIZER_PROFILE: &str = "xgeny.cli.durable-workspace-fs-materializer/v2";
-const WORKSPACE_APPROVAL_PROFILE: &str = "xgeny.cli.workspace-fs-approval/v2";
-const WORKSPACE_PLANNING_CONSTRAINT_PROFILE: &str = "xgeny.cli.workspace-fs-scope-constraint/v2";
+const WORKSPACE_ROUTE_PROFILE: &str = "xgeny.cli.workspace-filesystem-route/v3";
+const WORKSPACE_MATERIALIZER_PROFILE: &str = "xgeny.cli.durable-workspace-fs-materializer/v3";
+const WORKSPACE_APPROVAL_PROFILE: &str = "xgeny.cli.workspace-fs-approval/v3";
+const WORKSPACE_PLANNING_CONSTRAINT_PROFILE: &str = "xgeny.cli.workspace-fs-scope-constraint/v3";
 
 /// One new local Run invocation. Remote model transfer and local reads are separate decisions.
 pub struct LocalRunRequest {
@@ -1291,6 +1293,8 @@ struct WorkspaceDiscoveryProfileDescriptor<'a> {
 struct DiscoveryLimitsDescriptor {
     read_text_bytes: usize,
     write_atomic_bytes: usize,
+    apply_patch_bytes: usize,
+    apply_patch_edits: usize,
     list_entries: usize,
     directory_scan_entries: usize,
     search_query_bytes: usize,
@@ -1336,6 +1340,8 @@ fn workspace_discovery_profile_digest(workspace: &WorkspaceRoot) -> Result<Strin
         limits: DiscoveryLimitsDescriptor {
             read_text_bytes: ReadTextLimits::default().max_bytes(),
             write_atomic_bytes: MAX_WRITE_ATOMIC_BYTES,
+            apply_patch_bytes: MAX_APPLY_PATCH_BYTES,
+            apply_patch_edits: MAX_APPLY_PATCH_EDITS,
             list_entries: MAX_LIST_DIRECTORY_ENTRIES,
             directory_scan_entries: MAX_DIRECTORY_SCAN_ENTRIES,
             search_query_bytes: MAX_SEARCH_QUERY_BYTES,
@@ -1422,6 +1428,15 @@ fn workspace_discovery_specs(
     workspace: &WorkspaceRoot,
 ) -> Result<Vec<(CapabilityDefinitionBody, CapabilityInstanceBody)>, PublicRunError> {
     Ok(vec![
+        filesystem_spec(
+            include_str!(
+                "../../../protocol/fixtures/v1alpha1/valid/capability-definition.fs-apply-patch.json"
+            ),
+            APPLY_PATCH_CAPABILITY_ID,
+            APPLY_PATCH_CONTRACT_VERSION,
+            "local.fs.apply-patch.builtin.v1",
+            workspace.apply_patch_binding(),
+        )?,
         filesystem_spec(
             include_str!(
                 "../../../protocol/fixtures/v1alpha1/valid/capability-definition.fs-list-directory.json"
@@ -1529,6 +1544,15 @@ fn local_filesystem_product(
         verifiers
             .register(&workspace.write_atomic_binding(), write_verifier)
             .map_err(|_| PublicRunError::Internal)?;
+
+        let patch_adapter = workspace.apply_patch_adapter();
+        let patch_verifier = patch_adapter.verifier();
+        adapters
+            .register(&workspace.apply_patch_binding(), patch_adapter)
+            .map_err(|_| PublicRunError::Internal)?;
+        verifiers
+            .register(&workspace.apply_patch_binding(), patch_verifier)
+            .map_err(|_| PublicRunError::Internal)?;
     }
     Ok(LocalFilesystemProduct {
         capabilities,
@@ -1553,8 +1577,10 @@ impl PlannedRoutePort for ExactLocalRoute {
             .get(step_id)
             .and_then(|step| step.planned_invocation.as_ref())
             .ok_or(PlannedRouteFailure::Rejected)?;
-        let write = planned.capability_id() == WRITE_ATOMIC_CAPABILITY_ID
-            && planned.contract_version() == WRITE_ATOMIC_CONTRACT_VERSION;
+        let write = (planned.capability_id() == WRITE_ATOMIC_CAPABILITY_ID
+            && planned.contract_version() == WRITE_ATOMIC_CONTRACT_VERSION)
+            || (planned.capability_id() == APPLY_PATCH_CAPABILITY_ID
+                && planned.contract_version() == APPLY_PATCH_CONTRACT_VERSION);
         let expected_profile = if write {
             PlannedExecutionProfile::LocalSyncOnceV1
         } else {
@@ -1823,10 +1849,10 @@ mod tests {
         let discovery_catalog =
             LocalReadCatalog::build(&workspace, &[], &[".".to_owned()]).unwrap();
         let discovery = local_filesystem_product(&workspace, &discovery_catalog).unwrap();
-        assert_eq!(discovery.capabilities.definitions().count(), 5);
-        assert_eq!(discovery.capabilities.instances().count(), 5);
-        assert_eq!(discovery.adapters.len(), 5);
-        assert!(format!("{:?}", discovery.verifiers).contains("verifier_count: 5"));
+        assert_eq!(discovery.capabilities.definitions().count(), 6);
+        assert_eq!(discovery.capabilities.instances().count(), 6);
+        assert_eq!(discovery.adapters.len(), 6);
+        assert!(format!("{:?}", discovery.verifiers).contains("verifier_count: 6"));
         let scoped_catalog = LocalReadCatalog::build(&workspace, &[], &["src".to_owned()]).unwrap();
         let scoped = local_filesystem_product(&workspace, &scoped_catalog).unwrap();
         let root_definitions = discovery

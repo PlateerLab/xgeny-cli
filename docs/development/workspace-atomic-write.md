@@ -2,6 +2,8 @@
 
 `xgeny.fs/write-atomic@1.0.0`은 `--allow-dir` 아래의 UTF-8 file 하나를 create 또는 atomic replace한다.
 설계·비보장·복구 경계는 [ADR-0025](../adr/0025-capability-confined-atomic-write.md)를 따른다.
+기존 file의 작은 exact edit는 같은 commit primitive를 사용하는
+[Workspace apply patch](workspace-apply-patch.md)를 참고한다.
 
 ## 사용
 

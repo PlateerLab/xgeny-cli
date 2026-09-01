@@ -8,6 +8,9 @@
 - core local store schema: 8 유지
 - CLI material catalog schema: 1 유지, recipe canonical byte 상한 512 KiB로 확대
 
+> 후속 상태: ADR-0026이 이 rename 기반 물리 commit을 내부 primitive로 분리하고 strict single-file
+> `apply-patch`가 공유하도록 확장했다. 아래 patch 제외 설명은 ADR-0025 채택 당시 범위 기록이다.
+
 ## 문맥
 
 ADR-0024까지의 제품은 workspace를 찾고 읽을 수 있지만 수정할 수 없다. 일반 coding-agent의 다음 최소

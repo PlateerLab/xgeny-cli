@@ -6,11 +6,13 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use xgeny_adapter_filesystem::{
-    FILESYSTEM_READ_SCOPE, LIST_DIRECTORY_CAPABILITY_ID, LIST_DIRECTORY_CONTRACT_VERSION,
-    MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_QUERY_UNICODE_SCALARS, MAX_WRITE_ATOMIC_BYTES,
-    READ_TEXT_CAPABILITY_ID, READ_TEXT_CONTRACT_VERSION, SEARCH_TEXT_CAPABILITY_ID,
-    SEARCH_TEXT_CONTRACT_VERSION, STAT_CAPABILITY_ID, STAT_CONTRACT_VERSION,
-    WRITE_ATOMIC_CAPABILITY_ID, WRITE_ATOMIC_CONTRACT_VERSION, WorkspaceResourceResolver,
+    APPLY_PATCH_CAPABILITY_ID, APPLY_PATCH_CONTRACT_VERSION, FILESYSTEM_READ_SCOPE,
+    LIST_DIRECTORY_CAPABILITY_ID, LIST_DIRECTORY_CONTRACT_VERSION, MAX_APPLY_PATCH_BYTES,
+    MAX_APPLY_PATCH_EDITS, MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_QUERY_UNICODE_SCALARS,
+    MAX_WRITE_ATOMIC_BYTES, READ_TEXT_CAPABILITY_ID, READ_TEXT_CONTRACT_VERSION,
+    SEARCH_TEXT_CAPABILITY_ID, SEARCH_TEXT_CONTRACT_VERSION, STAT_CAPABILITY_ID,
+    STAT_CONTRACT_VERSION, WRITE_ATOMIC_CAPABILITY_ID, WRITE_ATOMIC_CONTRACT_VERSION,
+    WorkspaceResourceResolver,
 };
 use xgeny_domain::CapabilityRef;
 use xgeny_policy::ResourceResolver;
@@ -122,6 +124,9 @@ impl WorkspaceReadAuthorization {
                         .is_some_and(valid_expected_digest)
                     && self.authorizes_directory_or_descendant(path)
             }
+            (APPLY_PATCH_CAPABILITY_ID, APPLY_PATCH_CONTRACT_VERSION) => {
+                valid_patch_shape(object) && self.authorizes_directory_or_descendant(path)
+            }
             _ => false,
         }
     }
@@ -137,6 +142,7 @@ impl WorkspaceReadAuthorization {
             }
             (LIST_DIRECTORY_CAPABILITY_ID, LIST_DIRECTORY_CONTRACT_VERSION)
             | (SEARCH_TEXT_CAPABILITY_ID, SEARCH_TEXT_CONTRACT_VERSION)
+            | (APPLY_PATCH_CAPABILITY_ID, APPLY_PATCH_CONTRACT_VERSION)
             | (WRITE_ATOMIC_CAPABILITY_ID, WRITE_ATOMIC_CONTRACT_VERSION) => {
                 self.authorizes_directory_or_descendant(resource)
             }
@@ -199,7 +205,7 @@ fn planner_scope_hint(
     let files = serde_json::to_string(&files)
         .map_err(|_| WorkspaceReadAuthorizationError::Canonicalization)?;
     let hint = format!(
-        "Caller-authorized directory roots (list/search targets and descendant stat/read/write-atomic targets): {directories}. Additional exact files (stat/read only): {files}. write-atomic requires expectedDigest=null for creation or the exact digest previously read for replacement."
+        "Caller-authorized directory roots (list/search targets and descendant stat/read/write-atomic/apply-patch targets): {directories}. Additional exact files (stat/read only): {files}. write-atomic requires expectedDigest=null for creation or the exact digest previously read for replacement. apply-patch requires the exact digest previously read and 1..={MAX_APPLY_PATCH_EDITS} non-overlapping edits; every oldText must occur exactly once."
     );
     if hint.len() > MAX_PLANNER_SCOPE_HINT_BYTES {
         return Err(WorkspaceReadAuthorizationError::PlannerHintTooLarge);
@@ -264,6 +270,61 @@ fn valid_expected_digest(value: &Value) -> bool {
                         .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
             })
         })
+}
+
+fn valid_patch_shape(object: &serde_json::Map<String, Value>) -> bool {
+    if object.len() != 3
+        || !object
+            .get("expectedDigest")
+            .is_some_and(valid_digest_string)
+    {
+        return false;
+    }
+    let Some(edits) = object
+        .get("edits")
+        .and_then(Value::as_array)
+        .filter(|edits| !edits.is_empty() && edits.len() <= MAX_APPLY_PATCH_EDITS)
+    else {
+        return false;
+    };
+    let mut total_bytes = 0_usize;
+    edits.iter().all(|value| {
+        let Some(edit) = value.as_object().filter(|edit| edit.len() == 2) else {
+            return false;
+        };
+        let Some(old_text) = edit
+            .get("oldText")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        else {
+            return false;
+        };
+        let Some(new_text) = edit.get("newText").and_then(Value::as_str) else {
+            return false;
+        };
+        if old_text == new_text {
+            return false;
+        }
+        let Some(next_total) = total_bytes
+            .checked_add(old_text.len())
+            .and_then(|total| total.checked_add(new_text.len()))
+        else {
+            return false;
+        };
+        total_bytes = next_total;
+        total_bytes <= MAX_APPLY_PATCH_BYTES
+    })
+}
+
+fn valid_digest_string(value: &Value) -> bool {
+    value.as_str().is_some_and(|digest| {
+        digest.strip_prefix("sha256:").is_some_and(|hex| {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        })
+    })
 }
 
 #[derive(Serialize)]
@@ -413,6 +474,50 @@ mod tests {
                 "expectedDigest": "sha256:UPPER"
             }),
         ));
+    }
+
+    #[test]
+    fn patch_material_requires_exact_digest_bounded_edits_and_directory_scope() {
+        let catalog = authorization(&["README.md"], &["src"]);
+        let patch = capability(APPLY_PATCH_CAPABILITY_ID);
+        let digest = format!("sha256:{}", "a".repeat(64));
+        assert!(catalog.authorizes_material(
+            &patch,
+            &json!({
+                "path": "workspace:fixture/src/lib.rs",
+                "expectedDigest": digest,
+                "edits": [{"oldText": "old", "newText": "new"}]
+            }),
+        ));
+        for arguments in [
+            json!({
+                "path": "workspace:fixture/README.md",
+                "expectedDigest": digest,
+                "edits": [{"oldText": "old", "newText": "new"}]
+            }),
+            json!({
+                "path": "workspace:fixture/src/lib.rs",
+                "expectedDigest": null,
+                "edits": [{"oldText": "old", "newText": "new"}]
+            }),
+            json!({
+                "path": "workspace:fixture/src/lib.rs",
+                "expectedDigest": digest,
+                "edits": []
+            }),
+            json!({
+                "path": "workspace:fixture/src/lib.rs",
+                "expectedDigest": digest,
+                "edits": [{"oldText": "same", "newText": "same"}]
+            }),
+            json!({
+                "path": "workspace:fixture/src/lib.rs",
+                "expectedDigest": digest,
+                "edits": [{"oldText": "x", "newText": "y".repeat(MAX_APPLY_PATCH_BYTES)}]
+            }),
+        ] {
+            assert!(!catalog.authorizes_material(&patch, &arguments));
+        }
     }
 
     #[test]

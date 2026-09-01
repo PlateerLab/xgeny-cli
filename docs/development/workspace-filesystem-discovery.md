@@ -1,7 +1,8 @@
 # Workspace filesystem discovery
 
 이 문서는 source/main의 workspace read-only discovery 구현과 회귀 절차다. Directory mode에 추가된
-별도 승인형 mutation은 [Workspace atomic write](workspace-atomic-write.md)를 따른다. 최신 배포 prerelease
+별도 승인형 mutation은 [Workspace atomic write](workspace-atomic-write.md)와
+[Workspace apply patch](workspace-apply-patch.md)를 따른다. 최신 배포 prerelease
 `v0.1.0-rc.2`는 exact `--allow-file` read만 포함하므로, `--allow-dir`는 이 변경을 포함한 다음 release
 artifact부터 사용할 수 있다.
 
@@ -29,7 +30,7 @@ xgeny run \
 ```
 
 `--allow-dir .`은 선택한 workspace root 전체를 네 read-only Capability로 관찰할 후보 경계를 제공한다.
-같은 mode에서 `write-atomic`도 광고되지만 실제 mutation은 별도 `--allow-write`가 있어야 한다.
+같은 mode에서 `write-atomic`과 `apply-patch`도 광고되지만 실제 mutation은 별도 `--allow-write`가 있어야 한다.
 Planner는 immutable input schema에서 `.` 규칙을 받고, 별도 `planningConstraints`에서 caller가 허용한
 directory/file 목록을 받는다. Constrained provider prompt는 이를 후보 제한으로 따르되 권한으로
 간주하지 않는다. 또한 미래 observation을 placeholder로 참조하지 않고, 현재 context에서 argument가
@@ -43,6 +44,7 @@ directory/file 목록을 받는다. Constrained provider prompt는 이를 후보
 | `xgeny.fs/search-text@1.0.0` | directory 아래 case-sensitive literal UTF-8 검색 |
 | `xgeny.fs/read-text@1.0.0` | bounded UTF-8 file content 읽기 |
 | `xgeny.fs/write-atomic@1.0.0` | 별도 승인 아래 UTF-8 file create/atomic replace |
+| `xgeny.fs/apply-patch@1.0.0` | 별도 승인 아래 기존 UTF-8 file의 strict contextual edit |
 
 더 좁은 범위는 directory를 반복 지정하고 필요한 exact file만 추가한다.
 
@@ -84,11 +86,11 @@ runs/<run-id>/
 ```
 
 `run.sqlite3`는 Core journal/WorkGraph/Receipt/tool output을 보유하고 schema 8을 유지한다.
-`materials.sqlite3` schema 1은 모델이 선택한 dynamic path, search query와 write content를 opaque
+`materials.sqlite3` schema 1은 모델이 선택한 dynamic path, search query와 mutation content를 opaque
 digest reference로 복원하기 위한 CLI-owned recipe catalog다. 둘 다 binary에 embedded된 SQLite library를 사용하므로
 SQLite 프로그램이나 server를 설치하지 않는다.
 
-Manifest, WorkGraph event, Receipt와 status output에는 raw write content가 들어가지 않는다. 하지만 private
+Manifest, WorkGraph event, Receipt와 status output에는 raw write/patch content가 들어가지 않는다. 하지만 private
 material DB에는 path/query/content가, Run DB에는 goal과 successful output이 존재하므로 state root를 민감
 데이터로 취급한다. Completed summary replay는 두 DB 중 material catalog와 workspace가 없어도 된다.
 
@@ -100,7 +102,8 @@ material DB에는 path/query/content가, Run DB에는 goal과 successful output�
 - search: query 최대 64 Unicode scalar이면서 256 UTF-8 bytes, raw visited entry
   4,096, file 256 KiB, 실제 read aggregate 8 MiB, match 128,
   preview 512 bytes
-- read-text: file 64 KiB
+- read-text/write-atomic: file 64 KiB
+- apply-patch: source/result와 old/new 합 각각 64 KiB, edit 32개
 - discovery Run: model turn 8, provider reservation 16, planned/tool Step 8, context 512 KiB
 
 `truncated=true`는 결과가 complete하지 않다는 뜻이다. Search는 limit 도달뿐 아니라 VCS metadata,
