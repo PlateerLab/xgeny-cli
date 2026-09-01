@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tempfile::tempdir;
 use xgeny_local_store::{RunStore, SqliteRunStore};
+use xgeny_workgraph::{RunEventBody, StepStatus};
 
 const MODEL: &str = "test-workspace-model";
 const TOKENIZER: &str = "test-workspace-tokenizer";
@@ -242,6 +243,231 @@ fn process_execution_requires_separate_approval_and_resumes_without_replay() {
         receipts[0].capability.capability_id,
         "xgeny.process/execute"
     );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn process_outcome_commit_failure_recovers_without_reexecution() {
+    let fixture = tempdir().expect("test directory should exist");
+    let state_root = fixture.path().join("state");
+    let workspace = fixture.path().join("workspace");
+    let marker = fixture.path().join("process-executions.log");
+    fs::create_dir(&workspace).expect("workspace should create");
+    let test_binary = std::env::current_exe().expect("test executable should resolve");
+    let executable_spec = format!("test-helper={}", path_text(&test_binary));
+    let server = SequentialServer::spawn_responses(vec![plan_response(
+        "faulted_process",
+        "Run the test helper once without a shell",
+        "xgeny.process/execute",
+        &json!({
+            "executable": "test-helper",
+            "args": [
+                "process_no_replay_child",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1"
+            ],
+            "cwd": ".",
+            "env": {
+                "XGENY_PROCESS_NO_REPLAY_MARKER": path_text(&marker)
+            },
+            "timeoutMs": 30000,
+            "maxOutputBytes": 32768
+        }),
+    )]);
+
+    let planned = bounded_output(xgeny(&state_root).args([
+        "run",
+        "--workspace",
+        path_text(&workspace),
+        "--base-url",
+        &server.base_url,
+        "--model",
+        MODEL,
+        "--tokenizer",
+        TOKENIZER,
+        "--allow-dir",
+        ".",
+        "--allow-executable",
+        &executable_spec,
+        "--allow-remote-model-egress",
+        "Run the test helper exactly once.",
+    ]))
+    .expect("unapproved process should pause");
+    assert_eq!(planned.status.code(), Some(10), "{}", stderr(&planned));
+    assert!(stderr(&planned).contains("reason=execute_approval_required"));
+    let run_id = extract_run_id(&stderr(&planned));
+    server
+        .requests
+        .recv_timeout(TEST_TIMEOUT)
+        .expect("planning request should arrive");
+    server.handle.join().expect("provider server should finish");
+
+    let database = state_root.join("runs").join(&run_id).join("run.sqlite3");
+    let connection = rusqlite::Connection::open(&database).expect("fault fixture should open");
+    connection
+        .execute_batch(
+            r"
+            CREATE TRIGGER test_abort_process_effect_succeeded
+            BEFORE INSERT ON run_events
+            WHEN json_extract(CAST(NEW.event_json AS TEXT), '$.body.type') = 'effect_succeeded'
+            BEGIN
+                SELECT RAISE(ABORT, 'injected process outcome commit failure');
+            END;
+            ",
+        )
+        .expect("outcome fault trigger should install");
+    drop(connection);
+
+    let faulted = bounded_output(xgeny(&state_root).args([
+        "resume",
+        &run_id,
+        "--workspace",
+        path_text(&workspace),
+        "--allow-dir",
+        ".",
+        "--allow-executable",
+        &executable_spec,
+        "--allow-execute",
+    ]))
+    .expect("faulted process should return");
+    assert_eq!(faulted.status.code(), Some(30), "{}", stderr(&faulted));
+    assert!(stderr(&faulted).contains("reason=effect_outcome_unknown"));
+    assert!(!stderr(&faulted).contains("injected process outcome commit failure"));
+    assert_eq!(process_execution_count(&marker), 1);
+
+    let executing_store =
+        SqliteRunStore::open_existing(&database).expect("Executing store should reopen");
+    let executing = executing_store
+        .load()
+        .expect("Executing snapshot should load")
+        .expect("Executing snapshot should exist");
+    assert!(
+        executing
+            .state
+            .steps
+            .values()
+            .any(|step| step.status == StepStatus::Executing)
+    );
+    assert_eq!(
+        executing
+            .records
+            .iter()
+            .filter(|record| matches!(
+                record.event.body,
+                RunEventBody::EffectExecutionStarted { .. }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        executing
+            .records
+            .iter()
+            .filter(|record| matches!(record.event.body, RunEventBody::EffectSucceeded { .. }))
+            .count(),
+        0
+    );
+    let effect_id = executing
+        .state
+        .steps
+        .values()
+        .find_map(|step| step.intent.as_ref().map(|intent| intent.effect_id.clone()))
+        .expect("process intent should remain durable");
+    assert!(
+        executing_store
+            .load_tool_output(&effect_id)
+            .expect("tool output lookup should work")
+            .is_none()
+    );
+    assert!(
+        executing_store
+            .load_execution_receipts()
+            .expect("Receipt lookup should work")
+            .is_empty()
+    );
+    drop(executing_store);
+
+    let connection = rusqlite::Connection::open(&database).expect("fault fixture should reopen");
+    connection
+        .execute_batch("DROP TRIGGER test_abort_process_effect_succeeded;")
+        .expect("outcome fault trigger should remove");
+    drop(connection);
+
+    let recovered = bounded_output(xgeny(&state_root).args(["resume", &run_id]))
+        .expect("offline effect recovery should run");
+    assert_eq!(recovered.status.code(), Some(30), "{}", stderr(&recovered));
+    assert!(stderr(&recovered).contains("reason=effect_outcome_unknown"));
+    assert_eq!(process_execution_count(&marker), 1);
+
+    let unknown_store =
+        SqliteRunStore::open_existing(&database).expect("unknown store should reopen");
+    let unknown = unknown_store
+        .load()
+        .expect("unknown snapshot should load")
+        .expect("unknown snapshot should exist");
+    assert!(
+        unknown
+            .state
+            .steps
+            .values()
+            .any(|step| step.status == StepStatus::EffectUnknown)
+    );
+    assert_eq!(
+        unknown
+            .records
+            .iter()
+            .filter(|record| matches!(record.event.body, RunEventBody::EffectBecameUnknown { .. }))
+            .count(),
+        1
+    );
+    drop(unknown_store);
+
+    let repeated = bounded_output(xgeny(&state_root).args([
+        "resume",
+        &run_id,
+        "--workspace",
+        path_text(&workspace),
+        "--allow-dir",
+        ".",
+        "--allow-executable",
+        &executable_spec,
+        "--allow-execute",
+    ]))
+    .expect("repeated execution approval should remain blocked");
+    assert_eq!(repeated.status.code(), Some(30), "{}", stderr(&repeated));
+    assert!(stderr(&repeated).contains("reason=effect_outcome_unknown"));
+    assert_eq!(process_execution_count(&marker), 1);
+
+    let after_repeat = SqliteRunStore::open_existing(&database)
+        .expect("unknown store should reopen again")
+        .load()
+        .expect("repeated snapshot should load")
+        .expect("repeated snapshot should exist");
+    assert_eq!(after_repeat.state, unknown.state);
+    assert_eq!(after_repeat.records, unknown.records);
+}
+
+#[test]
+fn process_no_replay_child() {
+    let Some(marker) = std::env::var_os("XGENY_PROCESS_NO_REPLAY_MARKER") else {
+        return;
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(marker)
+        .expect("execution marker should open");
+    file.write_all(b"executed\n")
+        .expect("execution marker should append");
+    file.sync_all().expect("execution marker should be durable");
+}
+
+fn process_execution_count(marker: &Path) -> usize {
+    fs::read_to_string(marker)
+        .expect("execution marker should exist")
+        .lines()
+        .count()
 }
 
 #[test]
