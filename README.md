@@ -2,15 +2,16 @@
 
 Local-first general-purpose agent CLI and harness.
 
-> 현재 상태: 프로토콜 v0.1 검증, dependency DAG와 Receipt-gated 재개 frontier를 갖춘 model-free WorkGraph, embedded SQLite schema 8 store, effect 실행·복구 조정기, 결정론적 Capability Registry·Router, I/O 없는 Permission Broker, secret-free invocation material 복구, Direct Executor와 Core-owned Execution Receipt 검증 경계, 장기 Run용 VerifiedRunIndex를 실행할 수 있습니다. Provider-neutral bounded AgentLoop는 비신뢰 `PlanProposal`을 검증해 다중 Step DAG와 reconstructable input sidecar를 원자 commit하고 재시작 뒤 한 frontier action씩 이어갑니다. Model call은 provider 호출 전에 보수적인 possible-send slot을 journal에 예약하며 accepted/rejected/Unknown을 재시작 뒤 복원하고, 불확정 호출을 자동 재시도하지 않습니다. 별도 `xgeny-provider-openai` leaf adapter는 OpenAI-compatible Chat Completions의 단일 요청과 strict structured proposal을 이 lifecycle에 연결합니다. 내부 WorkGraph는 planned `ReadOnly`/`Idempotent`/`NonIdempotent`, Core Receipt v2의 bounded Artifact commitment와 event-anchored typed `ToolOutputRecord`를 지원하며, generation-checked `PlanningContext v3`는 Step의 plan journal 순서와 passed Receipt에 결합된 exact ToolOutput의 관찰 순서를 보존해 다음 model turn에 전달합니다. NonIdempotent durable output은 결과만 보존하고 Started 뒤 불확정 effect의 no-replay 의미는 유지합니다. Public `xgeny run/resume`은 기존 exact `--allow-file` mode를 보존하면서, 명시적 `--allow-dir` mode에서 네 read Capability와 `write-atomic`·`apply-patch`로 workspace를 탐색·수정합니다. Dynamic path/query/write content는 Run 전용 embedded `materials.sqlite3`에 digest-bound recipe로 저장되어 approval pause 뒤 다른 process에서도 복원됩니다. 읽기·쓰기·model egress는 별도 flag로 승인하며, 불확정 mutation을 자동 반복하지 않습니다. Process/network, interactive UI와 XGEN compatibility adapter는 후속 범위입니다.
+> 현재 상태: 프로토콜 v0.1 검증, dependency DAG와 Receipt-gated 재개 frontier를 갖춘 model-free WorkGraph, embedded SQLite schema 8 store, effect 실행·복구 조정기, 결정론적 Capability Registry·Router, I/O 없는 Permission Broker, secret-free invocation material 복구, Direct Executor와 Core-owned Execution Receipt 검증 경계, 장기 Run용 VerifiedRunIndex를 실행할 수 있습니다. Provider-neutral bounded AgentLoop는 비신뢰 `PlanProposal`을 검증해 다중 Step DAG와 reconstructable input sidecar를 원자 commit하고 재시작 뒤 한 frontier action씩 이어갑니다. Model call은 provider 호출 전에 보수적인 possible-send slot을 journal에 예약하며 accepted/rejected/Unknown을 재시작 뒤 복원하고, 불확정 호출을 자동 재시도하지 않습니다. 별도 `xgeny-provider-openai` leaf adapter는 OpenAI-compatible Chat Completions의 단일 요청과 strict structured proposal을 이 lifecycle에 연결합니다. 내부 WorkGraph는 planned `ReadOnly`/`Idempotent`/`NonIdempotent`, Core Receipt v2의 bounded Artifact commitment와 event-anchored typed `ToolOutputRecord`를 지원하며, generation-checked `PlanningContext v3`는 Step의 plan journal 순서와 passed Receipt에 결합된 exact ToolOutput의 관찰 순서를 보존해 다음 model turn에 전달합니다. NonIdempotent durable output은 결과만 보존하고 Started 뒤 불확정 effect의 no-replay 의미는 유지합니다. Public `xgeny run/resume`은 기존 exact `--allow-file` mode를 보존하면서, 명시적 `--allow-dir` mode에서 네 read Capability와 `write-atomic`·`apply-patch`로 workspace를 탐색·수정합니다. Host가 등록한 executable은 별도 승인 뒤 shell 없이 bounded cwd·argv·환경·timeout·출력 제한으로 실행하며 결과를 durable하게 보존하고 불확정 실행을 자동 반복하지 않습니다. Dynamic path/query/write/process material은 Run 전용 embedded `materials.sqlite3`에 digest-bound recipe로 저장되어 approval pause 뒤 다른 process에서도 복원됩니다. 읽기·쓰기·process 실행·model egress는 각각 별도 flag로 승인합니다. Network tool, interactive UI와 XGEN compatibility adapter는 후속 범위입니다.
 
 ## 설치와 첫 모델 연결
 
-`v0.1.0-rc.2` release부터 Linux x86-64/ARM64, macOS Intel/Apple Silicon, Windows x86-64용
-단일 native binary와 checksum 검증 installer를 제공합니다. 최종 사용자는 Rust, Node.js, Python,
+`v0.1.0-rc.3` release artifact가 게시되면 Linux x86-64/ARM64, macOS Intel/Apple Silicon, Windows
+x86-64용 단일 native binary와 checksum 검증 installer를 제공합니다. 최종 사용자는 Rust, Node.js, Python,
 SQLite 실행 파일이나 XGENy state용 별도 daemon을 설치하지 않습니다. 사용할 model endpoint는 로컬 또는
 원격에 별도로 실행 중이어야 합니다. 첫 RC는 prerelease이므로 stable 전용 `releases/latest`가 아니라
-아래 exact tag URL로 설치합니다.
+아래 exact tag URL로 설치합니다. 후보 version PR의 merge만으로 artifact가 생기지는 않으며 GitHub
+Release에 해당 tag가 게시된 뒤 설치 명령을 사용해야 합니다.
 
 Linux/macOS:
 
@@ -18,8 +19,8 @@ Linux/macOS:
 installer=$(mktemp "${TMPDIR:-/tmp}/xgeny-installer.XXXXXX")
 curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 \
   --connect-timeout 15 --max-time 60 --max-filesize 1048576 -fsSLo "$installer" \
-  https://github.com/PlateerLab/xgeny-cli/releases/download/v0.1.0-rc.2/xgeny-installer.sh
-sh "$installer" --version v0.1.0-rc.2
+  https://github.com/PlateerLab/xgeny-cli/releases/download/v0.1.0-rc.3/xgeny-installer.sh
+sh "$installer" --version v0.1.0-rc.3
 rm -f "$installer"
 export PATH="$HOME/.local/bin:$PATH"
 ```
@@ -28,9 +29,9 @@ Windows PowerShell:
 
 ```powershell
 $installer = Join-Path ([System.IO.Path]::GetTempPath()) "xgeny-installer-$([Guid]::NewGuid().ToString('N')).ps1"
-curl.exe -q --proto "=https" --proto-redir "=https" --tlsv1.2 --connect-timeout 15 --max-time 60 --max-filesize 1048576 -fsSLo $installer "https://github.com/PlateerLab/xgeny-cli/releases/download/v0.1.0-rc.2/xgeny-installer.ps1"
+curl.exe -q --proto "=https" --proto-redir "=https" --tlsv1.2 --connect-timeout 15 --max-time 60 --max-filesize 1048576 -fsSLo $installer "https://github.com/PlateerLab/xgeny-cli/releases/download/v0.1.0-rc.3/xgeny-installer.ps1"
 if ($LASTEXITCODE -ne 0) { throw "XGENy installer download failed" }
-& $installer -Version v0.1.0-rc.2
+& $installer -Version v0.1.0-rc.3
 Remove-Item -LiteralPath $installer
 $env:Path = "$env:LOCALAPPDATA\XGENy\bin;$env:Path"
 ```
@@ -51,9 +52,7 @@ xgeny run \
   'README를 읽고 핵심을 요약해줘.'
 ```
 
-현재 source/main의 workspace discovery mode는 다음처럼 프로젝트 root를 명시적으로 허용한다. 최신 배포
-prerelease `v0.1.0-rc.2`에는 아직 exact `--allow-file` mode만 있으므로 `--allow-dir`는 이 변경을 포함한
-다음 release artifact부터 사용할 수 있다.
+RC3의 workspace mode는 다음처럼 프로젝트 root와 실행 가능한 개발 도구를 명시적으로 허용한다.
 
 ```bash
 xgeny run \
@@ -63,12 +62,16 @@ xgeny run \
   --allow-remote-model-egress \
   --allow-read \
   --allow-write \
+  --allow-execute \
   '프로젝트 구조를 확인하고 필요한 파일을 수정한 뒤 테스트해줘.'
 ```
 
 Process는 shell 없이 실행되지만 별도 `--allow-execute` 전에는
 `execute_approval_required`로 pause한다. 허용한 executable과 하위 process는 사용자 OS 권한으로 project
 code를 실행하므로 이는 sandbox가 아니다. 승인·재개 예시는 [시작하기](docs/getting-started.md)를 따른다.
+
+RC3의 포함 범위와 알려진 한계는 [Developer Preview RC3 후보](docs/development/rc3-release-candidate.md)에
+정리되어 있다.
 
 `model check`는 명시한 endpoint에 `GET /v1/models` 하나만 보내 exact model ID의 광고 여부를
 확인한다. Prompt나 inference 요청을 보내지 않고 workspace·Run state도 만들지 않는다. PASS는 catalog

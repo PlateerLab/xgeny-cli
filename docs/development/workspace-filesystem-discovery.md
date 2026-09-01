@@ -2,9 +2,8 @@
 
 이 문서는 source/main의 workspace read-only discovery 구현과 회귀 절차다. Directory mode에 추가된
 별도 승인형 mutation은 [Workspace atomic write](workspace-atomic-write.md)와
-[Workspace apply patch](workspace-apply-patch.md)를 따른다. 최신 배포 prerelease
-`v0.1.0-rc.2`는 exact `--allow-file` read만 포함하므로, `--allow-dir`는 이 변경을 포함한 다음 release
-artifact부터 사용할 수 있다.
+[Workspace apply patch](workspace-apply-patch.md)를 따른다. `v0.1.0-rc.3`부터 `--allow-dir` discovery와
+별도 승인형 write/patch가 native release artifact에 포함된다.
 
 ## 실행 모드
 

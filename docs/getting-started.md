@@ -1,9 +1,10 @@
 # XGENy 설치와 첫 실행
 
-이 문서는 release binary 하나를 설치하고 OpenAI-compatible model에 연결해 현재 배포된
-`read-text` capability를 실행하는 최소 절차다. 최신 prerelease `v0.1.0-rc.2`는 exact
-`--allow-file` mode만 포함한다. Source/main의 `--allow-dir` workspace discovery는 이 변경을 포함한
-다음 release부터 사용할 수 있다. 소스 개발 절차와 달리 Rust, C compiler, Python,
+이 문서는 Developer Preview `v0.1.0-rc.3` release artifact가 게시된 뒤 binary 하나를 설치하고
+OpenAI-compatible model에 연결해 파일 읽기부터 프로젝트 탐색·수정·test/build까지 실행하는 최소
+절차다. RC3 후보는 exact
+`--allow-file`, `--allow-dir` workspace discovery, atomic write/patch와 host-catalogued shell-free
+process 실행을 포함한다. 소스 개발 절차와 달리 Rust, C compiler, Python,
 Node.js, SQLite 실행 파일, Docker 또는 XGENy state용 별도 daemon이 필요하지 않다. 사용할 model
 endpoint 자체는 로컬 또는 원격에 별도로 실행 중이어야 한다.
 
@@ -25,8 +26,9 @@ Linux binary는 musl target, Windows binary는 static CRT로 빌드한다. macOS
 ## 설치
 
 Installer를 먼저 파일로 받은 뒤 검토·실행한다. Installer는 shell profile이나 user PATH를 자동으로
-수정하지 않고 관리자 권한을 요청하지 않는다. 현재 첫 배포는 `v0.1.0-rc.2` prerelease이므로 stable
-release만 가리키는 `releases/latest` 대신 아래 exact tag를 사용한다.
+수정하지 않고 관리자 권한을 요청하지 않는다. RC3는 prerelease이므로 stable release만 가리키는
+`releases/latest` 대신 아래 exact tag를 사용한다. 후보 version PR의 merge만으로 artifact가 생기지는
+않으므로 GitHub Release에 `v0.1.0-rc.3`이 게시된 것을 확인한 뒤 실행한다.
 
 Linux/macOS:
 
@@ -34,8 +36,8 @@ Linux/macOS:
 installer=$(mktemp "${TMPDIR:-/tmp}/xgeny-installer.XXXXXX")
 curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 \
   --connect-timeout 15 --max-time 60 --max-filesize 1048576 -fsSLo "$installer" \
-  https://github.com/PlateerLab/xgeny-cli/releases/download/v0.1.0-rc.2/xgeny-installer.sh
-sh "$installer" --version v0.1.0-rc.2
+  https://github.com/PlateerLab/xgeny-cli/releases/download/v0.1.0-rc.3/xgeny-installer.sh
+sh "$installer" --version v0.1.0-rc.3
 rm -f "$installer"
 export PATH="$HOME/.local/bin:$PATH"
 ```
@@ -44,9 +46,9 @@ Windows PowerShell:
 
 ```powershell
 $installer = Join-Path ([System.IO.Path]::GetTempPath()) "xgeny-installer-$([Guid]::NewGuid().ToString('N')).ps1"
-curl.exe -q --proto "=https" --proto-redir "=https" --tlsv1.2 --connect-timeout 15 --max-time 60 --max-filesize 1048576 -fsSLo $installer "https://github.com/PlateerLab/xgeny-cli/releases/download/v0.1.0-rc.2/xgeny-installer.ps1"
+curl.exe -q --proto "=https" --proto-redir "=https" --tlsv1.2 --connect-timeout 15 --max-time 60 --max-filesize 1048576 -fsSLo $installer "https://github.com/PlateerLab/xgeny-cli/releases/download/v0.1.0-rc.3/xgeny-installer.ps1"
 if ($LASTEXITCODE -ne 0) { throw "XGENy installer download failed" }
-& $installer -Version v0.1.0-rc.2
+& $installer -Version v0.1.0-rc.3
 Remove-Item -LiteralPath $installer
 $env:Path = "$env:LOCALAPPDATA\XGENy\bin;$env:Path"
 ```
@@ -79,16 +81,16 @@ xgeny licenses
 installer=$(mktemp "${TMPDIR:-/tmp}/xgeny-installer.XXXXXX")
 curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 \
   --connect-timeout 15 --max-time 60 --max-filesize 1048576 -fsSLo "$installer" \
-  https://github.com/PlateerLab/xgeny-cli/releases/download/v0.1.0-rc.2/xgeny-installer.sh
-sh "$installer" --version v0.1.0-rc.2
+  https://github.com/PlateerLab/xgeny-cli/releases/download/v0.1.0-rc.3/xgeny-installer.sh
+sh "$installer" --version v0.1.0-rc.3
 rm -f "$installer"
 ```
 
 ```powershell
 $installer = Join-Path ([System.IO.Path]::GetTempPath()) "xgeny-installer-$([Guid]::NewGuid().ToString('N')).ps1"
-curl.exe -q --proto "=https" --proto-redir "=https" --tlsv1.2 --connect-timeout 15 --max-time 60 --max-filesize 1048576 -fsSLo $installer "https://github.com/PlateerLab/xgeny-cli/releases/download/v0.1.0-rc.2/xgeny-installer.ps1"
+curl.exe -q --proto "=https" --proto-redir "=https" --tlsv1.2 --connect-timeout 15 --max-time 60 --max-filesize 1048576 -fsSLo $installer "https://github.com/PlateerLab/xgeny-cli/releases/download/v0.1.0-rc.3/xgeny-installer.ps1"
 if ($LASTEXITCODE -ne 0) { throw "XGENy installer download failed" }
-& $installer -Version v0.1.0-rc.2
+& $installer -Version v0.1.0-rc.3
 Remove-Item -LiteralPath $installer
 ```
 
@@ -193,8 +195,8 @@ xgeny run `
   "README를 읽고 핵심을 요약해줘."
 ```
 
-이 변경을 포함한 source build 또는 다음 release에서는 사용자가 파일명을 미리 나열하지 않고 선택한
-workspace directory를 탐색하고 별도 승인 아래 atomic write할 수 있다.
+RC3에서는 사용자가 파일명을 미리 나열하지 않고 선택한 workspace directory를 탐색하고 별도 승인 아래
+atomic write할 수 있다.
 
 ```bash
 xgeny run \
@@ -212,8 +214,8 @@ xgeny run \
 directory 밖의 exact file만 `--allow-file Cargo.toml`로 추가한다. 미완료 재개에는 원래와 동일한
 `--allow-dir`/`--allow-file` 집합을 다시 제공해야 한다.
 
-이 변경을 포함한 source build에서는 test/build용 executable도 absolute path로 명시할 수 있다. 경로를
-model에 보내지는 않으며 logical ID만 planning constraint에 노출한다.
+RC3에서는 test/build용 executable도 absolute path로 명시할 수 있다. 경로를 model에 보내지는 않으며
+logical ID만 planning constraint에 노출한다.
 
 ```bash
 xgeny run \
@@ -265,9 +267,9 @@ xgeny resume run-0123456789abcdef0123456789abcdef
 ```
 
 상세 재개 절차는 [Public local run/resume prototype](development/public-local-run-resume.md)을 따른다.
-현재 배포된 RC2 capability는 allow-list 기반 UTF-8 file read 하나다. 이 변경을 포함한 source는 workspace
-discovery, bounded atomic text write/patch와 명시적 shell-free process 실행을 제공한다. Browser와 MCP는
-후속 범위이므로 현 상태를 Claude Code/Codex 전체 기능과 동일하다고 해석하지 않는다. Discovery 경계는
+RC3는 workspace discovery, bounded atomic text write/patch와 명시적 shell-free process 실행을
+제공한다. Browser와 MCP는 후속 범위이므로 현 상태를 Claude Code/Codex 전체 기능과 동일하다고 해석하지
+않는다. Discovery 경계는
 [Workspace filesystem discovery](development/workspace-filesystem-discovery.md), write 경계는
 [Workspace atomic write](development/workspace-atomic-write.md)를 따른다.
 

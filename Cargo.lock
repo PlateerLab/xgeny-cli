@@ -1893,7 +1893,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xgeny-adapter-filesystem"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
@@ -1911,7 +1911,7 @@ dependencies = [
 
 [[package]]
 name = "xgeny-adapter-process"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
@@ -1931,7 +1931,7 @@ dependencies = [
 
 [[package]]
 name = "xgeny-adapter-reference"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "jsonschema",
  "serde",
@@ -1949,7 +1949,7 @@ dependencies = [
 
 [[package]]
 name = "xgeny-cli"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
@@ -1976,7 +1976,7 @@ dependencies = [
 
 [[package]]
 name = "xgeny-domain"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -1984,7 +1984,7 @@ dependencies = [
 
 [[package]]
 name = "xgeny-local-store"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "libc",
  "rusqlite",
@@ -2002,7 +2002,7 @@ dependencies = [
 
 [[package]]
 name = "xgeny-policy"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "serde_json",
  "thiserror",
@@ -2011,7 +2011,7 @@ dependencies = [
 
 [[package]]
 name = "xgeny-protocol"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "jsonschema",
  "serde",
@@ -2024,7 +2024,7 @@ dependencies = [
 
 [[package]]
 name = "xgeny-provider-openai"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "serde",
  "serde_jcs",
@@ -2042,7 +2042,7 @@ dependencies = [
 
 [[package]]
 name = "xgeny-runtime"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "jsonschema",
  "serde",
@@ -2061,7 +2061,7 @@ dependencies = [
 
 [[package]]
 name = "xgeny-workgraph"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "proptest",
  "serde",
