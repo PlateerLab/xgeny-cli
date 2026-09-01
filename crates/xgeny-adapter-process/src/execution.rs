@@ -6,11 +6,11 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use process_wrap::std::CommandWrap;
 #[cfg(windows)]
 use process_wrap::std::JobObject;
 #[cfg(unix)]
 use process_wrap::std::ProcessGroup;
+use process_wrap::std::{ChildWrapper, CommandWrap};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use xgeny_domain::InstanceFeatures;
@@ -249,21 +249,21 @@ fn run_process(prepared: &PreparedProcess) -> Result<Value, AdapterExecutionUnkn
     };
     drop(wrapped);
     let Some(stdout) = child.stdout().take() else {
-        let _ = child.kill();
+        let _ = terminate_process_tree(child.as_mut());
         return Err(AdapterExecutionUnknownReason::AdapterTerminated);
     };
     let Some(stderr) = child.stderr().take() else {
-        let _ = child.kill();
+        let _ = terminate_process_tree(child.as_mut());
         return Err(AdapterExecutionUnknownReason::AdapterTerminated);
     };
     let stdout =
         start_capture(stdout, prepared.max_output_bytes, "xgeny-process-stdout").map_err(|()| {
-            let _ = child.kill();
+            let _ = terminate_process_tree(child.as_mut());
             AdapterExecutionUnknownReason::AdapterTerminated
         })?;
     let stderr =
         start_capture(stderr, prepared.max_output_bytes, "xgeny-process-stderr").map_err(|()| {
-            let _ = child.kill();
+            let _ = terminate_process_tree(child.as_mut());
             AdapterExecutionUnknownReason::AdapterTerminated
         })?;
 
@@ -272,24 +272,26 @@ fn run_process(prepared: &PreparedProcess) -> Result<Value, AdapterExecutionUnkn
             Ok(Some(status)) => {
                 // Background descendants are not part of a one-shot process Capability. Terminate
                 // the group/job even when the top-level process exited successfully.
-                let _ = child.start_kill();
-                let _ = child.wait();
+                let _ = terminate_process_tree(child.as_mut());
                 break Termination::Exited(status);
             }
-            Ok(None) if started.elapsed() >= prepared.timeout => match child.kill() {
-                Ok(()) => break Termination::TimedOut,
-                Err(_) => match child.try_wait() {
-                    Ok(Some(status)) => break Termination::Exited(status),
-                    _ => return Err(AdapterExecutionUnknownReason::TransportOutcomeUnknown),
-                },
-            },
+            Ok(None) if started.elapsed() >= prepared.timeout => {
+                match terminate_process_tree(child.as_mut()) {
+                    Ok(()) => break Termination::TimedOut,
+                    Err(()) => match child.try_wait() {
+                        Ok(Some(status)) => break Termination::Exited(status),
+                        _ => {
+                            return Err(AdapterExecutionUnknownReason::TransportOutcomeUnknown);
+                        }
+                    },
+                }
+            }
             Ok(None) => {
                 let remaining = prepared.timeout.saturating_sub(started.elapsed());
                 thread::sleep(POLL_INTERVAL.min(remaining));
             }
             Err(_) => {
-                let _ = child.start_kill();
-                let _ = child.wait();
+                let _ = terminate_process_tree(child.as_mut());
                 return Err(AdapterExecutionUnknownReason::TransportOutcomeUnknown);
             }
         }
@@ -321,6 +323,20 @@ fn run_process(prepared: &PreparedProcess) -> Result<Value, AdapterExecutionUnkn
             duration_ms,
         ),
     }
+}
+
+fn terminate_process_tree(child: &mut dyn ChildWrapper) -> Result<(), ()> {
+    child.start_kill().map_err(|_| ())?;
+
+    #[cfg(not(windows))]
+    child.wait().map_err(|_| ())?;
+
+    // `JobObjectChild::try_wait` polls the same completion port used by its blocking `wait`.
+    // Once the zero-active-process notification has been consumed, a second wait can block
+    // forever. `start_kill` already calls `TerminateJobObject`, so Windows must not perform that
+    // second unbounded wait. The bounded capture receivers below still require inherited output
+    // handles to close before an outcome can be accepted.
+    Ok(())
 }
 
 enum Termination {
@@ -631,6 +647,31 @@ mod tests {
             !marker.exists(),
             "a background descendant must not outlive one-shot execution"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn immediate_windows_process_exit_never_waits_twice_for_job_completion() {
+        let fixture = Fixture::new();
+
+        for _ in 0..16 {
+            let prepared = parse_arguments(
+                &fixture.arguments(None, MIN_CAPTURE_BYTES, 5_000),
+                &fixture.workspace,
+            )
+            .unwrap();
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            let worker = thread::spawn(move || {
+                let _ = sender.send(run_process(&prepared));
+            });
+            let output = receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a completed Windows Job Object must not wait for completion twice")
+                .unwrap();
+            worker.join().expect("process worker should finish");
+            assert_eq!(output["outcome"], "exited");
+            assert_eq!(output["success"], true);
+        }
     }
 
     #[test]
