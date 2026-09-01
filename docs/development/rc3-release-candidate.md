@@ -20,9 +20,10 @@ workspace search/read
   -> durable completion과 offline replay
 ```
 
-Rust, Node.js, Python 또는 SQLite 실행 파일은 XGENy 자체의 설치 의존성이 아니다. 단, model endpoint와
-사용자가 실행하려는 compiler/test runner는 별도로 존재해야 하며 executable absolute path를 host
-catalog에 명시해야 한다.
+Native installer 경로에서는 Rust, Node.js, Python 또는 SQLite 실행 파일이 XGENy 자체의 설치 의존성이
+아니다. npm 설치 경로만 launcher 실행을 위해 Node.js 22.14 이상이 필요하며 Rust compiler나 install
+script는 필요하지 않다. Model endpoint와 사용자가 실행하려는 compiler/test runner는 별도로 존재해야
+하며 executable absolute path를 host catalog에 명시해야 한다.
 
 ## 포함 범위
 
@@ -36,7 +37,7 @@ catalog에 명시해야 한다.
 | 지속성 | journal/WorkGraph/Receipt/ToolOutput과 private invocation recipe의 process-restart 복원 |
 | 복구 | Started 뒤 outcome을 확정하지 못한 effect를 Unknown으로 닫고 자동 replay하지 않음 |
 | 장기 turn | PlanningContext v3가 Step plan 순서와 passed Receipt ToolOutput 관찰 순서를 보존 |
-| 설치 | Linux x86-64/ARM64, macOS Intel/Apple Silicon, Windows x86-64 native binary와 checksum installer |
+| 설치 | 다섯 target native/checksum installer와 무스크립트 `@xgen/cli` exact-version npm package |
 
 Filesystem, process와 model egress 승인은 서로 대체하지 않는다. Process result의 `success=false`는 adapter
 장애가 아니라 test/build의 durable non-zero 결과일 수 있으며 모델은 그 bounded output을 다음 turn에서
@@ -75,11 +76,16 @@ cargo build --workspace --release --locked
 cargo run --quiet --locked -p xgeny-cli -- protocol check
 sh scripts/check-third-party-licenses.sh --check
 sh scripts/check-release-workflow.sh
+sh scripts/check-npm-distribution-workflow.sh
+npm ci --ignore-scripts --prefix npm
+npm run check --prefix npm
+npm test --prefix npm
 ```
 
 GitHub PR에서는 Quality/Linux와 Linux x86-64/ARM64, macOS Intel/Apple Silicon, Windows x86-64의 여섯
 필수 check가 모두 성공해야 한다. 각 platform job은 전체 workspace test, filesystem/process adapter
-clippy, protocol check, native dependency audit, release binary staging과 installer smoke를 수행한다.
+clippy, protocol check, native dependency audit, release binary staging, installer smoke와 npm pack/global
+install smoke를 수행한다.
 
 ## 알려진 한계
 
@@ -95,6 +101,8 @@ clippy, protocol check, native dependency audit, release binary staging과 insta
 
 ## 게시 경계
 
-이 문서를 merge하는 것만으로 release를 게시하지 않는다. Merge 뒤 현재 `origin/main` head와 package
-version이 정확히 일치할 때 별도 보호 tag `v0.1.0-rc.3`을 만들면 release workflow가 모든 release gate를
-다시 실행한다. 실패한 tag나 asset은 이동·교체·재사용하지 않고 더 높은 새 version으로 수정한다.
+이 문서를 merge하는 것만으로 release를 게시하지 않는다. Merge 뒤 npm scope/bootstrap/Trusted
+Publisher 준비와 `XGENY_NPM_PUBLISH_ENABLED=true`를 확인하고, 현재 `origin/main` head와 package version이
+정확히 일치할 때 별도 보호 tag `v0.1.0-rc.3`을 만들면 release workflow가 모든 release gate를 다시
+실행한다. GitHub Release 전 실패한 tag나 asset은 이동·교체·재사용하지 않고 더 높은 새 version으로
+수정한다. Immutable GitHub Release 뒤 동일 npm bundle의 부분 실패만 SRI 검증 아래 재실행한다.

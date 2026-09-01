@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "platforms": [
+    {
+      "target": "x86_64-unknown-linux-musl",
+      "packageName": "@xgen/cli-linux-x64-musl",
+      "os": "linux",
+      "cpu": "x64",
+      "asset": "xgeny-x86_64-unknown-linux-musl",
+      "binaryPath": "bin/xgeny",
+      "tarball": "xgen-cli-linux-x64-musl.tgz"
+    },
+    {
+      "target": "aarch64-unknown-linux-musl",
+      "packageName": "@xgen/cli-linux-arm64-musl",
+      "os": "linux",
+      "cpu": "arm64",
+      "asset": "xgeny-aarch64-unknown-linux-musl",
+      "binaryPath": "bin/xgeny",
+      "tarball": "xgen-cli-linux-arm64-musl.tgz"
+    },
+    {
+      "target": "x86_64-apple-darwin",
+      "packageName": "@xgen/cli-darwin-x64",
+      "os": "darwin",
+      "cpu": "x64",
+      "asset": "xgeny-x86_64-apple-darwin",
+      "binaryPath": "bin/xgeny",
+      "tarball": "xgen-cli-darwin-x64.tgz"
+    },
+    {
+      "target": "aarch64-apple-darwin",
+      "packageName": "@xgen/cli-darwin-arm64",
+      "os": "darwin",
+      "cpu": "arm64",
+      "asset": "xgeny-aarch64-apple-darwin",
+      "binaryPath": "bin/xgeny",
+      "tarball": "xgen-cli-darwin-arm64.tgz"
+    },
+    {
+      "target": "x86_64-pc-windows-msvc",
+      "packageName": "@xgen/cli-win32-x64",
+      "os": "win32",
+      "cpu": "x64",
+      "asset": "xgeny-x86_64-pc-windows-msvc.exe",
+      "binaryPath": "bin/xgeny.exe",
+      "tarball": "xgen-cli-win32-x64.tgz"
+    }
+  ]
+}

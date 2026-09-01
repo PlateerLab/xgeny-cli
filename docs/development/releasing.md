@@ -1,7 +1,8 @@
-# Native release 운영 절차
+# Native 및 npm release 운영 절차
 
-이 문서는 XGENy prototype native artifact의 생성·검증·게시 경계를 고정한다. npm package, package
-manager formula, MSI, background updater와 OS code signing은 이 단계에 포함하지 않는다.
+이 문서는 XGENy prototype native artifact와 npm package의 생성·검증·게시 경계를 고정한다. Package
+manager formula, MSI, background updater와 OS code signing은 이 단계에 포함하지 않는다. npm은 native
+binary를 감싸는 선택형 설치 채널이며 제품 runtime을 다시 구현하지 않는다.
 
 ## Release 전 조건
 
@@ -28,6 +29,13 @@ manager formula, MSI, background updater와 OS code signing은 이 단계에 포
   `XGENY_MAIN_PROTECTION_ENABLED=true`를 둔다.
 - Bypass actor가 없음을 관리자가 확인한 뒤 Actions repository variable
   `XGENY_RELEASE_RULESET_NO_BYPASS=true`를 설정한다. Read-only ruleset API는 bypass 목록을 숨길 수 있다.
+- npm의 `@xgen` scope에 여섯 package를 게시할 권한, 계정 2FA와 recovery 수단을 확인한다. 실행 파일이
+  없는 bootstrap version을 먼저 게시한 뒤 각 package의 Trusted Publisher를 repository
+  `PlateerLab/xgeny-cli`, workflow `release.yml`로 설정한다. 장기 npm token은 만들거나 GitHub secret에
+  저장하지 않는다. 전체 절차는 [npm 배포와 Trusted Publishing](npm-distribution.md)을 따른다.
+- 여섯 package의 Trusted Publisher 설정을 확인한 뒤 repository variable
+  `XGENY_NPM_PUBLISH_ENABLED=true`를 둔다. 값이 없거나 exact `true`가 아니면 native build 전에 release가
+  fail-closed한다.
 - macOS notarization과 Windows Authenticode가 없는 build는 SemVer와 별개로 prototype이라고 명시하고
   OS 경고 가능성을 안내한다.
 
@@ -39,6 +47,11 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo build --workspace --release --locked
 sh scripts/check-third-party-licenses.sh --check
+npm ci --ignore-scripts --prefix npm
+npm run check --prefix npm
+npm test --prefix npm
+sh scripts/check-release-workflow.sh
+sh scripts/check-npm-distribution-workflow.sh
 ```
 
 `Cargo.lock`, `about.toml` 또는 license template를 바꾼 뒤 고지를 갱신할 때는
@@ -78,9 +91,13 @@ Publish 이전에는 다음을 다시 확인한다.
    static CRT, physical System32 DLL 또는 정확히 고정·검토된 API-set contract로 한정된 import와 원본·설치본 실행
 7. 각 target의 release `public_run_resume`, `environment_onboarding` process test
 8. loopback fixture에서 exact-tag download, checksum, 설치, 재설치, protocol check와 test-owned 삭제
-9. 최종 asset allow-list, `sha256sum -c`, 조립된 Linux fixture installer smoke와 GitHub artifact attestation
-10. 게시 뒤 다섯 target에서 public exact-tag 설치, stable release의 `releases/latest/download` bootstrap과
-   내부 `latest` 해석, state 미생성
+9. 각 target native binary를 담은 exact-version npm package pack, loopback registry global-install smoke,
+   lifecycle script 부재와 raw release asset byte parity
+10. 최종 asset allow-list, `sha256sum -c`, 조립된 Linux fixture installer smoke와 GitHub artifact attestation
+11. GitHub 게시 뒤 npm OIDC Trusted Publishing으로 platform package 다섯 개와 launcher 순차 게시,
+    provenance·SRI·dist-tag 검증
+12. 게시 뒤 다섯 target에서 GitHub public exact-tag 및 exact npm version 설치, stable release의
+    `releases/latest/download` bootstrap과 내부 `latest` 해석, state 미생성
 
 Read-only assemble job은 검증된 target artifact와 installer·고지를 조립하고 checksum을 확인한 뒤
 하나의 allow-listed bundle로 전달한다. Checkout이나 repository script를 실행하지 않는 publish job은
@@ -100,7 +117,8 @@ latest로 지정한다. 게시 직후에는 일반 release 조회로 exact tag, 
 사전 ruleset과 관리자 확인을 대신하지 않는다.
 
 Quality, build와 assemble job은 repository read 권한만 가진다. 모든 target과 assembly가 통과한 뒤
-publish job에만 `contents: write`, `id-token: write`, `attestations: write`를 부여한다. 모든 checkout은
+GitHub publish job에만 `contents: write`, `id-token: write`, `attestations: write`를 부여한다. npm
+publish job은 GitHub Release 게시 뒤 별도로 `contents: read`, `id-token: write`만 받는다. 모든 checkout은
 credential persistence를 끈다. 외부 GitHub Action은 mutable tag가 아니라 full commit SHA로 고정한다.
 
 ## 게시 artifact
@@ -112,6 +130,12 @@ credential persistence를 끈다. 외부 GitHub Action은 mutable tag가 아니�
 - `xgeny-x86_64-pc-windows-msvc.exe`
 - `xgeny-installer.sh`
 - `xgeny-installer.ps1`
+- `xgen-cli.tgz`
+- `xgen-cli-linux-x64-musl.tgz`
+- `xgen-cli-linux-arm64-musl.tgz`
+- `xgen-cli-darwin-x64.tgz`
+- `xgen-cli-darwin-arm64.tgz`
+- `xgen-cli-win32-x64.tgz`
 - `checksums.sha256`
 - `LICENSE.txt`
 - `NATIVE_RUNTIME_PROVENANCE.md`
@@ -126,9 +150,12 @@ symlink/hardlink entry 해석이 설치 경로에 존재하지 않는다. Releas
 gh attestation verify PATH_TO_ASSET --repo PlateerLab/xgeny-cli
 ```
 
-Release가 실패하면 기존 tag나 asset을 교체해 재사용하지 않는다. 원인을 수정하고 version을 올린 새
-tag로 게시한다. 자동 update, downgrade와 실행 중 self-replacement는 signed update metadata와 rollback
-정책을 별도로 설계하기 전까지 추가하지 않는다.
+GitHub Release 게시 전 실패하면 기존 tag나 asset을 교체해 재사용하지 않는다. 원인을 수정하고 version을
+올린 새 tag로 게시한다. Immutable GitHub Release 게시 뒤 npm만 부분 실패했다면 같은 Actions job을
+재실행할 수 있다. 이때 이미 게시된 npm version은 local tarball과 SRI·dist-tag가 모두 같은 경우에만
+skip하며 overwrite하지 않는다. 불일치하면 중단하고 더 높은 새 version을 사용한다. 자동 update,
+downgrade와 실행 중 self-replacement는 signed update metadata와 rollback 정책을 별도로 설계하기 전까지
+추가하지 않는다.
 
 `v0.1.0-rc.1`은 Release API 호출 전 publisher의 repository-context 해석 실패로 GitHub Release와
 게시 asset 없이 폐기된 tag다. 보호된 tag를 이동·삭제·재사용하지 않고 `v0.1.0-rc.2`부터 이어간다.
