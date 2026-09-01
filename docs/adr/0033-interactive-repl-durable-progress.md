@@ -95,7 +95,8 @@ channel을 설계하기 전까지 포함하지 않는다.
 - 줄 끝 unescaped `\`: 다음 줄과 newline으로 결합
 
 한 line과 합성 goal은 16 KiB로 제한한다. Model summary의 terminal control character는 escape한다. REPL
-progress와 오류는 고정 code만 사용한다.
+progress와 오류는 고정 code만 사용한다. Windows PowerShell 5.1의 redirected stdin 호환을 위해 stream
+맨 처음의 UTF-8 BOM 한 개만 제거한다. 이후 line의 BOM과 다른 input byte는 그대로 사용자 입력이다.
 
 ## 검증
 
@@ -104,7 +105,8 @@ progress와 오류는 고정 code만 사용한다.
   completion → provider 없는 `/resume`, receipt 수 불변
 - Unix SIGINT process E2E: in-flight model request가 끊기면 `model_call_unknown`, effect 0회, 자동 replay 없음
 - 기존 `run/resume` 전체 회귀와 Linux/macOS/Windows release process test
-- npm global install과 native installer smoke 뒤 bare REPL의 non-network `/status`/`/exit` smoke
+- npm global install과 native installer smoke 뒤 bare REPL의 non-network `/status`/`/exit` smoke. Windows
+  native installer는 PowerShell 7과 BOM을 출력하는 Windows PowerShell 5.1을 각각 검증한다.
 
 ## 대안
 

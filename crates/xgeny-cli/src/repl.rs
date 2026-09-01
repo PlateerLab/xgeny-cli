@@ -400,9 +400,10 @@ pub(crate) fn run<R: BufRead, W: Write, H: ReplHost>(
     let mut last_run = None;
     let mut previous_summary = None;
     let mut outcome = SessionOutcome::Idle;
+    let mut first_input_line = true;
 
     loop {
-        let entry = match read_entry(reader, output) {
+        let entry = match read_entry(reader, output, &mut first_input_line) {
             Ok(entry) => entry,
             Err(InputFailure::TooLarge) => {
                 writeln!(output, "error: input_too_large")?;
@@ -791,6 +792,7 @@ fn prompt_approval<R: BufRead, W: Write>(
 fn read_entry<R: BufRead, W: Write>(
     reader: &mut R,
     output: &mut W,
+    first_input_line: &mut bool,
 ) -> Result<ReplEntry, InputFailure> {
     let mut lines = Vec::new();
     loop {
@@ -810,6 +812,12 @@ fn read_entry<R: BufRead, W: Write>(
         };
         if line == "\u{3}" {
             return Ok(ReplEntry::Interrupted);
+        }
+        if *first_input_line {
+            *first_input_line = false;
+            if line.starts_with('\u{feff}') {
+                line.drain(..'\u{feff}'.len_utf8());
+            }
         }
         if has_continuation(&line) {
             line.pop();
@@ -1199,6 +1207,21 @@ mod tests {
         assert!(output.contains("paused: write_approval_required"));
         assert!(output.contains("session cleared; durable Runs were not deleted"));
         assert!(output.contains("active_run: none"));
+    }
+
+    #[test]
+    fn leading_utf8_bom_does_not_turn_the_first_command_into_a_goal() {
+        let mut host = FakeHost::new([]);
+        let mut input = io::Cursor::new(b"\xef\xbb\xbf/status\n/exit\n");
+        let mut output = Vec::new();
+
+        run(&mut input, &mut output, &mut host, &Cancellation::default()).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(host.starts.is_empty());
+        assert!(output.contains("status: idle"));
+        assert!(!output.contains("Allow sending"));
+        assert!(output.contains("bye"));
     }
 
     #[test]
