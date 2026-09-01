@@ -662,7 +662,7 @@ fn public_cli_qwen_edits_fixes_and_reverifies_rust_project() {
             .arg(&goal),
         "qwen coding loop",
     );
-    require_exit(&completion, 0, "qwen coding loop");
+    require_coding_completion(&completion, &state_root);
     require(
         completion.stdout == CODING_COMPLETION.as_bytes(),
         "live coding completion was not the exact acceptance summary",
@@ -1351,6 +1351,104 @@ fn require_workspace_completion(output: &Output, state_root: &Path) {
         }
     }
     require_exit(output, 0, "workspace discovery");
+}
+
+fn require_coding_completion(output: &Output, state_root: &Path) {
+    if output.status.code() == Some(0) {
+        return;
+    }
+    if [
+        b"reason=proposal_rejected".as_slice(),
+        b"reason=model_rejected".as_slice(),
+        b"reason=material_rejected".as_slice(),
+        b"reason=admission_rejected".as_slice(),
+        b"reason=failed_work".as_slice(),
+    ]
+    .iter()
+    .any(|marker| contains_bytes(&output.stderr, marker))
+    {
+        let run_id = extract_run_id(&output.stderr);
+        if let Ok(store) =
+            SqliteRunStore::open_existing_read_only(run_database(state_root, &run_id))
+            && let Ok(Some(snapshot)) = store.load()
+        {
+            require(false, coding_rejection_progress_message(&snapshot));
+        }
+    }
+    require_exit(output, 0, "qwen coding loop");
+}
+
+fn coding_rejection_progress_message(snapshot: &xgeny_local_store::RunSnapshot) -> &'static str {
+    let completed = snapshot
+        .records
+        .iter()
+        .filter_map(|record| {
+            let RunEventBody::EffectSucceeded { step_id, .. } = &record.event.body else {
+                return None;
+            };
+            snapshot
+                .state
+                .steps
+                .get(step_id)
+                .and_then(|step| step.intent.as_ref())
+                .map(|intent| intent.invocation.capability_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    coding_rejection_progress_for(&completed)
+}
+
+fn coding_rejection_progress_for(completed: &[&str]) -> &'static str {
+    let expected = [
+        "xgeny.fs/search-text",
+        "xgeny.fs/read-text",
+        "xgeny.fs/apply-patch",
+        "xgeny.process/execute",
+        "xgeny.fs/apply-patch",
+        "xgeny.process/execute",
+        "xgeny.process/execute",
+    ];
+    if completed.len() > expected.len()
+        || !completed
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| *actual == expected)
+    {
+        return "live coding rejection followed an unexpected capability sequence";
+    }
+    match completed.len() {
+        0 => "live coding proposal was rejected before search completed",
+        1 => "live coding proposal was rejected after search",
+        2 => "live coding proposal was rejected after source read",
+        3 => "live coding proposal was rejected after the first patch",
+        4 => "live coding proposal was rejected after the failing test",
+        5 => "live coding proposal was rejected after the corrective patch",
+        6 => "live coding proposal was rejected after the successful re-test",
+        7 => "live coding completion was rejected after the successful build",
+        _ => "live coding proposal rejection progress was invalid",
+    }
+}
+
+#[test]
+fn coding_rejection_diagnostic_is_stage_specific_and_content_free() {
+    let expected = [
+        "xgeny.fs/search-text",
+        "xgeny.fs/read-text",
+        "xgeny.fs/apply-patch",
+        "xgeny.process/execute",
+        "xgeny.fs/apply-patch",
+        "xgeny.process/execute",
+        "xgeny.process/execute",
+    ];
+    for completed in 0..=expected.len() {
+        let message = coding_rejection_progress_for(&expected[..completed]);
+        assert!(message.starts_with("live coding"));
+        assert!(!message.contains(CODING_SEARCH_KEY));
+        assert!(!message.contains(CODING_COMPLETION));
+    }
+    assert_eq!(
+        coding_rejection_progress_for(&["xgeny.fs/read-text"]),
+        "live coding rejection followed an unexpected capability sequence"
+    );
 }
 
 fn workspace_invalid_response_message(snapshot: &xgeny_local_store::RunSnapshot) -> &'static str {
