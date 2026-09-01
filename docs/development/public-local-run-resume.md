@@ -172,6 +172,41 @@ Plan/Step/effect/Receipt/completion 각 1개, 원본 삭제 뒤 두 번째 model
 전에 종료하고 두 번째 model turn용 tunnel을 새로 열어 read process에 provider 경로가 없음을 고정한다.
 일반 CI는 이 test를 compile만 하고 외부 network 없이 ignore한다.
 
+### Workspace discovery live gate
+
+실제 Qwen이 알려지지 않은 상대 path를 스스로 찾는 경로는 같은 test binary의 별도 gate로 실행한다.
+이 gate는 기존 exact-file gate와 다른 확인 문자열을 요구하며, 실제 repository 대신 test-owned 임시
+workspace만 `--allow-dir .`로 연다.
+
+```bash
+XGENY_LIVE_CONFIRM=xgeny-go50902-workspace-discovery-v1 \
+XGENY_LIVE_KNOWN_HOSTS_FILE=/absolute/path/to/dedicated_known_hosts \
+XGENY_LIVE_OPENAI_BASE_URL=http://127.0.0.1:18000/v1 \
+cargo test --locked --release -p xgeny-cli \
+  --test live_go50902_public \
+  public_cli_workspace_discovery_and_offline_replay \
+  -- --ignored --exact
+```
+
+Test는 무작위 target path, 검색 locator와 결과 sentinel을 각각 만든다. Locator와 sentinel은 서로 다른
+줄에 있어 `search-text` preview만으로 최종 값을 알 수 없으며, goal에는 locator만 들어간다. 통과하려면
+모델이 root list, recursive search, matching file stat과 exact read를 모두 Receipt-completed Step으로
+수행하고 read 뒤 summary를 sentinel과 byte-exact하게 완성해야 한다. Discovery 전용 profile은 미래
+observation에 의존하는 argument를 추측하지 말고 turn마다 concrete Step 하나만 반환하도록 모델에
+요구한다. Gate는 실제 accepted Plan마다 Step이 하나이고 dependency가 비어 있는지도 확인한다. 모델이
+bounded 추가 관찰을 선택할 수 있어 총 model call 수를 5로 고정하지 않지만, 전체 Step/model turn은
+discovery Run budget 안이어야 하고 모든 effect는 1회 실행, model call은 전부 settled,
+Unknown/failure는 0이어야 한다.
+Tunnel을 닫고 workspace와 `materials.sqlite3`를 삭제한 뒤에도 summary가 offline replay되고 journal이
+변하지 않아야 한다.
+
+기존 exact-file live gate가 model egress와 local read를 서로 다른 process/tunnel 구간으로 분리해
+검증한다. Workspace gate는 그 권한 회귀를 중복하지 않고 실제 모델이 지시된 structured capability를
+호출하고 search observation에서 얻은 동적 path로 다음 turn을 이어 한 Run을 완료하는지 검증한다. 두
+gate는 서로 다른 explicit confirmation을 요구하므로 위와 기존 exact-file 명령으로 각각 실행하며, 같은
+local forward port에서 동시에 실행하지 않는다. 일반 CI에서는 두 test 모두 외부 연결 없이 compile만
+한다.
+
 ## Clean-SHA live evidence (2026-08-31)
 
 2026-08-31 05:57 KST에 Linux x86_64, Rust 1.98.0, release profile에서 test 구현 commit
@@ -197,6 +232,27 @@ host key, Run ID, 임시 path, 무작위 파일명, goal, marker, request/respon
 manifest의 base URL/workspace/state/상대 파일명/marker를 대상으로 통과했다. Run ID는 status stderr와
 manifest에, marker는 completion/replay stdout에만 의도적으로 허용된다. Test harness는 capture한 stream
 원문을 출력하지 않았고 임시 state와 listener도 실행 종료 뒤 남지 않았다.
+
+## Workspace discovery clean-SHA live evidence (2026-09-01)
+
+2026-09-01 08:48 KST까지 Linux x86_64, Rust 1.98.0, release profile에서 강화된 discovery gate 구현
+commit `1af892bc0474abbaecbd9e0ab6698530413fe2ec`을 clean working tree로 검증했다. Gate는 served model
+`qwen3.8-27b`와 tokenizer identity `Qwen/Qwen3.8-27B-FP8`를 요청했다. 기존에 신뢰한 resolved host
+entry를 strict matching한 뒤 test 전용 `HostKeyAlias=go50902` snapshot으로 bootstrap했으므로, 이 기록
+역시 독립적인 host identity attestation은 아니다.
+
+서로 다른 무작위 workspace, target path, locator와 sentinel을 사용한 discovery 실행 두 번이 연속
+PASS했다. 각 실행에서 `list-directory`, `search-text`, `stat`, `read-text`가 모두 Receipt에 결합된
+완료 Step으로 관측됐고 각 Step의 실행 시도는 1회였다. Search preview에는 locator만 있고 sentinel은
+없었다. 모든 accepted Plan은 dependency가 없는 Step 하나만 포함했다. 모든 model call은 settled됐고
+모든 effect가 성공했으며 failure, Unknown, reconciliation은 0이었다. Read 뒤 completion과 삭제 뒤
+offline replay는 sentinel과 byte-exact했고 journal도 변하지 않았다. Gate 내부에는 model-call 재시도나
+실패 시 전체 실행 재시도가 없다.
+
+같은 commit에서 기존 exact-file gate도 별도로 PASS했다. 따라서 constrained sequential discovery
+prompt가 기존 exact-path Plan/Step/effect/Receipt, 두 model turn과 삭제 뒤 offline replay 계약을
+회귀시키지 않았음을 함께 확인했다. 원격 endpoint, host key, forward, Run ID, 임시 경로, 무작위 입력,
+model request/response와 ToolOutput 원문은 이 증거에 남기지 않았다.
 
 ## 보안·운영 메모
 

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
@@ -10,16 +11,21 @@ use std::time::{Duration, Instant};
 
 use tempfile::tempdir;
 use xgeny_local_store::{RunStore, SqliteRunStore};
-use xgeny_workgraph::{RunEventBody, StepStatus, VerificationDisposition};
+use xgeny_workgraph::{
+    ModelCallRejectionReason, ModelCallSettlement, RunEventBody, StepStatus, ToolOutputRecord,
+    VerificationDisposition,
+};
 
 const LIVE_CONFIRMATION: &str = "xgeny-go50902-public-cli-v1";
+const WORKSPACE_LIVE_CONFIRMATION: &str = "xgeny-go50902-workspace-discovery-v1";
 const MODEL: &str = "qwen3.8-27b";
 const TOKENIZER: &str = "Qwen/Qwen3.8-27B-FP8";
 const PLANNER_ID: &str = "xgeny.live.go50902";
 const SSH_TARGET: &str = "go50902";
 const MAX_KNOWN_HOSTS_BYTES: u64 = 64 * 1024;
 const SSH_READY_TIMEOUT: Duration = Duration::from_secs(20);
-const XGENY_PROCESS_TIMEOUT: Duration = Duration::from_secs(180);
+const XGENY_PROCESS_TIMEOUT: Duration = Duration::from_secs(420);
+const WORKSPACE_SEARCH_KEY: &str = "XGENY_WORKSPACE_LIVE_TARGET";
 
 struct TunnelGuard {
     child: Option<Child>,
@@ -137,7 +143,7 @@ impl Drop for TunnelGuard {
 #[ignore = "requires explicit go50902 SSH and remote-model consent"]
 #[allow(clippy::too_many_lines)]
 fn public_cli_two_turn_read_and_offline_replay() {
-    require_live_confirmation();
+    require_live_confirmation(LIVE_CONFIRMATION);
     let base_url = required_env("XGENY_LIVE_OPENAI_BASE_URL");
     let local_address = loopback_address(&base_url);
 
@@ -390,6 +396,521 @@ fn public_cli_two_turn_read_and_offline_replay() {
     );
 }
 
+#[test]
+#[ignore = "requires explicit go50902 SSH and remote-model consent"]
+#[allow(clippy::too_many_lines)]
+fn public_cli_workspace_discovery_and_offline_replay() {
+    require_live_confirmation(WORKSPACE_LIVE_CONFIRMATION);
+    let base_url = required_env("XGENY_LIVE_OPENAI_BASE_URL");
+    let local_address = loopback_address(&base_url);
+
+    let fixture = tempdir().unwrap_or_else(|_| panic!("live fixture could not be created"));
+    let known_hosts = snapshot_known_hosts(fixture.path());
+    let state_root = fixture.path().join("state");
+    let workspace = fixture.path().join("workspace");
+    let target_directory = workspace.join("knowledge");
+    fs::create_dir_all(workspace.join("src"))
+        .unwrap_or_else(|_| panic!("live workspace could not be created"));
+    fs::create_dir(&target_directory)
+        .unwrap_or_else(|_| panic!("live target directory could not be created"));
+    let readme = b"A controlled workspace discovery fixture.\n";
+    let decoy_source = b"fn main() { println!(\"fixture\"); }\n";
+    fs::write(workspace.join("README.md"), readme)
+        .unwrap_or_else(|_| panic!("live decoy README could not be written"));
+    fs::write(workspace.join("src/main.rs"), decoy_source)
+        .unwrap_or_else(|_| panic!("live decoy source could not be written"));
+
+    let target_name = format!("entry-{}.txt", random_hex());
+    let target_relative = format!("knowledge/{target_name}");
+    let locator = format!("{WORKSPACE_SEARCH_KEY}_{}", random_hex());
+    let sentinel = format!("XGENY-LIVE-WORKSPACE-VALUE-{}", random_hex());
+    let source = format!("{locator}\nRESULT={sentinel}\n");
+    require(
+        source.len() != readme.len() && source.len() != decoy_source.len(),
+        "live target size must differ from every decoy file",
+    );
+    fs::write(target_directory.join(&target_name), source.as_bytes())
+        .unwrap_or_else(|_| panic!("live target source could not be written"));
+    let goal = format!(
+        "Investigate this workspace using exactly these read-only observations in order: call xgeny.fs/list-directory on '.', call xgeny.fs/search-text from '.' with the literal query '{locator}', call xgeny.fs/stat on the matching path, and call xgeny.fs/read-text on that same path. Do not guess a path or value. The search preview does not contain the requested result. After all four observations complete, return only the value after 'RESULT=' as the summary, with no prefix, suffix, Markdown, quotation marks, or explanation."
+    );
+    require(
+        !goal.contains(&sentinel) && !goal.contains(&target_name),
+        "live discovery goal must not contain the target path or observation",
+    );
+
+    let mut tunnel = TunnelGuard::start(local_address, &known_hosts);
+    let completion = run_redacted(
+        xgeny(&state_root)
+            .arg("run")
+            .arg("--workspace")
+            .arg(&workspace)
+            .arg("--base-url")
+            .arg(&base_url)
+            .arg("--model")
+            .arg(MODEL)
+            .arg("--tokenizer")
+            .arg(TOKENIZER)
+            .arg("--planner-id")
+            .arg(PLANNER_ID)
+            .arg("--allow-dir")
+            .arg(".")
+            .arg("--allow-read")
+            .arg("--allow-remote-model-egress")
+            .arg("--max-ticks")
+            .arg("96")
+            .arg(&goal),
+        "workspace discovery",
+    );
+    require_workspace_completion(&completion, &state_root);
+    require(
+        completion.stdout == sentinel.as_bytes(),
+        "live workspace completion did not equal the exact discovered value",
+    );
+    require_contains(
+        &completion.stderr,
+        b"XGENY_COMPLETED",
+        "live workspace discovery did not report completion",
+    );
+    let run_id = extract_run_id(&completion.stderr);
+    tunnel.stop();
+    require(
+        tunnel.is_stopped(),
+        "live workspace tunnel must stop before offline verification",
+    );
+
+    let run_directory = state_root.join("runs").join(&run_id);
+    let database = run_directory.join("run.sqlite3");
+    let material_catalog = run_directory.join("materials.sqlite3");
+    require(
+        material_catalog.is_file(),
+        "live workspace material catalog was missing",
+    );
+    let store = SqliteRunStore::open_existing_read_only(&database)
+        .unwrap_or_else(|_| panic!("live workspace store could not reopen"));
+    let before_replay = store
+        .load()
+        .unwrap_or_else(|_| panic!("live workspace snapshot could not load"))
+        .unwrap_or_else(|| panic!("live workspace snapshot was missing"));
+    verify_durable_workspace_result(
+        &store,
+        &before_replay,
+        &target_relative,
+        &locator,
+        &sentinel,
+        &source,
+    );
+    drop(store);
+
+    let workspace_text = path_text(&workspace);
+    let state_text = path_text(&state_root);
+    let manifest = fs::read(run_directory.join("manifest.json"))
+        .unwrap_or_else(|_| panic!("live workspace manifest could not be read"));
+    for forbidden in [
+        base_url.as_bytes(),
+        workspace_text.as_bytes(),
+        state_text.as_bytes(),
+        target_relative.as_bytes(),
+        locator.as_bytes(),
+        sentinel.as_bytes(),
+    ] {
+        require(
+            !contains_bytes(&manifest, forbidden),
+            "live workspace manifest retained a forbidden runtime value",
+        );
+    }
+
+    fs::remove_dir_all(&workspace)
+        .unwrap_or_else(|_| panic!("live workspace could not be removed"));
+    fs::remove_file(&material_catalog)
+        .unwrap_or_else(|_| panic!("live workspace material catalog could not be removed"));
+    require(
+        !workspace.exists() && !material_catalog.exists(),
+        "live workspace inputs must be absent before offline replay",
+    );
+
+    let replay = run_redacted(
+        xgeny(&state_root).arg("resume").arg(&run_id),
+        "workspace offline replay",
+    );
+    require_exit(&replay, 0, "workspace offline replay");
+    require(
+        replay.stdout == completion.stdout,
+        "live workspace offline replay did not byte-match completion",
+    );
+    require_contains(
+        &replay.stderr,
+        b"XGENY_COMPLETED",
+        "live workspace offline replay did not report completion",
+    );
+
+    let after_replay = SqliteRunStore::open_existing_read_only(&database)
+        .unwrap_or_else(|_| panic!("live workspace store could not reopen after replay"))
+        .load()
+        .unwrap_or_else(|_| panic!("live workspace snapshot could not load after replay"))
+        .unwrap_or_else(|| panic!("live workspace snapshot was missing after replay"));
+    require(
+        before_replay.state == after_replay.state && before_replay.records == after_replay.records,
+        "live workspace offline replay mutated the durable journal",
+    );
+
+    for observed in [&completion, &replay] {
+        require_output_absent(observed, base_url.as_bytes());
+        require_output_absent(observed, workspace_text.as_bytes());
+        require_output_absent(observed, state_text.as_bytes());
+        require_output_absent(observed, target_relative.as_bytes());
+        require_output_absent(observed, locator.as_bytes());
+        require(
+            !contains_bytes(&observed.stderr, sentinel.as_bytes()),
+            "live workspace stderr exposed the discovered value",
+        );
+    }
+    for forbidden in [
+        base_url.as_bytes(),
+        workspace_text.as_bytes(),
+        state_text.as_bytes(),
+    ] {
+        require_run_directory_absent(&run_directory, forbidden);
+    }
+
+    fs::remove_dir_all(&state_root)
+        .unwrap_or_else(|_| panic!("temporary live workspace state could not be removed"));
+    require(
+        !state_root.exists(),
+        "temporary live workspace state must be removed after verification",
+    );
+}
+
+#[allow(clippy::too_many_lines)] // Keep every redacted live invariant explicit in one verifier.
+fn verify_durable_workspace_result(
+    store: &SqliteRunStore,
+    snapshot: &xgeny_local_store::RunSnapshot,
+    target_relative: &str,
+    locator: &str,
+    sentinel: &str,
+    source: &str,
+) {
+    let calls = snapshot
+        .state
+        .agent_loop
+        .as_ref()
+        .and_then(|agent| agent.model_calls.as_ref())
+        .unwrap_or_else(|| panic!("live workspace model-call lifecycle was missing"));
+    require(
+        (2..=8).contains(&calls.reserved_calls)
+            && calls.reserved_calls == calls.settled_calls
+            && calls.unknown_calls == 0
+            && calls.active_call.is_none(),
+        "live workspace model-call lifecycle was not fully settled and bounded",
+    );
+
+    let step_count = snapshot.state.steps.len();
+    require(
+        (4..=8).contains(&step_count)
+            && snapshot.state.steps.values().all(|step| {
+                step.status == StepStatus::Completed
+                    && step.attempts == 1
+                    && step.execution_receipt_id.is_some()
+                    && step.execution_receipt_digest.is_some()
+            }),
+        "live workspace Steps were not bounded, once-executed, and receipt-completed",
+    );
+    let outputs = snapshot
+        .state
+        .steps
+        .values()
+        .map(|step| {
+            let intent = step
+                .intent
+                .as_ref()
+                .unwrap_or_else(|| panic!("live workspace effect intent was missing"));
+            store
+                .load_tool_output(&intent.effect_id)
+                .unwrap_or_else(|_| panic!("live workspace ToolOutput could not load"))
+                .unwrap_or_else(|| panic!("live workspace ToolOutput was missing"))
+        })
+        .collect::<Vec<ToolOutputRecord>>();
+    require(
+        outputs.len() == step_count
+            && store
+                .load_execution_receipts()
+                .unwrap_or_else(|_| panic!("live workspace Receipts could not load"))
+                .len()
+                == step_count,
+        "live workspace output and Receipt cardinality did not match completed Steps",
+    );
+
+    let observed_capabilities = outputs
+        .iter()
+        .map(ToolOutputRecord::capability_id)
+        .collect::<BTreeSet<_>>();
+    let expected_capabilities = BTreeSet::from([
+        "xgeny.fs/list-directory",
+        "xgeny.fs/read-text",
+        "xgeny.fs/search-text",
+        "xgeny.fs/stat",
+    ]);
+    require(
+        observed_capabilities == expected_capabilities,
+        "live workspace did not execute every required discovery capability",
+    );
+    require(
+        outputs.iter().any(|output| {
+            output.capability_id() == "xgeny.fs/list-directory"
+                && output.output()["entries"]
+                    .as_array()
+                    .is_some_and(|entries| {
+                        entries.iter().any(|entry| {
+                            entry["path"].as_str() == Some("knowledge")
+                                && entry["kind"].as_str() == Some("directory")
+                        })
+                    })
+        }),
+        "live workspace list observation did not contain the target directory",
+    );
+    require(
+        outputs.iter().any(|output| {
+            output.capability_id() == "xgeny.fs/search-text"
+                && output.output()["matches"]
+                    .as_array()
+                    .is_some_and(|matches| {
+                        matches.iter().any(|candidate| {
+                            candidate["path"].as_str() == Some(target_relative)
+                                && candidate["preview"].as_str() == Some(locator)
+                                && !candidate["preview"]
+                                    .as_str()
+                                    .is_some_and(|preview| preview.contains(sentinel))
+                        })
+                    })
+        }),
+        "live workspace search observation did not locate the target",
+    );
+    let source_size = u64::try_from(source.len())
+        .unwrap_or_else(|_| panic!("live workspace source size did not fit u64"));
+    require(
+        outputs.iter().any(|output| {
+            output.capability_id() == "xgeny.fs/stat"
+                && output.output()["kind"].as_str() == Some("file")
+                && output.output()["sizeBytes"].as_u64() == Some(source_size)
+        }),
+        "live workspace stat observation did not match the target file",
+    );
+    require(
+        outputs.iter().any(|output| {
+            output.capability_id() == "xgeny.fs/read-text"
+                && output.output()["content"].as_str() == Some(source)
+        }),
+        "live workspace read observation did not contain the exact target source",
+    );
+
+    let model_calls = usize::try_from(calls.reserved_calls)
+        .unwrap_or_else(|_| panic!("live workspace model-call count did not fit usize"));
+    let accepted_plans = snapshot
+        .records
+        .iter()
+        .filter_map(|record| {
+            if let RunEventBody::PlanAccepted { steps, .. } = &record.event.body {
+                Some(steps)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let plan_count = accepted_plans.len();
+    require(
+        plan_count == step_count
+            && accepted_plans
+                .iter()
+                .all(|steps| steps.len() == 1 && steps[0].depends_on.is_empty()),
+        "live workspace accepted Plans were not strictly sequential single-Step plans",
+    );
+    require(
+        plan_count + 1 == model_calls,
+        "live workspace model turns did not end in exactly one completion",
+    );
+    for (actual, expected, message) in [
+        (
+            count_events(&snapshot.records, |body| {
+                matches!(body, RunEventBody::ModelCallReserved { .. })
+            }),
+            model_calls,
+            "live workspace model-call reservation count was inconsistent",
+        ),
+        (
+            count_events(&snapshot.records, |body| {
+                matches!(body, RunEventBody::EffectIntentCommitted { .. })
+            }),
+            step_count,
+            "live workspace effect intent count was inconsistent",
+        ),
+        (
+            count_events(&snapshot.records, |body| {
+                matches!(body, RunEventBody::EffectExecutionStarted { .. })
+            }),
+            step_count,
+            "live workspace effect start count was inconsistent",
+        ),
+        (
+            count_events(&snapshot.records, |body| {
+                matches!(body, RunEventBody::EffectSucceeded { .. })
+            }),
+            step_count,
+            "live workspace effect success count was inconsistent",
+        ),
+        (
+            count_events(&snapshot.records, |body| {
+                matches!(
+                    body,
+                    RunEventBody::VerificationRecorded {
+                        disposition: VerificationDisposition::Passed,
+                        ..
+                    }
+                )
+            }),
+            step_count,
+            "live workspace passed verification count was inconsistent",
+        ),
+        (
+            count_events(&snapshot.records, |body| {
+                matches!(body, RunEventBody::CompletionCandidateRecorded { .. })
+            }),
+            1,
+            "live workspace completion count was inconsistent",
+        ),
+    ] {
+        require(actual == expected, message);
+    }
+    require(
+        count_events(&snapshot.records, |body| {
+            matches!(
+                body,
+                RunEventBody::ModelCallBecameUnknown { .. }
+                    | RunEventBody::ModelCallSettled { .. }
+                    | RunEventBody::StepPlanned { .. }
+                    | RunEventBody::InvocationMaterialUnavailable { .. }
+                    | RunEventBody::EffectFailed { .. }
+                    | RunEventBody::EffectBecameUnknown { .. }
+                    | RunEventBody::ReconciliationStarted { .. }
+                    | RunEventBody::ReconciliationResolved { .. }
+                    | RunEventBody::ManualInterventionRequired { .. }
+                    | RunEventBody::VerificationPassed { .. }
+                    | RunEventBody::VerificationFailed { .. }
+                    | RunEventBody::VerificationRecorded {
+                        disposition: VerificationDisposition::Failed
+                            | VerificationDisposition::Inconclusive,
+                        ..
+                    }
+            )
+        }) == 0,
+        "live workspace journal contained a failure, uncertainty, or legacy transition",
+    );
+}
+
+fn require_workspace_completion(output: &Output, state_root: &Path) {
+    if output.status.code() == Some(0) {
+        return;
+    }
+    if contains_bytes(&output.stderr, b"reason=failed_work")
+        || contains_bytes(&output.stderr, b"reason=model_rejected")
+    {
+        let run_id = extract_run_id(&output.stderr);
+        if let Ok(store) =
+            SqliteRunStore::open_existing_read_only(run_database(state_root, &run_id))
+            && let Ok(Some(snapshot)) = store.load()
+        {
+            if let Some(capability_id) = snapshot
+                .state
+                .steps
+                .values()
+                .find(|step| step.status == StepStatus::Failed)
+                .and_then(|step| step.intent.as_ref())
+                .map(|intent| intent.invocation.capability_id.as_str())
+            {
+                require(
+                    false,
+                    match capability_id {
+                        "xgeny.fs/list-directory" => "live workspace list-directory effect failed",
+                        "xgeny.fs/search-text" => "live workspace search-text effect failed",
+                        "xgeny.fs/stat" => "live workspace stat effect failed",
+                        "xgeny.fs/read-text" => "live workspace read-text effect failed",
+                        _ => "live workspace unknown capability effect failed",
+                    },
+                );
+            }
+            if let Some(reason) = snapshot.records.iter().rev().find_map(|record| {
+                if let RunEventBody::ModelCallSettled {
+                    settlement: ModelCallSettlement::Rejected { reason },
+                    ..
+                } = record.event.body
+                {
+                    Some(reason)
+                } else {
+                    None
+                }
+            }) {
+                require(
+                    false,
+                    match reason {
+                        ModelCallRejectionReason::PlannerInvalidResponse => {
+                            workspace_invalid_response_message(&snapshot)
+                        }
+                        ModelCallRejectionReason::ProviderLimit => {
+                            "live workspace provider response exceeded a limit"
+                        }
+                        ModelCallRejectionReason::ProviderRejected => {
+                            "live workspace provider rejected the request"
+                        }
+                        ModelCallRejectionReason::ProposalRejected => {
+                            "live workspace proposal failed runtime validation"
+                        }
+                        ModelCallRejectionReason::MaterializationFailed => {
+                            "live workspace proposal materialization failed"
+                        }
+                        ModelCallRejectionReason::StaleHead => {
+                            "live workspace model response was stale"
+                        }
+                    },
+                );
+            }
+        }
+    }
+    require_exit(output, 0, "workspace discovery");
+}
+
+fn workspace_invalid_response_message(snapshot: &xgeny_local_store::RunSnapshot) -> &'static str {
+    let completed = snapshot
+        .state
+        .steps
+        .values()
+        .filter(|step| step.status == StepStatus::Completed)
+        .filter_map(|step| step.intent.as_ref())
+        .map(|intent| intent.invocation.capability_id.as_str())
+        .collect::<BTreeSet<_>>();
+    match (
+        completed.contains("xgeny.fs/list-directory"),
+        completed.contains("xgeny.fs/search-text"),
+        completed.contains("xgeny.fs/stat"),
+        completed.contains("xgeny.fs/read-text"),
+    ) {
+        (false, false, false, false) => {
+            "live workspace planner returned an invalid initial response"
+        }
+        (true, false, false, false) => {
+            "live workspace planner returned an invalid response after list"
+        }
+        (true, true, false, false) => {
+            "live workspace planner returned an invalid response after search"
+        }
+        (true, true, true, false) => {
+            "live workspace planner returned an invalid response after stat"
+        }
+        (true, true, true, true) => {
+            "live workspace planner returned an invalid completion response"
+        }
+        _ => "live workspace planner returned an invalid response after unexpected progress",
+    }
+}
+
 fn verify_durable_live_result(snapshot: &xgeny_local_store::RunSnapshot, receipt_count: usize) {
     let calls = snapshot
         .state
@@ -525,7 +1046,10 @@ fn xgeny(state_root: &Path) -> Command {
         .env_remove("XGENY_OPENAI_API_KEY")
         .env_remove("XGENY_LIVE_CONFIRM")
         .env_remove("XGENY_LIVE_KNOWN_HOSTS_FILE")
-        .env_remove("XGENY_LIVE_OPENAI_BASE_URL");
+        .env_remove("XGENY_LIVE_OPENAI_BASE_URL")
+        .env_remove("XGENY_OPENAI_BASE_URL")
+        .env_remove("XGENY_OPENAI_MODEL")
+        .env_remove("XGENY_OPENAI_TOKENIZER");
     command
 }
 
@@ -617,14 +1141,80 @@ fn terminate_child(child: &mut Child) {
 fn require_exit(output: &Output, expected: i32, stage: &'static str) {
     require(
         output.status.code() == Some(expected),
-        match stage {
-            "first model turn" => "first model turn returned an unexpected exit status",
-            "local read turn" => "local read turn returned an unexpected exit status",
-            "second model turn" => "second model turn returned an unexpected exit status",
-            "offline replay" => "offline replay returned an unexpected exit status",
-            _ => "live child returned an unexpected exit status",
-        },
+        classified_exit_message(output, stage),
     );
+}
+
+fn classified_exit_message(output: &Output, stage: &'static str) -> &'static str {
+    for (marker, message) in [
+        (
+            b"reason=proposal_rejected".as_slice(),
+            "live child proposal was rejected",
+        ),
+        (
+            b"reason=model_rejected".as_slice(),
+            "live child model response was rejected",
+        ),
+        (
+            b"reason=material_rejected".as_slice(),
+            "live child material was rejected",
+        ),
+        (
+            b"reason=admission_rejected".as_slice(),
+            "live child admission was rejected",
+        ),
+        (
+            b"reason=failed_work".as_slice(),
+            "live child reported failed work",
+        ),
+        (
+            b"reason=model_call_unknown".as_slice(),
+            "live child model call became unknown",
+        ),
+        (
+            b"reason=effect_outcome_unknown".as_slice(),
+            "live child effect outcome became unknown",
+        ),
+        (
+            b"reason=tick_budget_exhausted".as_slice(),
+            "live child exhausted its tick budget",
+        ),
+        (
+            b"reason=read_approval_required".as_slice(),
+            "live child unexpectedly required read approval",
+        ),
+        (
+            b"reason=remote_model_egress_consent_required".as_slice(),
+            "live child unexpectedly required model egress consent",
+        ),
+        (
+            b"XGENY_ERROR code=configuration_mismatch".as_slice(),
+            "live child configuration did not match",
+        ),
+        (
+            b"XGENY_ERROR code=run_integrity_failure".as_slice(),
+            "live child Run integrity verification failed",
+        ),
+        (
+            b"XGENY_ERROR code=internal_safety_failure".as_slice(),
+            "live child internal safety check failed",
+        ),
+    ] {
+        if contains_bytes(&output.stderr, marker) {
+            return message;
+        }
+    }
+    match stage {
+        "first model turn" => "first model turn returned an unclassified exit status",
+        "local read turn" => "local read turn returned an unclassified exit status",
+        "second model turn" => "second model turn returned an unclassified exit status",
+        "offline replay" => "offline replay returned an unclassified exit status",
+        "workspace discovery" => "workspace discovery returned an unclassified exit status",
+        "workspace offline replay" => {
+            "workspace offline replay returned an unclassified exit status"
+        }
+        _ => "live child returned an unclassified exit status",
+    }
 }
 
 fn extract_run_id(stderr: &[u8]) -> String {
@@ -647,10 +1237,10 @@ fn run_database(state_root: &Path, run_id: &str) -> PathBuf {
     state_root.join("runs").join(run_id).join("run.sqlite3")
 }
 
-fn require_live_confirmation() {
+fn require_live_confirmation(expected: &str) {
     let confirmation = required_env("XGENY_LIVE_CONFIRM");
     require(
-        confirmation == LIVE_CONFIRMATION,
+        confirmation == expected,
         "live confirmation value was not exact",
     );
 }
