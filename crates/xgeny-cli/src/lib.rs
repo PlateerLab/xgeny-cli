@@ -7,7 +7,9 @@ mod composition;
 mod driver;
 mod manifest;
 mod material_catalog;
+mod model_profile;
 mod run_layout;
 
 pub use composition::*;
 pub use driver::*;
+pub use model_profile::*;

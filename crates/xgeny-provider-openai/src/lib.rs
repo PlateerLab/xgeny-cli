@@ -32,6 +32,7 @@ const DEFAULT_MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const DEFAULT_MAX_PROPOSAL_BYTES: usize = 256 * 1024;
 const DEFAULT_MAX_JSON_DEPTH: usize = 64;
+const MAX_MODEL_CATALOG_ENTRIES: usize = 4_096;
 const MAX_IDENTIFIER_BYTES: usize = 256;
 const MAX_MODEL_ID_BYTES: usize = 512;
 const MAX_OUTPUT_TOKENS: u32 = 65_536;
@@ -52,6 +53,9 @@ const CONSTRAINED_SYSTEM_PROMPT: &str = concat!(
     "A completion_candidate is allowed only after sufficient receipt-completed observations exist. For completion, set formatVersion to 1, kind to completion_candidate, steps to an empty array, and summary to the non-empty final result. ",
     "Never claim that a tool ran, that permission was granted, or that the goal completed merely because it was requested."
 );
+const COMPATIBILITY_SYSTEM_PROMPT: &str = "This is an XGENy connectivity probe. Return exactly one JSON object matching the supplied schema. Do not call tools and do not add explanatory text.";
+const COMPATIBILITY_USER_PROMPT: &str =
+    "Return a successful XGENy OpenAI-compatible connection result.";
 
 /// A bearer credential retained only as a sensitive HTTP header value.
 #[derive(Clone)]
@@ -391,13 +395,159 @@ impl OpenAiModelChecker {
     ///
     /// Returns a redacted failure class for transport, status, response, or catalog mismatch.
     pub fn check(&mut self) -> Result<(), OpenAiModelCheckFailure> {
+        let models = self.models()?;
+        match models
+            .iter()
+            .filter(|model| model.as_str() == self.config.model)
+            .count()
+        {
+            1 => Ok(()),
+            0 => Err(OpenAiModelCheckFailure::ModelNotAdvertised),
+            _ => Err(OpenAiModelCheckFailure::InvalidResponse),
+        }
+    }
+
+    /// Send exactly one model-catalog GET and return a deterministic advertised-model list.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted failure class when transport, status, bounds, JSON shape, or model IDs
+    /// are invalid. Duplicate model identifiers are rejected rather than silently collapsed.
+    pub fn models(&mut self) -> Result<Vec<String>, OpenAiModelCheckFailure> {
         let body = self.transport.fetch(ModelCatalogTransportRequest {
             endpoint: &self.config.model_catalog_endpoint,
             authorization: self.credential.as_ref().map(|value| &value.0),
             max_response_bytes: self.config.max_response_bytes,
         })?;
-        decode_model_catalog(&body, &self.config.model, self.config.max_json_depth)
+        decode_model_catalog_models(&body, self.config.max_json_depth)
     }
+}
+
+/// One explicit Chat Completions and strict JSON Schema compatibility probe.
+pub struct OpenAiCompatibilityChecker {
+    config: OpenAiPlannerConfig,
+    credential: Option<BearerCredential>,
+    transport: Box<dyn Transport + Send>,
+}
+
+impl OpenAiCompatibilityChecker {
+    /// Build a compatibility checker with the planner's exact transport policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a credential would cross plaintext HTTP or plaintext HTTP is not
+    /// addressed to a literal loopback IP.
+    pub fn new(
+        config: OpenAiPlannerConfig,
+        credential: Option<BearerCredential>,
+    ) -> Result<Self, OpenAiPlannerConfigError> {
+        validate_transport_security(&config.endpoint, credential.as_ref())?;
+        let transport = UreqTransport::new(config.timeout);
+        Ok(Self {
+            config,
+            credential,
+            transport: Box::new(transport),
+        })
+    }
+
+    #[cfg(test)]
+    fn with_transport<T>(
+        config: OpenAiPlannerConfig,
+        credential: Option<BearerCredential>,
+        transport: T,
+    ) -> Result<Self, OpenAiPlannerConfigError>
+    where
+        T: Transport + Send + 'static,
+    {
+        validate_transport_security(&config.endpoint, credential.as_ref())?;
+        Ok(Self {
+            config,
+            credential,
+            transport: Box::new(transport),
+        })
+    }
+
+    /// Send one non-streaming Chat Completions request and validate strict JSON Schema behavior.
+    ///
+    /// This probe deliberately has no local workspace or Run state. It verifies the endpoint,
+    /// selected model, Chat Completions envelope, strict `json_schema` response format, and exact
+    /// response-model identity used by the production planner.
+    ///
+    /// # Errors
+    ///
+    /// Returns only a fixed redacted failure class. Provider response bodies are never exposed.
+    pub fn check(&mut self) -> Result<(), OpenAiCompatibilityCheckFailure> {
+        let schema = compatibility_schema();
+        let body = serde_json::to_vec(&ChatCompletionRequest {
+            model: &self.config.model,
+            messages: [
+                ChatMessage {
+                    role: "system",
+                    content: COMPATIBILITY_SYSTEM_PROMPT,
+                },
+                ChatMessage {
+                    role: "user",
+                    content: COMPATIBILITY_USER_PROMPT,
+                },
+            ],
+            temperature: 0,
+            seed: 0,
+            max_tokens: 256,
+            stream: false,
+            n: 1,
+            response_format: ResponseFormat {
+                response_type: "json_schema",
+                json_schema: JsonSchemaResponse {
+                    name: "xgeny_connection_probe_v1",
+                    strict: true,
+                    schema: &schema,
+                },
+            },
+        })
+        .map_err(|_| OpenAiCompatibilityCheckFailure::InvalidResponse)?;
+        if body.len() > self.config.max_request_bytes {
+            return Err(OpenAiCompatibilityCheckFailure::InvalidResponse);
+        }
+        let response = self
+            .transport
+            .send(TransportRequest {
+                endpoint: &self.config.endpoint,
+                authorization: self.credential.as_ref().map(|value| &value.0),
+                body: &body,
+                max_response_bytes: self.config.max_response_bytes,
+            })
+            .map_err(map_compatibility_transport_failure)?;
+        decode_compatibility_response(&response, &self.config.model, self.config.max_json_depth)
+    }
+}
+
+impl fmt::Debug for OpenAiCompatibilityChecker {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OpenAiCompatibilityChecker")
+            .field("config", &self.config)
+            .field(
+                "credential",
+                &self.credential.as_ref().map(|_| "<redacted>"),
+            )
+            .field("transport", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Redacted outcome classes for the explicit Chat Completions compatibility probe.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAiCompatibilityCheckFailure {
+    #[error("compatibility request timed out")]
+    Timeout,
+    #[error("compatibility endpoint is unavailable")]
+    Unavailable,
+    #[error("compatibility response is invalid")]
+    InvalidResponse,
+    #[error("compatibility request exceeded provider limits")]
+    ProviderLimit,
+    #[error("compatibility request was rejected")]
+    RequestRejected,
 }
 
 impl fmt::Debug for OpenAiModelChecker {
@@ -790,6 +940,18 @@ fn map_model_check_status(status: u16) -> OpenAiModelCheckFailure {
     }
 }
 
+const fn map_compatibility_transport_failure(
+    failure: PlannerPortFailure,
+) -> OpenAiCompatibilityCheckFailure {
+    match failure {
+        PlannerPortFailure::Timeout => OpenAiCompatibilityCheckFailure::Timeout,
+        PlannerPortFailure::Unavailable => OpenAiCompatibilityCheckFailure::Unavailable,
+        PlannerPortFailure::InvalidResponse => OpenAiCompatibilityCheckFailure::InvalidResponse,
+        PlannerPortFailure::ProviderLimit => OpenAiCompatibilityCheckFailure::ProviderLimit,
+        PlannerPortFailure::ProviderRejected => OpenAiCompatibilityCheckFailure::RequestRejected,
+    }
+}
+
 #[derive(Deserialize)]
 struct ChatCompletionResponse {
     model: String,
@@ -942,25 +1104,97 @@ fn decode_chat_response(
     }
 }
 
+#[cfg(test)]
 fn decode_model_catalog(
     body: &[u8],
     expected_model: &str,
     max_json_depth: usize,
 ) -> Result<(), OpenAiModelCheckFailure> {
-    let envelope = parse_unique_json(body, max_json_depth)
-        .map_err(|_| OpenAiModelCheckFailure::InvalidResponse)?;
-    let response: ModelCatalogResponse =
-        serde_json::from_value(envelope).map_err(|_| OpenAiModelCheckFailure::InvalidResponse)?;
-    match response
-        .data
+    let models = decode_model_catalog_models(body, max_json_depth)?;
+    match models
         .iter()
-        .filter(|entry| entry.id == expected_model)
+        .filter(|model| model.as_str() == expected_model)
         .count()
     {
         1 => Ok(()),
         0 => Err(OpenAiModelCheckFailure::ModelNotAdvertised),
         _ => Err(OpenAiModelCheckFailure::InvalidResponse),
     }
+}
+
+fn decode_model_catalog_models(
+    body: &[u8],
+    max_json_depth: usize,
+) -> Result<Vec<String>, OpenAiModelCheckFailure> {
+    let envelope = parse_unique_json(body, max_json_depth)
+        .map_err(|_| OpenAiModelCheckFailure::InvalidResponse)?;
+    let response: ModelCatalogResponse =
+        serde_json::from_value(envelope).map_err(|_| OpenAiModelCheckFailure::InvalidResponse)?;
+    if response.data.is_empty() || response.data.len() > MAX_MODEL_CATALOG_ENTRIES {
+        return Err(OpenAiModelCheckFailure::InvalidResponse);
+    }
+    let mut models = response
+        .data
+        .into_iter()
+        .map(|entry| {
+            validate_profile_text("model", &entry.id)
+                .map(|()| entry.id)
+                .map_err(|_| OpenAiModelCheckFailure::InvalidResponse)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    models.sort();
+    if models.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(OpenAiModelCheckFailure::InvalidResponse);
+    }
+    Ok(models)
+}
+
+fn decode_compatibility_response(
+    body: &[u8],
+    expected_model: &str,
+    max_json_depth: usize,
+) -> Result<(), OpenAiCompatibilityCheckFailure> {
+    let envelope = parse_unique_json(body, max_json_depth)
+        .map_err(|_| OpenAiCompatibilityCheckFailure::InvalidResponse)?;
+    let response: ChatCompletionResponse = serde_json::from_value(envelope)
+        .map_err(|_| OpenAiCompatibilityCheckFailure::InvalidResponse)?;
+    if response.model != expected_model {
+        return Err(OpenAiCompatibilityCheckFailure::InvalidResponse);
+    }
+    let [choice] = response.choices.as_slice() else {
+        return Err(OpenAiCompatibilityCheckFailure::InvalidResponse);
+    };
+    if choice.index != 0 || choice.message.role != "assistant" {
+        return Err(OpenAiCompatibilityCheckFailure::InvalidResponse);
+    }
+    if choice.finish_reason == "length" {
+        return Err(OpenAiCompatibilityCheckFailure::ProviderLimit);
+    }
+    if choice.finish_reason != "stop"
+        || choice.message.refusal.is_some()
+        || choice.message.tool_calls.is_some()
+        || choice.message.function_call.is_some()
+    {
+        return Err(OpenAiCompatibilityCheckFailure::InvalidResponse);
+    }
+    let content = choice
+        .message
+        .content
+        .as_deref()
+        .ok_or(OpenAiCompatibilityCheckFailure::InvalidResponse)?;
+    if content.len() > 1_024 {
+        return Err(OpenAiCompatibilityCheckFailure::InvalidResponse);
+    }
+    let probe = parse_unique_json(content.as_bytes(), max_json_depth)
+        .map_err(|_| OpenAiCompatibilityCheckFailure::InvalidResponse)?;
+    let object = probe
+        .as_object()
+        .filter(|object| object.len() == 1)
+        .ok_or(OpenAiCompatibilityCheckFailure::InvalidResponse)?;
+    if object.get("status").and_then(Value::as_str) != Some("ok") {
+        return Err(OpenAiCompatibilityCheckFailure::InvalidResponse);
+    }
+    Ok(())
 }
 
 fn decode_dependency(dependency: DependencyDocument) -> Result<PlanDependency, PlannerPortFailure> {
@@ -1167,6 +1401,17 @@ fn proposal_schema() -> Value {
             "summary": {"type": "string", "maxLength": 5000}
         },
         "required": ["formatVersion", "kind", "steps", "summary"],
+        "additionalProperties": false
+    })
+}
+
+fn compatibility_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "const": "ok"}
+        },
+        "required": ["status"],
         "additionalProperties": false
     })
 }
@@ -1868,6 +2113,10 @@ mod tests {
             Err(OpenAiModelCheckFailure::ModelNotAdvertised)
         );
         assert_eq!(
+            decode_model_catalog_models(br#"{"data":[]}"#, 8),
+            Err(OpenAiModelCheckFailure::InvalidResponse)
+        );
+        assert_eq!(
             decode_model_catalog(
                 br#"{"data":[{"id":"qwen3.8-27b"},{"id":"qwen3.8-27b"}]}"#,
                 MODEL,
@@ -1883,6 +2132,10 @@ mod tests {
             decode_model_catalog(br#"{"data":[[[[[{"id":"qwen3.8-27b"}]]]]]}"#, MODEL, 4),
             Err(OpenAiModelCheckFailure::InvalidResponse)
         );
+        assert_eq!(
+            decode_model_catalog_models(br#"{"data":[{"id":"z-model"},{"id":"a-model"}]}"#, 8,),
+            Ok(vec!["a-model".to_owned(), "z-model".to_owned()])
+        );
     }
 
     #[test]
@@ -1897,6 +2150,74 @@ mod tests {
         let debug = format!("{checker:?}");
         assert!(!debug.contains("provider.example"));
         assert!(!debug.contains("catalog-secret"));
+    }
+
+    #[test]
+    fn compatibility_checker_uses_chat_completions_and_strict_schema_without_leaking_secret() {
+        let credential = BearerCredential::new("compatibility-secret").unwrap();
+        let mut checker = OpenAiCompatibilityChecker::with_transport(
+            config("https://provider.example/v1"),
+            Some(credential),
+            ExpectedCompatibilityTransport,
+        )
+        .unwrap();
+
+        assert_eq!(checker.check(), Ok(()));
+        let debug = format!("{checker:?}");
+        assert!(!debug.contains("provider.example"));
+        assert!(!debug.contains("compatibility-secret"));
+    }
+
+    #[test]
+    fn compatibility_response_requires_exact_model_single_safe_choice_and_exact_probe_object() {
+        assert_eq!(
+            decode_compatibility_response(&response(r#"{"status":"ok"}"#, "stop"), MODEL, 8),
+            Ok(())
+        );
+
+        let wrong_model = serde_json::to_vec(&json!({
+            "model": "other-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "{\"status\":\"ok\"}"},
+                "finish_reason": "stop"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            decode_compatibility_response(&wrong_model, MODEL, 8),
+            Err(OpenAiCompatibilityCheckFailure::InvalidResponse)
+        );
+        assert_eq!(
+            decode_compatibility_response(
+                &response(r#"{"status":"ok","extra":true}"#, "stop"),
+                MODEL,
+                8,
+            ),
+            Err(OpenAiCompatibilityCheckFailure::InvalidResponse)
+        );
+        assert_eq!(
+            decode_compatibility_response(&response(r#"{"status":"ok"}"#, "length"), MODEL, 8),
+            Err(OpenAiCompatibilityCheckFailure::ProviderLimit)
+        );
+
+        let tool_call = serde_json::to_vec(&json!({
+            "model": MODEL,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "{\"status\":\"ok\"}",
+                    "tool_calls": []
+                },
+                "finish_reason": "stop"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            decode_compatibility_response(&tool_call, MODEL, 8),
+            Err(OpenAiCompatibilityCheckFailure::InvalidResponse)
+        );
     }
 
     #[test]
@@ -1944,6 +2265,35 @@ mod tests {
             assert_eq!(authorization.to_str().unwrap(), "Bearer catalog-secret");
             assert!(authorization.is_sensitive());
             Ok(br#"{"data":[{"id":"qwen3.8-27b"}]}"#.to_vec())
+        }
+    }
+
+    struct ExpectedCompatibilityTransport;
+
+    impl Transport for ExpectedCompatibilityTransport {
+        fn send(&mut self, request: TransportRequest<'_>) -> Result<Vec<u8>, PlannerPortFailure> {
+            assert_eq!(
+                request.endpoint.as_str(),
+                "https://provider.example/v1/chat/completions"
+            );
+            let authorization = request
+                .authorization
+                .expect("credential should be attached");
+            assert_eq!(
+                authorization.to_str().unwrap(),
+                "Bearer compatibility-secret"
+            );
+            assert!(authorization.is_sensitive());
+            let body: Value = serde_json::from_slice(request.body).unwrap();
+            assert_eq!(body["model"], MODEL);
+            assert_eq!(body["stream"], false);
+            assert_eq!(body["response_format"]["type"], "json_schema");
+            assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+            assert_eq!(
+                body["response_format"]["json_schema"]["schema"]["additionalProperties"],
+                false
+            );
+            Ok(response(r#"{"status":"ok"}"#, "stop"))
         }
     }
 

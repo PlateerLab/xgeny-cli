@@ -133,60 +133,69 @@ Checksum은 전송 손상을 탐지하지만 같은 release publisher 자체를 
 - response의 `model` 문자열이 설정한 served model ID와 정확히 같다.
 - custom CA, ambient proxy, redirect와 자동 retry에 의존하지 않는다.
 
-로컬 vLLM 예시:
+일반 사용자는 대화형 온보딩을 한 번 실행한다. 누락된 URL과 API key를 묻고 catalog에서 model을
+선택한다. API key는 숨김 입력이며 일반 config나 SQLite가 아니라 OS 보안 저장소에만 보관한다.
 
 ```bash
-export XGENY_OPENAI_BASE_URL=http://127.0.0.1:8000/v1
-export XGENY_OPENAI_MODEL=qwen3.8-27b
-# 선택: 생략하면 model ID와 같은 identity를 사용한다.
-export XGENY_OPENAI_TOKENIZER=Qwen/Qwen3.8-27B-FP8
-xgeny model check
+xgeny model setup
+xgeny model list
+xgeny model check --compatibility
 ```
 
-Windows PowerShell에서는 같은 설정을 다음처럼 지정한다.
+인증 없는 loopback vLLM을 non-interactive하게 지정할 수도 있다. Tokenizer를 생략하면 model ID를
+tokenizer/profile identity로 사용한다.
 
-```powershell
-$env:XGENY_OPENAI_BASE_URL = "http://127.0.0.1:8000/v1"
-$env:XGENY_OPENAI_MODEL = "qwen3.8-27b"
-$env:XGENY_OPENAI_TOKENIZER = "Qwen/Qwen3.8-27B-FP8"
-xgeny model check
+```bash
+xgeny model setup \
+  --base-url http://127.0.0.1:8000/v1 \
+  --model qwen3.8-27b \
+  --tokenizer Qwen/Qwen3.8-27B-FP8
 ```
 
 Loopback HTTP에는 ambient `XGENY_OPENAI_API_KEY`가 있더라도 전송하지 않는다.
 
-원격 provider는 HTTPS를 사용하고 key는 secret manager 또는 현재 process environment로만 주입한다.
-`--api-key` 옵션과 plaintext key config file은 없다.
+원격 provider는 HTTPS를 사용한다. Interactive setup은 macOS Keychain, Windows Credential Manager 또는
+Linux Secret Service에 key를 저장한다. Headless/CI는 secret manager 출력을 stdin으로 전달한다.
+`--store-token`을 생략하면 현재 setup 검증에만 사용하고 저장하지 않는다.
 
 ```bash
-export XGENY_OPENAI_BASE_URL=https://provider.example/v1
-export XGENY_OPENAI_MODEL=served-model-id
-# 셸의 secret manager에서 현재 process로 주입한다. 값 자체를 명령행에 쓰지 않는다.
-export XGENY_OPENAI_API_KEY="$(secret-manager-command)"
-xgeny model check
+secret-manager-command | xgeny model setup \
+  --name qwen-xgen \
+  --base-url https://provider.example/v1 \
+  --model served-model-id \
+  --token-stdin \
+  --store-token
 ```
 
-Windows PowerShell에서 대화형 입력이 필요하면 plaintext CLI argument 대신 다음처럼 현재 process의
-environment에만 둔다.
+OS 보안 저장소가 없는 Linux server에서는 평문 파일로 fallback하지 않고
+`credential_store_unavailable`로 실패한다. 이 경우 환경변수나 stdin을 매 실행에 주입한다.
 
-```powershell
-$secureKey = Read-Host "API key" -AsSecureString
-$keyPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureKey)
-try {
-    $env:XGENY_OPENAI_API_KEY = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($keyPointer)
-} finally {
-    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($keyPointer)
-}
-xgeny model check
+```bash
+XGENY_OPENAI_API_KEY="$(secret-manager-command)" xgeny model check --compatibility
 ```
 
-`xgeny model check`는 사용자가 명시적으로 실행할 때만 현재 endpoint에 bounded
-`GET /v1/models` 한 번을 보낸다. Prompt와 inference 요청은 보내지 않고 workspace, SQLite 또는 Run
-state를 만들지 않는다. Redirect, retry와 ambient proxy는 사용하지 않으며 loopback HTTP에는 ambient
-API key를 보내지 않는다. 일부 compatible server는 catalog를 제공하지 않거나 alias를 다르게
-광고하므로 `model_not_advertised`는
-strict generation 비호환 확정이 아니라 catalog에서 확인되지 않았다는 뜻이다. PASS도 catalog 접근과
-그 endpoint가 강제한 인증만 뜻한다. Chat Completions의 인증·권한, strict JSON Schema와 exact
-response model 호환성은 첫 `run`이 durable reservation 뒤 검증한다.
+일반 설정 우선순위는 명시적 option, `XGENY_OPENAI_*` 환경변수, selected/active profile 순서다.
+Credential은 `--token-stdin`, `XGENY_OPENAI_API_KEY`, profile secure store 순서다. Stored credential은
+profile URL과 최종 URL이 정확히 같을 때만 쓴다.
+
+`xgeny model setup`은 bounded `GET /v1/models` 뒤 실제 strict JSON Schema
+`POST /v1/chat/completions`를 보내 두 요청이 모두 성공한 profile만 commit한다. Workspace, SQLite 또는
+Run state를 만들지 않는다. `model check` 기본형은 기존 자동화 호환성을 위해 catalog GET만 수행하고,
+`--compatibility`를 지정하면 같은 inference probe를 추가한다. Redirect, retry와 ambient proxy는
+사용하지 않는다. 일부 compatible server는 catalog를 제공하지 않거나 alias를 다르게 광고하므로
+`model_not_advertised`는 catalog에서 확인되지 않았다는 뜻이다. Setup probe 통과도 전체 coding loop
+품질을 보장하지는 않으며 실제 workspace E2E는 별도 release gate다.
+
+Profile 관리는 다음 명령으로 한다.
+
+```bash
+xgeny model list
+xgeny model use qwen-xgen
+xgeny model logout qwen-xgen
+xgeny model remove qwen-xgen
+```
+
+세부 보안·headless 동작은 [모델 프로필과 최초 온보딩](development/model-onboarding.md)을 따른다.
 전송 여부가 불확정한 inference transport 실패는 자동 재시도하지 않고 해당 Run을
 `model_call_unknown` recovery 상태로 남길 수 있다.
 
@@ -203,7 +212,7 @@ xgeny run \
   'README를 읽고 핵심을 요약해줘.'
 ```
 
-Windows PowerShell에서도 동일한 환경변수를 설정한 뒤 다음처럼 실행한다.
+Windows PowerShell에서도 active profile을 사용해 같은 명령을 실행한다.
 
 ```powershell
 xgeny run `
