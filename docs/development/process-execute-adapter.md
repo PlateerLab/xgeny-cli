@@ -82,6 +82,11 @@ Composition root는 다음 항목을 같은 exact binding으로 Core에 등록�
 - stdout/stderr는 UTF-8 변환 뒤에도 각각 32 KiB 이하만 durable output에 보존한다.
 - Adapter와 verifier `Debug`에는 path, argv, env value, raw output을 넣지 않는다.
 
+Process가 실제로 출력한 compiler/test 진단은 private Run store의 ToolOutput에 원문으로 남는다. 이 출력은
+workspace 절대경로나 source snippet을 포함할 수 있으므로 state root는 공유·게시 가능한 로그가 아니다.
+CLI status/completion 출력과 manifest에는 raw ToolOutput을 복제하지 않으며 endpoint, state root와
+executable host path도 process observation으로 저장하지 않는다.
+
 이 경계는 command injection과 accidental path escape를 줄이는 capability boundary이지 OS sandbox가
 아니다. 허용된 `cargo test`, Python, Node 같은 executable은 project code와 자체 child process를
 사용자 계정 권한으로 실행할 수 있다. Host catalog는 신뢰한 개발 도구만 넣고 credential-bearing 환경을

@@ -755,9 +755,11 @@ fn public_cli_qwen_edits_fixes_and_reverifies_rust_project() {
             require_output_absent(observed, forbidden);
         }
     }
+    // Compiler diagnostics can legitimately retain the workspace path inside
+    // private durable ToolOutput. Endpoint, state, and executable host paths
+    // are not process observations and must remain absent from the Run files.
     for forbidden in [
         base_url.as_bytes(),
-        workspace_text.as_bytes(),
         state_text.as_bytes(),
         cargo_text.as_bytes(),
     ] {

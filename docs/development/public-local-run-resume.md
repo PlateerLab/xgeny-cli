@@ -293,9 +293,10 @@ model request/response와 ToolOutput 원문은 이 증거에 남기지 않았다
 ## 보안·운영 메모
 
 - `manifest.json`에는 endpoint, token, root path, allow-file/allow-dir path, search query와 content가 없다.
-- Run DB에는 goal과 성공한 tool output이 의도적으로 존재한다. Discovery mode의 private
+- Run DB에는 goal과 ToolOutput이 의도적으로 존재한다. Process stdout/stderr에는 compiler가 출력한
+  workspace 절대경로나 source snippet이 포함될 수 있다. Discovery mode의 private
   `materials.sqlite3`에는 dynamic path/query recipe가 존재한다. state root 전체를 민감 데이터로
-  취급한다.
+  취급하고 CLI status/completion 출력이나 manifest로 raw ToolOutput을 복제하지 않는다.
 - allow-file은 ambient absolute path가 아니라 workspace-relative portable path만 받는다.
 - Debug/error 출력으로 내부 path나 provider body를 내보내지 않는다.
 - `XGENY_STATE_HOME`은 넓은 기존 경로나 final symlink를 가리키면 안 되며, 기존 directory 권한을

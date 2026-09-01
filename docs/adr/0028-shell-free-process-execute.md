@@ -106,6 +106,13 @@ idempotency key는 identity이지 replay 허가가 아니다. `Executing` 상태
 prepare/execute하지 않고 `EffectUnknown`으로 닫는다. Exact output bundle commit이 끝난 경우에만
 `Validating`에서 verifier와 Receipt 생성을 이어간다.
 
+Bounded stdout/stderr는 모델이 실패 원인을 수정하고 offline replay가 동일한 관찰을 재사용하도록 private
+Run store에 원문으로 보존한다. Compiler와 test runner가 workspace 절대경로 또는 source snippet을
+출력할 수 있으므로 state root 전체를 민감 데이터로 취급한다. 이 관찰을 일반 CLI stdout/stderr나
+`manifest.json`으로 다시 내보내지는 않으며 endpoint, state root와 executable host path는 Run store의
+process observation이 아니다. 기본 redaction으로 workspace 경로를 지우면 진단 정확성과 durable
+observation digest를 훼손하므로 RC3에서는 선택하지 않는다.
+
 ## 검증
 
 - public fixture의 schema/round-trip/manifest conformance
