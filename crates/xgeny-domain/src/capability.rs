@@ -70,8 +70,16 @@ pub struct CapabilityExecution {
     pub styles: Vec<ExecutionStyle>,
     pub cancellable: bool,
     pub idempotency_key_supported: bool,
+    /// Request a bounded durable tool-output record for an idempotent effect.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub durable_tool_output: bool,
     pub default_timeout_ms: u64,
     pub max_timeout_ms: u64,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde skip predicates receive a shared reference.
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

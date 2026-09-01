@@ -4,6 +4,7 @@ mod path;
 mod query;
 mod read_text;
 mod root_identity;
+mod write_atomic;
 
 use std::fmt;
 use std::path::Path;
@@ -24,6 +25,7 @@ pub use read_text::{
     MAX_READ_TEXT_BYTES, ReadTextAdapter, ReadTextLimits, ReadTextLimitsError, ReadTextVerifier,
 };
 pub use root_identity::{WorkspaceRootIdentity, WorkspaceRootIdentityError};
+pub use write_atomic::{MAX_WRITE_ATOMIC_BYTES, WriteAtomicAdapter, WriteAtomicVerifier};
 
 /// Exact public Capability identifier implemented by this adapter.
 pub const READ_TEXT_CAPABILITY_ID: &str = "xgeny.fs/read-text";
@@ -49,8 +51,16 @@ pub const SEARCH_TEXT_CAPABILITY_ID: &str = "xgeny.fs/search-text";
 pub const SEARCH_TEXT_CONTRACT_VERSION: &str = "1.0.0";
 /// Exact operation name used in the root-bound search Instance.
 pub const SEARCH_TEXT_OPERATION_REF: &str = "searchText";
+/// Exact public Capability identifier for one atomic UTF-8 file replacement.
+pub const WRITE_ATOMIC_CAPABILITY_ID: &str = "xgeny.fs/write-atomic";
+/// Exact immutable write-atomic contract version.
+pub const WRITE_ATOMIC_CONTRACT_VERSION: &str = "1.0.0";
+/// Exact operation name used in the root-bound write Instance.
+pub const WRITE_ATOMIC_OPERATION_REF: &str = "writeAtomic";
 /// Resource scope accepted by the workspace resolver.
 pub const FILESYSTEM_READ_SCOPE: &str = "filesystem.read";
+/// Resource scope accepted for explicit workspace mutations.
+pub const FILESYSTEM_WRITE_SCOPE: &str = "filesystem.write";
 
 const WORKSPACE_BINDING_PREFIX: &str = "builtin://core-os/filesystem/workspaces/";
 
@@ -185,6 +195,12 @@ impl WorkspaceRoot {
         workspace_binding(&self.workspace_id, SEARCH_TEXT_OPERATION_REF)
     }
 
+    /// Return the exact root-bound binding for atomic writes.
+    #[must_use]
+    pub fn write_atomic_binding(&self) -> InstanceBinding {
+        workspace_binding(&self.workspace_id, WRITE_ATOMIC_OPERATION_REF)
+    }
+
     /// Construct the bounded one-level directory adapter.
     #[must_use]
     pub fn list_directory_adapter(&self) -> FilesystemQueryAdapter {
@@ -201,6 +217,12 @@ impl WorkspaceRoot {
     #[must_use]
     pub fn search_text_adapter(&self) -> FilesystemQueryAdapter {
         FilesystemQueryAdapter::search_text(self.clone())
+    }
+
+    /// Construct the bounded atomic UTF-8 write adapter.
+    #[must_use]
+    pub fn write_atomic_adapter(&self) -> WriteAtomicAdapter {
+        WriteAtomicAdapter::new(self.clone())
     }
 }
 
@@ -226,7 +248,7 @@ pub struct WorkspaceResourceResolver {
 
 impl ResourceResolver for WorkspaceResourceResolver {
     fn resolve(&self, scope: &str, resource: &str) -> Result<String, ResourceResolutionFailure> {
-        if scope != FILESYSTEM_READ_SCOPE {
+        if !matches!(scope, FILESYSTEM_READ_SCOPE | FILESYSTEM_WRITE_SCOPE) {
             return Err(ResourceResolutionFailure::UnsupportedScope);
         }
         path::canonical_resource(&self.workspace_id, resource).map_err(path::PathError::resolution)
@@ -287,7 +309,13 @@ mod tests {
             }
         );
         assert_eq!(
-            resolver.resolve("filesystem.write", "README.md"),
+            resolver
+                .resolve(FILESYSTEM_WRITE_SCOPE, "README.md")
+                .expect("write scope uses the same confined path grammar"),
+            canonical
+        );
+        assert_eq!(
+            resolver.resolve("filesystem.execute", "README.md"),
             Err(ResourceResolutionFailure::UnsupportedScope)
         );
 

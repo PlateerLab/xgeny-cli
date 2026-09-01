@@ -9,7 +9,7 @@
 ```text
 crates/
   xgeny-adapter-reference/ publish하지 않는 preopened-handle conformance 기준
-  xgeny-adapter-filesystem/ capability-confined workspace read/list/stat/search 제품 adapter
+  xgeny-adapter-filesystem/ capability-confined workspace read/list/stat/search/write 제품 adapter
   xgeny-domain/       I/O 없는 정본 Rust 프로토콜 타입
   xgeny-protocol/     bundled/offline schema·fixture·digest 검증
   xgeny-workgraph/    model-free RunEvent 상태 전이·재생 실험
@@ -20,7 +20,7 @@ crates/
   xgeny-cli/          protocol check와 public local run/resume를 제공하는 실행 파일·driver library
 ```
 
-`xgeny-workgraph`, `xgeny-local-store`, `xgeny-runtime`의 durable effect, invocation material, Direct Executor, Core verification, VerifiedRunIndex, Persistent dependency frontier, bounded AgentLoop와 model-call lifecycle 계약은 ADR-0008·0010·0011·0012·0013·0014·0015·0016 연구 gate를 위한 내부 실험이다. ADR-0018은 내부 ReadOnly profile, Artifact-bearing Core Receipt v2와 기존 구성요소를 조합하는 bounded CLI library driver를 추가했다. ADR-0019는 public protocol v0.1 schema를 바꾸지 않고 event-anchored `ToolOutputRecord`, same-transaction verification snapshot과 SQLite physical schema 7을 추가했다. ADR-0020은 같은 schema와 public protocol을 유지하면서 generation-checked planning snapshot, mandatory exact `toolOutputs`와 PlanningContext/OpenAI prompt v2를 추가했다. ADR-0021은 event-anchored `CompletionOutputRecord`와 SQLite physical schema 8을 추가해 exact UTF-8 summary를 process 재시작 뒤 모델 재호출 없이 복원한다. Registry와 Router 기본형도 기존 `CapabilityDefinition`·`CapabilityInstance`를 그대로 사용하며 wire 문서를 추가하지 않는다. `xgeny-policy`의 Allow는 provisional 결과로 유지되고, runtime의 Admission 기본형만 exact invocation에서 만든 local one-shot allow를 current Run/Step/action/Instance/material과 결합해 durable intent로 발행한다. Admission은 Receipt용 canonical PolicyDecision ID/digest commitment를 만들지만 reusable `Grant`나 조회 가능한 `PolicyDecision` wire document를 저장하지 않는다. `xgeny-adapter-reference`는 public runtime port를 실제 preopened 임시 파일 I/O와 read-only verifier로 검증하지만 `publish = false`인 비제품 기준이다. `xgeny-adapter-filesystem`은 exact-file `read-text`와 opt-in directory `list-directory`·`stat`·`search-text`를 제공하고, `xgeny-provider-openai`는 Core가 역의존하지 않는 leaf crate로 model/tokenizer/prompt/schema profile과 단일 HTTP request를 구현한다. Public CLI는 기존 `--allow-file` profile을 보존하면서 `--allow-dir` workspace discovery를 제공한다. 일반 process·write·network 제품 adapter, interactive 승인 UI, MCP, Connector, XGEN 원격 연동과 `InvocationPlan` wire 투영은 아직 구현하지 않는다.
+`xgeny-workgraph`, `xgeny-local-store`, `xgeny-runtime`의 durable effect, invocation material, Direct Executor, Core verification, VerifiedRunIndex, Persistent dependency frontier, bounded AgentLoop와 model-call lifecycle 계약은 ADR-0008·0010·0011·0012·0013·0014·0015·0016 연구 gate를 위한 내부 실험이다. ADR-0018은 내부 ReadOnly profile, Artifact-bearing Core Receipt v2와 기존 구성요소를 조합하는 bounded CLI library driver를 추가했다. ADR-0019는 event-anchored `ToolOutputRecord`와 SQLite physical schema 7을 추가했고, ADR-0020·0021은 generation-checked planning context와 durable completion을 schema 8에 연결했다. Registry와 Router는 기존 Definition/Instance를 사용한다. `xgeny-policy`의 Allow는 provisional이며 runtime Admission이 exact invocation의 one-shot authority를 Run/Step/action/Instance/material에 결합한다. `xgeny-adapter-reference`는 비제품 conformance 기준이다. 제품 `xgeny-adapter-filesystem`은 exact-file `read-text`와 opt-in directory `list-directory`·`stat`·`search-text`·`write-atomic`을 제공한다. Public CLI는 기존 `--allow-file` profile을 보존하면서 `--allow-dir` discovery와 별도 `--allow-write` atomic mutation을 제공한다. 일반 process·patch·network adapter, interactive 승인 UI, MCP, Connector와 XGEN 원격 연동은 아직 구현하지 않는다.
 
 ## 준비물
 
@@ -140,7 +140,7 @@ cargo build --locked --release -p xgeny-cli
 
 - JSON Schema draft 2020-12 스키마 9개의 meta-schema 유효성
 - 임의 HTTP/file retrieval을 끈 bundled registry의 `$ref` 해석
-- manifest에 선언된 valid/invalid fixture 23개의 기대 결과
+- manifest에 선언된 valid/invalid fixture 25개의 기대 결과
 - valid fixture의 Rust 도메인 타입 역직렬화·재직렬화·재검증
 - optional extension 보존과 unknown required extension fail-closed
 - Capability 입력·출력 스키마의 meta-validation과 offline compile
@@ -152,7 +152,7 @@ cargo build --locked --release -p xgeny-cli
 GitHub Actions는 Linux에서 format과 clippy를 검사하고 Linux x86-64/ARM64, macOS Intel/Apple Silicon,
 Windows x86-64에서 workspace test, `protocol check`, native release build와 loopback installer smoke를
 수행한다. 따라서 현재 보장하는 것은 이 다섯 target의 **I/O 없는 Registry·Router·Permission
-Broker·상태 기계, 내장 프로토콜 검증, 격리된 실제 workspace read, public run/resume process 회귀와
+Broker·상태 기계, 내장 프로토콜 검증, 격리된 실제 workspace read/atomic write, public run/resume process 회귀와
 checksum 기반 설치 경로**다.
 
 실제 OS 권한 broker, 일반 shell/process 실행, OS code signing/notarization과 게시된 GitHub Release의

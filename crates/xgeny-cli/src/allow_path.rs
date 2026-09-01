@@ -7,9 +7,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use xgeny_adapter_filesystem::{
     FILESYSTEM_READ_SCOPE, LIST_DIRECTORY_CAPABILITY_ID, LIST_DIRECTORY_CONTRACT_VERSION,
-    MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_QUERY_UNICODE_SCALARS, READ_TEXT_CAPABILITY_ID,
-    READ_TEXT_CONTRACT_VERSION, SEARCH_TEXT_CAPABILITY_ID, SEARCH_TEXT_CONTRACT_VERSION,
-    STAT_CAPABILITY_ID, STAT_CONTRACT_VERSION, WorkspaceResourceResolver,
+    MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_QUERY_UNICODE_SCALARS, MAX_WRITE_ATOMIC_BYTES,
+    READ_TEXT_CAPABILITY_ID, READ_TEXT_CONTRACT_VERSION, SEARCH_TEXT_CAPABILITY_ID,
+    SEARCH_TEXT_CONTRACT_VERSION, STAT_CAPABILITY_ID, STAT_CONTRACT_VERSION,
+    WRITE_ATOMIC_CAPABILITY_ID, WRITE_ATOMIC_CONTRACT_VERSION, WorkspaceResourceResolver,
 };
 use xgeny_domain::CapabilityRef;
 use xgeny_policy::ResourceResolver;
@@ -110,6 +111,17 @@ impl WorkspaceReadAuthorization {
                         .is_some_and(valid_query)
                     && self.authorizes_directory_or_descendant(path)
             }
+            (WRITE_ATOMIC_CAPABILITY_ID, WRITE_ATOMIC_CONTRACT_VERSION) => {
+                object.len() == 3
+                    && object
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|content| content.len() <= MAX_WRITE_ATOMIC_BYTES)
+                    && object
+                        .get("expectedDigest")
+                        .is_some_and(valid_expected_digest)
+                    && self.authorizes_directory_or_descendant(path)
+            }
             _ => false,
         }
     }
@@ -124,7 +136,8 @@ impl WorkspaceReadAuthorization {
                 self.authorizes_file_or_descendant(resource)
             }
             (LIST_DIRECTORY_CAPABILITY_ID, LIST_DIRECTORY_CONTRACT_VERSION)
-            | (SEARCH_TEXT_CAPABILITY_ID, SEARCH_TEXT_CONTRACT_VERSION) => {
+            | (SEARCH_TEXT_CAPABILITY_ID, SEARCH_TEXT_CONTRACT_VERSION)
+            | (WRITE_ATOMIC_CAPABILITY_ID, WRITE_ATOMIC_CONTRACT_VERSION) => {
                 self.authorizes_directory_or_descendant(resource)
             }
             _ => false,
@@ -186,7 +199,7 @@ fn planner_scope_hint(
     let files = serde_json::to_string(&files)
         .map_err(|_| WorkspaceReadAuthorizationError::Canonicalization)?;
     let hint = format!(
-        "Caller-authorized directory roots (list/search targets and descendant stat/read targets): {directories}. Additional exact files (stat/read only): {files}."
+        "Caller-authorized directory roots (list/search targets and descendant stat/read/write-atomic targets): {directories}. Additional exact files (stat/read only): {files}. write-atomic requires expectedDigest=null for creation or the exact digest previously read for replacement."
     );
     if hint.len() > MAX_PLANNER_SCOPE_HINT_BYTES {
         return Err(WorkspaceReadAuthorizationError::PlannerHintTooLarge);
@@ -239,6 +252,18 @@ fn valid_query(query: &str) -> bool {
         && query.len() <= MAX_SEARCH_QUERY_BYTES
         && query.chars().count() <= MAX_SEARCH_QUERY_UNICODE_SCALARS
         && !query.chars().any(char::is_control)
+}
+
+fn valid_expected_digest(value: &Value) -> bool {
+    value.is_null()
+        || value.as_str().is_some_and(|digest| {
+            digest.strip_prefix("sha256:").is_some_and(|hex| {
+                hex.len() == 64
+                    && hex
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            })
+        })
 }
 
 #[derive(Serialize)]
@@ -350,6 +375,44 @@ mod tests {
             !catalog
                 .authorizes_material(&wrong, &json!({"path": "workspace:fixture", "query": "ok"}),)
         );
+    }
+
+    #[test]
+    fn write_material_is_bounded_and_requires_a_directory_scope() {
+        let catalog = authorization(&["README.md"], &["src"]);
+        let write = capability(WRITE_ATOMIC_CAPABILITY_ID);
+        assert!(catalog.authorizes_material(
+            &write,
+            &json!({
+                "path": "workspace:fixture/src/new.rs",
+                "content": "fn main() {}",
+                "expectedDigest": null
+            }),
+        ));
+        assert!(!catalog.authorizes_material(
+            &write,
+            &json!({
+                "path": "workspace:fixture/README.md",
+                "content": "replacement",
+                "expectedDigest": null
+            }),
+        ));
+        assert!(!catalog.authorizes_material(
+            &write,
+            &json!({
+                "path": "workspace:fixture/src/new.rs",
+                "content": "x".repeat(MAX_WRITE_ATOMIC_BYTES + 1),
+                "expectedDigest": null
+            }),
+        ));
+        assert!(!catalog.authorizes_material(
+            &write,
+            &json!({
+                "path": "workspace:fixture/src/new.rs",
+                "content": "replacement",
+                "expectedDigest": "sha256:UPPER"
+            }),
+        ));
     }
 
     #[test]

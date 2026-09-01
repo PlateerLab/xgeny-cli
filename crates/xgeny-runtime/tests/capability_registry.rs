@@ -1,7 +1,7 @@
 use xgeny_domain::{
     API_VERSION_V1ALPHA1, Architecture, AuthState, CapabilityDefinitionBody,
-    CapabilityInstanceBody, CapabilityRef, CapabilitySource, ExecutionStyle, HealthStatus,
-    OperatingSystem, Placement, ProtocolDocument,
+    CapabilityInstanceBody, CapabilityRef, CapabilitySource, EffectClass, ExecutionStyle,
+    HealthStatus, OperatingSystem, Placement, ProtocolDocument,
 };
 use xgeny_runtime::{CapabilityRegistry, RegistryError};
 
@@ -14,6 +14,24 @@ fn definition() -> CapabilityDefinitionBody {
         ProtocolDocument::CapabilityDefinition(body) => *body,
         other => panic!("expected a capability definition, got {other:?}"),
     }
+}
+
+#[test]
+fn durable_tool_output_is_limited_to_read_only_or_idempotent_effects() {
+    let mut valid = definition();
+    valid.spec.effect.class = EffectClass::Idempotent;
+    valid.spec.execution.durable_tool_output = true;
+    CapabilityRegistry::new()
+        .register_schema_validated_definition(valid)
+        .expect("idempotent durable output should register");
+
+    let mut invalid = renamed_definition("example/non-idempotent-output", "1.0.0");
+    invalid.spec.effect.class = EffectClass::NonIdempotent;
+    invalid.spec.execution.durable_tool_output = true;
+    assert!(matches!(
+        CapabilityRegistry::new().register_schema_validated_definition(invalid),
+        Err(RegistryError::UnsupportedDurableToolOutputEffect { .. })
+    ));
 }
 
 fn instance() -> CapabilityInstanceBody {

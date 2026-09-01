@@ -72,6 +72,10 @@ pub(crate) const FIXTURES: &[Asset] = &[
         "../../../protocol/fixtures/v1alpha1/valid/capability-definition.fs-stat.json"
     ),
     asset!(
+        "valid/capability-definition.fs-write-atomic.json",
+        "../../../protocol/fixtures/v1alpha1/valid/capability-definition.fs-write-atomic.json"
+    ),
+    asset!(
         "valid/capability-instance.local-fs.json",
         "../../../protocol/fixtures/v1alpha1/valid/capability-instance.local-fs.json"
     ),
@@ -114,6 +118,10 @@ pub(crate) const FIXTURES: &[Asset] = &[
     asset!(
         "invalid/capability-definition.unknown-effect.json",
         "../../../protocol/fixtures/v1alpha1/invalid/capability-definition.unknown-effect.json"
+    ),
+    asset!(
+        "invalid/capability-definition.durable-output-non-idempotent.json",
+        "../../../protocol/fixtures/v1alpha1/invalid/capability-definition.durable-output-non-idempotent.json"
     ),
     asset!(
         "invalid/capability-instance.raw-token.json",

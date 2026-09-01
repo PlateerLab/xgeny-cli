@@ -194,7 +194,7 @@ xgeny run `
 ```
 
 이 변경을 포함한 source build 또는 다음 release에서는 사용자가 파일명을 미리 나열하지 않고 선택한
-workspace directory를 read-only로 탐색하게 할 수 있다.
+workspace directory를 탐색하고 별도 승인 아래 atomic write할 수 있다.
 
 ```bash
 xgeny run \
@@ -202,11 +202,13 @@ xgeny run \
   --allow-dir . \
   --allow-remote-model-egress \
   --allow-read \
-  '프로젝트 구조를 확인하고 관련 구현을 찾아 설명해줘.'
+  --allow-write \
+  '프로젝트 구조를 확인하고 필요한 파일을 안전하게 수정해줘.'
 ```
 
 이 mode는 `list-directory`, `stat`, case-sensitive literal `search-text`, bounded UTF-8
-`read-text`를 제공한다. 더 좁게 허용하려면 `--allow-dir src --allow-dir tests`처럼 반복하고,
+`read-text`, `write-atomic`을 제공한다. `--allow-write`는 read/model egress와 독립된 동의다. 더 좁게
+허용하려면 `--allow-dir src --allow-dir tests`처럼 반복하고,
 directory 밖의 exact file만 `--allow-file Cargo.toml`로 추가한다. 미완료 재개에는 원래와 동일한
 `--allow-dir`/`--allow-file` 집합을 다시 제공해야 한다.
 
@@ -229,10 +231,11 @@ xgeny resume run-0123456789abcdef0123456789abcdef
 ```
 
 상세 재개 절차는 [Public local run/resume prototype](development/public-local-run-resume.md)을 따른다.
-현재 배포된 RC2 capability는 allow-list 기반 UTF-8 file read 하나다. Source/main의 workspace
-discovery도 여전히 read-only다. 일반 shell/process, file write, browser와 MCP는 후속 범위이므로 현
-상태를 Claude Code/Codex 전체 기능과 동일하다고 해석하지 않는다. Discovery의 limit·state·재개
-경계는 [Workspace filesystem discovery](development/workspace-filesystem-discovery.md)를 따른다.
+현재 배포된 RC2 capability는 allow-list 기반 UTF-8 file read 하나다. Source/main은 workspace
+discovery와 bounded atomic text write까지 제공한다. 일반 shell/process, patch, browser와 MCP는 후속
+범위이므로 현 상태를 Claude Code/Codex 전체 기능과 동일하다고 해석하지 않는다. Discovery 경계는
+[Workspace filesystem discovery](development/workspace-filesystem-discovery.md), write 경계는
+[Workspace atomic write](development/workspace-atomic-write.md)를 따른다.
 
 ## 삭제
 

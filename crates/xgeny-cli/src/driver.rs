@@ -2,6 +2,7 @@ use std::fmt;
 use std::num::NonZeroU32;
 
 use thiserror::Error;
+use xgeny_domain::EffectClass;
 use xgeny_local_store::{RunStore, StoreError};
 use xgeny_policy::{PolicyInputs, ResolvedPermissionRequest, ResourceResolver};
 use xgeny_runtime::{
@@ -91,6 +92,7 @@ pub enum DriverOutcome {
     Quiescent(AgentLoopQuiescence),
     ApprovalPending {
         step_id: String,
+        effect_class: EffectClass,
     },
     ApprovalDenied {
         step_id: String,
@@ -260,6 +262,7 @@ impl RunDriver {
                             ApprovalDecision::Pending => {
                                 return Ok(DriverOutcome::ApprovalPending {
                                     step_id: action.step_id,
+                                    effect_class: pending.permission_request().effect_class(),
                                 });
                             }
                             ApprovalDecision::Denied => {

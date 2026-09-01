@@ -20,7 +20,7 @@ fn protocol_check_succeeds_and_reports_conformance_scope() {
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
     assert!(stdout.contains("XGENy protocol v0.1: PASS"));
     assert!(stdout.contains("schemas: 9"));
-    assert!(stdout.contains("fixtures: 23 (14 valid, 9 invalid)"));
+    assert!(stdout.contains("fixtures: 25 (15 valid, 10 invalid)"));
     assert!(stdout.contains("reference resolution: bundled/offline"));
 }
 
@@ -146,6 +146,7 @@ fn run_help_names_environment_contract_without_exposing_values() {
     assert!(stdout.contains("XGENY_OPENAI_API_KEY"));
     assert!(stdout.contains("--allow-file"));
     assert!(stdout.contains("--allow-dir"));
+    assert!(stdout.contains("--allow-write"));
     assert!(!stdout.contains(sentinel));
 }
 

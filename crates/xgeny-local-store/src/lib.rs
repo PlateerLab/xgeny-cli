@@ -935,23 +935,28 @@ fn verify_material_bundle(
             .ok_or(StoreError::ReceiptProvenanceRequired)?;
         let profile_matches_effect = matches!(
             (provenance.profile_version.as_str(), intent.effect_class),
-            (CORE_RECEIPT_PROFILE_V2, EffectClass::ReadOnly)
-                | (
-                    CORE_RECEIPT_PROFILE_V1,
-                    EffectClass::Reversible | EffectClass::Idempotent | EffectClass::NonIdempotent
-                )
+            (
+                CORE_RECEIPT_PROFILE_V2,
+                EffectClass::ReadOnly | EffectClass::Idempotent
+            ) | (
+                CORE_RECEIPT_PROFILE_V1,
+                EffectClass::Reversible | EffectClass::Idempotent | EffectClass::NonIdempotent
+            )
         );
         if !profile_matches_effect {
             return Err(StoreError::UnsupportedReceiptProfile);
         }
-        let output_profile_matches_effect = match intent.effect_class {
-            EffectClass::ReadOnly => {
-                provenance.tool_output_profile.as_deref() == Some(TOOL_OUTPUT_PROFILE_V1)
-            }
-            EffectClass::Reversible | EffectClass::Idempotent | EffectClass::NonIdempotent => {
-                provenance.tool_output_profile.is_none()
-            }
-        };
+        let output_profile_matches_effect =
+            match (intent.effect_class, provenance.profile_version.as_str()) {
+                (EffectClass::ReadOnly | EffectClass::Idempotent, CORE_RECEIPT_PROFILE_V2) => {
+                    provenance.tool_output_profile.as_deref() == Some(TOOL_OUTPUT_PROFILE_V1)
+                }
+                (
+                    EffectClass::Reversible | EffectClass::Idempotent | EffectClass::NonIdempotent,
+                    CORE_RECEIPT_PROFILE_V1,
+                ) => provenance.tool_output_profile.is_none(),
+                _ => false,
+            };
         if !output_profile_matches_effect {
             return Err(StoreError::ToolOutputProfileRequired);
         }
@@ -2108,8 +2113,10 @@ fn verify_core_receipt_artifacts(
             }
         }
         CORE_RECEIPT_PROFILE_V2 => {
-            if intent.effect_class != EffectClass::ReadOnly
-                || receipt.artifacts.is_empty()
+            if !matches!(
+                intent.effect_class,
+                EffectClass::ReadOnly | EffectClass::Idempotent
+            ) || receipt.artifacts.is_empty()
                 || receipt.artifacts.len() > CORE_RECEIPT_MAX_ARTIFACTS_V2
             {
                 return Err(StoreError::Corrupt(

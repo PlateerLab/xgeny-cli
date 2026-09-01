@@ -1,0 +1,31 @@
+{
+  "apiVersion": "xgeny.io/v1alpha1",
+  "kind": "CapabilityDefinition",
+  "metadata": {
+    "id": "example/unsafe-output",
+    "contractVersion": "1.0.0",
+    "displayName": "Invalid non-idempotent output"
+  },
+  "spec": {
+    "summary": "This fixture must fail because a non-idempotent effect requests durable tool output.",
+    "inputSchema": {"type": "object"},
+    "outputSchema": {"type": "object"},
+    "effect": {
+      "class": "non_idempotent",
+      "resourceSelectors": [],
+      "criticalActions": []
+    },
+    "requiredCapabilities": [],
+    "execution": {
+      "styles": ["sync"],
+      "cancellable": false,
+      "idempotencyKeySupported": false,
+      "durableToolOutput": true,
+      "defaultTimeoutMs": 1000,
+      "maxTimeoutMs": 1000
+    },
+    "verification": [
+      {"strategy": "output_schema", "required": true}
+    ]
+  }
+}

@@ -21,7 +21,7 @@ pub(crate) const WORKSPACE_READ_MATERIAL_PROVIDER_ID: &str = "xgeny.cli.workspac
 pub(crate) const WORKSPACE_READ_MATERIAL_CATALOG_SCHEMA_VERSION: i64 = 1;
 pub(crate) const WORKSPACE_READ_RECIPE_FORMAT_VERSION: u32 = 1;
 pub(crate) const WORKSPACE_READ_RECIPE_DOMAIN: &str = "xgeny.cli.workspace-read-recipe/v1";
-const MAX_RECIPE_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_RECIPE_BYTES: usize = 512 * 1024;
 
 pub(crate) struct RunMaterialCatalog {
     connection: Connection,

@@ -892,7 +892,7 @@ pub enum ToolOutputError {
     UnsupportedFormatVersion(u32),
     #[error("tool output profile is missing or unsupported")]
     UnsupportedProfile,
-    #[error("tool output is only supported for read-only effects")]
+    #[error("tool output is only supported for read-only or idempotent effects")]
     UnsupportedEffectClass,
     #[error("tool output identity field `{0}` is invalid")]
     InvalidIdentity(&'static str),
@@ -1012,7 +1012,10 @@ fn bounded_tool_output_text_add(current: usize, added: usize) -> Result<usize, T
 fn required_tool_output_provenance(
     intent: &EffectIntent,
 ) -> Result<&ReceiptProvenance, ToolOutputError> {
-    if intent.effect_class != EffectClass::ReadOnly {
+    if !matches!(
+        intent.effect_class,
+        EffectClass::ReadOnly | EffectClass::Idempotent
+    ) {
         return Err(ToolOutputError::UnsupportedEffectClass);
     }
     let provenance = intent
@@ -4538,7 +4541,11 @@ fn validate_tool_output_profile(intent: &EffectIntent) -> Result<(), TransitionE
         .receipt_provenance
         .as_ref()
         .and_then(|provenance| provenance.tool_output_profile.as_deref())
-        && (profile != TOOL_OUTPUT_PROFILE_V1 || intent.effect_class != EffectClass::ReadOnly)
+        && (profile != TOOL_OUTPUT_PROFILE_V1
+            || !matches!(
+                intent.effect_class,
+                EffectClass::ReadOnly | EffectClass::Idempotent
+            ))
     {
         return Err(TransitionError::UnsupportedToolOutputProfile {
             effect_id: intent.effect_id.clone(),

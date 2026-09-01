@@ -221,9 +221,9 @@ impl PreparedAdapterInvocation for PreparedReadText {
     }
 }
 
-struct ReadObservation {
-    content: String,
-    digest: String,
+pub(crate) struct ReadObservation {
+    pub(crate) content: String,
+    pub(crate) digest: String,
 }
 
 struct InspectedOutput {
@@ -233,7 +233,7 @@ struct InspectedOutput {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum ReadFailure {
+pub(crate) enum ReadFailure {
     Open,
     NonRegular,
     TooLarge,
@@ -364,7 +364,7 @@ fn inspect_output(
     })
 }
 
-fn read_text(
+pub(crate) fn read_text(
     root: &Dir,
     relative_path: &RelativePath,
     limits: ReadTextLimits,
@@ -434,7 +434,7 @@ const fn is_windows_reparse_point(_metadata: &cap_std::fs::Metadata) -> bool {
     false
 }
 
-fn sha256_digest(bytes: &[u8]) -> String {
+pub(crate) fn sha256_digest(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut encoded = String::with_capacity(64);
     for byte in digest {

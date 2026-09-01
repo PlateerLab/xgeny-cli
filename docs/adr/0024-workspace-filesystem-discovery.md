@@ -1,5 +1,8 @@
 # ADR-0024: Workspace filesystem discovery와 durable dynamic material
 
+> 후속 상태: [ADR-0025](0025-capability-confined-atomic-write.md)가 directory mode에 별도 승인형
+> `write-atomic`을 추가했다. 아래 read-only 범위와 다음 단계는 ADR-0024 결정 당시의 기록이다.
+
 - 상태: 채택
 - 기준일: 2026-08-31
 - 적용 범위: `list-directory`·`stat`·`search-text`, workspace read authorization, public CLI run/resume

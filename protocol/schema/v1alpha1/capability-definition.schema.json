@@ -91,6 +91,7 @@
             },
             "cancellable": {"type": "boolean"},
             "idempotencyKeySupported": {"type": "boolean"},
+            "durableToolOutput": {"type": "boolean", "default": false},
             "defaultTimeoutMs": {"type": "integer", "minimum": 1},
             "maxTimeoutMs": {"type": "integer", "minimum": 1}
           },
@@ -129,6 +130,25 @@
           "additionalProperties": false
         }
       },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "execution": {
+                "properties": {"durableToolOutput": {"const": true}},
+                "required": ["durableToolOutput"]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "effect": {
+                "properties": {"class": {"enum": ["read_only", "idempotent"]}}
+              }
+            }
+          }
+        }
+      ],
       "additionalProperties": false
     }
   },
