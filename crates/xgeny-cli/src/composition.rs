@@ -33,8 +33,9 @@ use xgeny_policy::{
     ResourceResolutionFailure, ResourceResolver,
 };
 use xgeny_provider_openai::{
-    BearerCredential, OpenAiModelCheckFailure, OpenAiModelChecker, OpenAiPlanner,
-    OpenAiPlannerConfig, OpenAiPlannerConfigError,
+    BearerCredential, OpenAiCompatibilityCheckFailure, OpenAiCompatibilityChecker,
+    OpenAiModelCheckFailure, OpenAiModelChecker, OpenAiPlanner, OpenAiPlannerConfig,
+    OpenAiPlannerConfigError,
 };
 use xgeny_runtime::{
     AgentLoop, AgentLoopQuiescence, AgentLoopTick, CapabilityRegistry, DirectExecutor,
@@ -108,6 +109,7 @@ pub struct LocalRunRequest {
     pub planner_id: String,
     pub model: String,
     pub tokenizer: String,
+    pub credential: Option<BearerCredential>,
     pub allow_files: Vec<String>,
     pub allow_dirs: Vec<String>,
     pub allow_executables: Vec<String>,
@@ -135,6 +137,7 @@ impl LocalRunRequest {
             planner_id: DEFAULT_PLANNER_ID.to_owned(),
             model,
             tokenizer,
+            credential: None,
             allow_files,
             allow_dirs: Vec::new(),
             allow_executables: Vec::new(),
@@ -153,6 +156,7 @@ pub struct LocalResumeRequest {
     pub run_id: String,
     pub workspace: Option<PathBuf>,
     pub base_url: Option<String>,
+    pub credential: Option<BearerCredential>,
     pub allow_files: Vec<String>,
     pub allow_dirs: Vec<String>,
     pub allow_executables: Vec<String>,
@@ -168,6 +172,7 @@ pub struct ModelCheckRequest {
     pub base_url: String,
     pub model: String,
     pub tokenizer: String,
+    pub credential: Option<BearerCredential>,
 }
 
 /// Stable, redacted failure classes returned by `xgeny model check`.
@@ -265,15 +270,57 @@ pub fn check_openai_model(request: ModelCheckRequest) -> Result<(), ModelCheckEr
         base_url,
         model,
         tokenizer,
+        credential,
     } = request;
     let config = OpenAiPlannerConfig::new(&base_url, DEFAULT_PLANNER_ID, &model, &tokenizer)
         .and_then(|config| config.with_timeout(MODEL_CHECK_TIMEOUT))
         .map_err(map_model_check_config)?;
-    let credential = provider_credential(&config).map_err(map_model_check_config)?;
     OpenAiModelChecker::new(config, credential)
         .map_err(map_model_check_config)?
         .check()
         .map_err(map_model_check_failure)
+}
+
+/// Return the bounded deterministic model catalog without creating Run state.
+///
+/// # Errors
+///
+/// Returns only stable, redacted configuration, transport, status, and response classes.
+pub fn list_openai_models(request: ModelCheckRequest) -> Result<Vec<String>, ModelCheckError> {
+    let ModelCheckRequest {
+        base_url,
+        model,
+        tokenizer,
+        credential,
+    } = request;
+    let config = OpenAiPlannerConfig::new(&base_url, DEFAULT_PLANNER_ID, &model, &tokenizer)
+        .and_then(|config| config.with_timeout(MODEL_CHECK_TIMEOUT))
+        .map_err(map_model_check_config)?;
+    OpenAiModelChecker::new(config, credential)
+        .map_err(map_model_check_config)?
+        .models()
+        .map_err(map_model_check_failure)
+}
+
+/// Send one explicit strict-JSON Chat Completions compatibility probe without Run state.
+///
+/// # Errors
+///
+/// Returns only stable redacted failure classes and never exposes provider response bodies.
+pub fn check_openai_compatibility(request: ModelCheckRequest) -> Result<(), ModelCheckError> {
+    let ModelCheckRequest {
+        base_url,
+        model,
+        tokenizer,
+        credential,
+    } = request;
+    let config = OpenAiPlannerConfig::new(&base_url, DEFAULT_PLANNER_ID, &model, &tokenizer)
+        .and_then(|config| config.with_timeout(MODEL_CHECK_TIMEOUT))
+        .map_err(map_model_check_config)?;
+    OpenAiCompatibilityChecker::new(config, credential)
+        .map_err(map_model_check_config)?
+        .check()
+        .map_err(map_compatibility_check_failure)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -490,7 +537,7 @@ where
         },
     )
     .map_err(|_| PublicRunError::Configuration)?;
-    let planner = remote_planner(config)?;
+    let planner = remote_planner(config, request.credential)?;
     let state_root = discover_state_root().map_err(|_| PublicRunError::Configuration)?;
     let layout = RunLayout::create(&state_root, manifest.run_id()).map_err(map_layout_create)?;
     layout
@@ -526,8 +573,28 @@ where
 /// # Errors
 ///
 /// Returns a fixed public failure class on invalid configuration, contention, or corrupt state.
-#[allow(clippy::too_many_lines)]
 pub fn resume_local(request: LocalResumeRequest) -> Result<LocalCommandResult, PublicRunError> {
+    resume_local_with_model_resolver(request, || Err(PublicRunError::Configuration))
+}
+
+/// Resume a Run while deferring CLI model-profile and credential resolution until a new remote
+/// model call is actually required.
+///
+/// Completed replay and recovery-only outcomes return before invoking `resolve_model`, preserving
+/// the provider-free offline replay contract.
+///
+/// # Errors
+///
+/// Returns a fixed public failure class on invalid configuration, deferred model resolution,
+/// contention, or corrupt state.
+#[allow(clippy::too_many_lines)]
+pub fn resume_local_with_model_resolver<F>(
+    request: LocalResumeRequest,
+    resolve_model: F,
+) -> Result<LocalCommandResult, PublicRunError>
+where
+    F: FnOnce() -> Result<(String, Option<BearerCredential>), PublicRunError>,
+{
     validate_max_ticks(request.max_ticks)?;
     let state_root = discover_state_root().map_err(|_| PublicRunError::Configuration)?;
     let layout = RunLayout::existing(&state_root, &request.run_id)
@@ -625,7 +692,10 @@ pub fn resume_local(request: LocalResumeRequest) -> Result<LocalCommandResult, P
         return Err(PublicRunError::Configuration);
     }
     let planner = if request.allow_remote_model_egress {
-        let base_url = request.base_url.ok_or(PublicRunError::Configuration)?;
+        let (base_url, credential) = match request.base_url.as_ref() {
+            Some(base_url) => (base_url.clone(), request.credential.clone()),
+            None => resolve_model()?,
+        };
         let config = planner_config(
             &base_url,
             manifest.planner_id(),
@@ -636,7 +706,7 @@ pub fn resume_local(request: LocalResumeRequest) -> Result<LocalCommandResult, P
         if manifest.request_profile_digest() != config.request_profile_digest() {
             return Err(PublicRunError::Configuration);
         }
-        Some(remote_planner(config)?)
+        Some(remote_planner(config, credential)?)
     } else {
         None
     };
@@ -1172,26 +1242,11 @@ fn planner_config(
     }
 }
 
-fn remote_planner(config: OpenAiPlannerConfig) -> Result<OpenAiPlanner, PublicRunError> {
-    let credential = provider_credential(&config).map_err(map_provider_config)?;
+fn remote_planner(
+    config: OpenAiPlannerConfig,
+    credential: Option<BearerCredential>,
+) -> Result<OpenAiPlanner, PublicRunError> {
     OpenAiPlanner::new(config, credential).map_err(map_provider_config)
-}
-
-fn provider_credential(
-    config: &OpenAiPlannerConfig,
-) -> Result<Option<BearerCredential>, OpenAiPlannerConfigError> {
-    let credential = if config.accepts_bearer_credential() {
-        match env::var("XGENY_OPENAI_API_KEY") {
-            Ok(value) => Some(BearerCredential::new(&value)?),
-            Err(env::VarError::NotPresent) => None,
-            Err(env::VarError::NotUnicode(_)) => {
-                return Err(OpenAiPlannerConfigError::InvalidCredential);
-            }
-        }
-    } else {
-        None
-    };
-    Ok(credential)
 }
 
 fn map_provider_config(_error: OpenAiPlannerConfigError) -> PublicRunError {
@@ -1207,6 +1262,16 @@ fn map_model_check_failure(error: OpenAiModelCheckFailure) -> ModelCheckError {
         OpenAiModelCheckFailure::Unavailable => ModelCheckError::Unavailable,
         OpenAiModelCheckFailure::InvalidResponse => ModelCheckError::InvalidResponse,
         OpenAiModelCheckFailure::ModelNotAdvertised => ModelCheckError::ModelNotAdvertised,
+    }
+}
+
+fn map_compatibility_check_failure(error: OpenAiCompatibilityCheckFailure) -> ModelCheckError {
+    match error {
+        OpenAiCompatibilityCheckFailure::Timeout => ModelCheckError::Timeout,
+        OpenAiCompatibilityCheckFailure::Unavailable => ModelCheckError::Unavailable,
+        OpenAiCompatibilityCheckFailure::InvalidResponse => ModelCheckError::InvalidResponse,
+        OpenAiCompatibilityCheckFailure::ProviderLimit => ModelCheckError::RateLimited,
+        OpenAiCompatibilityCheckFailure::RequestRejected => ModelCheckError::RequestRejected,
     }
 }
 
@@ -2108,6 +2173,7 @@ mod tests {
             planner_id: DEFAULT_PLANNER_ID.to_owned(),
             model: "model".to_owned(),
             tokenizer: "tokenizer".to_owned(),
+            credential: None,
             allow_files: vec!["README.md".to_owned()],
             allow_dirs: Vec::new(),
             allow_executables: Vec::new(),

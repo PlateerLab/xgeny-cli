@@ -394,7 +394,7 @@ fn separate_processes_read_once_continue_with_exact_output_and_replay_offline() 
     fs::remove_dir_all(&workspace).expect("workspace may disappear after completion");
 
     let replay = xgeny(&state_root)
-        .args(["resume", &run_id])
+        .args(["resume", &run_id, "--allow-remote-model-egress"])
         .env("XGENY_OPENAI_BASE_URL", "not-a-provider-url")
         .env("XGENY_OPENAI_API_KEY", "invalid\ncredential")
         .bounded_output()

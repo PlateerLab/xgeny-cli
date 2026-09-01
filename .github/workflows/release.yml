@@ -220,6 +220,9 @@ jobs:
             --test environment_onboarding \
             --target "${{ matrix.target }}"
           cargo test --locked --release -p xgeny-cli \
+            --test model_profiles \
+            --target "${{ matrix.target }}"
+          cargo test --locked --release -p xgeny-cli \
             --test workspace_discovery \
             --target "${{ matrix.target }}"
 

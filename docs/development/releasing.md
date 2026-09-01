@@ -89,7 +89,8 @@ Publish 이전에는 다음을 다시 확인한다.
 6. Linux ELF architecture와 `INTERP`/`NEEDED`/`RPATH`/`RUNPATH` 부재, macOS Xcode 16.4·SDK 15.5와
    Mach-O architecture/system-only dependency, Windows Server 2025 + Visual Studio 2026의 x64 PE와
    static CRT, physical System32 DLL 또는 정확히 고정·검토된 API-set contract로 한정된 import와 원본·설치본 실행
-7. 각 target의 release `public_run_resume`, `environment_onboarding` process test
+7. 각 target의 release `public_run_resume`, `environment_onboarding`, `model_profiles`,
+   `workspace_discovery` process test
 8. loopback fixture에서 exact-tag download, checksum, 설치, 재설치, protocol check와 test-owned 삭제
 9. 각 target native binary를 담은 exact-version npm package pack, loopback registry global-install smoke,
    lifecycle script 부재와 raw release asset byte parity

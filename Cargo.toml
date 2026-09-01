@@ -27,9 +27,11 @@ cap-std = "4.0.3"
 clap = { version = "4.6.6", features = ["derive", "env"] }
 getrandom = "0.3.4"
 jsonschema = { version = "0.52.0", default-features = false }
+keyring = { version = "4.2.0", default-features = false, features = ["v1"] }
 libc = "0.2.189"
 process-wrap = { version = "10.0.0", default-features = false, features = ["std", "process-group", "job-object"] }
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
+rpassword = "7.5.4"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_jcs = "0.2.0"
@@ -40,6 +42,7 @@ thiserror = "2.0.20"
 time = { version = "0.3.55", features = ["formatting", "parsing"] }
 ureq = { version = "3.4.0", default-features = false, features = ["rustls"] }
 url = "2.5.8"
+zeroize = "1.8.2"
 
 [profile.release]
 codegen-units = 1

@@ -177,6 +177,40 @@ fn environment_model_current_workspace_and_tokenizer_fallback_reach_real_request
 }
 
 #[test]
+fn headless_environment_configuration_does_not_require_a_profile_directory() {
+    let fixture = tempdir().expect("fixture should exist");
+    let workspace = fixture.path().join("workspace");
+    let state = fixture.path().join("state");
+    fs::create_dir(&workspace).expect("workspace should create");
+    fs::write(workspace.join("README.md"), "fixture").expect("file should write");
+    let server = CompletionServer::spawn();
+
+    let output = xgeny(&state)
+        .current_dir(&workspace)
+        .env_remove("XGENY_CONFIG_HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("HOME")
+        .env_remove("APPDATA")
+        .env_remove("LOCALAPPDATA")
+        .env_remove("USERPROFILE")
+        .env("XGENY_OPENAI_BASE_URL", &server.base_url)
+        .env("XGENY_OPENAI_MODEL", MODEL)
+        .args([
+            "run",
+            "--allow-file",
+            "README.md",
+            "--allow-remote-model-egress",
+            "test profile-free headless onboarding",
+        ])
+        .output()
+        .expect("xgeny should run");
+
+    assert_read_approval_pause(&output);
+    let request = server.handle.join().expect("server should finish");
+    assert_eq!(request_body(&request)["model"], MODEL);
+}
+
+#[test]
 fn command_line_model_settings_override_environment_values() {
     let fixture = tempdir().expect("fixture should exist");
     let workspace = fixture.path().join("workspace");
@@ -427,6 +461,14 @@ fn xgeny(state: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_xgeny"));
     command
         .env("XGENY_STATE_HOME", state)
+        .env(
+            "XGENY_CONFIG_HOME",
+            state
+                .parent()
+                .expect("isolated state should have a parent")
+                .join("config"),
+        )
+        .env_remove("XGENY_MODEL_PROFILE")
         .env_remove("XGENY_OPENAI_API_KEY");
     command
 }

@@ -8,6 +8,7 @@
 - non-streaming JSON Schema request
 - retry/redirect/proxy/fallback 없는 HTTP POST 최대 1회
 - user-invoked `GET /v1/models` 1회의 non-durable model catalog checker
+- bounded model 목록 decode와 strict JSON Schema Chat Completions compatibility checker
 - request, response, proposal와 JSON depth hard bound
 - duplicate/unknown field를 거부하는 strict proposal codec
 - configured served model과 response model exact match
@@ -37,9 +38,11 @@ cargo test --workspace --locked
 - request 전달 뒤 connection loss에서 transport retry 0회
 - loopback server 종료 뒤 completion replay의 HTTP 재호출 0회
 - catalog check의 exact GET·model ID, inference/state 0과 loopback credential 미전송
+- onboarding의 catalog GET → strict compatibility POST → active profile `run` 수직 연결
 
-HTTPS bearer가 sensitive header로 catalog GET에만 결합되는지는 credential을 노출하지 않는 transport
-test double 단위 테스트로 별도 검증한다. 실제 HTTPS endpoint 전송은 배포 환경의 첫 연결 검증 범위다.
+HTTPS bearer가 sensitive header로 catalog GET과 compatibility POST에만 결합되는지는 credential을
+노출하지 않는 transport test double 단위 테스트로 별도 검증한다. 실제 HTTPS endpoint와 OS 보안
+저장소는 배포 환경의 첫 연결 검증 범위다.
 
 Ignored live test도 모든 OS에서 compile되지만 일반 CI에서는 실행하지 않는다.
 
@@ -63,9 +66,10 @@ cargo test -p xgeny-provider-openai \
 ```
 
 Live test와 `run`은 health/model-list preflight를 자동 호출하지 않는다. 한 durable reservation에
-inference POST 외의 요청을 더하지 않기 위해서다. 사용자는 그 전에 `xgeny model check`를 별도로 실행할
-수 있지만 PASS는 catalog 광고까지만 뜻한다. Endpoint나 model이 잘못됐으면 고정 failure로 종료하고 raw
-response를 출력하지 않는다.
+inference POST 외의 요청을 더하지 않기 위해서다. 사용자는 그 전에 `xgeny model setup` 또는
+`xgeny model check --compatibility`를 실행할 수 있다. Setup은 catalog와 별도 probe를 확인하지만 실제
+planner prompt와 coding loop 품질은 첫 Run 및 live E2E가 증명한다. Endpoint나 model이 잘못됐으면 고정
+failure로 종료하고 raw response를 출력하지 않는다.
 
 2026-08-30 검증 환경:
 
@@ -107,4 +111,5 @@ synthetic `PlanAccepted` smoke를 대체하지 않고, 같은 provider adapter�
 effect, SQLite restart와 offline completion replay까지 수직으로 검증한다. 통과 결과는 실행한 exact
 commit과 함께 별도로 기록하며, 실행 전에는 완료됐다고 주장하지 않는다.
 
-설계 근거와 failure matrix는 [ADR-0017](../adr/0017-openai-compatible-provider-adapter.md)을 따른다.
+Provider failure matrix는 [ADR-0017](../adr/0017-openai-compatible-provider-adapter.md), profile과 credential
+경계는 [ADR-0032](../adr/0032-model-profiles-and-secure-credential-boundary.md)를 따른다.
