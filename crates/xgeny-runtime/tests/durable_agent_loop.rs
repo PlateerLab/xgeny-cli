@@ -327,8 +327,11 @@ impl RunStore for ProjectionStore {
         if expected != actual {
             return Err(StoreError::HeadConflict { expected, actual });
         }
+        let planning_step_order = self.state.steps.keys().cloned().collect();
         Ok(Some(RunPlanningSnapshot::new(
             self.state.clone(),
+            planning_step_order,
+            Vec::new(),
             BTreeMap::new(),
         )))
     }
@@ -2071,7 +2074,7 @@ fn context_preserves_whole_schemas_steps_and_host_owned_digest_envelope() {
         }
     ));
     let context = &planner.contexts[0];
-    assert_eq!(context.profile_version(), "xgeny.planning-context/v2");
+    assert_eq!(context.profile_version(), "xgeny.planning-context/v3");
     assert!(context.tool_outputs().is_empty());
     assert_eq!(context.steps().len(), 1);
     assert_eq!(context.omitted_steps(), 0);

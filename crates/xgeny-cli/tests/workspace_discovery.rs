@@ -18,7 +18,7 @@ const TOKENIZER: &str = "test-workspace-tokenizer";
 const NEEDLE: &str = "XGENY_WORKSPACE_DISCOVERY_NEEDLE";
 const COMPLETION: &str = "workspace discovery completed";
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
-const PROCESS_TIMEOUT: Duration = Duration::from_secs(120);
+const PROCESS_TIMEOUT: Duration = Duration::from_secs(180);
 
 struct SequentialServer {
     base_url: String,
@@ -849,6 +849,8 @@ fn public_cli_discovers_searches_stats_reads_and_replays_offline() {
     assert!(first_system_prompt.contains("return exactly one Step"));
     assert!(first_system_prompt.contains("cannot refer to future tool outputs"));
     assert!(first_system_prompt.contains("always set dependsOn to an empty array"));
+    assert!(first_system_prompt.contains("durable plan chronology"));
+    assert!(first_system_prompt.contains("durable receipt-completion chronology"));
     assert_eq!(first["capabilities"].as_array().unwrap().len(), 6);
     assert_eq!(first["toolOutputs"], json!([]));
     assert!(capability_ids(&first).contains(&"xgeny.fs/list-directory"));
@@ -887,6 +889,14 @@ fn public_cli_discovers_searches_stats_reads_and_replays_offline() {
         after_list["toolOutputs"][0]["capability"]["capabilityId"],
         "xgeny.fs/list-directory"
     );
+    assert_eq!(
+        chronological_step_capabilities(&after_list),
+        ["xgeny.fs/list-directory"]
+    );
+    assert_eq!(
+        chronological_output_capabilities(&after_list),
+        ["xgeny.fs/list-directory"]
+    );
     assert!(
         after_list["toolOutputs"][0]["output"]["entries"]
             .as_array()
@@ -896,6 +906,14 @@ fn public_cli_discovers_searches_stats_reads_and_replays_offline() {
     );
 
     let after_search = planning_context(&requests[2]);
+    assert_eq!(
+        chronological_step_capabilities(&after_search),
+        ["xgeny.fs/list-directory", "xgeny.fs/search-text"]
+    );
+    assert_eq!(
+        chronological_output_capabilities(&after_search),
+        ["xgeny.fs/list-directory", "xgeny.fs/search-text"]
+    );
     assert!(
         tool_output(&after_search, "xgeny.fs/search-text")["matches"]
             .as_array()
@@ -905,6 +923,22 @@ fn public_cli_discovers_searches_stats_reads_and_replays_offline() {
     );
 
     let after_stat = planning_context(&requests[3]);
+    assert_eq!(
+        chronological_step_capabilities(&after_stat),
+        [
+            "xgeny.fs/list-directory",
+            "xgeny.fs/search-text",
+            "xgeny.fs/stat",
+        ]
+    );
+    assert_eq!(
+        chronological_output_capabilities(&after_stat),
+        [
+            "xgeny.fs/list-directory",
+            "xgeny.fs/search-text",
+            "xgeny.fs/stat",
+        ]
+    );
     assert_eq!(tool_output(&after_stat, "xgeny.fs/stat")["kind"], "file");
     assert_eq!(
         tool_output(&after_stat, "xgeny.fs/stat")["sizeBytes"],
@@ -912,6 +946,24 @@ fn public_cli_discovers_searches_stats_reads_and_replays_offline() {
     );
 
     let after_read = planning_context(&requests[4]);
+    assert_eq!(
+        chronological_step_capabilities(&after_read),
+        [
+            "xgeny.fs/list-directory",
+            "xgeny.fs/search-text",
+            "xgeny.fs/stat",
+            "xgeny.fs/read-text",
+        ]
+    );
+    assert_eq!(
+        chronological_output_capabilities(&after_read),
+        [
+            "xgeny.fs/list-directory",
+            "xgeny.fs/search-text",
+            "xgeny.fs/stat",
+            "xgeny.fs/read-text",
+        ]
+    );
     assert_eq!(
         tool_output(&after_read, "xgeny.fs/read-text")["content"],
         source
@@ -968,6 +1020,32 @@ fn tool_output<'a>(context: &'a Value, capability_id: &str) -> &'a Value {
         .iter()
         .find(|output| output["capability"]["capabilityId"] == capability_id)
         .expect("requested capability output should exist")["output"]
+}
+
+fn chronological_step_capabilities(context: &Value) -> Vec<&str> {
+    context["steps"]
+        .as_array()
+        .expect("steps should be an array")
+        .iter()
+        .map(|step| {
+            step["capability"]["capabilityId"]
+                .as_str()
+                .expect("Step capability ID should be text")
+        })
+        .collect()
+}
+
+fn chronological_output_capabilities(context: &Value) -> Vec<&str> {
+    context["toolOutputs"]
+        .as_array()
+        .expect("ToolOutputs should be an array")
+        .iter()
+        .map(|output| {
+            output["capability"]["capabilityId"]
+                .as_str()
+                .expect("ToolOutput capability ID should be text")
+        })
+        .collect()
 }
 
 fn plan_response(key: &str, objective: &str, capability_id: &str, arguments: &Value) -> Vec<u8> {

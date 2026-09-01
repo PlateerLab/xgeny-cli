@@ -80,23 +80,40 @@ pub struct RunVerificationSnapshot {
 #[derive(Clone, PartialEq, Eq)]
 pub struct RunPlanningSnapshot {
     pub state: RunState,
+    planning_step_order: Vec<String>,
+    completed_tool_output_order: Vec<String>,
     completed_tool_outputs: BTreeMap<String, ToolOutputRecord>,
 }
 
 impl RunPlanningSnapshot {
     /// Construct a snapshot for a trusted [`RunStore`] implementation.
     ///
-    /// Runtime consumers still validate every output against `state`; built-in stores additionally
+    /// Implementers must supply exact plan and passed-Receipt chronology. Runtime consumers still
+    /// validate both order vectors and every output against `state`; built-in stores additionally
     /// guarantee one-generation reads and durable sidecar verification before construction.
     #[must_use]
     pub fn new(
         state: RunState,
+        planning_step_order: Vec<String>,
+        completed_tool_output_order: Vec<String>,
         completed_tool_outputs: BTreeMap<String, ToolOutputRecord>,
     ) -> Self {
         Self {
             state,
+            planning_step_order,
+            completed_tool_output_order,
             completed_tool_outputs,
         }
+    }
+
+    #[must_use]
+    pub fn planning_step_order(&self) -> &[String] {
+        &self.planning_step_order
+    }
+
+    #[must_use]
+    pub fn completed_tool_output_order(&self) -> &[String] {
+        &self.completed_tool_output_order
     }
 
     #[must_use]
@@ -110,6 +127,11 @@ impl std::fmt::Debug for RunPlanningSnapshot {
         formatter
             .debug_struct("RunPlanningSnapshot")
             .field("state", &self.state)
+            .field("planning_step_count", &self.planning_step_order.len())
+            .field(
+                "completed_tool_output_order_count",
+                &self.completed_tool_output_order.len(),
+            )
             .field(
                 "completed_tool_output_bindings",
                 &PlanningOutputBindingsDebug(&self.completed_tool_outputs),
@@ -195,6 +217,12 @@ struct EffectStartAnchor {
 struct PlannedInvocationAnchor {
     event_sequence: u64,
     binding: PlannedInvocationBinding,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct StepJournalPosition {
+    event_sequence: u64,
+    event_step_index: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -292,6 +320,7 @@ struct VerifiedRunIndex {
     state: Option<RunState>,
     last_record: Option<EventRecord>,
     event_ids: BTreeSet<String>,
+    step_positions: BTreeMap<String, StepJournalPosition>,
     planned_invocations: BTreeMap<String, PlannedInvocationAnchor>,
     plan_input_step_ids: BTreeSet<String>,
     intents: BTreeMap<String, EffectIntentAnchor>,
@@ -734,7 +763,7 @@ pub trait RunStore {
     }
 
     /// Load one exact Run head and every verified completed tool output from the same logical
-    /// store generation.
+    /// store generation, with Steps in durable plan order and outputs in passed-Receipt order.
     ///
     /// Implementations must not compose this view from independent point reads. The default
     /// fails closed because a cross-generation context could expose an output under the wrong
@@ -1354,6 +1383,64 @@ fn build_completion_output(
     }
 }
 
+fn planning_step_order(
+    index: &VerifiedRunIndex,
+    state: &RunState,
+) -> Result<Vec<String>, StoreError> {
+    if index.step_positions.len() != state.steps.len()
+        || index
+            .step_positions
+            .keys()
+            .any(|step_id| !state.steps.contains_key(step_id))
+    {
+        return Err(StoreError::Corrupt(
+            "journal Step chronology differs from the projected WorkGraph".to_owned(),
+        ));
+    }
+    let mut positioned = index
+        .step_positions
+        .iter()
+        .map(|(step_id, position)| (*position, step_id.clone()))
+        .collect::<Vec<_>>();
+    positioned.sort();
+    Ok(positioned.into_iter().map(|(_, step_id)| step_id).collect())
+}
+
+fn completed_tool_output_order(
+    index: &VerifiedRunIndex,
+    expected: &BTreeSet<String>,
+) -> Result<Vec<String>, StoreError> {
+    let mut observed = BTreeSet::new();
+    let mut order = Vec::with_capacity(expected.len());
+    let mut receipts = index
+        .receipt_events
+        .iter()
+        .filter(|receipt| {
+            receipt.disposition == VerificationDisposition::Passed
+                && expected.contains(&receipt.step_id)
+        })
+        .collect::<Vec<_>>();
+    receipts.sort_by(|left, right| {
+        (left.event_sequence, left.step_id.as_str())
+            .cmp(&(right.event_sequence, right.step_id.as_str()))
+    });
+    for receipt in receipts {
+        if !observed.insert(receipt.step_id.clone()) {
+            return Err(StoreError::Corrupt(
+                "completed ToolOutput has duplicate Receipt chronology".to_owned(),
+            ));
+        }
+        order.push(receipt.step_id.clone());
+    }
+    if &observed != expected {
+        return Err(StoreError::Corrupt(
+            "completed ToolOutput chronology differs from passed Receipts".to_owned(),
+        ));
+    }
+    Ok(order)
+}
+
+#[allow(clippy::too_many_lines)] // Keep one generation-checked state/output/order assembly path.
 fn build_planning_snapshot<F>(
     index: &VerifiedRunIndex,
     expected: ExpectedHead,
@@ -1370,6 +1457,7 @@ where
     let Some(state) = index.state.clone() else {
         return Ok(None);
     };
+    let planning_step_order = planning_step_order(index, &state)?;
     let mut selections = Vec::new();
     let mut selected_output_bytes = 0_u64;
     for (step_id, step) in &state.steps {
@@ -1460,8 +1548,12 @@ where
             ));
         }
     }
+    let completed_output_steps = completed_tool_outputs.keys().cloned().collect();
+    let completed_tool_output_order = completed_tool_output_order(index, &completed_output_steps)?;
     Ok(Some(RunPlanningSnapshot::new(
         state,
+        planning_step_order,
+        completed_tool_output_order,
         completed_tool_outputs,
     )))
 }
@@ -1553,8 +1645,40 @@ impl VerifiedRunIndex {
                 ));
             }
             match &record.event.body {
+                RunEventBody::StepPlanned { step_id, .. } => {
+                    if index
+                        .step_positions
+                        .insert(
+                            step_id.clone(),
+                            StepJournalPosition {
+                                event_sequence: record.sequence,
+                                event_step_index: 0,
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err(StoreError::Corrupt(
+                            "journal contains a duplicate Step position".to_owned(),
+                        ));
+                    }
+                }
                 RunEventBody::PlanAccepted { steps, .. } => {
-                    for step in steps {
+                    for (event_step_index, step) in steps.iter().enumerate() {
+                        if index
+                            .step_positions
+                            .insert(
+                                step.step_id.clone(),
+                                StepJournalPosition {
+                                    event_sequence: record.sequence,
+                                    event_step_index,
+                                },
+                            )
+                            .is_some()
+                        {
+                            return Err(StoreError::Corrupt(
+                                "journal contains a duplicate Step position".to_owned(),
+                            ));
+                        }
                         if index
                             .planned_invocations
                             .insert(
@@ -1839,8 +1963,24 @@ impl VerifiedRunIndex {
         } = anchors;
         self.event_ids.insert(commit.record.event.event_id.clone());
         match &commit.record.event.body {
+            RunEventBody::StepPlanned { step_id, .. } => {
+                self.step_positions.insert(
+                    step_id.clone(),
+                    StepJournalPosition {
+                        event_sequence: commit.record.sequence,
+                        event_step_index: 0,
+                    },
+                );
+            }
             RunEventBody::PlanAccepted { steps, .. } => {
-                for step in steps {
+                for (event_step_index, step) in steps.iter().enumerate() {
+                    self.step_positions.insert(
+                        step.step_id.clone(),
+                        StepJournalPosition {
+                            event_sequence: commit.record.sequence,
+                            event_step_index,
+                        },
+                    );
                     self.planned_invocations.insert(
                         step.step_id.clone(),
                         PlannedInvocationAnchor {
@@ -2912,6 +3052,16 @@ mod tests {
                 .step_id(),
             "step-a"
         );
+        let memory_planning = memory
+            .load_planning_snapshot(ExpectedHead::from_state(&memory_commit.state), u64::MAX)
+            .expect("memory planning snapshot should load")
+            .expect("memory Run should exist");
+        assert_eq!(
+            memory_planning.planning_step_order(),
+            &["step-b".to_owned(), "step-a".to_owned()],
+            "accepted proposal order must not be replaced by Step ID order",
+        );
+        assert!(memory_planning.completed_tool_output_order().is_empty());
 
         let directory = tempdir().expect("temp directory should exist");
         let path = directory.path().join("planned.db");
@@ -2934,6 +3084,41 @@ mod tests {
                 .expect("step-b input should exist")
                 .step_id(),
             "step-b"
+        );
+        let reopened_planning = reopened
+            .load_planning_snapshot(ExpectedHead::from_state(&sqlite_commit.state), u64::MAX)
+            .expect("reopened planning snapshot should load")
+            .expect("reopened Run should exist");
+        assert_eq!(
+            reopened_planning.planning_step_order(),
+            memory_planning.planning_step_order(),
+        );
+    }
+
+    #[test]
+    fn completed_output_order_uses_receipt_sequence_before_step_identity() {
+        let receipt = |event_sequence, step_id: &str| ReceiptEventAnchor {
+            event_sequence,
+            run_id: "run-1".to_owned(),
+            step_id: step_id.to_owned(),
+            effect_id: format!("effect-{step_id}"),
+            disposition: VerificationDisposition::Passed,
+            receipt_id: format!("receipt-{step_id}"),
+            receipt_digest: format!("sha256:{}", "a".repeat(64)),
+            started_at: "2026-09-01T00:00:00Z".to_owned(),
+            ended_at: "2026-09-01T00:00:01Z".to_owned(),
+        };
+        let index = VerifiedRunIndex {
+            receipt_events: vec![receipt(9, "step-a"), receipt(5, "step-z")],
+            ..VerifiedRunIndex::default()
+        };
+        let expected = ["step-a".to_owned(), "step-z".to_owned()]
+            .into_iter()
+            .collect();
+
+        assert_eq!(
+            completed_tool_output_order(&index, &expected).expect("chronology should derive"),
+            ["step-z".to_owned(), "step-a".to_owned()],
         );
     }
 

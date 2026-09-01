@@ -229,8 +229,12 @@ impl RunStore for PlanningProjectionStore {
         if total.is_none_or(|bytes| bytes > max_output_bytes) {
             return Err(StoreError::PlanningSnapshotBudgetExceeded);
         }
+        let planning_step_order = self.state.steps.keys().cloned().collect();
+        let completed_tool_output_order = self.outputs.keys().cloned().collect();
         Ok(Some(RunPlanningSnapshot::new(
             self.state.clone(),
+            planning_step_order,
+            completed_tool_output_order,
             self.outputs.clone(),
         )))
     }
@@ -1233,7 +1237,7 @@ fn sqlite_driver_completes_read_only_plan_with_core_bound_artifact_and_replays()
     let contexts = planner_contexts.borrow();
     assert_eq!(contexts.len(), 2);
     let continued = &contexts[1];
-    assert_eq!(continued["profileVersion"], "xgeny.planning-context/v2");
+    assert_eq!(continued["profileVersion"], "xgeny.planning-context/v3");
     let outputs = continued["toolOutputs"]
         .as_array()
         .expect("toolOutputs should be an array");

@@ -8,7 +8,7 @@
 - Accepted planned-invocation Admission은 ReadOnly intent에 Core Receipt v2 provenance를 발행한다. Legacy/unplanned direct ReadOnly는 명시적으로 닫혀 있다.
 - Verifier는 bounded artifact descriptor를 제출하고 Core가 exact Run/Step/Receipt provenance를 붙인다.
 - Adapter의 bounded typed JSON은 exact Definition output schema 검증 뒤 event-anchored `ToolOutputRecord`로 schema 7에 원자 저장되며, verifier는 같은-generation snapshot을 받는다.
-- PlanningContext v2는 Receipt-completed exact output을 다음 model turn에 전달하고, schema 8 `CompletionOutputRecord`는 그 turn의 exact UTF-8 summary를 별도 process 재시작 뒤 모델 재호출 없이 복원한다.
+- PlanningContext v3는 Step의 plan journal 순서와 Receipt-completed exact output의 관찰 순서를 보존해 다음 model turn에 전달하고, schema 8 `CompletionOutputRecord`는 그 turn의 exact UTF-8 summary를 별도 process 재시작 뒤 모델 재호출 없이 복원한다.
 - Memory/SQLite store가 v1 empty-artifact와 v2 artifact-bearing 의미를 각각 다시 검증한다.
 - `xgeny-cli` library의 `RunDriver`가 기존 AgentLoop, admission, executor와 verifier를 bounded 순서로 조합한다.
 - test-only fake planner/adapter로 approval pending/deny 무효과, IntentCommitted·Validating SQLite 재개, 완료와 no-call replay를 검증한다.

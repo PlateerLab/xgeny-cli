@@ -58,8 +58,11 @@ Started durable commit
   -> EffectSucceeded + ToolOutputRecord atomic commit
   -> read-only verifier
   -> Receipt v2 + terminal event atomic commit
-  -> generation-checked PlanningContext v2
+  -> generation-checked chronological PlanningContext v3
 ```
+
+PlanningContext의 same-generation binding은 ADR-0020, plan/Receipt journal chronology는
+[ADR-0030](0030-chronological-planning-context-v3.md)을 따른다.
 
 `ToolOutputRecord`는 Run, Step, effect, action, exact Definition/Instance, plan, execution attempt, evidence digest와 typed output digest를 결합한다. Raw output은 journal, projection, Receipt와 `Debug`에 복제하지 않는다. Receipt에는 bounded artifact metadata와 output digest만 남고 exact typed body는 event-anchored SQLite sidecar에 남는다.
 

@@ -4,6 +4,11 @@
 - 날짜: 2026-08-30
 - 적용 범위: `xgeny-local-store`, `xgeny-runtime`, `xgeny-provider-openai`, CLI driver 검증
 
+> 후속 상태: [ADR-0030](0030-chronological-planning-context-v3.md)은 Step ID 사전순이 장기 작업의
+> 관찰 chronology를 보존하지 못한다는 실제 Qwen gate 결과에 따라 provider payload를 v3로 올렸다.
+> v2의 generation/output binding은 유지하고, Step은 plan journal 순서, ToolOutput은 passed Receipt
+> 순서로 전달한다.
+
 ## 배경
 
 [ADR-0019](0019-durable-tool-output-and-schema-7.md)는 exact typed JSON tool output을

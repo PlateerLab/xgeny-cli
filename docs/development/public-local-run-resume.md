@@ -67,6 +67,11 @@ manifest에 저장하거나 동일성 비교하지 않으므로 tunnel port를 �
 보낼 때도 flag를 다시 명시해야 한다. Managed endpoint registry와 transport identity pinning은 후속이다.
 
 미완료 Run은 원래 workspace mapping, 현재 endpoint와 같은 allow-file/allow-dir catalog를 다시 제공한다.
+RC3의 chronological PlanningContext v3는 새 immutable request-profile digest를 사용한다. RC2 Run에
+이미 계획된 로컬 action은 같은 local-execution profile과 별도 승인을 만족하면 모델 없이 마칠 수 있다.
+그 뒤 model egress가 필요해지면 provider 호출 전에 `configuration_mismatch`로 닫으며 v2 fallback이나
+자동 변환을 하지 않는다. 원래 RC2 binary로 마치거나 새 RC3 Run을 시작해야 한다. 이미 완료된 Run의
+offline replay는 provider profile을 재구성하지 않으므로 계속 가능하다.
 
 ```bash
 xgeny resume run-0123456789abcdef0123456789abcdef \
