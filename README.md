@@ -7,11 +7,22 @@ Local-first general-purpose agent CLI and harness.
 ## 설치와 첫 모델 연결
 
 `v0.1.0-rc.3` release artifact가 게시되면 Linux x86-64/ARM64, macOS Intel/Apple Silicon, Windows
-x86-64용 단일 native binary와 checksum 검증 installer를 제공합니다. 최종 사용자는 Rust, Node.js, Python,
-SQLite 실행 파일이나 XGENy state용 별도 daemon을 설치하지 않습니다. 사용할 model endpoint는 로컬 또는
-원격에 별도로 실행 중이어야 합니다. 첫 RC는 prerelease이므로 stable 전용 `releases/latest`가 아니라
-아래 exact tag URL로 설치합니다. 후보 version PR의 merge만으로 artifact가 생기지는 않으며 GitHub
-Release에 해당 tag가 게시된 뒤 설치 명령을 사용해야 합니다.
+x86-64용 동일 native binary를 GitHub checksum installer와 npm 두 경로로 제공합니다. Native installer는
+Rust, Node.js, Python, SQLite 실행 파일이나 XGENy state용 별도 daemon을 요구하지 않습니다. npm 경로만
+얇은 launcher를 위해 Node.js 22.14 이상이 필요하며 install script, GitHub 추가 download와 native
+compile은 수행하지 않습니다. 사용할 model endpoint는 로컬 또는 원격에 별도로 실행 중이어야 합니다.
+후보 version PR의 merge만으로 artifact가 생기지는 않으며 GitHub/npm에 해당 version이 게시된 뒤 설치
+명령을 사용해야 합니다.
+
+Node.js가 이미 있다면 exact RC를 npm으로 설치할 수 있습니다. `--omit=optional`은 native package를
+제거하므로 사용하지 않습니다.
+
+```bash
+npm install --global @xgen/cli@0.1.0-rc.3
+xgeny --version
+```
+
+Node.js 없는 native 설치와 prerelease exact-tag 검증은 아래와 같습니다.
 
 Linux/macOS:
 
@@ -132,6 +143,7 @@ binary에 포함되어 있어 network나 별도 파일 없이 `xgeny licenses`�
 - [ADR-0028: shell 없는 로컬 process 실행 경계](docs/adr/0028-shell-free-process-execute.md)
 - [ADR-0029: Core-derived action occurrence와 반복 coding loop](docs/adr/0029-core-derived-action-occurrence.md)
 - [ADR-0030: Journal chronology를 보존하는 PlanningContext v3](docs/adr/0030-chronological-planning-context-v3.md)
+- [ADR-0031: npm은 네이티브 XGENy의 무스크립트 배포 계층](docs/adr/0031-npm-native-distribution.md)
 
 ## 개발 및 검증
 

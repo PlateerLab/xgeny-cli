@@ -4,9 +4,10 @@
 OpenAI-compatible model에 연결해 파일 읽기부터 프로젝트 탐색·수정·test/build까지 실행하는 최소
 절차다. RC3 후보는 exact
 `--allow-file`, `--allow-dir` workspace discovery, atomic write/patch와 host-catalogued shell-free
-process 실행을 포함한다. 소스 개발 절차와 달리 Rust, C compiler, Python,
-Node.js, SQLite 실행 파일, Docker 또는 XGENy state용 별도 daemon이 필요하지 않다. 사용할 model
-endpoint 자체는 로컬 또는 원격에 별도로 실행 중이어야 한다.
+process 실행을 포함한다. Native installer 경로는 소스 개발 절차와 달리 Rust, C compiler, Python,
+Node.js, SQLite 실행 파일, Docker 또는 XGENy state용 별도 daemon이 필요하지 않다. npm 경로만
+launcher용 Node.js 22.14 이상이 필요하다. 사용할 model endpoint 자체는 로컬 또는 원격에 별도로 실행
+중이어야 한다.
 
 ## 게시 target과 CI 검증 OS
 
@@ -24,6 +25,23 @@ Linux binary는 musl target, Windows binary는 static CRT로 빌드한다. macOS
 대신하지 않는다. 표보다 오래된 OS version은 아직 설치 E2E를 통과했다고 주장하지 않는다.
 
 ## 설치
+
+Node.js 22.14 이상이 이미 있는 개발자는 RC3가 npm에 게시된 뒤 다음처럼 exact version을 설치한다.
+`@xgen/cli`에는 lifecycle script가 없고 현재 OS/CPU용 native optional package 하나를 registry에서 함께
+설치한다. 설치 중 GitHub download나 source compile을 하지 않는다.
+
+```bash
+npm install --global @xgen/cli@0.1.0-rc.3
+xgeny --version
+xgeny licenses
+```
+
+Prerelease 최신 채널은 `@xgen/cli@next`, stable은 `@xgen/cli@latest`지만 재현 가능한 설치와 검증에는
+exact version을 사용한다. `npm install --omit=optional`은 실행 binary package를 제거하므로 지원하지
+않는다. npm 경로에서 platform package를 찾지 못하면 launcher는 다른 binary를 내려받지 않고 종료한다.
+
+Node.js를 설치하고 싶지 않거나 GitHub attestation까지 직접 확인하려면 아래 checksum installer 경로를
+사용한다.
 
 Installer를 먼저 파일로 받은 뒤 검토·실행한다. Installer는 shell profile이나 user PATH를 자동으로
 수정하지 않고 관리자 권한을 요청하지 않는다. RC3는 prerelease이므로 stable release만 가리키는

@@ -28,6 +28,20 @@ jobs:
       - name: Show active Rust toolchain
         run: rustup show active-toolchain
 
+      - name: Install pinned Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.20.0
+          package-manager-cache: false
+
+      - name: Check npm distribution contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --prefix npm
+          npm run check --prefix npm
+          npm test --prefix npm
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -38,7 +52,11 @@ jobs:
         run: sh scripts/check-third-party-licenses.sh --check
 
       - name: Check release publisher context
-        run: sh scripts/check-release-workflow.sh
+        shell: bash
+        run: |
+          set -euo pipefail
+          sh scripts/check-release-workflow.sh
+          sh scripts/check-npm-distribution-workflow.sh
 
       - name: Build release workspace
         run: cargo build --workspace --release --locked
@@ -53,24 +71,29 @@ jobs:
             target: x86_64-unknown-linux-musl
             asset: xgeny-x86_64-unknown-linux-musl
             binary: target/x86_64-unknown-linux-musl/release/xgeny
+            npm_tarball: xgen-cli-linux-x64-musl.tgz
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             asset: xgeny-aarch64-unknown-linux-musl
             binary: target/aarch64-unknown-linux-musl/release/xgeny
+            npm_tarball: xgen-cli-linux-arm64-musl.tgz
           - os: macos-15-intel
             target: x86_64-apple-darwin
             asset: xgeny-x86_64-apple-darwin
             binary: target/x86_64-apple-darwin/release/xgeny
+            npm_tarball: xgen-cli-darwin-x64.tgz
             developer_dir: /Applications/Xcode_16.4.app/Contents/Developer
           - os: macos-15
             target: aarch64-apple-darwin
             asset: xgeny-aarch64-apple-darwin
             binary: target/aarch64-apple-darwin/release/xgeny
+            npm_tarball: xgen-cli-darwin-arm64.tgz
             developer_dir: /Applications/Xcode_16.4.app/Contents/Developer
           - os: windows-2025-vs2026
             target: x86_64-pc-windows-msvc
             asset: xgeny-x86_64-pc-windows-msvc.exe
             binary: target/x86_64-pc-windows-msvc/release/xgeny.exe
+            npm_tarball: xgen-cli-win32-x64.tgz
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -84,6 +107,12 @@ jobs:
           set -euo pipefail
           rustup toolchain install --no-self-update
           rustup target add "${{ matrix.target }}"
+
+      - name: Install pinned Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.20.0
+          package-manager-cache: false
 
       - name: Install musl linker
         if: runner.os == 'Linux'
@@ -146,6 +175,26 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path release -Force | Out-Null
           Copy-Item -LiteralPath "${{ matrix.binary }}" -Destination "release/${{ matrix.asset }}"
+
+      - name: Pack and smoke npm global install
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --prefix npm
+          npm_output="$RUNNER_TEMP/xgeny-npm-launcher"
+          mkdir -p "$npm_output"
+          node npm/scripts/pack.mjs \
+            --launcher \
+            --output-dir "$npm_output"
+          node npm/scripts/pack.mjs \
+            --target "${{ matrix.target }}" \
+            --binary "${{ matrix.binary }}" \
+            --output-dir release
+          test -f "release/${{ matrix.npm_tarball }}"
+          node npm/scripts/smoke.mjs \
+            --launcher "$npm_output/xgen-cli.tgz" \
+            --platform "release/${{ matrix.npm_tarball }}" \
+            --target "${{ matrix.target }}"
 
       - name: Smoke shell installer against staged asset
         if: runner.os != 'Windows'
