@@ -247,6 +247,24 @@ Goal은 각 planning 응답에 dependency 없는 concrete Step 하나만 반환�
 이 live gate도 `--nocapture`, `--show-output`, shell tracing 또는 `tee` 없이 clean test implementation
 commit에서 실행한다. 일반 CI는 외부 endpoint나 SSH 없이 ignored test를 compile한다.
 
+## RC3 Qwen coding evidence (2026-09-01)
+
+2026-09-01 KST에 Linux x86-64, Rust 1.98.0, release profile, 구현 commit
+`c46b9998fb4d6bcedf467d8ee9d755a351e5d12e`에서 위 coding loop gate를 두 번 연속 실행했고 모두
+통과했다. 두 실행 모두 `qwen3.8-27b`, tokenizer identity `Qwen/Qwen3.8-27B-FP8`, chronological
+PlanningContext v3와 동일한 host-catalogued cargo binary를 사용했다.
+
+각 실행은 model-call lifecycle 8 reserved/8 settled/0 Unknown, 순서가 고정된 7개 single-Step Plan과
+7개 passed Receipt를 확인했다. 첫 cargo test는 non-zero durable result였고 그 출력에 근거한 corrective
+patch 뒤 re-test와 build가 성공했다. Tunnel 종료, workspace와 material catalog 삭제 뒤 completion의
+byte-exact offline replay와 journal 불변성도 통과했다. Runtime endpoint, temporary path, locator와 raw
+model/process output은 이 증거에 남기지 않았다.
+
+최종 evidence 전 기능 commit `1cabec8`의 한 실행은 failed-test 관찰 뒤 다음 model proposal이 거절됐다.
+원문을 노출하지 않고 rejection layer와 완료 action stage만 구분하는 진단을 추가한 뒤 최종 clean SHA에서
+2회 연속 성공했다. 이는 실제 모델 응답의 변동성이 0이라는 주장이 아니며, proposal rejection 뒤 bounded
+re-plan/resume UX는 RC3 이후 reliability 고도화 항목으로 남긴다.
+
 ## Clean-SHA live evidence (2026-08-31)
 
 2026-08-31 05:57 KST에 Linux x86_64, Rust 1.98.0, release profile에서 test 구현 commit
