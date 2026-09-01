@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { npmInvocation } from '../scripts/config.mjs';
+import {
+  npmInvocation,
+  windowsShimVersionInvocation,
+} from '../scripts/config.mjs';
 
 test('Windows npm invocation bypasses the cmd shim without enabling a shell', () => {
   assert.deepEqual(
@@ -43,5 +46,24 @@ test('Unix npm invocation retains the PATH executable fallback', () => {
       npmExecPath: null,
     }),
     { command: 'npm', args: ['root'] },
+  );
+});
+
+test('Windows command shim invocation preserves cmd outer and path quotes verbatim', () => {
+  assert.deepEqual(
+    windowsShimVersionInvocation(
+      'C:\\Users\\Example User\\install\\xgeny.cmd',
+      'C:\\Windows\\System32\\cmd.exe',
+    ),
+    {
+      command: 'C:\\Windows\\System32\\cmd.exe',
+      args: [
+        '/d',
+        '/s',
+        '/c',
+        '""C:\\Users\\Example User\\install\\xgeny.cmd" --version"',
+      ],
+      windowsVerbatimArguments: true,
+    },
   );
 });

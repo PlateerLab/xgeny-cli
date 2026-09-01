@@ -18,6 +18,7 @@ import {
   distributionMetadata,
   npmInvocation,
   platformPackageJson,
+  windowsShimVersionInvocation,
 } from './config.mjs';
 
 function parseArguments(argv) {
@@ -222,11 +223,11 @@ async function main() {
     let versionResult;
     if (process.platform === 'win32') {
       const shim = path.join(installRoot, 'xgeny.cmd');
-      versionResult = await run(
-        process.env.ComSpec ?? 'cmd.exe',
-        ['/d', '/s', '/c', `"${shim}" --version`],
-        { env: executionEnvironment },
-      );
+      const invocation = windowsShimVersionInvocation(shim);
+      versionResult = await run(invocation.command, invocation.args, {
+        env: executionEnvironment,
+        windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+      });
     } else {
       const shim = path.join(installRoot, 'bin', 'xgeny');
       versionResult = await run(shim, ['--version'], { env: executionEnvironment });
