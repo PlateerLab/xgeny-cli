@@ -127,6 +127,7 @@ binary에 포함되어 있어 network나 별도 파일 없이 `xgeny licenses`�
 - [ADR-0026: Strict single-file patch와 공유 atomic commit](docs/adr/0026-strict-single-file-atomic-patch.md)
 - [ADR-0027: NonIdempotent durable tool output와 no-replay 경계](docs/adr/0027-non-idempotent-durable-tool-output.md)
 - [ADR-0028: shell 없는 로컬 process 실행 경계](docs/adr/0028-shell-free-process-execute.md)
+- [ADR-0029: Core-derived action occurrence와 반복 coding loop](docs/adr/0029-core-derived-action-occurrence.md)
 
 ## 개발 및 검증
 

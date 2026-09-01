@@ -20,7 +20,9 @@ use xgeny_workgraph::{
     receipt_releases_dependency, validate_completion_summary_candidate,
 };
 
-use crate::admission::{definition_contract_digest, prepare_invocation_facts};
+use crate::admission::{
+    definition_contract_digest, planned_action_occurrence_digest, prepare_invocation_facts,
+};
 use crate::{
     AdmissionError, CapabilityRegistry, EventFactory, EventFactoryError, EventMetadataError,
     RunLease,
@@ -866,6 +868,7 @@ pub enum ProposalRejection {
     CapabilityUnavailable,
     CapabilityUnsupported,
     InvocationInvalid,
+    /// Two Steps in the same proposal resolve to one canonical semantic action.
     DuplicateSemanticAction,
     PlannedStepBudgetExceeded,
     ToolCallBudgetExhausted,
@@ -2460,7 +2463,7 @@ struct ValidatedPlanStep {
     capability: CapabilityRef,
     normalized_arguments: Value,
     definition_digest: String,
-    action_digest: String,
+    semantic_action_digest: String,
     material_digest: String,
     effect_class: EffectClass,
 }
@@ -2473,7 +2476,7 @@ struct AcceptedPlanDigestStep<'a> {
     depends_on: &'a [PlanDependency],
     capability: &'a CapabilityRef,
     definition_digest: &'a str,
-    action_digest: &'a str,
+    semantic_action_digest: &'a str,
     material_digest: &'a str,
 }
 
@@ -2540,22 +2543,7 @@ fn prepare_plan<R: ResourceResolver>(
         step.depends_on.sort();
     }
 
-    let existing_action_digests: BTreeSet<_> = state
-        .steps
-        .values()
-        .flat_map(|step| {
-            step.planned_invocation
-                .as_ref()
-                .map(|invocation| invocation.action_digest().to_owned())
-                .into_iter()
-                .chain(
-                    step.intent
-                        .as_ref()
-                        .map(|intent| intent.action_digest.clone()),
-                )
-        })
-        .collect();
-    let mut proposed_action_digests = BTreeSet::new();
+    let mut proposed_semantic_action_digests = BTreeSet::new();
     let mut validated = Vec::with_capacity(steps.len());
     for step in steps {
         if !context
@@ -2589,9 +2577,7 @@ fn prepare_plan<R: ResourceResolver>(
             resolver,
         )
         .map_err(|error| map_invocation_rejection(&error))?;
-        if existing_action_digests.contains(&facts.action_digest)
-            || !proposed_action_digests.insert(facts.action_digest.clone())
-        {
+        if !proposed_semantic_action_digests.insert(facts.semantic_action_digest.clone()) {
             return Err(ProposalRejection::DuplicateSemanticAction);
         }
         validated.push(ValidatedPlanStep {
@@ -2601,7 +2587,7 @@ fn prepare_plan<R: ResourceResolver>(
             capability: step.capability,
             normalized_arguments: facts.normalized_arguments,
             definition_digest: facts.definition_digest,
-            action_digest: facts.action_digest,
+            semantic_action_digest: facts.semantic_action_digest,
             material_digest: facts.material_digest,
             effect_class: definition.spec.effect.class,
         });
@@ -2614,12 +2600,12 @@ fn prepare_plan<R: ResourceResolver>(
             depends_on: &step.depends_on,
             capability: &step.capability,
             definition_digest: &step.definition_digest,
-            action_digest: &step.action_digest,
+            semantic_action_digest: &step.semantic_action_digest,
             material_digest: &step.material_digest,
         })
         .collect();
     let proposal_digest = digest_serializable(&AcceptedPlanDigestInput {
-        domain: "xgeny.plan-proposal.accepted/v2",
+        domain: "xgeny.plan-proposal.accepted/v3-action-occurrence",
         run_id: &state.run_id,
         context_digest: context.context_digest(),
         steps: &digest_steps,
@@ -2642,11 +2628,17 @@ fn prepare_plan<R: ResourceResolver>(
         .map_err(|error| map_invocation_rejection(&error))?;
         if final_facts.normalized_arguments != step.normalized_arguments
             || final_facts.definition_digest != step.definition_digest
-            || final_facts.action_digest != step.action_digest
+            || final_facts.semantic_action_digest != step.semantic_action_digest
             || final_facts.material_digest != step.material_digest
         {
             return Err(ProposalRejection::InvocationInvalid);
         }
+        let action_digest = planned_action_occurrence_digest(
+            &state.run_id,
+            &step_id,
+            &final_facts.semantic_action_digest,
+        )
+        .map_err(|_| ProposalRejection::InvocationInvalid)?;
         let mut depends_on = step
             .depends_on
             .into_iter()
@@ -2663,7 +2655,7 @@ fn prepare_plan<R: ResourceResolver>(
             capability: step.capability,
             normalized_arguments: final_facts.normalized_arguments,
             definition_digest: final_facts.definition_digest,
-            action_digest: final_facts.action_digest,
+            action_digest,
             material_digest: final_facts.material_digest,
             effect_class: step.effect_class,
         });
@@ -2851,9 +2843,9 @@ fn materialize_plan<M: PlanMaterializer>(
             step.action_digest.as_str(),
             step.material_digest.as_str(),
             match step.effect_class {
-                EffectClass::ReadOnly => PlannedExecutionProfile::LocalSyncReadOnlyV1,
+                EffectClass::ReadOnly => PlannedExecutionProfile::LocalSyncReadOnlyOccurrenceV1,
                 EffectClass::Idempotent | EffectClass::NonIdempotent => {
-                    PlannedExecutionProfile::LocalSyncOnceV1
+                    PlannedExecutionProfile::LocalSyncOnceOccurrenceV1
                 }
                 EffectClass::Compensatable | EffectClass::Unknown => {
                     return Err(PlanMaterializerFailure::Rejected);

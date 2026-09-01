@@ -8,6 +8,8 @@
 
 > 후속 ADR-0024가 list/stat/search를 위해 `.` workspace-root logical resource를 추가했다. 기존
 > read-text의 regular-file-only 실행 의미와 legacy allow-file의 root 거부는 유지한다.
+> 후속 ADR-0029가 file-ID identity가 아니라 Core-derived Run/Step occurrence를 도입해, 완료된 read 뒤
+> 같은 logical resource를 별도 승인 identity로 다시 관찰할 수 있게 했다.
 
 ## 문맥
 

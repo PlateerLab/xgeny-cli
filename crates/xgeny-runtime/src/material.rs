@@ -13,9 +13,9 @@ use xgeny_workgraph::{
 
 use crate::admission::{
     AdmissionError, AdmissionRequest, InvocationAdmission, PendingInvocation,
-    definition_contract_digest, executable_binding_digest, require_admission_ready_step,
-    semantic_action_digest, validate_arguments, verify_planned_definition_binding,
-    verify_planned_route_binding,
+    definition_contract_digest, executable_binding_digest, planned_action_digest,
+    require_admission_ready_step, semantic_action_digest, validate_arguments,
+    verify_planned_definition_binding, verify_planned_route_binding,
 };
 use crate::{CapabilityRegistry, EventFactory, EventFactoryError, RouteRequest, RunLease};
 
@@ -392,13 +392,14 @@ impl InvocationMaterialRecovery {
         {
             return Err(MaterialRecoveryError::MaterialDigestMismatch);
         }
-        let action_digest = semantic_action_digest(
+        let semantic_action_digest = semantic_action_digest(
             &capability,
             &intent.invocation.definition_digest,
             definition.spec.effect.class,
             recovered_request.normalized_arguments(),
             recovered_request.permission_request(),
         )?;
+        let action_digest = planned_action_digest(&state, step_id, &semantic_action_digest)?;
         if action_digest != intent.action_digest || action_digest != record.action_digest() {
             return Err(MaterialRecoveryError::ActionDigestMismatch);
         }

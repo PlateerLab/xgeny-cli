@@ -6,7 +6,10 @@
 - 공개 protocol v0.1 schema 변경: 없음
 - local store schema: 5 → 6
 
-> 후속 상태: ADR-0018이 기존 `local_sync_once_v1` 의미를 유지하면서 accepted planned ReadOnly 전용 `local_sync_read_only_v1` profile을 추가했다. 아래 단일 profile 설명은 ADR-0015 결정 당시의 기록이다.
+> 후속 상태: ADR-0018이 accepted planned ReadOnly profile을 추가했다. ADR-0029는 아래의 Run-wide
+> semantic duplicate 금지와 semantic-only effect/grant identity를 대체해, 같은 Proposal 안의 duplicate만
+> 거부하고 Receipt-completed Step 뒤에는 Core-derived Run/Step occurrence를 허용한다. 기존
+> `local_sync_once_v1`/`local_sync_read_only_v1` 저장 Run은 legacy 의미로 유지된다.
 
 ## 문맥
 

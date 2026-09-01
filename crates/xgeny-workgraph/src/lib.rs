@@ -1660,8 +1660,14 @@ impl ExpectedPlanningTurn {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlannedExecutionProfile {
+    /// Legacy profile whose action identity is the canonical semantic action within the Run.
     LocalSyncOnceV1,
+    /// Legacy read-only profile whose identity is the canonical semantic action within the Run.
     LocalSyncReadOnlyV1,
+    /// One-shot effect whose authority identity is a Core-derived occurrence for one Step.
+    LocalSyncOnceOccurrenceV1,
+    /// Read-only effect whose authority identity is a Core-derived occurrence for one Step.
+    LocalSyncReadOnlyOccurrenceV1,
 }
 
 /// Secret-free semantic facts calculated from normalized transient arguments before plan commit.
@@ -4613,7 +4619,8 @@ fn validate_planned_execution_profile(
     provenance: &ReceiptProvenance,
 ) -> Result<(), TransitionError> {
     match planned.execution_profile {
-        PlannedExecutionProfile::LocalSyncOnceV1 => {
+        PlannedExecutionProfile::LocalSyncOnceV1
+        | PlannedExecutionProfile::LocalSyncOnceOccurrenceV1 => {
             if intent.effect_class == EffectClass::ReadOnly {
                 return Err(TransitionError::PlannedInvocationMismatch {
                     step_id: step.step_id.clone(),
@@ -4627,7 +4634,8 @@ fn validate_planned_execution_profile(
                 });
             }
         }
-        PlannedExecutionProfile::LocalSyncReadOnlyV1 => {
+        PlannedExecutionProfile::LocalSyncReadOnlyV1
+        | PlannedExecutionProfile::LocalSyncReadOnlyOccurrenceV1 => {
             if intent.effect_class != EffectClass::ReadOnly {
                 return Err(TransitionError::PlannedInvocationMismatch {
                     step_id: step.step_id.clone(),
@@ -5077,7 +5085,7 @@ mod tests {
     type IntentMutation = Box<dyn Fn(&mut EffectIntent)>;
 
     #[test]
-    fn read_only_execution_semantics_have_distinct_wire_values() {
+    fn execution_profiles_preserve_legacy_and_occurrence_wire_values() {
         assert_eq!(
             serde_json::to_value(EffectClass::ReadOnly).expect("effect class should serialize"),
             serde_json::json!("read_only")
@@ -5086,6 +5094,30 @@ mod tests {
             serde_json::to_value(PlannedExecutionProfile::LocalSyncReadOnlyV1)
                 .expect("execution profile should serialize"),
             serde_json::json!("local_sync_read_only_v1")
+        );
+        assert_eq!(
+            serde_json::to_value(PlannedExecutionProfile::LocalSyncOnceOccurrenceV1)
+                .expect("occurrence profile should serialize"),
+            serde_json::json!("local_sync_once_occurrence_v1")
+        );
+        assert_eq!(
+            serde_json::to_value(PlannedExecutionProfile::LocalSyncReadOnlyOccurrenceV1)
+                .expect("read-only occurrence profile should serialize"),
+            serde_json::json!("local_sync_read_only_occurrence_v1")
+        );
+        assert_eq!(
+            serde_json::from_value::<PlannedExecutionProfile>(serde_json::json!(
+                "local_sync_once_v1"
+            ))
+            .expect("legacy profile should remain readable"),
+            PlannedExecutionProfile::LocalSyncOnceV1
+        );
+        assert_eq!(
+            serde_json::from_value::<PlannedExecutionProfile>(serde_json::json!(
+                "local_sync_once_occurrence_v1"
+            ))
+            .expect("occurrence profile should deserialize"),
+            PlannedExecutionProfile::LocalSyncOnceOccurrenceV1
         );
     }
 

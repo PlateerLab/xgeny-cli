@@ -7,6 +7,9 @@
 - local store schema: 6에서 7로 변경
 
 > 후속 변경: [ADR-0027](0027-non-idempotent-durable-tool-output.md)은 같은 schema 7/8 sidecar를 `durableToolOutput=true`인 `NonIdempotent` effect에도 확장한다. 이 확장은 output 보존 의미만 추가하며 no-blind-retry 규칙은 바꾸지 않는다.
+> [ADR-0029](0029-core-derived-action-occurrence.md)는 Receipt-completed output 뒤 같은 semantic action을
+> 새 Core-owned Step occurrence로 재관찰하는 identity를 추가했다. 한 occurrence의 crash recovery와
+> no-blind-retry는 그대로다.
 
 ## 문맥
 
@@ -243,7 +246,7 @@ restart no-model-recall E2E를 완료했다. 남은 항목은 다음과 같다.
 2. process restart에도 invocation argument를 복원할 권한 제한 durable recipe provider
 3. 실제 bounded filesystem adapter와 descriptor-relative/no-follow confinement
 4. filesystem read 승인과 model egress 승인 분리 및 public composition 적용
-5. 같은 ReadOnly semantic action을 다시 관찰할 occurrence/generation identity
+5. 같은 ReadOnly semantic action을 다시 관찰할 occurrence identity — ADR-0029에서 완료
 6. packaged Linux/macOS/Windows binary와 opt-in live provider/tool smoke
 
 현재 table은 effect당 bounded final JSON 하나만 지원한다. Streaming output, 여러 output generation, retention/GC, encryption과 remote synchronization은 이 schema의 암묵적 기능이 아니며 후속 schema 결정이 필요하다.
@@ -255,7 +258,7 @@ restart no-model-recall E2E를 완료했다. 남은 항목은 다음과 같다.
 - Schema migration 중 legacy output 추론/backfill
 - At-rest encryption, DLP 또는 secret 분류
 - Streaming/chunked output과 effect당 여러 final output
-- 동일 ReadOnly action 반복 관찰
+- 동일 ReadOnly action 반복 관찰(당시 비목표, ADR-0029에서 후속 구현)
 - 실제 filesystem confinement와 public `xgeny run`
 - durable completion 본문(당시 비목표이며 ADR-0021에서 local sidecar로 후속 구현)
 - write/process/network/MCP/XGEN adapter

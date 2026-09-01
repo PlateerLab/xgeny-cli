@@ -3,7 +3,8 @@
 ## 현재 가능한 것
 
 - WorkGraph가 `ReadOnly`를 별도 의미로 보존한다.
-- planned ReadOnly invocation은 `LocalSyncReadOnlyV1`이며 idempotency key와 sink guarantee가 없다.
+- 새 planned ReadOnly invocation은 `LocalSyncReadOnlyOccurrenceV1`이며 idempotency key와 sink guarantee가
+  없다. 기존 저장 Run의 `LocalSyncReadOnlyV1`은 legacy semantic identity로 계속 읽는다.
 - Accepted planned-invocation Admission은 ReadOnly intent에 Core Receipt v2 provenance를 발행한다. Legacy/unplanned direct ReadOnly는 명시적으로 닫혀 있다.
 - Verifier는 bounded artifact descriptor를 제출하고 Core가 exact Run/Step/Receipt provenance를 붙인다.
 - Adapter의 bounded typed JSON은 exact Definition output schema 검증 뒤 event-anchored `ToolOutputRecord`로 schema 7에 원자 저장되며, verifier는 같은-generation snapshot을 받는다.
@@ -34,7 +35,10 @@ composition으로 연결한다. 다만 승인은 invocation flag이고 interacti
 
 Driver는 approval을 만들거나 model/effect uncertainty를 자동 retry하지 않는다.
 
-현재 같은 Run의 동일 Capability+normalized argument는 ReadOnly여도 semantic action 중복으로 거부된다. 변경 후 같은 파일을 다시 관찰하는 generation/occurrence identity는 제품 adapter 전 별도 결정이 필요하다.
+같은 Proposal 안의 동일 Capability+normalized argument는 semantic duplicate로 거부된다. 이전 Step이
+Core Receipt-completed된 뒤에는 ADR-0029의 Core-derived Run/Step occurrence로 같은 파일을 다시 관찰할
+수 있다. 각 observation은 별도 approval/action/Receipt identity를 사용하고 unresolved read lifecycle을
+자동 replay하지 않는다.
 
 ## 검증
 
@@ -46,4 +50,4 @@ cargo test -p xgeny-cli --test durable_driver
 cargo test --workspace --locked
 ```
 
-ReadOnly/driver 기반은 [ADR-0018](../adr/0018-read-only-artifact-and-cli-driver-foundation.md), durable tool output은 [ADR-0019](../adr/0019-durable-tool-output-and-schema-7.md), next-turn context는 [ADR-0020](../adr/0020-generation-checked-planning-context-v2.md), durable completion은 [ADR-0021](../adr/0021-durable-completion-output-and-schema-8.md), 제품 filesystem read 경계는 [ADR-0022](../adr/0022-capability-confined-filesystem-read-adapter.md)를 따른다.
+ReadOnly/driver 기반은 [ADR-0018](../adr/0018-read-only-artifact-and-cli-driver-foundation.md), durable tool output은 [ADR-0019](../adr/0019-durable-tool-output-and-schema-7.md), next-turn context는 [ADR-0020](../adr/0020-generation-checked-planning-context-v2.md), durable completion은 [ADR-0021](../adr/0021-durable-completion-output-and-schema-8.md), 제품 filesystem read 경계는 [ADR-0022](../adr/0022-capability-confined-filesystem-read-adapter.md), 반복 action identity는 [ADR-0029](../adr/0029-core-derived-action-occurrence.md)를 따른다.

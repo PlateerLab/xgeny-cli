@@ -6,6 +6,10 @@
 - 공개 protocol v0.1 schema 변경: 없음
 - local store schema: 6 유지
 
+> 후속 상태: [ADR-0029](0029-core-derived-action-occurrence.md)는 당시 남겨 둔 occurrence 결정을
+> 완료했다. 새 planned ReadOnly는 `LocalSyncReadOnlyOccurrenceV1`을 사용하며 Receipt-completed Step 뒤
+> 같은 semantic read를 새 Core-owned occurrence로 다시 관찰할 수 있다. 아래 제한은 ADR-0018 당시 기록이다.
+
 ## 문맥
 
 ADR-0017은 실제 OpenAI-compatible 모델이 durable reservation 하나에 proposal 요청을 한 번만 보내고 `PlanAccepted`까지 도달하는 경계를 닫았다. 그 다음 단계에서 곧바로 사용자용 `xgeny run`과 파일 읽기를 노출하면 다음 세 가지를 사실과 다르게 주장하게 된다.
@@ -29,7 +33,9 @@ ADR-0017은 실제 OpenAI-compatible 모델이 durable reservation 하나에 pro
 
 Reducer는 profile/effect/key/sink/local placement/platform을 authorization budget 소비 전에 교차검증한다. Accepted planned-invocation Admission은 Definition `ReadOnly`를 같은 내부 variant로 보존하고 key를 발행하지 않는다. ReadOnly Definition은 `idempotencyKeySupported`를 요구하지 않는다. Legacy `StepPlanned`의 unplanned/direct ReadOnly는 이 PR에서 열지 않고 resolver 전에 고정 오류로 닫는다. 읽기도 accepted tool-call budget에는 한 번으로 계산된다.
 
-현재 semantic action과 effect/grant identity가 Run+normalized action에 결합되므로 같은 Capability와 normalized argument의 ReadOnly 작업은 한 Run에서 한 번만 수락된다. 파일 변경 후 같은 경로를 재조회하려면 occurrence/generation identity가 필요하다. 이를 path나 Step ID를 임의로 섞어 우회하지 않고 output durability 설계에서 먼저 결정한다.
+이 결정 당시 semantic action과 effect/grant identity가 Run+normalized action에 결합되므로 같은
+Capability와 normalized argument의 ReadOnly 작업은 한 Run에서 한 번만 수락됐다. 후속 ADR-0029는
+모델 nonce가 아니라 Core-derived final Step occurrence를 도입해 이 제한을 해소했다.
 
 ReadOnly라고 해서 crash 뒤 무조건 안전한 자동 재실행을 뜻하지 않는다. 현재 Direct Executor의 `Executing` 복구는 기존처럼 Unknown/manual 규칙을 유지한다. 실제 filesystem adapter에서 handle-relative 재읽기와 output sidecar 원자성을 설계할 때 ReadOnly 전용 recovery event를 별도 결정한다.
 
@@ -136,7 +142,7 @@ Public `xgeny run`을 열기 전 필요한 계약은 한 PR에 묶지 않고 다
 2. verification snapshot과 planning snapshot에서 state/output 세대 일치
 3. Receipt-completed output만 포함하는 `xgeny.planning-context/v2`
 4. raw completion summary를 digest와 함께 원자 보존하는 `CompletionOutputRecord`
-5. 같은 ReadOnly semantic action의 재관찰을 위한 occurrence/generation identity
+5. 같은 ReadOnly semantic action의 재관찰을 위한 occurrence identity — ADR-0029에서 완료
 
 ### B. filesystem confinement
 
@@ -183,7 +189,7 @@ Hard link, mount/bind mount, FUSE/network filesystem, hostile same-UID process, 
 - output을 다음 planning turn에 전달하는 context v2
 - 사용자에게 보여 줄 completion 원문 durable 저장
 - ReadOnly crash 자동 retry
-- 같은 Run에서 동일 ReadOnly semantic action 반복 관찰
+- 같은 Run에서 동일 ReadOnly semantic action 반복 관찰(당시 비목표, ADR-0029에서 후속 구현)
 - write/process/network/MCP/XGEN adapter
 - live `go50902` tool execution
 - package installer/signing

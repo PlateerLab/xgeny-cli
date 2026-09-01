@@ -76,7 +76,8 @@ newline, Unicode와 지정하지 않은 모든 byte는 그대로 보존한다.
 
 ### 4. 권한·durable output·불확정 복구는 기존 mutation 규칙을 따른다
 
-`apply-patch`는 `filesystem.write`, `Idempotent`, `LocalSyncOnceV1`, idempotency key와
+`apply-patch`는 `filesystem.write`, `Idempotent`, 새 plan에서는
+`LocalSyncOnceOccurrenceV1`, idempotency key와
 `durableToolOutput=true`를 사용한다.
 
 - `--allow-dir` component descendant만 후보와 실제 resource로 허용한다.

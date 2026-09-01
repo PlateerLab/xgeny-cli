@@ -17,6 +17,7 @@ use xgeny_policy::{
     BrokerError, InvocationResolutionError, PolicyAllowance, PolicyContribution, PolicyInputs,
     ResolvedPermissionRequest, ResourceResolutionFailure, ResourceResolver,
 };
+use xgeny_protocol::canonical_digest;
 use xgeny_runtime::{
     AdmissionError, AdmissionOutcome, AdmissionRequest, CapabilityRegistry, EventFactory,
     EventFactoryError, EventMetadata, InvocationAdmission, InvocationMaterialProvider,
@@ -354,15 +355,38 @@ fn seed_accepted_plan<S: RunStore>(
     store: &mut S,
     definition: &CapabilityDefinitionBody,
     definition_digest: String,
-    action_digest: String,
+    action_digest: &str,
     material_digest: String,
+) -> (RunState, PlannedInvocationBinding) {
+    seed_accepted_plan_with_profile(
+        store,
+        definition,
+        RUN_ID,
+        STEP_ID,
+        definition_digest,
+        action_digest,
+        material_digest,
+        PlannedExecutionProfile::LocalSyncOnceV1,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn seed_accepted_plan_with_profile<S: RunStore>(
+    store: &mut S,
+    definition: &CapabilityDefinitionBody,
+    run_id: &str,
+    step_id: &str,
+    definition_digest: String,
+    semantic_action_digest: &str,
+    material_digest: String,
+    profile: PlannedExecutionProfile,
 ) -> (RunState, PlannedInvocationBinding) {
     let created = store
         .append(
             ExpectedHead::Empty,
             seed_event(
                 "planned-seed-event-1",
-                RUN_ID,
+                run_id,
                 RunEventBody::RunCreated {
                     goal: "admit one durable planned effect".to_owned(),
                 },
@@ -375,7 +399,7 @@ fn seed_accepted_plan<S: RunStore>(
             ExpectedHead::from_state(&created),
             seed_event(
                 "planned-seed-event-2",
-                RUN_ID,
+                run_id,
                 RunEventBody::AgentLoopConfigured {
                     budget: AgentLoopBudget::new(2, 2, 2, 16_384).expect("budget should validate"),
                 },
@@ -388,9 +412,9 @@ fn seed_accepted_plan<S: RunStore>(
         definition.metadata.id.clone(),
         definition.metadata.contract_version.clone(),
         definition_digest,
-        action_digest,
+        action_digest_for_profile(run_id, step_id, semantic_action_digest, profile),
         material_digest,
-        PlannedExecutionProfile::LocalSyncOnceV1,
+        profile,
         std::env::consts::OS,
         std::env::consts::ARCH,
     )
@@ -398,7 +422,7 @@ fn seed_accepted_plan<S: RunStore>(
     let reference = ReconstructableMaterialReference::new("run-recipe", "recipe-1", "rev-1")
         .expect("reference should validate");
     let (binding, input) =
-        PlannedInvocationMaterialRecord::bind(RUN_ID, STEP_ID, &proposal_digest, spec, reference)
+        PlannedInvocationMaterialRecord::bind(run_id, step_id, &proposal_digest, spec, reference)
             .expect("planned input should bind");
     let decision =
         ExpectedPlanningTurn::new(1, format!("sha256:{}", "b".repeat(64)), proposal_digest)
@@ -408,11 +432,11 @@ fn seed_accepted_plan<S: RunStore>(
             ExpectedHead::from_state(&configured),
             seed_event(
                 "planned-seed-event-3",
-                RUN_ID,
+                run_id,
                 RunEventBody::PlanAccepted {
                     decision,
                     steps: vec![AcceptedPlanStep {
-                        step_id: STEP_ID.to_owned(),
+                        step_id: step_id.to_owned(),
                         objective: "write one marker".to_owned(),
                         depends_on: Vec::new(),
                         invocation: binding.clone(),
@@ -424,6 +448,27 @@ fn seed_accepted_plan<S: RunStore>(
         .expect("accepted plan and input should commit atomically")
         .state;
     (state, binding)
+}
+
+fn action_digest_for_profile(
+    run_id: &str,
+    step_id: &str,
+    semantic_action_digest: &str,
+    profile: PlannedExecutionProfile,
+) -> String {
+    match profile {
+        PlannedExecutionProfile::LocalSyncOnceOccurrenceV1
+        | PlannedExecutionProfile::LocalSyncReadOnlyOccurrenceV1 => canonical_digest(&json!({
+            "domain": "xgeny.planned-action-occurrence/v1",
+            "runId": run_id,
+            "stepId": step_id,
+            "semanticActionDigest": semantic_action_digest,
+        }))
+        .expect("occurrence identity fixture should canonicalize"),
+        PlannedExecutionProfile::LocalSyncOnceV1 | PlannedExecutionProfile::LocalSyncReadOnlyV1 => {
+            semantic_action_digest.to_owned()
+        }
+    }
 }
 
 fn source(kind: PolicySourceKind, id: &str, byte: char) -> PolicySource {
@@ -566,7 +611,7 @@ fn commit_reconstructable<S: RunStore>(
 }
 
 #[test]
-fn accepted_plan_reconstructs_after_sqlite_reopen_and_commits_the_exact_plan_id() {
+fn legacy_plan_reconstructs_after_sqlite_reopen_with_its_semantic_action_identity() {
     let definition = definition_fixture();
     let instance = instance_fixture(&definition);
     let registry = registry_with(&definition, [instance]);
@@ -586,11 +631,16 @@ fn accepted_plan_reconstructs_after_sqlite_reopen_and_commits_the_exact_plan_id(
             &mut store,
             &definition,
             definition_digest,
-            action_digest,
+            &action_digest,
             material_digest,
         )
         .1
     };
+    assert_eq!(
+        binding.execution_profile(),
+        PlannedExecutionProfile::LocalSyncOnceV1
+    );
+    assert_eq!(binding.action_digest(), action_digest);
 
     let mut store = SqliteRunStore::open(&path).expect("SQLite should reopen");
     let (_lease_directory, lease) = acquire_lease(RUN_ID);
@@ -615,6 +665,7 @@ fn accepted_plan_reconstructs_after_sqlite_reopen_and_commits_the_exact_plan_id(
     let AdmissionOutcome::Authorized(admitted) = outcome else {
         panic!("planned invocation should be authorized")
     };
+    assert_eq!(admitted.action_digest(), binding.action_digest());
     let step = &admitted.commit().state.steps[STEP_ID];
     assert_eq!(step.status, StepStatus::IntentCommitted);
     assert_eq!(
@@ -626,6 +677,200 @@ fn accepted_plan_reconstructs_after_sqlite_reopen_and_commits_the_exact_plan_id(
     );
     drop(store);
     assert_sqlite_artifacts_exclude(directory.path(), &[SECRET_SENTINEL.as_bytes()]);
+}
+
+#[test]
+fn occurrence_plan_reconstructs_after_sqlite_reopen_with_core_derived_identity() {
+    let definition = definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, [instance]);
+    let resolver = CanonicalResolver::default();
+    let expected_arguments = arguments(CANONICAL_PATH, SECRET_SENTINEL);
+    let (definition_digest, semantic_action_digest, material_digest) = planning_facts(
+        &registry,
+        &resolver,
+        &definition,
+        expected_arguments.clone(),
+    );
+    let expected_occurrence = action_digest_for_profile(
+        RUN_ID,
+        STEP_ID,
+        &semantic_action_digest,
+        PlannedExecutionProfile::LocalSyncOnceOccurrenceV1,
+    );
+    let directory = tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("occurrence-planned-run.db");
+    let binding = {
+        let mut store = SqliteRunStore::open(&path).expect("SQLite should open");
+        seed_accepted_plan_with_profile(
+            &mut store,
+            &definition,
+            RUN_ID,
+            STEP_ID,
+            definition_digest,
+            &semantic_action_digest,
+            material_digest,
+            PlannedExecutionProfile::LocalSyncOnceOccurrenceV1,
+        )
+        .1
+    };
+    assert_eq!(
+        binding.execution_profile(),
+        PlannedExecutionProfile::LocalSyncOnceOccurrenceV1
+    );
+    assert_eq!(binding.action_digest(), expected_occurrence);
+    assert_ne!(binding.action_digest(), semantic_action_digest);
+
+    let mut store = SqliteRunStore::open(&path).expect("SQLite should reopen");
+    let (_lease_directory, lease) = acquire_lease(RUN_ID);
+    let mut providers = FixedMaterialProvider::available("run-recipe", expected_arguments);
+    let pending = InvocationMaterialRecovery::new()
+        .prepare_planned_admission(
+            &store,
+            &lease,
+            &registry,
+            &resolver,
+            &mut providers,
+            PlannedAdmissionRequest::new(STEP_ID, route_request(&definition)),
+        )
+        .expect("occurrence input should reconstruct and prepare");
+    assert_eq!(pending.action_digest(), expected_occurrence);
+    let inputs = allow_inputs(pending.permission_request());
+    let outcome = InvocationAdmission::new()
+        .authorize_and_commit(
+            pending,
+            &inputs,
+            &registry,
+            &mut store,
+            &mut DeterministicEvents,
+            &lease,
+        )
+        .expect("occurrence invocation should authorize");
+    let AdmissionOutcome::Authorized(admitted) = outcome else {
+        panic!("occurrence invocation should be authorized")
+    };
+    let intent = admitted.commit().state.steps[STEP_ID]
+        .intent
+        .as_ref()
+        .expect("occurrence intent should be durable");
+    assert_eq!(admitted.action_digest(), expected_occurrence);
+    assert_eq!(intent.action_digest, expected_occurrence);
+    assert_eq!(
+        intent
+            .receipt_provenance
+            .as_ref()
+            .map(|provenance| provenance.plan_id.as_str()),
+        Some(binding.plan_id())
+    );
+    drop(store);
+    assert_sqlite_artifacts_exclude(directory.path(), &[SECRET_SENTINEL.as_bytes()]);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Proves every authority identity changes with the Step occurrence.
+fn repeated_semantic_action_gets_distinct_permission_grant_effect_and_idempotency_identities() {
+    let definition = definition_fixture();
+    let registry = registry_with(&definition, [instance_fixture(&definition)]);
+    let resolver = CanonicalResolver::default();
+    let exact_arguments = arguments(CANONICAL_PATH, "same-action");
+    let (definition_digest, semantic_action_digest, material_digest) =
+        planning_facts(&registry, &resolver, &definition, exact_arguments.clone());
+    let first_occurrence = action_digest_for_profile(
+        RUN_ID,
+        STEP_ID,
+        &semantic_action_digest,
+        PlannedExecutionProfile::LocalSyncOnceOccurrenceV1,
+    );
+    assert_eq!(
+        first_occurrence,
+        action_digest_for_profile(
+            RUN_ID,
+            STEP_ID,
+            &semantic_action_digest,
+            PlannedExecutionProfile::LocalSyncOnceOccurrenceV1,
+        ),
+        "one action occurrence must be deterministic"
+    );
+    assert_ne!(
+        first_occurrence,
+        action_digest_for_profile(
+            "run-admission-other",
+            STEP_ID,
+            &semantic_action_digest,
+            PlannedExecutionProfile::LocalSyncOnceOccurrenceV1,
+        ),
+        "an occurrence cannot cross Run boundaries"
+    );
+    let mut identities = Vec::new();
+
+    for step_id in [STEP_ID, OTHER_STEP_ID] {
+        let mut store = MemoryRunStore::new();
+        let (_, binding) = seed_accepted_plan_with_profile(
+            &mut store,
+            &definition,
+            RUN_ID,
+            step_id,
+            definition_digest.clone(),
+            &semantic_action_digest,
+            material_digest.clone(),
+            PlannedExecutionProfile::LocalSyncOnceOccurrenceV1,
+        );
+        let (_lease_directory, lease) = acquire_lease(RUN_ID);
+        let pending = prepare_for_step(
+            &store,
+            &lease,
+            &registry,
+            &resolver,
+            &definition,
+            step_id,
+            exact_arguments.clone(),
+        )
+        .expect("occurrence should prepare");
+        assert_eq!(pending.action_digest(), binding.action_digest());
+        let permission_request_id = pending.permission_request().request_id().to_owned();
+        let inputs = allow_inputs(pending.permission_request());
+        let outcome = InvocationAdmission::new()
+            .authorize_and_commit(
+                pending,
+                &inputs,
+                &registry,
+                &mut store,
+                &mut DeterministicEvents,
+                &lease,
+            )
+            .expect("occurrence should authorize");
+        let AdmissionOutcome::Authorized(admitted) = outcome else {
+            panic!("occurrence should be authorized")
+        };
+        let intent = admitted.commit().state.steps[step_id]
+            .intent
+            .as_ref()
+            .expect("occurrence intent should commit");
+        identities.push((
+            permission_request_id,
+            admitted.action_digest().to_owned(),
+            admitted.effect_id().to_owned(),
+            intent.authorization.grant_id.clone(),
+            intent
+                .idempotency_key
+                .clone()
+                .expect("idempotent occurrence should have a key"),
+            intent
+                .receipt_provenance
+                .as_ref()
+                .expect("occurrence should bind Receipt provenance")
+                .invocation_id
+                .clone(),
+        ));
+    }
+
+    assert_eq!(identities.len(), 2);
+    assert_ne!(identities[0].0, identities[1].0, "permission request");
+    assert_ne!(identities[0].1, identities[1].1, "action occurrence");
+    assert_ne!(identities[0].2, identities[1].2, "effect");
+    assert_ne!(identities[0].3, identities[1].3, "one-shot grant");
+    assert_ne!(identities[0].4, identities[1].4, "idempotency key");
+    assert_ne!(identities[0].5, identities[1].5, "invocation Receipt");
 }
 
 #[test]
@@ -642,7 +887,7 @@ fn direct_planned_prepare_pins_the_accepted_recipe_and_ignores_reference_replace
         &mut store,
         &definition,
         definition_digest,
-        action_digest,
+        &action_digest,
         material_digest,
     );
     let (_directory, lease) = acquire_lease(RUN_ID);
@@ -704,7 +949,7 @@ fn planned_definition_drift_is_rejected_before_recipe_or_resource_access() {
         &mut store,
         &definition,
         definition_digest,
-        action_digest,
+        &action_digest,
         material_digest,
     )
     .0;
@@ -754,7 +999,7 @@ fn reconstructed_arguments_that_differ_from_the_accepted_plan_leave_the_run_unch
         &mut store,
         &definition,
         definition_digest,
-        action_digest,
+        &action_digest,
         material_digest,
     );
     let (_directory, lease) = acquire_lease(RUN_ID);
@@ -805,7 +1050,7 @@ fn wrong_planned_route_is_rejected_before_material_provider_access() {
         &mut store,
         &definition,
         definition_digest,
-        action_digest,
+        &action_digest,
         material_digest,
     );
     let (_directory, lease) = acquire_lease(RUN_ID);
@@ -849,7 +1094,7 @@ fn unreleased_planned_dependency_is_rejected_before_material_provider_access() {
         &mut store,
         &definition,
         first_facts.0,
-        first_facts.1,
+        &first_facts.1,
         first_facts.2,
     );
     let proposal_digest = format!("sha256:{}", "c".repeat(64));
