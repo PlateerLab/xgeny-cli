@@ -850,8 +850,8 @@ mod tests {
     fn bundled_protocol_is_conformant() {
         let report = check_bundled_protocol().expect("bundled protocol should be conformant");
         assert_eq!(report.schema_count, 9);
-        assert_eq!(report.fixture_count, 27);
-        assert_eq!(report.valid_fixture_count, 17);
+        assert_eq!(report.fixture_count, 28);
+        assert_eq!(report.valid_fixture_count, 18);
         assert_eq!(report.invalid_fixture_count, 10);
         assert!(report.semantic_check_count >= 10);
     }
