@@ -1,0 +1,43 @@
+{
+  "apiVersion": "xgeny.io/v1alpha1",
+  "kind": "CapabilityDefinition",
+  "metadata": {
+    "id": "xgeny.test/non-idempotent-durable-output",
+    "contractVersion": "1.0.0",
+    "displayName": "Non-idempotent durable output fixture"
+  },
+  "spec": {
+    "summary": "Exercises bounded durable output without making a non-idempotent effect replayable.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "required": ["result"],
+      "properties": {
+        "result": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "effect": {
+      "class": "non_idempotent",
+      "resourceSelectors": [],
+      "criticalActions": []
+    },
+    "requiredCapabilities": [],
+    "execution": {
+      "styles": ["sync"],
+      "cancellable": false,
+      "idempotencyKeySupported": true,
+      "durableToolOutput": true,
+      "defaultTimeoutMs": 1000,
+      "maxTimeoutMs": 1000
+    },
+    "verification": [
+      {"strategy": "output_schema", "required": true}
+    ]
+  }
+}

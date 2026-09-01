@@ -691,8 +691,10 @@ fn build_receipt_provenance(
     definition: &CapabilityDefinitionBody,
 ) -> ReceiptProvenance {
     let durable_tool_output = definition.spec.effect.class == DomainEffectClass::ReadOnly
-        || (definition.spec.effect.class == DomainEffectClass::Idempotent
-            && definition.spec.execution.durable_tool_output);
+        || (matches!(
+            definition.spec.effect.class,
+            DomainEffectClass::Idempotent | DomainEffectClass::NonIdempotent
+        ) && definition.spec.execution.durable_tool_output);
     ReceiptProvenance {
         profile_version: if durable_tool_output {
             CORE_RECEIPT_PROFILE_V2

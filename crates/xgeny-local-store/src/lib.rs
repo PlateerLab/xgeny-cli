@@ -937,7 +937,7 @@ fn verify_material_bundle(
             (provenance.profile_version.as_str(), intent.effect_class),
             (
                 CORE_RECEIPT_PROFILE_V2,
-                EffectClass::ReadOnly | EffectClass::Idempotent
+                EffectClass::ReadOnly | EffectClass::Idempotent | EffectClass::NonIdempotent
             ) | (
                 CORE_RECEIPT_PROFILE_V1,
                 EffectClass::Reversible | EffectClass::Idempotent | EffectClass::NonIdempotent
@@ -948,9 +948,10 @@ fn verify_material_bundle(
         }
         let output_profile_matches_effect =
             match (intent.effect_class, provenance.profile_version.as_str()) {
-                (EffectClass::ReadOnly | EffectClass::Idempotent, CORE_RECEIPT_PROFILE_V2) => {
-                    provenance.tool_output_profile.as_deref() == Some(TOOL_OUTPUT_PROFILE_V1)
-                }
+                (
+                    EffectClass::ReadOnly | EffectClass::Idempotent | EffectClass::NonIdempotent,
+                    CORE_RECEIPT_PROFILE_V2,
+                ) => provenance.tool_output_profile.as_deref() == Some(TOOL_OUTPUT_PROFILE_V1),
                 (
                     EffectClass::Reversible | EffectClass::Idempotent | EffectClass::NonIdempotent,
                     CORE_RECEIPT_PROFILE_V1,
@@ -2115,7 +2116,7 @@ fn verify_core_receipt_artifacts(
         CORE_RECEIPT_PROFILE_V2 => {
             if !matches!(
                 intent.effect_class,
-                EffectClass::ReadOnly | EffectClass::Idempotent
+                EffectClass::ReadOnly | EffectClass::Idempotent | EffectClass::NonIdempotent
             ) || receipt.artifacts.is_empty()
                 || receipt.artifacts.len() > CORE_RECEIPT_MAX_ARTIFACTS_V2
             {
@@ -3637,6 +3638,21 @@ mod tests {
         effect
     }
 
+    fn non_idempotent_durable_receipt_intent(state: &RunState) -> EffectIntent {
+        let mut effect = receipt_intent(state);
+        let provenance = effect
+            .receipt_provenance
+            .as_mut()
+            .expect("Receipt provenance should exist");
+        provenance.profile_version = CORE_RECEIPT_PROFILE_V2.to_owned();
+        provenance.tool_output_profile = Some(TOOL_OUTPUT_PROFILE_V1.to_owned());
+        effect.authorization.binding.receipt_provenance_digest =
+            Some(receipt_provenance_digest(provenance).expect("provenance should canonicalize"));
+        effect.authorization.grant_digest = authorization_digest(&effect.authorization.binding, 1)
+            .expect("non-idempotent authorization should canonicalize");
+        effect
+    }
+
     fn second_receipt_intent(state: &RunState) -> EffectIntent {
         let mut effect = receipt_intent(state);
         effect.effect_id = "effect-2".to_owned();
@@ -3772,6 +3788,37 @@ mod tests {
                 ),
             )
             .expect("read-only effect should start");
+        (started, effect)
+    }
+
+    fn seed_non_idempotent_durable_executing<S: RunStore>(store: &mut S) -> (Commit, EffectIntent) {
+        let planned = seed(store);
+        let effect = non_idempotent_durable_receipt_intent(&planned.state);
+        let committed = store
+            .append_with_invocation_material(
+                ExpectedHead::from_state(&planned.state),
+                event(
+                    "non-idempotent-output-intent",
+                    RunEventBody::EffectIntentCommitted {
+                        step_id: "step-1".to_owned(),
+                        intent: Box::new(effect.clone()),
+                    },
+                ),
+                material_for(&planned.state, "step-1", &effect),
+            )
+            .expect("non-idempotent durable-output intent should commit");
+        let started = store
+            .append(
+                ExpectedHead::from_state(&committed.state),
+                event(
+                    "non-idempotent-output-started",
+                    RunEventBody::EffectExecutionStarted {
+                        step_id: "step-1".to_owned(),
+                        effect_id: effect.effect_id.clone(),
+                    },
+                ),
+            )
+            .expect("non-idempotent effect should start once");
         (started, effect)
     }
 
@@ -3976,6 +4023,18 @@ mod tests {
             extensions: BTreeMap::new(),
             required_extensions: Vec::new(),
         }];
+        seal_receipt(&mut receipt);
+        receipt
+    }
+
+    fn successful_non_idempotent_output_receipt(
+        effect: &EffectIntent,
+        output: &ToolOutputRecord,
+    ) -> ExecutionReceiptBody {
+        let mut receipt = successful_read_only_receipt(effect);
+        receipt.effect.class = ProtocolEffectClass::NonIdempotent;
+        receipt.effect.idempotency_key = effect.idempotency_key.clone();
+        receipt.output_digest = output.output_digest().to_owned();
         seal_receipt(&mut receipt);
         receipt
     }
@@ -4720,6 +4779,70 @@ mod tests {
     }
 
     #[test]
+    fn non_idempotent_output_receipt_reopens_into_planning_context_and_tampering_fails_closed() {
+        let directory = tempdir().expect("temp directory should exist");
+        let path = directory.path().join("non-idempotent-output.db");
+        let mut store = SqliteRunStore::open(&path).expect("SQLite should open");
+        let (started, effect) = seed_non_idempotent_durable_executing(&mut store);
+        let (candidate, output) = tool_output_success(
+            &started.state,
+            &effect,
+            "non-idempotent-output-succeeded",
+            serde_json::json!({"stdout": "verified", "stderr": "", "exitCode": 0}),
+        );
+        let validating = store
+            .append_with_tool_output(
+                ExpectedHead::from_state(&started.state),
+                candidate,
+                output.clone(),
+            )
+            .expect("non-idempotent output should commit atomically");
+        let receipt = successful_non_idempotent_output_receipt(&effect, &output);
+        let completed = store
+            .append_with_execution_receipt(
+                ExpectedHead::from_state(&validating.state),
+                receipt_event(&effect, &receipt),
+                receipt,
+            )
+            .expect("non-idempotent output Receipt should complete the Step");
+        let expected_head = ExpectedHead::from_state(&completed.state);
+        let snapshot = store
+            .load_planning_snapshot(expected_head.clone(), u64::MAX)
+            .expect("planning snapshot should load")
+            .expect("Run should exist");
+        assert_eq!(
+            snapshot.completed_tool_outputs().get("step-1"),
+            Some(&output)
+        );
+        assert_eq!(effect.sink_guarantee, SinkGuarantee::None);
+        drop(store);
+
+        let reopened = SqliteRunStore::open(&path).expect("SQLite should cold-open");
+        let reopened_snapshot = reopened
+            .load_planning_snapshot(expected_head, u64::MAX)
+            .expect("cold planning snapshot should verify")
+            .expect("Run should exist");
+        assert_eq!(
+            reopened_snapshot.completed_tool_outputs().get("step-1"),
+            Some(&output)
+        );
+        drop(reopened);
+
+        let external = rusqlite::Connection::open(&path).expect("external SQLite should open");
+        external
+            .execute(
+                "UPDATE tool_outputs SET output_digest = 'sha256:corrupted'",
+                [],
+            )
+            .expect("corruption fixture should commit");
+        drop(external);
+        assert!(matches!(
+            SqliteRunStore::open(&path),
+            Err(StoreError::Corrupt(_))
+        ));
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // One vertical snapshot/restart contract with shared fixtures.
     fn planning_snapshot_exposes_only_receipt_completed_outputs_from_the_expected_head() {
         const OUTPUT_SENTINEL: &str = "planning-output-visible-only-in-local-context";
@@ -5360,11 +5483,20 @@ mod tests {
     fn unsupported_receipt_profile_is_rejected_before_intent_commit() {
         let mut store = MemoryRunStore::new();
         let planned = seed(&mut store);
-        for (event_id, profile) in [
-            ("unsupported-profile-intent", "unsupported-receipt-profile"),
-            ("wrong-effect-profile-intent", CORE_RECEIPT_PROFILE_V2),
+        for (event_id, profile, effect_class) in [
+            (
+                "unsupported-profile-intent",
+                "unsupported-receipt-profile",
+                EffectClass::NonIdempotent,
+            ),
+            (
+                "wrong-effect-profile-intent",
+                CORE_RECEIPT_PROFILE_V2,
+                EffectClass::Reversible,
+            ),
         ] {
             let mut effect = receipt_intent(&planned.state);
+            effect.effect_class = effect_class;
             let provenance = effect
                 .receipt_provenance
                 .as_mut()

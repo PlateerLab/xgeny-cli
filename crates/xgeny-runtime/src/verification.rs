@@ -654,7 +654,9 @@ fn receipt_profile_matches_effect(intent: &EffectIntent, provenance: &ReceiptPro
         (provenance.profile_version.as_str(), intent.effect_class),
         (
             CORE_RECEIPT_PROFILE_V2,
-            xgeny_workgraph::EffectClass::ReadOnly | xgeny_workgraph::EffectClass::Idempotent
+            xgeny_workgraph::EffectClass::ReadOnly
+                | xgeny_workgraph::EffectClass::Idempotent
+                | xgeny_workgraph::EffectClass::NonIdempotent
         ) | (
             CORE_RECEIPT_PROFILE_V1,
             xgeny_workgraph::EffectClass::Reversible
@@ -670,7 +672,9 @@ fn tool_output_profile_matches_effect(
 ) -> bool {
     match (intent.effect_class, provenance.profile_version.as_str()) {
         (
-            xgeny_workgraph::EffectClass::ReadOnly | xgeny_workgraph::EffectClass::Idempotent,
+            xgeny_workgraph::EffectClass::ReadOnly
+            | xgeny_workgraph::EffectClass::Idempotent
+            | xgeny_workgraph::EffectClass::NonIdempotent,
             CORE_RECEIPT_PROFILE_V2,
         ) => provenance.tool_output_profile.as_deref() == Some(TOOL_OUTPUT_PROFILE_V1),
         (
@@ -774,7 +778,9 @@ fn verify_report_profile(
         CORE_RECEIPT_PROFILE_V2 => {
             matches!(
                 intent.effect_class,
-                xgeny_workgraph::EffectClass::ReadOnly | xgeny_workgraph::EffectClass::Idempotent
+                xgeny_workgraph::EffectClass::ReadOnly
+                    | xgeny_workgraph::EffectClass::Idempotent
+                    | xgeny_workgraph::EffectClass::NonIdempotent
             ) && !report.artifacts().is_empty()
         }
         _ => false,

@@ -2,16 +2,16 @@
   "apiVersion": "xgeny.io/v1alpha1",
   "kind": "CapabilityDefinition",
   "metadata": {
-    "id": "example/unsafe-output",
+    "id": "example/unsupported-compensatable-output",
     "contractVersion": "1.0.0",
-    "displayName": "Invalid non-idempotent output"
+    "displayName": "Invalid compensatable durable output"
   },
   "spec": {
-    "summary": "This fixture must fail because a non-idempotent effect requests durable tool output.",
+    "summary": "This fixture must fail because compensatable durable output has no runtime profile.",
     "inputSchema": {"type": "object"},
     "outputSchema": {"type": "object"},
     "effect": {
-      "class": "non_idempotent",
+      "class": "compensatable",
       "resourceSelectors": [],
       "criticalActions": []
     },

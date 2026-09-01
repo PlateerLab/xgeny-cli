@@ -53,6 +53,7 @@ cargo run --locked --quiet -p xgeny-cli -- protocol check
 - validator는 CapabilityDefinition 자체뿐 아니라 내장된 `inputSchema`와 `outputSchema`에도 JSON Schema 2020-12 `check_schema`를 수행한다.
 - schema `$ref`는 bundled 또는 digest-pinned registry에서만 해석하고 validation 중 임의 HTTP fetch를 하지 않는다.
 - persisted `ArtifactRef`에는 presigned URL이나 storage credential을 넣지 않는다. 다운로드·업로드 URL은 별도 transient transfer 응답에서만 전달한다.
+- `durableToolOutput=true`는 bounded 결과 보존을 뜻한다. `non_idempotent` effect에 이 flag를 사용해도 effect가 replayable해지지 않으며 Started 뒤 불확정 실행을 자동 재시도하지 않는다.
 
 ## Digest 규칙
 

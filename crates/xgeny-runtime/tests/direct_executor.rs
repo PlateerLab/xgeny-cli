@@ -36,7 +36,7 @@ use xgeny_runtime::{
     MaterialProviderRegistry, MaterialProviderRegistryError, PreparedAdapterInvocation,
     RequiredRouteFeatures, RouteRequest, RuleVerificationObservation, RuntimePolicy,
     VerificationPortFailure, VerificationRegistryError, VerificationReport, VerificationRequest,
-    VerificationRunner, VerifierOutputDigest,
+    VerificationRunner, VerifiedArtifactDescriptor, VerifierOutputDigest,
 };
 use xgeny_workgraph::{
     AcceptedPlanStep, AgentLoopBudget, EventRecord, ExpectedPlanningTurn, InvocationMaterialRecord,
@@ -334,6 +334,10 @@ impl<S: RunStore> RunStore for LostReceiptAckStore<S> {
         self.inner.load()
     }
 
+    fn load_current(&self) -> Result<Option<RunState>, StoreError> {
+        self.inner.load_current()
+    }
+
     fn append_with_invocation_material(
         &mut self,
         expected: ExpectedHead,
@@ -373,6 +377,17 @@ impl<S: RunStore> RunStore for LostReceiptAckStore<S> {
         &self,
     ) -> Result<Vec<xgeny_domain::ExecutionReceiptBody>, StoreError> {
         self.inner.load_execution_receipts()
+    }
+
+    fn load_tool_output(&self, effect_id: &str) -> Result<Option<ToolOutputRecord>, StoreError> {
+        self.inner.load_tool_output(effect_id)
+    }
+
+    fn load_verification_snapshot(
+        &self,
+        step_id: &str,
+    ) -> Result<Option<RunVerificationSnapshot>, StoreError> {
+        self.inner.load_verification_snapshot(step_id)
     }
 }
 
@@ -839,6 +854,13 @@ fn read_only_definition_fixture() -> CapabilityDefinitionBody {
     definition.spec.execution.idempotency_key_supported = false;
     assert_eq!(definition.spec.effect.class, EffectClass::ReadOnly);
     *definition
+}
+
+fn non_idempotent_durable_output_definition_fixture() -> CapabilityDefinitionBody {
+    let mut definition = definition_fixture();
+    definition.spec.effect.class = EffectClass::NonIdempotent;
+    definition.spec.execution.durable_tool_output = true;
+    definition
 }
 
 fn capability(definition: &CapabilityDefinitionBody) -> CapabilityRef {
@@ -1774,6 +1796,85 @@ fn lost_tool_output_commit_ack_reopens_as_validating_without_duplicate_adapter_e
 }
 
 #[test]
+fn non_idempotent_lost_output_ack_never_reexecutes_the_effect() {
+    let directory = tempdir().expect("temporary Run directory should exist");
+    let database = directory.path().join("non-idempotent-output-ack.db");
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let counters = Rc::new(AdapterCounters::default());
+    let definition = non_idempotent_durable_output_definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, instance.clone());
+    let (_lease_directory, lease) = acquire_lease();
+    let mut store = LostOutputAckStore {
+        inner: SqliteRunStore::open(&database).expect("SQLite should open"),
+        lose_once: true,
+    };
+    seed(&mut store);
+    let admitted = admit(&mut store, &lease, &registry, &definition, false);
+    let material = (*admitted)
+        .into_ephemeral_material()
+        .expect("admitted material should verify");
+    let mut adapter = FakeAdapter::succeeding(Rc::clone(&counters), Rc::clone(&trace));
+    adapter.executions = VecDeque::from([AdapterExecutionObservation::SucceededWithOutput {
+        evidence_digest: digest('a'),
+        output: AdapterToolOutput::new(json!({
+            "content": "durable non-idempotent result",
+            "digest": format!("sha256:{}", "f".repeat(64))
+        })),
+    }]);
+    let mut adapters = EffectAdapterRegistry::new();
+    register_fake(&mut adapters, &instance, adapter);
+
+    let first = DirectExecutor::new().drive_step(
+        &mut store,
+        &mut DeterministicEvents,
+        &lease,
+        &registry,
+        &mut adapters,
+        STEP_ID,
+        Some(&material),
+    );
+    assert!(matches!(first, Err(DirectExecutorError::Runtime(_))));
+    assert_eq!(counters.prepares.get(), 1);
+    assert_eq!(counters.executes.get(), 1);
+    let state = store
+        .load_current()
+        .expect("committed state should load")
+        .expect("Run should exist");
+    assert_eq!(state.steps[STEP_ID].status, StepStatus::Validating);
+    let effect_id = state.steps[STEP_ID]
+        .intent
+        .as_ref()
+        .expect("intent should remain")
+        .effect_id
+        .clone();
+    assert!(
+        store
+            .load_tool_output(&effect_id)
+            .expect("committed output should load")
+            .is_some()
+    );
+    drop(store);
+
+    let mut reopened = SqliteRunStore::open(&database).expect("SQLite should cold-open");
+    let resumed = DirectExecutor::new()
+        .drive_step(
+            &mut reopened,
+            &mut DeterministicEvents,
+            &lease,
+            &CapabilityRegistry::new(),
+            &mut EffectAdapterRegistry::new(),
+            STEP_ID,
+            None,
+        )
+        .expect("Validating should resume without an adapter");
+    assert_eq!(resumed.action, DriveAction::NoAction);
+    assert_eq!(resumed.state.steps[STEP_ID].status, StepStatus::Validating);
+    assert_eq!(counters.prepares.get(), 1);
+    assert_eq!(counters.executes.get(), 1);
+}
+
+#[test]
 fn prepare_failure_keeps_intent_committed_and_never_starts_or_executes() {
     let trace = Rc::new(RefCell::new(Vec::new()));
     let counters = Rc::new(AdapterCounters::default());
@@ -2632,6 +2733,10 @@ struct PassingVerifier {
     calls: Rc<Cell<usize>>,
 }
 
+struct DurableOutputVerifier {
+    calls: Rc<Cell<usize>>,
+}
+
 struct ResultVerifier {
     calls: Rc<Cell<usize>>,
     result: VerificationResult,
@@ -2668,6 +2773,52 @@ impl EffectVerifier for ResultVerifier {
                 .expect("output digest should be canonical"),
             rules,
         ))
+    }
+}
+
+impl EffectVerifier for DurableOutputVerifier {
+    fn verify(
+        &mut self,
+        request: VerificationRequest<'_>,
+    ) -> Result<VerificationReport, VerificationPortFailure> {
+        self.calls.set(self.calls.get() + 1);
+        let output = request
+            .tool_output()
+            .expect("durable-output verifier requires the exact sidecar");
+        let rules = request
+            .definition()
+            .spec
+            .verification
+            .iter()
+            .map(|rule| {
+                RuleVerificationObservation::new(
+                    rule.strategy,
+                    VerificationResult::Passed,
+                    Some(
+                        AdapterEvidenceDigest::new(
+                            request.outcome_evidence_digest().as_str().to_owned(),
+                        )
+                        .expect("durable evidence should remain canonical"),
+                    ),
+                )
+            })
+            .collect();
+        VerificationReport::new(
+            VerifierOutputDigest::new(output.output_digest().to_owned())
+                .expect("tool output digest should remain canonical"),
+            rules,
+        )
+        .with_artifacts(vec![
+            VerifiedArtifactDescriptor::new(
+                "artifact-non-idempotent-output",
+                Some("tool-output.json"),
+                "application/json",
+                output.canonical_size_bytes(),
+                output.output_digest(),
+            )
+            .expect("bounded output artifact should validate"),
+        ])
+        .map_err(|_| VerificationPortFailure::ResponseUnverifiable)
     }
 }
 
@@ -3734,6 +3885,131 @@ fn lost_receipt_commit_acknowledgement_does_not_repeat_effect_or_verifier() {
     assert_eq!(verifier_calls.get(), 1);
     assert_eq!(counters.executes.get(), 1);
     assert_eq!(store.load_execution_receipts().expect("Receipts").len(), 1);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep one restart/ack-loss vertical contract together.
+fn non_idempotent_output_survives_lost_receipt_ack_and_reaches_the_next_planning_context() {
+    let directory = tempdir().expect("temporary Run directory should exist");
+    let database_path = directory.path().join("non-idempotent-output.db");
+    let definition = non_idempotent_durable_output_definition_fixture();
+    let instance = instance_fixture(&definition);
+    let registry = registry_with(&definition, instance.clone());
+    let (_lease_directory, lease) = acquire_lease();
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let counters = Rc::new(AdapterCounters::default());
+    let mut sqlite = SqliteRunStore::open(&database_path).expect("SQLite should open");
+    seed(&mut sqlite);
+    let admitted = admit(&mut sqlite, &lease, &registry, &definition, false);
+    let material = (*admitted)
+        .into_ephemeral_material()
+        .expect("admitted material should verify");
+    let output_value = json!({
+        "content": "bounded non-idempotent result",
+        "digest": format!("sha256:{}", "f".repeat(64))
+    });
+    let mut adapter = FakeAdapter::succeeding(Rc::clone(&counters), trace);
+    adapter.executions = VecDeque::from([AdapterExecutionObservation::SucceededWithOutput {
+        evidence_digest: digest('a'),
+        output: AdapterToolOutput::new(output_value.clone()),
+    }]);
+    let mut adapters = EffectAdapterRegistry::new();
+    register_fake(&mut adapters, &instance, adapter);
+
+    let executed = DirectExecutor::new()
+        .drive_step(
+            &mut sqlite,
+            &mut DeterministicEvents,
+            &lease,
+            &registry,
+            &mut adapters,
+            STEP_ID,
+            Some(&material),
+        )
+        .expect("non-idempotent effect should execute once");
+    assert_eq!(executed.action, DriveAction::EffectSucceeded);
+    assert_eq!(executed.state.steps[STEP_ID].status, StepStatus::Validating);
+    assert_eq!(counters.executes.get(), 1);
+    let effect_id = executed.state.steps[STEP_ID]
+        .intent
+        .as_ref()
+        .expect("intent should remain")
+        .effect_id
+        .clone();
+    let output = sqlite
+        .load_tool_output(&effect_id)
+        .expect("tool output lookup should work")
+        .expect("tool output should be durable");
+    assert_eq!(output.output(), &output_value);
+
+    let verifier_calls = Rc::new(Cell::new(0));
+    let mut verifiers = EffectVerifierRegistry::new();
+    verifiers
+        .register(
+            &instance.binding,
+            DurableOutputVerifier {
+                calls: Rc::clone(&verifier_calls),
+            },
+        )
+        .expect("exact verifier should register");
+    let mut lost_ack = LostReceiptAckStore {
+        inner: sqlite,
+        lose_once: true,
+    };
+    let first = VerificationRunner::new().drive_step(
+        &mut lost_ack,
+        &mut DeterministicEvents,
+        &lease,
+        &registry,
+        &mut verifiers,
+        STEP_ID,
+    );
+    assert!(
+        matches!(
+            &first,
+            Err(xgeny_runtime::VerificationRunnerError::Store(
+                StoreError::InjectedFault(_)
+            ))
+        ),
+        "unexpected non-idempotent verification result: {first:?}"
+    );
+    assert_eq!(verifier_calls.get(), 1);
+    drop(lost_ack);
+
+    let mut reopened = SqliteRunStore::open(&database_path).expect("SQLite should cold-open");
+    let state = reopened
+        .load_current()
+        .expect("Run should load")
+        .expect("Run should exist");
+    assert_eq!(state.steps[STEP_ID].status, StepStatus::Completed);
+    let receipts = reopened
+        .load_execution_receipts()
+        .expect("Receipt should load");
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].effect.class, EffectClass::NonIdempotent);
+    assert_eq!(receipts[0].output_digest, output.output_digest());
+    let planning = reopened
+        .load_planning_snapshot(ExpectedHead::from_state(&state), u64::MAX)
+        .expect("planning snapshot should load")
+        .expect("Run should exist");
+    assert_eq!(
+        planning.completed_tool_outputs().get(STEP_ID),
+        Some(&output)
+    );
+
+    let resumed = VerificationRunner::new()
+        .drive_step(
+            &mut reopened,
+            &mut DeterministicEvents,
+            &lease,
+            &registry,
+            &mut EffectVerifierRegistry::new(),
+            STEP_ID,
+        )
+        .expect("durably completed Step should not verify again");
+    assert_eq!(resumed.action, DriveAction::NoAction);
+    assert_eq!(counters.executes.get(), 1);
+    assert_eq!(verifier_calls.get(), 1);
 }
 
 #[test]

@@ -94,7 +94,7 @@ Verifier 자체의 unavailable/unsupported/evidence-unavailable/unverifiable 오
 
 ## Receipt 생성과 판정
 
-Core는 admission provenance, durable intent, start event, verifier report와 event factory 시각으로 `ExecutionReceiptBody`를 만든다. 기존 `xgeny.core-receipt/v1`은 Artifact 0개 의미를 유지한다. ADR-0018의 ReadOnly intent는 `xgeny.core-receipt/v2`를 사용하고 verifier의 bounded artifact descriptor에 Core가 exact Run/Step/Receipt provenance를 붙인다. ADR-0019의 output profile에서는 verifier report와 Receipt `outputDigest`가 같은-generation durable `ToolOutputRecord.outputDigest`와 정확히 같아야 하며, verifier는 외부 파일을 다시 여는 대신 이 bounded snapshot을 검증한다. ID·summary·redaction·판정 함수와 v2 artifact bound는 `xgeny-protocol`의 한 구현을 runtime과 store가 공유한다. `receiptDigest`는 `kind: ExecutionReceipt`를 포함한 전체 protocol document에서 top-level `receiptDigest`만 제외해 RFC 8785 canonical JSON/SHA-256으로 계산한다.
+Core는 admission provenance, durable intent, start event, verifier report와 event factory 시각으로 `ExecutionReceiptBody`를 만든다. 기존 `xgeny.core-receipt/v1`은 Artifact 0개 의미를 유지한다. ADR-0018의 ReadOnly intent와 `durableToolOutput=true`인 Idempotent/NonIdempotent intent는 `xgeny.core-receipt/v2`를 사용하고 verifier의 bounded artifact descriptor에 Core가 exact Run/Step/Receipt provenance를 붙인다. ADR-0019/0027의 output profile에서는 verifier report와 Receipt `outputDigest`가 같은-generation durable `ToolOutputRecord.outputDigest`와 정확히 같아야 하며, verifier는 effect를 다시 실행하는 대신 이 bounded snapshot을 검증한다. ID·summary·redaction·판정 함수와 v2 artifact bound는 `xgeny-protocol`의 한 구현을 runtime과 store가 공유한다. `receiptDigest`는 `kind: ExecutionReceipt`를 포함한 전체 protocol document에서 top-level `receiptDigest`만 제외해 RFC 8785 canonical JSON/SHA-256으로 계산한다.
 
 ```text
 required failed                           -> failed / Failed
