@@ -284,8 +284,12 @@ impl RunStore for OutputSnapshotStore {
         if output_bytes.is_none_or(|total| total > max_output_bytes) {
             return Err(StoreError::PlanningSnapshotBudgetExceeded);
         }
+        let planning_step_order = self.state.steps.keys().cloned().collect();
+        let completed_tool_output_order = self.outputs.keys().cloned().collect();
         Ok(Some(RunPlanningSnapshot::new(
             self.state.clone(),
+            planning_step_order,
+            completed_tool_output_order,
             self.outputs.clone(),
         )))
     }
@@ -511,7 +515,7 @@ fn assert_strict_request_contract(request: &[u8]) -> Value {
     assert_eq!(prompt["profileVersion"], "xgeny.planner-request/v1");
     assert_eq!(
         prompt["planningContext"]["profileVersion"],
-        "xgeny.planning-context/v2"
+        "xgeny.planning-context/v3"
     );
     assert_eq!(prompt["planningContext"]["toolOutputs"], json!([]));
     assert_eq!(

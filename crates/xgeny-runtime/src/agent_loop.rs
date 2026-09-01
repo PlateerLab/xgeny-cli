@@ -28,7 +28,7 @@ use crate::{
     RunLease,
 };
 
-const PLANNING_CONTEXT_PROFILE_V2: &str = "xgeny.planning-context/v2";
+const PLANNING_CONTEXT_PROFILE_V3: &str = "xgeny.planning-context/v3";
 const MAX_PROPOSAL_BYTES: usize = 256 * 1024;
 const MAX_PROPOSAL_KEY_BYTES: usize = 128;
 const MAX_CAPABILITY_SUMMARY_BYTES: usize = 512;
@@ -1197,9 +1197,11 @@ impl AgentLoop {
         if planning_snapshot.state != state {
             return Err(AgentLoopError::PlanningSnapshotMismatch);
         }
-        let context = match build_context(
+        let context = match build_context_ordered(
             &state,
             planning_snapshot.completed_tool_outputs(),
+            planning_snapshot.planning_step_order(),
+            planning_snapshot.completed_tool_output_order(),
             &frontier,
             capabilities,
             &self.planning_constraints,
@@ -1990,19 +1992,30 @@ enum ContextBuildError {
 fn build_planning_tool_outputs(
     state: &RunState,
     completed_tool_outputs: &BTreeMap<String, ToolOutputRecord>,
+    completed_tool_output_order: &[String],
 ) -> Result<Vec<PlanningToolOutput>, ContextBuildError> {
     let expected_count = state
         .steps
         .values()
         .filter(|step| step.status == StepStatus::Completed && step.output_record_digest.is_some())
         .count();
-    if expected_count != completed_tool_outputs.len() {
+    if expected_count != completed_tool_outputs.len()
+        || completed_tool_output_order.len() != completed_tool_outputs.len()
+    {
         return Err(ContextBuildError::OutputBinding);
     }
     let mut outputs = Vec::with_capacity(expected_count);
-    for (step_id, step) in &state.steps {
+    let mut seen = BTreeSet::new();
+    for step_id in completed_tool_output_order {
+        if !seen.insert(step_id.as_str()) {
+            return Err(ContextBuildError::OutputBinding);
+        }
+        let step = state
+            .steps
+            .get(step_id)
+            .ok_or(ContextBuildError::OutputBinding)?;
         if step.status != StepStatus::Completed || step.output_record_digest.is_none() {
-            continue;
+            return Err(ContextBuildError::OutputBinding);
         }
         if !receipt_releases_dependency(step) {
             return Err(ContextBuildError::OutputBinding);
@@ -2047,10 +2060,13 @@ fn build_planning_tool_outputs(
             output: output.output().clone(),
         });
     }
+    if seen.len() != expected_count {
+        return Err(ContextBuildError::OutputBinding);
+    }
     Ok(outputs)
 }
 
-#[allow(clippy::too_many_lines)] // Keeps one canonical packing pipeline and exact byte checks.
+#[cfg(test)]
 fn build_context(
     state: &RunState,
     completed_tool_outputs: &BTreeMap<String, ToolOutputRecord>,
@@ -2059,8 +2075,47 @@ fn build_context(
     planning_constraints: &[PlanningConstraint],
     budget: &AgentLoopBudget,
 ) -> Result<PlanningContext, ContextBuildError> {
+    let planning_step_order = state.steps.keys().cloned().collect::<Vec<_>>();
+    let completed_tool_output_order = completed_tool_outputs.keys().cloned().collect::<Vec<_>>();
+    build_context_ordered(
+        state,
+        completed_tool_outputs,
+        &planning_step_order,
+        &completed_tool_output_order,
+        frontier,
+        registry,
+        planning_constraints,
+        budget,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn build_context_ordered(
+    state: &RunState,
+    completed_tool_outputs: &BTreeMap<String, ToolOutputRecord>,
+    planning_step_order: &[String],
+    completed_tool_output_order: &[String],
+    frontier: &WorkFrontier,
+    registry: &CapabilityRegistry,
+    planning_constraints: &[PlanningConstraint],
+    budget: &AgentLoopBudget,
+) -> Result<PlanningContext, ContextBuildError> {
     if !planning_context_preflight(state, registry) {
         return Err(ContextBuildError::InputLimitExceeded);
+    }
+    if planning_step_order.len() != state.steps.len() {
+        return Err(ContextBuildError::OutputBinding);
+    }
+    let planning_step_set = planning_step_order
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if planning_step_set.len() != state.steps.len()
+        || planning_step_set
+            .iter()
+            .any(|step_id| !state.steps.contains_key(*step_id))
+    {
+        return Err(ContextBuildError::OutputBinding);
     }
     let mut source_bytes = planning_constraints
         .iter()
@@ -2072,7 +2127,8 @@ fn build_context(
                 .filter(|size| *size <= MAX_PLANNING_SOURCE_BYTES)
                 .ok_or(ContextBuildError::InputLimitExceeded)
         })?;
-    let tool_outputs = build_planning_tool_outputs(state, completed_tool_outputs)?;
+    let tool_outputs =
+        build_planning_tool_outputs(state, completed_tool_outputs, completed_tool_output_order)?;
     source_bytes = tool_outputs
         .iter()
         .try_fold(source_bytes, |total, output| {
@@ -2151,7 +2207,11 @@ fn build_context(
     })
     .map_err(|_| ContextBuildError::Canonicalization)?;
     let mut step_summaries = Vec::with_capacity(state.steps.len());
-    for step in state.steps.values() {
+    for step_id in planning_step_order {
+        let step = state
+            .steps
+            .get(step_id)
+            .ok_or(ContextBuildError::OutputBinding)?;
         validate_planning_step_shape(step)?;
         let summary = PlanningStepSummary {
             step_id: step.step_id.clone(),
@@ -2182,7 +2242,7 @@ fn build_context(
     let total_steps = step_summaries.len();
     let total_capabilities = summaries.len();
     let mut payload = PlanningContextPayload {
-        profile_version: PLANNING_CONTEXT_PROFILE_V2,
+        profile_version: PLANNING_CONTEXT_PROFILE_V3,
         run_id: state.run_id.clone(),
         authority: state.authority.clone(),
         authority_epoch: state.authority_epoch,
@@ -2236,7 +2296,7 @@ fn build_context(
     let canonical_size_bytes =
         u64::try_from(exact_size).map_err(|_| ContextBuildError::BudgetExceeded)?;
     let context_digest = digest_serializable(&ContextDigestInput {
-        domain: "xgeny.planning-context.digest/v2",
+        domain: "xgeny.planning-context.digest/v3",
         payload: &payload,
     })
     .map_err(|_| ContextBuildError::Canonicalization)?;
@@ -3167,6 +3227,62 @@ mod tests {
         .expect("context should fit");
         validate_proposal_structure(&state, &frontier, &context, &proposal("released"))
             .expect("receipt-released dependency should remain usable");
+    }
+
+    #[test]
+    fn planning_context_serializes_verified_journal_step_order() {
+        let state = state(vec![
+            step("step-a", StepStatus::Planned, Vec::new()),
+            step("step-z", StepStatus::Planned, Vec::new()),
+        ]);
+        let frontier = derive_frontier(&state).expect("frontier should derive");
+        let context = build_context_ordered(
+            &state,
+            &BTreeMap::new(),
+            &["step-z".to_owned(), "step-a".to_owned()],
+            &[],
+            &frontier,
+            &CapabilityRegistry::new(),
+            &[],
+            &test_budget(),
+        )
+        .expect("ordered context should fit");
+        let value = serde_json::to_value(&context).expect("context should serialize");
+        let step_ids = value["steps"]
+            .as_array()
+            .expect("steps should be an array")
+            .iter()
+            .map(|step| step["stepId"].as_str().expect("Step ID should be text"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(step_ids, ["step-z", "step-a"]);
+        assert_eq!(context.profile_version(), "xgeny.planning-context/v3");
+        assert!(matches!(
+            build_context_ordered(
+                &state,
+                &BTreeMap::new(),
+                &["step-a".to_owned(), "step-a".to_owned()],
+                &[],
+                &frontier,
+                &CapabilityRegistry::new(),
+                &[],
+                &test_budget(),
+            ),
+            Err(ContextBuildError::OutputBinding)
+        ));
+        assert!(matches!(
+            build_context_ordered(
+                &state,
+                &BTreeMap::new(),
+                &["step-z".to_owned(), "step-a".to_owned()],
+                &["step-a".to_owned()],
+                &frontier,
+                &CapabilityRegistry::new(),
+                &[],
+                &test_budget(),
+            ),
+            Err(ContextBuildError::OutputBinding)
+        ));
     }
 
     #[test]
