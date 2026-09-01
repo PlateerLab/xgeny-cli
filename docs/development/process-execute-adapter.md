@@ -122,3 +122,9 @@ workspace test에서 실행한다. CLI integration test는 loopback model을 사
 검증한다. 별도 fault test는 실제 child가 durable marker를 한 번 만든 직후 SQLite outcome commit을
 실패시킨다. 첫 재개는 남은 `Executing`을 `EffectUnknown`으로 바꾸고, 동일 executable과 새
 `--allow-execute`를 다시 주어도 marker count, journal과 Receipt가 변하지 않아야 한다.
+
+실제 모델 기반 수직 검증은
+[Qwen coding loop live gate](public-local-run-resume.md#qwen-coding-loop-live-gate)를 따른다. 이 gate는
+Qwen이 workspace 검색과 읽기, 두 번의 patch, 실패한 test 결과 해석, 재검증과 build를 shell 없이
+연결하는지 확인한다. 일반 CI는 test를 compile하고 실제 go50902 실행은 별도 explicit confirmation을
+요구한다.

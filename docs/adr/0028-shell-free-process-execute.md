@@ -120,6 +120,8 @@ prepare/execute하지 않고 `EffectUnknown`으로 닫는다. Exact output bundl
 - 변경된 executable catalog로 재개 실패와 완료된 process의 no-replay
 - 실제 process 적용 뒤 outcome/output transaction commit 실패 → `Executing` cold resume →
   `EffectUnknown`; 반복 재개·재승인에도 외부 marker 1회, start event 1개, Receipt 0개 유지
+- opt-in Qwen live gate의 search → read → patch → 실패한 `cargo test --offline` → 실패 출력 기반 patch →
+  성공한 재-test → `cargo build --offline`과 입력 삭제 뒤 offline replay
 - Linux x86-64/ARM64, macOS Intel/Apple Silicon, Windows x86-64의 workspace test
 - ADR-0027의 SQLite crash/lost-ack no-replay 회귀 suite 유지
 

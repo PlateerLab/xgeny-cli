@@ -215,6 +215,34 @@ gate는 서로 다른 explicit confirmation을 요구하므로 위와 기존 exa
 local forward port에서 동시에 실행하지 않는다. 일반 CI에서는 두 test 모두 외부 연결 없이 compile만
 한다.
 
+### Qwen coding loop live gate
+
+Developer Preview RC3의 실제 코딩 수직 슬라이스는 세 번째 확인 문자열과 test-owned Rust project를
+사용한다. 실행 전 host가 신뢰한 `cargo`의 absolute path를 명시하며, model은 이 path를 보거나 선택하지
+않고 logical executable ID `cargo`만 사용한다.
+
+```bash
+XGENY_LIVE_CONFIRM=xgeny-go50902-coding-loop-v1 \
+XGENY_LIVE_KNOWN_HOSTS_FILE=/absolute/path/to/dedicated_known_hosts \
+XGENY_LIVE_OPENAI_BASE_URL=http://127.0.0.1:18000/v1 \
+XGENY_LIVE_CARGO_PATH=/absolute/path/to/cargo \
+cargo test --locked --release -p xgeny-cli \
+  --test live_go50902_public \
+  public_cli_qwen_edits_fixes_and_reverifies_rust_project \
+  -- --ignored --exact
+```
+
+이 gate의 goal은 acceptance test path와 기대값을 공개하지 않는다. 실제 Qwen은 locator 검색, source 읽기,
+불완전한 첫 patch, 실패해야 하는 `cargo test --offline`, durable 실패 출력에 근거한 두 번째 patch, 성공한
+재검증, `cargo build --offline`을 순서대로 수행해야 한다. 정확히 일곱 개의 single-Step Plan과 여덟 번의
+settled model call, 일곱 Receipt, process argv `test/test/build`, 처음 한 번의 non-zero 결과와 뒤의 두
+성공 결과를 durable store에서 확인한다. 모든 effect attempt는 1회이고 Unknown, failed verification,
+reconciliation은 0이어야 한다. Tunnel을 닫은 뒤 workspace와 private material catalog를 삭제해도 완료
+summary가 byte-exact하게 replay되고 journal이 변하지 않아야 한다.
+
+이 live gate도 `--nocapture`, `--show-output`, shell tracing 또는 `tee` 없이 clean test implementation
+commit에서 실행한다. 일반 CI는 외부 endpoint나 SSH 없이 ignored test를 compile한다.
+
 ## Clean-SHA live evidence (2026-08-31)
 
 2026-08-31 05:57 KST에 Linux x86_64, Rust 1.98.0, release profile에서 test 구현 commit
