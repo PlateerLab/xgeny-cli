@@ -20,22 +20,33 @@ function Invoke-InteractiveSmoke([string]$Executable) {
 
     $Process = [System.Diagnostics.Process]::new()
     $Process.StartInfo = $StartInfo
+    $StandardOutputBuffer = [System.IO.MemoryStream]::new()
+    $StandardErrorBuffer = [System.IO.MemoryStream]::new()
     try {
         if (-not $Process.Start()) {
             throw "failed to start installed binary"
         }
-        $Process.StandardInput.WriteLine("/status")
-        $Process.StandardInput.WriteLine("/exit")
+        $StandardOutputTask = $Process.StandardOutput.BaseStream.CopyToAsync($StandardOutputBuffer)
+        $StandardErrorTask = $Process.StandardError.BaseStream.CopyToAsync($StandardErrorBuffer)
+        $StandardInputBytes = [System.Text.Encoding]::ASCII.GetBytes("/status`n/exit`n")
+        $Process.StandardInput.BaseStream.Write(
+            $StandardInputBytes,
+            0,
+            $StandardInputBytes.Length
+        )
+        $Process.StandardInput.BaseStream.Flush()
         $Process.StandardInput.Close()
-        $StandardOutputTask = $Process.StandardOutput.ReadToEndAsync()
-        $StandardErrorTask = $Process.StandardError.ReadToEndAsync()
         $Process.WaitForExit()
+        $StandardOutputTask.GetAwaiter().GetResult()
+        $StandardErrorTask.GetAwaiter().GetResult()
         return [PSCustomObject]@{
             ExitCode = $Process.ExitCode
-            StandardOutput = $StandardOutputTask.GetAwaiter().GetResult()
-            StandardError = $StandardErrorTask.GetAwaiter().GetResult()
+            StandardOutput = [System.Text.Encoding]::UTF8.GetString($StandardOutputBuffer.ToArray())
+            StandardError = [System.Text.Encoding]::UTF8.GetString($StandardErrorBuffer.ToArray())
         }
     } finally {
+        $StandardOutputBuffer.Dispose()
+        $StandardErrorBuffer.Dispose()
         $Process.Dispose()
     }
 }
@@ -193,13 +204,24 @@ try {
         throw "installed protocol check failed"
     }
     $InteractiveResult = Invoke-InteractiveSmoke $Installed
+    $InteractiveBannerPresent = $InteractiveResult.StandardOutput.Contains("XGENy Developer Preview")
+    $InteractiveStatusPresent = $InteractiveResult.StandardOutput.Contains("status: idle")
+    $InteractiveExitPresent = $InteractiveResult.StandardOutput.Contains("bye")
     if (
         $InteractiveResult.ExitCode -ne 0 -or
-        -not $InteractiveResult.StandardOutput.Contains("XGENy Developer Preview") -or
-        -not $InteractiveResult.StandardOutput.Contains("status: idle") -or
-        -not $InteractiveResult.StandardOutput.Contains("bye")
+        -not $InteractiveBannerPresent -or
+        -not $InteractiveStatusPresent -or
+        -not $InteractiveExitPresent
     ) {
-        throw "installed interactive smoke failed"
+        $InteractiveDiagnostic = @(
+            "exit=$($InteractiveResult.ExitCode)",
+            "banner=$InteractiveBannerPresent",
+            "status=$InteractiveStatusPresent",
+            "bye=$InteractiveExitPresent",
+            "stdout_chars=$($InteractiveResult.StandardOutput.Length)",
+            "stderr_chars=$($InteractiveResult.StandardError.Length)"
+        ) -join " "
+        throw "installed interactive smoke failed ($InteractiveDiagnostic)"
     }
     $LicenseOutput = (& $Installed licenses | Out-String)
     if (
