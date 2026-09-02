@@ -68,6 +68,8 @@ xgeny model remove qwen-xgen
 `--token-stdin`, `XGENY_OPENAI_API_KEY`, profile secure store 순서다. Profile credential은 profile URL과
 최종 URL이 정확히 같을 때만 사용한다.
 
+Compatibility probe는 production planner와 같은 출력 token 예산을 요청한다. Reasoning을 많이 쓰는 model이 최종 JSON 전에 예산을 소진하면 `provider_output_truncated`로 닫으며, rate limit과 구분한다.
+
 `model check`는 기본적으로 기존 계약인 catalog GET만 보낸다. `--compatibility`는 strict JSON Schema
 Chat Completions POST를 한 번 추가한다. `model setup`은 profile commit 전에 두 요청을 항상 수행한다.
 
