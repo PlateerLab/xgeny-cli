@@ -43,7 +43,7 @@ use xgeny_runtime::{
     EffectAdapterRegistry, EffectVerifierRegistry, EventFactory, EventFactoryError, EventMetadata,
     LocalRunLease, MaterialProviderRegistry, PlanMaterializationRequest, PlanMaterializer,
     PlanMaterializerFailure, PlanProposal, PlannerCallRequest, PlannerPort, PlannerPortFailure,
-    PlanningConstraint, RequiredRouteFeatures, RouteRequest,
+    PlanningConstraint, ProposalRejection, RequiredRouteFeatures, RouteRequest,
 };
 use xgeny_workgraph::{
     CompletionOutputRecord, ModelCallStatus, PlannedExecutionProfile,
@@ -239,6 +239,7 @@ pub enum ModelCheckError {
     InsecureEndpointTransport,
     AuthenticationRejected,
     RateLimited,
+    OutputTruncated,
     Timeout,
     RequestRejected,
     Unavailable,
@@ -260,6 +261,7 @@ impl ModelCheckError {
             Self::InsecureEndpointTransport => "plaintext_endpoint_must_be_loopback",
             Self::AuthenticationRejected => "authentication_rejected",
             Self::RateLimited => "rate_limited",
+            Self::OutputTruncated => "provider_output_truncated",
             Self::Timeout => "timeout",
             Self::RequestRejected => "request_rejected",
             Self::Unavailable => "provider_unavailable",
@@ -279,7 +281,7 @@ impl ModelCheckError {
             | Self::InvalidCredential
             | Self::InsecureCredentialTransport
             | Self::InsecureEndpointTransport => 64,
-            Self::InvalidResponse | Self::ModelNotAdvertised => 65,
+            Self::InvalidResponse | Self::ModelNotAdvertised | Self::OutputTruncated => 65,
             Self::AuthenticationRejected => 77,
             Self::RateLimited | Self::Timeout | Self::RequestRejected | Self::Unavailable => 69,
         }
@@ -404,7 +406,8 @@ impl PauseReason {
 pub enum RejectionReason {
     ApprovalDenied,
     AdmissionRejected,
-    ProposalRejected,
+    /// The Core rejected the untrusted proposal. The class is a Core verdict, never model text.
+    ProposalRejected(ProposalRejection),
     MaterialRejected,
     ModelRejected,
     FailedWork,
@@ -416,10 +419,46 @@ impl RejectionReason {
         match self {
             Self::ApprovalDenied => "approval_denied",
             Self::AdmissionRejected => "admission_rejected",
-            Self::ProposalRejected => "proposal_rejected",
+            Self::ProposalRejected(rejection) => proposal_rejection_code(rejection),
             Self::MaterialRejected => "material_rejected",
             Self::ModelRejected => "model_rejected",
             Self::FailedWork => "failed_work",
+        }
+    }
+}
+
+const fn proposal_rejection_code(rejection: ProposalRejection) -> &'static str {
+    match rejection {
+        ProposalRejection::EmptyPlan => "proposal_rejected.empty_plan",
+        ProposalRejection::TooManySteps => "proposal_rejected.too_many_steps",
+        ProposalRejection::TooManyEdges => "proposal_rejected.too_many_edges",
+        ProposalRejection::ProposalTooLarge => "proposal_rejected.proposal_too_large",
+        ProposalRejection::InvalidStepKey => "proposal_rejected.invalid_step_key",
+        ProposalRejection::DuplicateStepKey => "proposal_rejected.duplicate_step_key",
+        ProposalRejection::InvalidObjective => "proposal_rejected.invalid_objective",
+        ProposalRejection::InvalidDependency => "proposal_rejected.invalid_dependency",
+        ProposalRejection::DuplicateDependency => "proposal_rejected.duplicate_dependency",
+        ProposalRejection::UnknownDependency => "proposal_rejected.unknown_dependency",
+        ProposalRejection::BlockedExistingDependency => {
+            "proposal_rejected.blocked_existing_dependency"
+        }
+        ProposalRejection::SelfDependency => "proposal_rejected.self_dependency",
+        ProposalRejection::DependencyCycle => "proposal_rejected.dependency_cycle",
+        ProposalRejection::CapabilityUnavailable => "proposal_rejected.capability_unavailable",
+        ProposalRejection::CapabilityUnsupported => "proposal_rejected.capability_unsupported",
+        ProposalRejection::InvocationInvalid => "proposal_rejected.invocation_invalid",
+        ProposalRejection::DuplicateSemanticAction => "proposal_rejected.duplicate_semantic_action",
+        ProposalRejection::PlannedStepBudgetExceeded => {
+            "proposal_rejected.planned_step_budget_exceeded"
+        }
+        ProposalRejection::ToolCallBudgetExhausted => {
+            "proposal_rejected.tool_call_budget_exhausted"
+        }
+        ProposalRejection::CompletionWithoutReceiptCompletedPlan => {
+            "proposal_rejected.completion_without_receipt_completed_plan"
+        }
+        ProposalRejection::InvalidCompletionSummary => {
+            "proposal_rejected.invalid_completion_summary"
         }
     }
 }
@@ -1477,6 +1516,7 @@ fn map_compatibility_check_failure(error: OpenAiCompatibilityCheckFailure) -> Mo
         OpenAiCompatibilityCheckFailure::Unavailable => ModelCheckError::Unavailable,
         OpenAiCompatibilityCheckFailure::InvalidResponse => ModelCheckError::InvalidResponse,
         OpenAiCompatibilityCheckFailure::ProviderLimit => ModelCheckError::RateLimited,
+        OpenAiCompatibilityCheckFailure::OutputTruncated => ModelCheckError::OutputTruncated,
         OpenAiCompatibilityCheckFailure::RequestRejected => ModelCheckError::RequestRejected,
     }
 }
@@ -1600,9 +1640,9 @@ fn map_driver_outcome(
             run_id,
             reason: RejectionReason::AdmissionRejected,
         },
-        DriverOutcome::ProposalRejected(_) => LocalCommandResult::Rejected {
+        DriverOutcome::ProposalRejected(rejection) => LocalCommandResult::Rejected {
             run_id,
-            reason: RejectionReason::ProposalRejected,
+            reason: RejectionReason::ProposalRejected(rejection),
         },
         DriverOutcome::MaterializerUnavailable(_) => LocalCommandResult::Rejected {
             run_id,
@@ -2372,6 +2412,33 @@ mod tests {
             false,
             PlannedExecutionProfile::LocalSyncOnceV1
         ));
+    }
+
+    #[test]
+    fn proposal_rejection_class_reaches_the_public_result_code() {
+        assert_eq!(
+            map_driver_outcome(
+                "run-proposal-rejection",
+                DriverOutcome::ProposalRejected(ProposalRejection::InvocationInvalid),
+            )
+            .unwrap(),
+            LocalCommandResult::Rejected {
+                run_id: "run-proposal-rejection".to_owned(),
+                reason: RejectionReason::ProposalRejected(ProposalRejection::InvocationInvalid),
+            }
+        );
+        assert_eq!(
+            RejectionReason::ProposalRejected(ProposalRejection::InvocationInvalid).code(),
+            "proposal_rejected.invocation_invalid"
+        );
+        assert_eq!(
+            RejectionReason::ProposalRejected(ProposalRejection::CapabilityUnsupported).code(),
+            "proposal_rejected.capability_unsupported"
+        );
+        assert_eq!(
+            RejectionReason::ProposalRejected(ProposalRejection::ToolCallBudgetExhausted).code(),
+            "proposal_rejected.tool_call_budget_exhausted"
+        );
     }
 
     #[test]

@@ -415,6 +415,8 @@ State 삭제는 Run 기록과 durable recovery 정보를 잃으므로 uninstall�
 | PowerShell에서 installer 차단 | Script를 먼저 검토한다. 현재 process 한정 execution-policy 예외는 조직 정책이 허용할 때만 사용한다. SmartScreen 경고는 RC3에 Authenticode가 없기 때문이다. |
 | `credential_store_unavailable` | 평문 저장 fallback은 없다. Secret manager 출력을 `--token-stdin`이나 현재 process의 `XGENY_OPENAI_API_KEY`로 전달한다. |
 | `model_not_advertised` 또는 compatibility 실패 | URL이 `/v1`로 끝나는지, exact served model ID와 strict JSON Schema Chat Completions 지원을 확인한다. Redirect나 자동 retry에 의존하지 않는다. |
+| `provider_output_truncated` | Probe나 planner 응답이 출력 token 예산에서 잘렸다. Reasoning을 많이 쓰는 model은 최종 JSON 전에 예산을 소진할 수 있으므로 model의 thinking 설정이나 profile의 출력 예산을 조정한다. Rate limit이 아니므로 재시도로 해결되지 않는다. |
+| `proposal_rejected.*` | 뒤의 class가 Core가 제안을 거부한 이유다. `capability_unavailable`/`capability_unsupported`는 허용하지 않은 capability 선택, `invocation_invalid`는 scope 밖 인자나 스키마 위반, `tool_call_budget_exhausted`는 예산 소진이다. Class는 Core 판정이며 model 출력 원문이 아니다. |
 | `configuration_mismatch` | 원래 workspace, file/directory scope, executable와 model profile binding으로 resume한다. 자동 대체하지 말고 필요하면 새 Run을 시작한다. |
 | `model_call_unknown` 또는 `effect_outcome_unknown` | 불확정 작업을 자동 반복하지 않는다. `/status`와 `/resume`의 고정 진단을 확인하고 외부 상태를 별도로 검증한다. |
 
