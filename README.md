@@ -156,6 +156,7 @@ binary에 포함되어 있어 network나 별도 파일 없이 `xgeny licenses`�
 - [ADR-0031: npm은 네이티브 XGENy의 무스크립트 배포 계층](docs/adr/0031-npm-native-distribution.md)
 - [ADR-0032: 모델 프로필과 OS 보안 저장소 분리](docs/adr/0032-model-profiles-and-secure-credential-boundary.md)
 - [ADR-0033: 대화형 REPL과 durable progress/cancellation 경계](docs/adr/0033-interactive-repl-durable-progress.md)
+- [ADR-0034: npm granular token 게시와 provenance 분리](docs/adr/0034-npm-token-publishing-policy.md)
 
 ## 개발 및 검증
 

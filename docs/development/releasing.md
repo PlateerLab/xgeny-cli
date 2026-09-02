@@ -29,15 +29,12 @@ binary를 감싸는 선택형 설치 채널이며 제품 runtime을 다시 구�
   `XGENY_MAIN_PROTECTION_ENABLED=true`를 둔다.
 - Bypass actor가 없음을 관리자가 확인한 뒤 Actions repository variable
   `XGENY_RELEASE_RULESET_NO_BYPASS=true`를 설정한다. Read-only ruleset API는 bypass 목록을 숨길 수 있다.
-- npm의 `@xgen` scope에 여섯 package를 게시할 권한, 계정 2FA와 recovery 수단을 확인한다. 실행 파일이
-  없는 bootstrap version을 먼저 게시한 뒤 각 package의 Trusted Publisher를 repository
-  `PlateerLab/xgeny-cli`, workflow `release.yml`, environment 없음, allowed action `npm publish`로 설정한다.
-  Publishing access는 `Require two-factor authentication and disallow tokens`로 제한한다. 장기 npm
-  token은 만들거나 GitHub secret에 저장하지 않는다. 전체 절차는
-  [npm 배포와 Trusted Publishing](npm-distribution.md)을 따른다.
-- 여섯 package의 Trusted Publisher 설정을 확인한 뒤 repository variable
-  `XGENY_NPM_PUBLISH_ENABLED=true`를 둔다. 값이 없거나 exact `true`가 아니면 native build 전에 release가
-  fail-closed한다.
+- npm의 `@xgen` scope에 여섯 package를 게시할 owner 권한을 확인한다. Package read/write와 `bypass 2FA`
+  권한이 있는 granular token을 repository secret `NPM_TOKEN`에 저장하고 source, artifact와 명령 출력에는
+  넣지 않는다. 실행 파일이 없는 bootstrap version을 같은 정책으로 먼저 게시한다. 전체 절차는
+  [npm granular token 게시와 provenance](npm-distribution.md)를 따른다.
+- token의 scope와 권한을 확인한 뒤 repository variable `XGENY_NPM_PUBLISH_ENABLED=true`를 둔다. 값이
+  없거나 exact `true`가 아니면 native build 전에 release가 fail-closed한다.
 - macOS notarization과 Windows Authenticode가 없는 build는 SemVer와 별개로 prototype이라고 명시하고
   OS 경고 가능성을 안내한다.
 
@@ -97,7 +94,7 @@ Publish 이전에는 다음을 다시 확인한다.
 9. 각 target native binary를 담은 exact-version npm package pack, loopback registry global-install smoke,
    lifecycle script 부재와 raw release asset byte parity
 10. 최종 asset allow-list, `sha256sum -c`, 조립된 Linux fixture installer smoke와 GitHub artifact attestation
-11. GitHub 게시 뒤 npm OIDC Trusted Publishing으로 platform package 다섯 개와 launcher 순차 게시,
+11. GitHub 게시 뒤 granular token으로 platform package 다섯 개와 launcher 순차 게시, GitHub OIDC
     provenance·SRI·dist-tag 검증
 12. 게시 뒤 다섯 target에서 GitHub public exact-tag 및 exact npm version 설치, 대화형 `/status`/`/exit`,
     동일 version 재설치·제거, stable release의 `releases/latest/download` bootstrap과 내부 `latest`
@@ -123,8 +120,9 @@ latest로 지정한다. 게시 직후에는 일반 release 조회로 exact tag, 
 
 Quality, build와 assemble job은 repository read 권한만 가진다. 모든 target과 assembly가 통과한 뒤
 GitHub publish job에만 `contents: write`, `id-token: write`, `attestations: write`를 부여한다. npm
-publish job은 GitHub Release 게시 뒤 별도로 `contents: read`, `id-token: write`만 받는다. 모든 checkout은
-credential persistence를 끈다. 외부 GitHub Action은 mutable tag가 아니라 full commit SHA로 고정한다.
+publish job은 GitHub Release 게시 뒤 별도로 `contents: read`, `id-token: write`만 받고, `NPM_TOKEN`은
+검증이 끝난 publish 단일 step에만 주입한다. 모든 checkout은 credential persistence를 끈다. 외부 GitHub
+Action은 mutable tag가 아니라 full commit SHA로 고정한다.
 
 ## 게시 artifact
 

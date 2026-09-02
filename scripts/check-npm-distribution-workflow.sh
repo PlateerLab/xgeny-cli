@@ -31,9 +31,12 @@ def fail(message: str) -> None:
     raise SystemExit(f"{workflow}: {message}")
 
 
-for secret_marker in ("NODE_AUTH_TOKEN", "NPM_TOKEN", "_authToken", "npm_password"):
+for secret_marker in ("_authToken", "npm_password"):
     if secret_marker.lower() in text.lower():
-        fail(f"long-lived npm credential marker is forbidden: {secret_marker}")
+        fail(f"literal npm credential configuration is forbidden: {secret_marker}")
+
+if re.search(r"npm_[A-Za-z0-9]{20,}", text):
+    fail("literal npm token value is forbidden")
 
 job_starts = [index for index, line in enumerate(lines) if line == "  publish-npm:"]
 if len(job_starts) != 1:
@@ -57,6 +60,7 @@ required_job_fragments = (
     "test \"$NPM_PUBLISH_ENABLED\" = \"true\"",
     "node-version: 24.20.0",
     "actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38",
+    "registry-url: https://registry.npmjs.org/",
     "node npm/scripts/verify-release.mjs",
     "node npm/scripts/publish.mjs",
 )
@@ -71,7 +75,28 @@ if job.count("node npm/scripts/publish.mjs") != 1:
 if job.index("node npm/scripts/verify-release.mjs") > job.index("node npm/scripts/publish.mjs"):
     fail("npm release bundle verification must happen before publication")
 
-gate_step = text.find("- name: Require npm Trusted Publishing readiness")
+secret_expression = "${{ secrets.NPM_TOKEN }}"
+if text.count(secret_expression) != 1:
+    fail("NPM_TOKEN secret must be referenced exactly once")
+publish_step_marker = "- name: Publish platform packages then launcher"
+if publish_step_marker not in job:
+    fail("npm publish step is missing")
+publish_step = job[job.index(publish_step_marker) :]
+for fragment in (
+    f"NODE_AUTH_TOKEN: {secret_expression}",
+    'test -n "$NODE_AUTH_TOKEN"',
+    "node npm/scripts/publish.mjs",
+):
+    if fragment not in publish_step:
+        fail(f"npm publish step is missing token isolation contract: {fragment}")
+if job[: job.index(publish_step_marker)].count("NODE_AUTH_TOKEN") != 0:
+    fail("npm token must not be exposed before the publish step")
+if job.count("NODE_AUTH_TOKEN") != 2:
+    fail("npm token must be limited to one env binding and one non-empty check")
+if job.index("node npm/scripts/verify-release.mjs") > job.index(secret_expression):
+    fail("npm token must not be exposed until after release bundle verification")
+
+gate_step = text.find("- name: Require npm token publishing readiness")
 build_job = text.find("\n  build:")
 if gate_step < 0 or build_job < 0 or gate_step > build_job:
     fail("npm readiness must fail closed in the release quality gate before native builds")

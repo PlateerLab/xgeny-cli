@@ -111,8 +111,8 @@ install smoke를 수행한다.
 
 ## 게시 경계
 
-이 문서를 merge하는 것만으로 release를 게시하지 않는다. Merge 뒤 npm scope/bootstrap/Trusted
-Publisher 준비와 `XGENY_NPM_PUBLISH_ENABLED=true`를 확인하고, 현재 `origin/main` head와 package version이
+이 문서를 merge하는 것만으로 release를 게시하지 않는다. Merge 뒤 npm scope/bootstrap, repository secret
+`NPM_TOKEN`과 `XGENY_NPM_PUBLISH_ENABLED=true`를 확인하고, 현재 `origin/main` head와 package version이
 정확히 일치할 때 별도 보호 tag `v0.1.0-rc.3`을 만들면 release workflow가 모든 release gate를 다시
 실행한다. GitHub Release 전 실패한 tag나 asset은 이동·교체·재사용하지 않고 더 높은 새 version으로
 수정한다. Immutable GitHub Release 뒤 동일 npm bundle의 부분 실패만 SRI 검증 아래 재실행한다.
