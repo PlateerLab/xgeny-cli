@@ -492,7 +492,7 @@ impl OpenAiCompatibilityChecker {
             ],
             temperature: 0,
             seed: 0,
-            max_tokens: 256,
+            max_tokens: self.config.max_output_tokens,
             stream: false,
             n: 1,
             response_format: ResponseFormat {
@@ -546,6 +546,9 @@ pub enum OpenAiCompatibilityCheckFailure {
     InvalidResponse,
     #[error("compatibility request exceeded provider limits")]
     ProviderLimit,
+    /// The provider stopped at the output token budget before completing the probe object.
+    #[error("compatibility response was truncated by the output token budget")]
+    OutputTruncated,
     #[error("compatibility request was rejected")]
     RequestRejected,
 }
@@ -1168,7 +1171,7 @@ fn decode_compatibility_response(
         return Err(OpenAiCompatibilityCheckFailure::InvalidResponse);
     }
     if choice.finish_reason == "length" {
-        return Err(OpenAiCompatibilityCheckFailure::ProviderLimit);
+        return Err(OpenAiCompatibilityCheckFailure::OutputTruncated);
     }
     if choice.finish_reason != "stop"
         || choice.message.refusal.is_some()
@@ -2169,6 +2172,25 @@ mod tests {
     }
 
     #[test]
+    fn compatibility_probe_requests_the_configured_output_budget() {
+        let config = config("https://provider.example/v1")
+            .with_max_output_tokens(2_048)
+            .expect("test budget should validate");
+        let mut checker =
+            OpenAiCompatibilityChecker::with_transport(config, None, ProbeBudgetTransport).unwrap();
+
+        assert_eq!(checker.check(), Ok(()));
+    }
+
+    #[test]
+    fn truncated_compatibility_output_is_not_reported_as_a_provider_limit() {
+        assert_eq!(
+            decode_compatibility_response(&response("", "length"), MODEL, 8),
+            Err(OpenAiCompatibilityCheckFailure::OutputTruncated)
+        );
+    }
+
+    #[test]
     fn compatibility_response_requires_exact_model_single_safe_choice_and_exact_probe_object() {
         assert_eq!(
             decode_compatibility_response(&response(r#"{"status":"ok"}"#, "stop"), MODEL, 8),
@@ -2198,7 +2220,7 @@ mod tests {
         );
         assert_eq!(
             decode_compatibility_response(&response(r#"{"status":"ok"}"#, "length"), MODEL, 8),
-            Err(OpenAiCompatibilityCheckFailure::ProviderLimit)
+            Err(OpenAiCompatibilityCheckFailure::OutputTruncated)
         );
 
         let tool_call = serde_json::to_vec(&json!({
@@ -2293,6 +2315,16 @@ mod tests {
                 body["response_format"]["json_schema"]["schema"]["additionalProperties"],
                 false
             );
+            Ok(response(r#"{"status":"ok"}"#, "stop"))
+        }
+    }
+
+    struct ProbeBudgetTransport;
+
+    impl Transport for ProbeBudgetTransport {
+        fn send(&mut self, request: TransportRequest<'_>) -> Result<Vec<u8>, PlannerPortFailure> {
+            let body: Value = serde_json::from_slice(request.body).unwrap();
+            assert_eq!(body["max_tokens"], json!(2_048));
             Ok(response(r#"{"status":"ok"}"#, "stop"))
         }
     }
