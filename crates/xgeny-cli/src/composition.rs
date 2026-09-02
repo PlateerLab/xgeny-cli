@@ -239,6 +239,7 @@ pub enum ModelCheckError {
     InsecureEndpointTransport,
     AuthenticationRejected,
     RateLimited,
+    OutputTruncated,
     Timeout,
     RequestRejected,
     Unavailable,
@@ -260,6 +261,7 @@ impl ModelCheckError {
             Self::InsecureEndpointTransport => "plaintext_endpoint_must_be_loopback",
             Self::AuthenticationRejected => "authentication_rejected",
             Self::RateLimited => "rate_limited",
+            Self::OutputTruncated => "provider_output_truncated",
             Self::Timeout => "timeout",
             Self::RequestRejected => "request_rejected",
             Self::Unavailable => "provider_unavailable",
@@ -279,7 +281,7 @@ impl ModelCheckError {
             | Self::InvalidCredential
             | Self::InsecureCredentialTransport
             | Self::InsecureEndpointTransport => 64,
-            Self::InvalidResponse | Self::ModelNotAdvertised => 65,
+            Self::InvalidResponse | Self::ModelNotAdvertised | Self::OutputTruncated => 65,
             Self::AuthenticationRejected => 77,
             Self::RateLimited | Self::Timeout | Self::RequestRejected | Self::Unavailable => 69,
         }
@@ -1477,6 +1479,7 @@ fn map_compatibility_check_failure(error: OpenAiCompatibilityCheckFailure) -> Mo
         OpenAiCompatibilityCheckFailure::Unavailable => ModelCheckError::Unavailable,
         OpenAiCompatibilityCheckFailure::InvalidResponse => ModelCheckError::InvalidResponse,
         OpenAiCompatibilityCheckFailure::ProviderLimit => ModelCheckError::RateLimited,
+        OpenAiCompatibilityCheckFailure::OutputTruncated => ModelCheckError::OutputTruncated,
         OpenAiCompatibilityCheckFailure::RequestRejected => ModelCheckError::RequestRejected,
     }
 }
