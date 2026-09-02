@@ -85,16 +85,24 @@ require(
 require(
     npm_distribution,
     (
-        "allowed actions",
-        "`npm publish`만 선택",
-        "`npm stage publish`는 선택하지 않음",
-        "npm trust github",
-        "--allow-publish",
-        "npm trust list",
-        "Require two-factor authentication and disallow tokens",
+        "granular access token",
+        "`bypass 2FA`",
+        "GitHub Actions repository secret `NPM_TOKEN`",
+        "publish 단일 step의 `NODE_AUTH_TOKEN`",
+        "`--provenance`",
+        "npm 인증이 아니라",
     ),
     "npm-distribution",
 )
+for stale_fragment in (
+    "Require two-factor authentication and disallow tokens",
+    "npm trust github",
+    "npm trust list",
+):
+    if stale_fragment in npm_distribution:
+        raise SystemExit(
+            f"{npm_distribution_path}: stale Trusted Publishing instruction remains: {stale_fragment}"
+        )
 
 print("RC3 public documentation contract: PASS")
 PY

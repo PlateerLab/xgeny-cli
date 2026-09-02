@@ -1,6 +1,6 @@
 # ADR-0031: npm은 네이티브 XGENy의 무스크립트 배포 계층이다
 
-- 상태: Accepted
+- 상태: Accepted (`npm` 게시 인증 결정은 [ADR-0034](0034-npm-token-publishing-policy.md)가 대체)
 - 날짜: 2026-09-01
 - 적용 범위: npm package, GitHub Actions release, 사용자 설치
 
@@ -47,20 +47,16 @@ license/provenance notice와 binary hash를 게시 전에 다시 검증한다. P
 마지막에 게시한다.
 
 GitHub Release를 만드는 workflow의 `GITHUB_TOKEN`이 별도 `release` event workflow를 시작한다고
-가정하지 않는다. 같은 `.github/workflows/release.yml`의 후속 `publish-npm` job이 npm Trusted Publisher
-OIDC를 사용한다. 이 job만 `id-token: write`를 가지며 npm password나 장기 access token은 저장하지 않는다.
+가정하지 않는다. 같은 `.github/workflows/release.yml`의 후속 `publish-npm` job이 npm을 게시한다. 게시
+인증과 provenance credential의 분리 정책은 ADR-0034를 따른다.
 
-### 4. 최초 package 생성만 사람의 2FA 승인을 요구한다
+### 4. 최초 package 생성도 별도 실행 파일을 포함하지 않는다
 
-npm은 아직 존재하지 않는 package에 Trusted Publisher를 미리 연결할 수 없다. 그래서 실행 파일이 없는
-`0.0.0-bootstrap.0` tarball 여섯 개를 사람이 검토한 뒤 npm 2FA로 한 번 게시한다. 그 다음 각 package의
-Trusted Publisher를 repository `PlateerLab/xgeny-cli`, workflow `release.yml`, environment 없음,
-allowed action `npm publish`에 연결한다. Publishing access는 2FA를 요구하고 token publish를 금지한 뒤
-`XGENY_NPM_PUBLISH_ENABLED=true`를 설정한다. Scope 또는 package 소유권을 확인할 수 없으면 release하지
-않고 package 이름 계약부터 다시 결정한다.
+npm package 이름을 최초 생성할 때는 실행 파일이 없는 `0.0.0-bootstrap.0` tarball 여섯 개를 검토한 뒤
+게시한다. Bootstrap package는 launcher, native binary와 lifecycle script를 포함하지 않는다. Scope 또는
+package 소유권을 확인할 수 없으면 release하지 않고 package 이름 계약부터 다시 결정한다.
 
-Bootstrap package는 launcher, native binary와 lifecycle script를 포함하지 않는다. 계정 비밀번호,
-recovery code, OTP와 npm token은 repository, 명령 기록 또는 GitHub secret에 넣지 않는다.
+Bootstrap과 실제 release의 게시 인증은 ADR-0034의 granular token 경계를 동일하게 적용한다.
 
 ### 5. 부분 실패는 동일 bytes만 재개한다
 
@@ -83,7 +79,7 @@ job은 같은 immutable GitHub Release로 재실행할 수 있지만, bytes가 �
 - 다섯 OS/architecture에서 package pack과 loopback registry global-install smoke
 - GitHub Release raw asset과 tar member의 streaming SHA-256 parity
 - 게시 전 `npm publish --dry-run` file allow-list
-- 장기 token marker, OIDC 권한, 검증-before-publish와 launcher-last workflow 정적 검사
+- token secret 격리, provenance OIDC 권한, 검증-before-publish와 launcher-last workflow 정적 검사
 - 게시 뒤 다섯 target에서 exact npm version 설치, platform package 존재, `--version`, `licenses`, state
   미생성 확인
 

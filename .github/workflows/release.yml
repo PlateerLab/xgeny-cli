@@ -97,7 +97,7 @@ jobs:
           test -n "$package_version"
           test "$RELEASE_TAG" = "v$package_version"
 
-      - name: Require npm Trusted Publishing readiness
+      - name: Require npm token publishing readiness
         env:
           NPM_PUBLISH_ENABLED: ${{ vars.XGENY_NPM_PUBLISH_ENABLED }}
         shell: bash
@@ -856,7 +856,7 @@ jobs:
           }
 
   publish-npm:
-    name: Publish npm packages with OIDC
+    name: Publish npm packages with token authentication and provenance
     needs: publish
     runs-on: ubuntu-24.04
     permissions:
@@ -875,6 +875,7 @@ jobs:
         with:
           node-version: 24.20.0
           package-manager-cache: false
+          registry-url: https://registry.npmjs.org/
 
       - name: Recheck immutable GitHub Release binding
         env:
@@ -955,10 +956,12 @@ jobs:
 
       - name: Publish platform packages then launcher
         env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
         shell: bash
         run: |
           set -euo pipefail
+          test -n "$NODE_AUTH_TOKEN"
           node npm/scripts/publish.mjs \
             --directory release \
             --tag "$RELEASE_TAG"
