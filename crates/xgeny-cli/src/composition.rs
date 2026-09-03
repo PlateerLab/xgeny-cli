@@ -367,13 +367,28 @@ pub fn check_openai_compatibility(request: ModelCheckRequest) -> Result<(), Mode
         tokenizer,
         credential,
     } = request;
-    let config = OpenAiPlannerConfig::new(&base_url, DEFAULT_PLANNER_ID, &model, &tokenizer)
-        .and_then(|config| config.with_timeout(MODEL_CHECK_TIMEOUT))
-        .map_err(map_model_check_config)?;
+    let config = compatibility_probe_config(&base_url, &model, &tokenizer)?;
     OpenAiCompatibilityChecker::new(config, credential)
         .map_err(map_model_check_config)?
         .check()
         .map_err(map_compatibility_check_failure)
+}
+
+/// Build the compatibility probe with the exact non-secret request semantics of the production
+/// planner: the same output token budget and the same inference wall-clock budget.
+///
+/// The catalog checks keep the shorter `MODEL_CHECK_TIMEOUT` because a `GET /v1/models` performs
+/// no inference. A real strict-JSON inference on a local model scales with model size and cold
+/// load, so a catalog-sized timeout produces spurious `timeout` failures during onboarding.
+fn compatibility_probe_config(
+    base_url: &str,
+    model: &str,
+    tokenizer: &str,
+) -> Result<OpenAiPlannerConfig, ModelCheckError> {
+    OpenAiPlannerConfig::new(base_url, DEFAULT_PLANNER_ID, model, tokenizer)
+        .and_then(|config| config.with_max_output_tokens(MAX_OUTPUT_TOKENS))
+        .and_then(|config| config.with_timeout(MODEL_TIMEOUT))
+        .map_err(map_model_check_config)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2412,6 +2427,26 @@ mod tests {
             false,
             PlannedExecutionProfile::LocalSyncOnceV1
         ));
+    }
+
+    #[test]
+    fn compatibility_probe_config_matches_the_production_planner_profile() {
+        let probe = compatibility_probe_config("http://127.0.0.1:1/v1", "model", "tokenizer")
+            .expect("probe config should validate");
+        let production = planner_config(
+            "http://127.0.0.1:1/v1",
+            DEFAULT_PLANNER_ID,
+            "model",
+            "tokenizer",
+            false,
+        )
+        .expect("production config should validate");
+
+        assert_eq!(
+            probe.request_profile_digest(),
+            production.request_profile_digest(),
+            "probe must commit the same non-secret request semantics the production planner uses"
+        );
     }
 
     #[test]
