@@ -68,7 +68,7 @@ xgeny model remove qwen-xgen
 `--token-stdin`, `XGENY_OPENAI_API_KEY`, profile secure store 순서다. Profile credential은 profile URL과
 최종 URL이 정확히 같을 때만 사용한다.
 
-Compatibility probe는 production planner와 같은 출력 token 예산과 inference timeout을 사용한다. Catalog GET만 더 짧은 timeout을 유지한다. Reasoning을 많이 쓰는 model이 최종 JSON 전에 예산을 소진하면 `provider_output_truncated`로 닫으며, rate limit과 구분한다.
+Compatibility probe는 production planner와 같은 proposal JSON Schema, 출력 token 예산, inference timeout을 사용하고 응답을 production과 같은 document 규칙으로 검증한다. Probe는 model에게 schema 밖의 top-level field를 하나 더 넣으라고 요구하므로, strict schema를 실제로 강제하는 provider만 통과한다. Schema를 받아들이지만 강제하지 못하는 provider(예: 문법 컴파일에 실패하고도 200을 반환하는 서버)는 첫 planner call 대신 `model setup`에서 실패한다. Catalog GET만 더 짧은 timeout을 유지한다. Reasoning을 많이 쓰는 model이 최종 JSON 전에 예산을 소진하면 `provider_output_truncated`로 닫으며, rate limit과 구분한다.
 
 `model check`는 기본적으로 기존 계약인 catalog GET만 보낸다. `--compatibility`는 strict JSON Schema
 Chat Completions POST를 한 번 추가한다. `model setup`은 profile commit 전에 두 요청을 항상 수행한다.

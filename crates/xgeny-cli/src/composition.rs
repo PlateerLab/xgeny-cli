@@ -240,6 +240,9 @@ pub enum ModelCheckError {
     AuthenticationRejected,
     RateLimited,
     OutputTruncated,
+    /// The inference probe answered, but not with a production-shaped document: the provider
+    /// accepted the strict schema without enforcing it, or answered outside the envelope.
+    IncompatibleResponse,
     Timeout,
     RequestRejected,
     Unavailable,
@@ -262,6 +265,7 @@ impl ModelCheckError {
             Self::AuthenticationRejected => "authentication_rejected",
             Self::RateLimited => "rate_limited",
             Self::OutputTruncated => "provider_output_truncated",
+            Self::IncompatibleResponse => "chat_completions_incompatible",
             Self::Timeout => "timeout",
             Self::RequestRejected => "request_rejected",
             Self::Unavailable => "provider_unavailable",
@@ -281,7 +285,10 @@ impl ModelCheckError {
             | Self::InvalidCredential
             | Self::InsecureCredentialTransport
             | Self::InsecureEndpointTransport => 64,
-            Self::InvalidResponse | Self::ModelNotAdvertised | Self::OutputTruncated => 65,
+            Self::InvalidResponse
+            | Self::ModelNotAdvertised
+            | Self::OutputTruncated
+            | Self::IncompatibleResponse => 65,
             Self::AuthenticationRejected => 77,
             Self::RateLimited | Self::Timeout | Self::RequestRejected | Self::Unavailable => 69,
         }
@@ -1543,7 +1550,7 @@ fn map_compatibility_check_failure(error: OpenAiCompatibilityCheckFailure) -> Mo
     match error {
         OpenAiCompatibilityCheckFailure::Timeout => ModelCheckError::Timeout,
         OpenAiCompatibilityCheckFailure::Unavailable => ModelCheckError::Unavailable,
-        OpenAiCompatibilityCheckFailure::InvalidResponse => ModelCheckError::InvalidResponse,
+        OpenAiCompatibilityCheckFailure::InvalidResponse => ModelCheckError::IncompatibleResponse,
         OpenAiCompatibilityCheckFailure::ProviderLimit => ModelCheckError::RateLimited,
         OpenAiCompatibilityCheckFailure::OutputTruncated => ModelCheckError::OutputTruncated,
         OpenAiCompatibilityCheckFailure::RequestRejected => ModelCheckError::RequestRejected,
@@ -2452,6 +2459,16 @@ mod tests {
             false,
             PlannedExecutionProfile::LocalSyncOnceV1
         ));
+    }
+
+    #[test]
+    fn schema_violating_probe_answer_is_reported_as_chat_completions_incompatible() {
+        let error =
+            map_compatibility_check_failure(OpenAiCompatibilityCheckFailure::InvalidResponse);
+        assert_eq!(error.code(), "chat_completions_incompatible");
+        assert_eq!(error.exit_code(), 65);
+        // The catalog stage keeps its own class; the two stages must not share a code string.
+        assert_ne!(error.code(), ModelCheckError::InvalidResponse.code());
     }
 
     #[test]

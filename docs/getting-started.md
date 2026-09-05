@@ -414,6 +414,7 @@ State 삭제는 Run 기록과 durable recovery 정보를 잃으므로 uninstall�
 | Installer가 destination을 거부 | 관리자 공용 경로 대신 user-owned directory를 사용하고 symbolic link/reparse point나 broadly writable directory를 제거하지 말고 다른 빈 경로를 선택한다. |
 | PowerShell에서 installer 차단 | Script를 먼저 검토한다. 현재 process 한정 execution-policy 예외는 조직 정책이 허용할 때만 사용한다. SmartScreen 경고는 RC3에 Authenticode가 없기 때문이다. |
 | `credential_store_unavailable` | 평문 저장 fallback은 없다. Secret manager 출력을 `--token-stdin`이나 현재 process의 `XGENY_OPENAI_API_KEY`로 전달한다. |
+| `chat_completions_incompatible` | Provider가 strict JSON Schema 요청을 받아들였지만 실제로 강제하지 않았거나 envelope 밖으로 답했다. Probe는 production planner와 같은 proposal schema를 보내고 schema 밖 field를 하나 더 요구하므로, 문법을 강제하지 못하는 서버는 planner call 대신 `model setup`에서 여기서 닫힌다. 이는 의도된 동작이다. Provider의 JSON Schema 지원 범위(예: `maxLength` 상한, `additionalProperties`)를 확인한다. |
 | `model_not_advertised` 또는 compatibility 실패 | URL이 `/v1`로 끝나는지, exact served model ID와 strict JSON Schema Chat Completions 지원을 확인한다. Redirect나 자동 retry에 의존하지 않는다. |
 | `model setup`/`model check`의 `timeout` | Inference probe는 production planner와 같은 wall-clock 예산을 쓴다. 로컬 model은 첫 로드가 크기와 disk cache 상태에 따라 수십 초 걸릴 수 있으므로 endpoint에서 model을 한 번 warm-up한 뒤 재시도한다. |
 | `provider_output_truncated` | Probe나 planner 응답이 출력 token 예산에서 잘렸다. Reasoning을 많이 쓰는 model은 최종 JSON 전에 예산을 소진할 수 있으므로 model의 thinking 설정이나 profile의 출력 예산을 조정한다. Rate limit이 아니므로 재시도로 해결되지 않는다. |
