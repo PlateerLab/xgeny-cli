@@ -46,7 +46,7 @@ use xgeny_runtime::{
     PlanningConstraint, ProposalRejection, RequiredRouteFeatures, RouteRequest,
 };
 use xgeny_workgraph::{
-    CompletionOutputRecord, ModelCallStatus, PlannedExecutionProfile,
+    CompletionOutputRecord, ModelCallRejectionReason, ModelCallStatus, PlannedExecutionProfile,
     ReconstructableMaterialReference, RunEvent, RunEventBody, RunState, StepStatus,
     derive_frontier,
 };
@@ -424,7 +424,8 @@ pub enum RejectionReason {
     /// The Core rejected the untrusted proposal. The class is a Core verdict, never model text.
     ProposalRejected(ProposalRejection),
     MaterialRejected,
-    ModelRejected,
+    /// The model call was rejected. The class is the same durable class the journal records.
+    ModelRejected(ModelCallRejectionReason),
     FailedWork,
 }
 
@@ -436,9 +437,22 @@ impl RejectionReason {
             Self::AdmissionRejected => "admission_rejected",
             Self::ProposalRejected(rejection) => proposal_rejection_code(rejection),
             Self::MaterialRejected => "material_rejected",
-            Self::ModelRejected => "model_rejected",
+            Self::ModelRejected(reason) => model_rejection_code(reason),
             Self::FailedWork => "failed_work",
         }
+    }
+}
+
+const fn model_rejection_code(reason: ModelCallRejectionReason) -> &'static str {
+    match reason {
+        ModelCallRejectionReason::PlannerInvalidResponse => {
+            "model_rejected.planner_invalid_response"
+        }
+        ModelCallRejectionReason::ProviderLimit => "model_rejected.provider_limit",
+        ModelCallRejectionReason::ProviderRejected => "model_rejected.provider_rejected",
+        ModelCallRejectionReason::ProposalRejected => "model_rejected.proposal_rejected",
+        ModelCallRejectionReason::MaterializationFailed => "model_rejected.materialization_failed",
+        ModelCallRejectionReason::StaleHead => "model_rejected.stale_head",
     }
 }
 
@@ -1591,6 +1605,28 @@ fn map_layout_create(error: crate::run_layout::RunLayoutError) -> PublicRunError
     }
 }
 
+/// Map an un-journaled planner port failure onto the same public classes the journal uses.
+///
+/// Transport uncertainty stays a recovery boundary; every deterministic rejection carries the
+/// durable `ModelCallRejectionReason` class so callers never see a bare `model_rejected`.
+fn map_planner_unavailable(run_id: String, failure: PlannerPortFailure) -> LocalCommandResult {
+    let reason = match failure {
+        PlannerPortFailure::Timeout | PlannerPortFailure::Unavailable => {
+            return LocalCommandResult::RecoveryRequired {
+                run_id,
+                reason: RecoveryReason::ModelCallUnknown,
+            };
+        }
+        PlannerPortFailure::InvalidResponse => ModelCallRejectionReason::PlannerInvalidResponse,
+        PlannerPortFailure::ProviderLimit => ModelCallRejectionReason::ProviderLimit,
+        PlannerPortFailure::ProviderRejected => ModelCallRejectionReason::ProviderRejected,
+    };
+    LocalCommandResult::Rejected {
+        run_id,
+        reason: RejectionReason::ModelRejected(reason),
+    }
+}
+
 fn map_driver_outcome(
     run_id: &str,
     outcome: DriverOutcome,
@@ -1663,25 +1699,14 @@ fn map_driver_outcome(
             run_id,
             reason: RejectionReason::MaterialRejected,
         },
-        DriverOutcome::PlannerUnavailable(failure) => match failure {
-            PlannerPortFailure::Timeout | PlannerPortFailure::Unavailable => {
-                LocalCommandResult::RecoveryRequired {
-                    run_id,
-                    reason: RecoveryReason::ModelCallUnknown,
-                }
-            }
-            _ => LocalCommandResult::Rejected {
-                run_id,
-                reason: RejectionReason::ModelRejected,
-            },
-        },
+        DriverOutcome::PlannerUnavailable(failure) => map_planner_unavailable(run_id, failure),
         DriverOutcome::ModelCallRecoveryRequired { .. } => LocalCommandResult::RecoveryRequired {
             run_id,
             reason: RecoveryReason::ModelCallUnknown,
         },
-        DriverOutcome::ModelCallRejected(_) => LocalCommandResult::Rejected {
+        DriverOutcome::ModelCallRejected(reason) => LocalCommandResult::Rejected {
             run_id,
-            reason: RejectionReason::ModelRejected,
+            reason: RejectionReason::ModelRejected(reason),
         },
         DriverOutcome::ModelEgressRequired => LocalCommandResult::Paused {
             run_id: Some(run_id),
@@ -2447,6 +2472,64 @@ mod tests {
             production.request_profile_digest(),
             "probe must commit the same non-secret request semantics the production planner uses"
         );
+    }
+
+    #[test]
+    fn model_rejection_class_reaches_the_public_result_code() {
+        // Journaled settlement path: the durable ModelCallRejectionReason must survive to the code.
+        assert_eq!(
+            map_driver_outcome(
+                "run-model-rejection",
+                DriverOutcome::ModelCallRejected(ModelCallRejectionReason::PlannerInvalidResponse),
+            )
+            .unwrap(),
+            LocalCommandResult::Rejected {
+                run_id: "run-model-rejection".to_owned(),
+                reason: RejectionReason::ModelRejected(
+                    ModelCallRejectionReason::PlannerInvalidResponse
+                ),
+            }
+        );
+        // Un-journaled planner port failures map onto the same durable class names.
+        assert_eq!(
+            map_driver_outcome(
+                "run-model-rejection",
+                DriverOutcome::PlannerUnavailable(PlannerPortFailure::ProviderRejected),
+            )
+            .unwrap(),
+            LocalCommandResult::Rejected {
+                run_id: "run-model-rejection".to_owned(),
+                reason: RejectionReason::ModelRejected(ModelCallRejectionReason::ProviderRejected),
+            }
+        );
+        for (reason, code) in [
+            (
+                ModelCallRejectionReason::PlannerInvalidResponse,
+                "model_rejected.planner_invalid_response",
+            ),
+            (
+                ModelCallRejectionReason::ProviderLimit,
+                "model_rejected.provider_limit",
+            ),
+            (
+                ModelCallRejectionReason::ProviderRejected,
+                "model_rejected.provider_rejected",
+            ),
+            (
+                ModelCallRejectionReason::ProposalRejected,
+                "model_rejected.proposal_rejected",
+            ),
+            (
+                ModelCallRejectionReason::MaterializationFailed,
+                "model_rejected.materialization_failed",
+            ),
+            (
+                ModelCallRejectionReason::StaleHead,
+                "model_rejected.stale_head",
+            ),
+        ] {
+            assert_eq!(RejectionReason::ModelRejected(reason).code(), code);
+        }
     }
 
     #[test]
