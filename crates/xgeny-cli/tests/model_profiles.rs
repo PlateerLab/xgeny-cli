@@ -76,7 +76,7 @@ impl ModelServer {
                         })
                         .to_string()
                     } else {
-                        json!({"status":"ok"}).to_string()
+                        json!({"formatVersion":1,"kind":"completion_candidate","steps":[],"summary":"ok"}).to_string()
                     };
                     json!({
                         "model": MODEL,
