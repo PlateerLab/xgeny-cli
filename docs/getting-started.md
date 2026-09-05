@@ -173,6 +173,18 @@ xgeny model setup \
 
 Loopback HTTP에는 ambient `XGENY_OPENAI_API_KEY`가 있더라도 전송하지 않는다.
 
+Planner 호출의 wall-clock 예산과 출력 token 예산은 프로필 설정이다. 기본값은 300초와 1024 token이며
+`--inference-timeout <초>`, `--max-output-tokens <토큰>` 또는 `XGENY_OPENAI_INFERENCE_TIMEOUT`,
+`XGENY_OPENAI_MAX_OUTPUT_TOKENS`로 바꾼다. 로컬 27B 급 model은 planning context prefill만 30초
+이상 걸릴 수 있으므로 timeout을 줄일 때는 `model_call_unknown`이 늘어난다. 두 값은 Run의 request
+profile에 묶이므로 Run 시작 뒤 프로필에서 바꾸면 그 Run의 resume은 `configuration_mismatch`로
+닫힌다.
+
+```bash
+xgeny model setup --name qwen38 --base-url http://127.0.0.1:11434/v1 \
+  --model qwen3.8:27b-q4_K_M --inference-timeout 300 --max-output-tokens 1024
+```
+
 원격 provider는 HTTPS를 사용한다. Interactive setup은 macOS Keychain, Windows Credential Manager 또는
 Linux Secret Service에 key를 저장한다. Headless/CI는 secret manager 출력을 stdin으로 전달한다.
 `--store-token`을 생략하면 현재 setup 검증에만 사용하고 저장하지 않는다.
@@ -420,7 +432,8 @@ State 삭제는 Run 기록과 durable recovery 정보를 잃으므로 uninstall�
 | `provider_output_truncated` | Probe나 planner 응답이 출력 token 예산에서 잘렸다. Reasoning을 많이 쓰는 model은 최종 JSON 전에 예산을 소진할 수 있으므로 model의 thinking 설정이나 profile의 출력 예산을 조정한다. Rate limit이 아니므로 재시도로 해결되지 않는다. |
 | `proposal_rejected.*` | 뒤의 class가 Core가 제안을 거부한 이유다. `capability_unavailable`/`capability_unsupported`는 허용하지 않은 capability 선택, `invocation_invalid`는 scope 밖 인자나 스키마 위반, `tool_call_budget_exhausted`는 예산 소진이다. Class는 Core 판정이며 model 출력 원문이 아니다. |
 | `model_rejected.*` | 뒤의 class는 journal의 model call settlement와 같은 값이다. `planner_invalid_response`는 provider가 strict JSON Schema를 지키지 않은 응답(문법 미지원·미적용), `provider_limit`은 출력 예산·요청 크기 초과, `provider_rejected`는 4xx 거부다. Class는 Core 판정이며 model 출력 원문이 아니다. |
-| `configuration_mismatch` | 원래 workspace, file/directory scope, executable와 model profile binding으로 resume한다. 자동 대체하지 말고 필요하면 새 Run을 시작한다. |
+| `configuration_mismatch` | 원래 workspace, file/directory scope, executable와 model profile binding(inference timeout·출력 예산 포함)으로 resume한다. 자동 대체하지 말고 필요하면 새 Run을 시작한다. |
+| `model_call_unknown`이 planner 호출마다 반복 | 프로필의 inference timeout이 model·hardware에 비해 짧다. 로컬 27B는 호출당 60초 안팎이 걸리므로 `--inference-timeout`을 올린다. |
 | `model_call_unknown` 또는 `effect_outcome_unknown` | 불확정 작업을 자동 반복하지 않는다. `/status`와 `/resume`의 고정 진단을 확인하고 외부 상태를 별도로 검증한다. |
 
 지원 요청에는 `xgeny --version`, OS/architecture, 설치 채널, 종료 코드와 고정된 오류 코드만 우선 제공한다.

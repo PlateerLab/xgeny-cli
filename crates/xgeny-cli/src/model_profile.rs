@@ -4,6 +4,7 @@ use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use cap_std::fs::Dir;
 use getrandom::fill;
@@ -24,6 +25,64 @@ const CREDENTIAL_SERVICE: &str = "com.plateer.xgeny.model";
 const PROFILE_VALIDATION_PLANNER_ID: &str = "xgeny.cli.openai";
 const TEMP_CREATE_ATTEMPTS: usize = 8;
 
+/// Default planner inference wall-clock budget (ADR-0035).
+pub const DEFAULT_INFERENCE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Default planner output token budget (ADR-0035).
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 1_024;
+
+/// Non-secret planner request limits carried by a model profile.
+///
+/// Both values are inputs to the committed request profile digest, so they are bound to a Run at
+/// start and must be unchanged for that Run to resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InferenceLimits {
+    timeout: Duration,
+    max_output_tokens: u32,
+}
+
+impl InferenceLimits {
+    /// Validate one pair of limits against the provider adapter bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidProfile` for a zero or over-one-hour timeout, or a zero or over-65,536
+    /// token budget.
+    pub fn new(timeout: Duration, max_output_tokens: u32) -> Result<Self, ModelProfileError> {
+        OpenAiPlannerConfig::new(
+            "https://limits.invalid/v1",
+            PROFILE_VALIDATION_PLANNER_ID,
+            "limits-validation",
+            "limits-validation",
+        )
+        .and_then(|config| config.with_timeout(timeout))
+        .and_then(|config| config.with_max_output_tokens(max_output_tokens))
+        .map_err(|_| ModelProfileError::InvalidProfile)?;
+        Ok(Self {
+            timeout,
+            max_output_tokens,
+        })
+    }
+
+    #[must_use]
+    pub const fn timeout(self) -> Duration {
+        self.timeout
+    }
+
+    #[must_use]
+    pub const fn max_output_tokens(self) -> u32 {
+        self.max_output_tokens
+    }
+}
+
+impl Default for InferenceLimits {
+    fn default() -> Self {
+        Self {
+            timeout: DEFAULT_INFERENCE_TIMEOUT,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+        }
+    }
+}
+
 /// One non-secret OpenAI-compatible model profile.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ModelProfile {
@@ -32,6 +91,7 @@ pub struct ModelProfile {
     model: String,
     tokenizer: String,
     credential_ref: Option<String>,
+    inference_limits: InferenceLimits,
 }
 
 impl ModelProfile {
@@ -52,9 +112,29 @@ impl ModelProfile {
             model: model.into(),
             tokenizer: tokenizer.into(),
             credential_ref: None,
+            inference_limits: InferenceLimits::default(),
         };
         profile.validate()?;
         Ok(profile)
+    }
+
+    #[must_use]
+    pub const fn inference_limits(&self) -> InferenceLimits {
+        self.inference_limits
+    }
+
+    /// Replace the planner inference limits.
+    ///
+    /// # Errors
+    ///
+    /// Never fails today; the limits were validated on construction. Kept fallible so callers
+    /// treat it like the other profile mutators.
+    pub fn set_inference_limits(
+        &mut self,
+        limits: InferenceLimits,
+    ) -> Result<(), ModelProfileError> {
+        self.inference_limits = limits;
+        self.validate()
     }
 
     #[must_use]
@@ -121,6 +201,8 @@ impl ModelProfile {
             &self.model,
             &self.tokenizer,
         )
+        .and_then(|config| config.with_timeout(self.inference_limits.timeout))
+        .and_then(|config| config.with_max_output_tokens(self.inference_limits.max_output_tokens))
         .map(|_| ())
         .map_err(|_| ModelProfileError::InvalidProfile)
     }
@@ -138,6 +220,7 @@ impl std::fmt::Debug for ModelProfile {
                 "credential_ref",
                 &self.credential_ref.as_ref().map(|_| "<present>"),
             )
+            .field("inference_limits", &self.inference_limits)
             .finish()
     }
 }
@@ -629,6 +712,18 @@ struct StoredProfile {
     model: String,
     tokenizer: String,
     credential_ref: Option<String>,
+    #[serde(default = "default_inference_timeout_seconds")]
+    inference_timeout_seconds: u64,
+    #[serde(default = "default_max_output_tokens")]
+    max_output_tokens: u32,
+}
+
+fn default_inference_timeout_seconds() -> u64 {
+    DEFAULT_INFERENCE_TIMEOUT.as_secs()
+}
+
+const fn default_max_output_tokens() -> u32 {
+    DEFAULT_MAX_OUTPUT_TOKENS
 }
 
 impl StoredProfile {
@@ -639,16 +734,24 @@ impl StoredProfile {
             model: profile.model.clone(),
             tokenizer: profile.tokenizer.clone(),
             credential_ref: profile.credential_ref.clone(),
+            inference_timeout_seconds: profile.inference_limits.timeout.as_secs(),
+            max_output_tokens: profile.inference_limits.max_output_tokens,
         }
     }
 
     fn into_profile(self) -> Result<ModelProfile, ModelProfileError> {
+        let inference_limits = InferenceLimits::new(
+            Duration::from_secs(self.inference_timeout_seconds),
+            self.max_output_tokens,
+        )
+        .map_err(|_| ModelProfileError::InvalidProfileFile)?;
         let profile = ModelProfile {
             name: self.name,
             base_url: self.base_url,
             model: self.model,
             tokenizer: self.tokenizer,
             credential_ref: self.credential_ref,
+            inference_limits,
         };
         profile
             .validate()
@@ -1010,6 +1113,72 @@ mod tests {
             store.save(&mut stale),
             Err(ModelProfileError::ConcurrentModification)
         );
+    }
+
+    #[test]
+    fn inference_limits_round_trip_and_legacy_files_load_with_defaults() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("config");
+        let store = ModelProfileStore::at(root.clone()).unwrap();
+        let mut profiles = store.load().unwrap();
+        let mut tuned = profile("tuned");
+        tuned
+            .set_inference_limits(
+                InferenceLimits::new(std::time::Duration::from_secs(600), 2_048).unwrap(),
+            )
+            .unwrap();
+        profiles.upsert(tuned).unwrap();
+        profiles.upsert(profile("plain")).unwrap();
+        store.save(&mut profiles).unwrap();
+
+        let text = fs::read_to_string(root.join(PROFILE_FILE)).unwrap();
+        assert!(text.contains("\"inferenceTimeoutSeconds\": 600"));
+        assert!(text.contains("\"maxOutputTokens\": 2048"));
+
+        let loaded = store.load().unwrap();
+        let tuned = loaded.get("tuned").unwrap();
+        assert_eq!(
+            tuned.inference_limits().timeout(),
+            std::time::Duration::from_secs(600)
+        );
+        assert_eq!(tuned.inference_limits().max_output_tokens(), 2_048);
+        // A profile created without explicit limits carries the defaults.
+        assert_eq!(
+            loaded.get("plain").unwrap().inference_limits(),
+            InferenceLimits::default()
+        );
+
+        // A file written before this field existed still loads, with defaults.
+        let legacy = br#"{
+          "formatVersion": 1,
+          "activeProfile": "old",
+          "profiles": [
+            {"name":"old","baseUrl":"https://provider.example/v1","model":"m","tokenizer":"t","credentialRef":null}
+          ]
+        }"#;
+        let path = root.join(PROFILE_FILE);
+        fs::write(&path, legacy).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let legacy_loaded = store.load().unwrap();
+        assert_eq!(
+            legacy_loaded.active().unwrap().inference_limits(),
+            InferenceLimits::default()
+        );
+
+        // Out-of-range stored values fail closed like any other invalid profile field.
+        let out_of_range = br#"{
+          "formatVersion": 1,
+          "activeProfile": "bad",
+          "profiles": [
+            {"name":"bad","baseUrl":"https://provider.example/v1","model":"m","tokenizer":"t","credentialRef":null,"inferenceTimeoutSeconds":0,"maxOutputTokens":1024}
+          ]
+        }"#;
+        fs::write(&path, out_of_range).unwrap();
+        assert_eq!(store.load(), Err(ModelProfileError::InvalidProfileFile));
     }
 
     #[test]

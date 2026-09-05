@@ -69,6 +69,7 @@ use crate::material_catalog::{
     WORKSPACE_READ_MATERIAL_PROVIDER_ID, WORKSPACE_READ_RECIPE_DOMAIN,
     WORKSPACE_READ_RECIPE_FORMAT_VERSION, WorkspaceReadMaterialProvider, WorkspaceReadMaterializer,
 };
+use crate::model_profile::InferenceLimits;
 use crate::run_layout::{RunLayout, discover_state_root, generate_run_id};
 
 const WORKSPACE_ID: &str = "primary";
@@ -76,8 +77,6 @@ const WORKSPACE_IDENTITY_PROFILE: &str = "xgeny.fs.workspace-root-identity.v1";
 const DEFAULT_PLANNER_ID: &str = "xgeny.cli.openai";
 const MAX_GOAL_BYTES: usize = 16 * 1024;
 const MAX_TICKS: u32 = 1_024;
-const MAX_OUTPUT_TOKENS: u32 = 1_024;
-const MODEL_TIMEOUT: Duration = Duration::from_secs(60);
 const MODEL_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCAL_EXECUTION_PROFILE_DOMAIN: &str = "xgeny.cli.local-execution-profile/v1";
 const WORKSPACE_DISCOVERY_PROFILE_DOMAIN: &str =
@@ -111,6 +110,7 @@ pub struct LocalRunRequest {
     pub model: String,
     pub tokenizer: String,
     pub credential: Option<BearerCredential>,
+    pub inference_limits: InferenceLimits,
     pub allow_files: Vec<String>,
     pub allow_dirs: Vec<String>,
     pub allow_executables: Vec<String>,
@@ -139,6 +139,7 @@ impl LocalRunRequest {
             model,
             tokenizer,
             credential: None,
+            inference_limits: InferenceLimits::default(),
             allow_files,
             allow_dirs: Vec::new(),
             allow_executables: Vec::new(),
@@ -158,6 +159,7 @@ pub struct LocalResumeRequest {
     pub workspace: Option<PathBuf>,
     pub base_url: Option<String>,
     pub credential: Option<BearerCredential>,
+    pub inference_limits: InferenceLimits,
     pub allow_files: Vec<String>,
     pub allow_dirs: Vec<String>,
     pub allow_executables: Vec<String>,
@@ -224,6 +226,7 @@ pub struct ModelCheckRequest {
     pub model: String,
     pub tokenizer: String,
     pub credential: Option<BearerCredential>,
+    pub inference_limits: InferenceLimits,
 }
 
 /// Stable, redacted failure classes returned by `xgeny model check`.
@@ -331,6 +334,7 @@ pub fn check_openai_model(request: ModelCheckRequest) -> Result<(), ModelCheckEr
         model,
         tokenizer,
         credential,
+        inference_limits: _,
     } = request;
     let config = OpenAiPlannerConfig::new(&base_url, DEFAULT_PLANNER_ID, &model, &tokenizer)
         .and_then(|config| config.with_timeout(MODEL_CHECK_TIMEOUT))
@@ -352,6 +356,7 @@ pub fn list_openai_models(request: ModelCheckRequest) -> Result<Vec<String>, Mod
         model,
         tokenizer,
         credential,
+        inference_limits: _,
     } = request;
     let config = OpenAiPlannerConfig::new(&base_url, DEFAULT_PLANNER_ID, &model, &tokenizer)
         .and_then(|config| config.with_timeout(MODEL_CHECK_TIMEOUT))
@@ -373,8 +378,9 @@ pub fn check_openai_compatibility(request: ModelCheckRequest) -> Result<(), Mode
         model,
         tokenizer,
         credential,
+        inference_limits,
     } = request;
-    let config = compatibility_probe_config(&base_url, &model, &tokenizer)?;
+    let config = compatibility_probe_config(&base_url, &model, &tokenizer, inference_limits)?;
     OpenAiCompatibilityChecker::new(config, credential)
         .map_err(map_model_check_config)?
         .check()
@@ -391,10 +397,11 @@ fn compatibility_probe_config(
     base_url: &str,
     model: &str,
     tokenizer: &str,
+    limits: InferenceLimits,
 ) -> Result<OpenAiPlannerConfig, ModelCheckError> {
     OpenAiPlannerConfig::new(base_url, DEFAULT_PLANNER_ID, model, tokenizer)
-        .and_then(|config| config.with_max_output_tokens(MAX_OUTPUT_TOKENS))
-        .and_then(|config| config.with_timeout(MODEL_TIMEOUT))
+        .and_then(|config| config.with_max_output_tokens(limits.max_output_tokens()))
+        .and_then(|config| config.with_timeout(limits.timeout()))
         .map_err(map_model_check_config)
 }
 
@@ -709,6 +716,7 @@ where
         &request.planner_id,
         &request.model,
         &request.tokenizer,
+        request.inference_limits,
         planning_constraints_required,
     )?;
     let local_execution_profile_digest =
@@ -963,6 +971,7 @@ where
             manifest.planner_id(),
             manifest.model(),
             manifest.tokenizer(),
+            request.inference_limits,
             catalog.workspace_discovery() || process.is_some(),
         )?;
         if manifest.request_profile_digest() != config.request_profile_digest() {
@@ -1508,11 +1517,12 @@ fn planner_config(
     planner_id: &str,
     model: &str,
     tokenizer: &str,
+    limits: InferenceLimits,
     planning_constraints_required: bool,
 ) -> Result<OpenAiPlannerConfig, PublicRunError> {
     let config = OpenAiPlannerConfig::new(base_url, planner_id, model, tokenizer)
-        .and_then(|config| config.with_max_output_tokens(MAX_OUTPUT_TOKENS))
-        .and_then(|config| config.with_timeout(MODEL_TIMEOUT))
+        .and_then(|config| config.with_max_output_tokens(limits.max_output_tokens()))
+        .and_then(|config| config.with_timeout(limits.timeout()))
         .map_err(map_provider_config)?;
     if planning_constraints_required {
         config
@@ -2472,14 +2482,74 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_probe_config_matches_the_production_planner_profile() {
-        let probe = compatibility_probe_config("http://127.0.0.1:1/v1", "model", "tokenizer")
-            .expect("probe config should validate");
+    fn inference_limits_default_to_the_measured_local_budget() {
+        let limits = InferenceLimits::default();
+        assert_eq!(limits.timeout(), Duration::from_secs(300));
+        assert_eq!(limits.max_output_tokens(), 1_024);
+    }
+
+    #[test]
+    fn inference_limits_reject_values_outside_the_provider_bounds() {
+        assert!(InferenceLimits::new(Duration::from_secs(0), 1_024).is_err());
+        assert!(InferenceLimits::new(Duration::from_secs(3_601), 1_024).is_err());
+        assert!(InferenceLimits::new(Duration::from_secs(300), 0).is_err());
+        assert!(InferenceLimits::new(Duration::from_secs(300), 65_537).is_err());
+        assert!(InferenceLimits::new(Duration::from_secs(1), 1).is_ok());
+        assert!(InferenceLimits::new(Duration::from_secs(3_600), 65_536).is_ok());
+    }
+
+    #[test]
+    fn probe_and_planner_follow_the_profile_limits_and_stay_digest_identical() {
+        let limits = InferenceLimits::new(Duration::from_secs(300), 2_048).unwrap();
+        let probe =
+            compatibility_probe_config("http://127.0.0.1:1/v1", "model", "tokenizer", limits)
+                .unwrap();
         let production = planner_config(
             "http://127.0.0.1:1/v1",
             DEFAULT_PLANNER_ID,
             "model",
             "tokenizer",
+            limits,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            probe.request_profile_digest(),
+            production.request_profile_digest()
+        );
+
+        let other = InferenceLimits::new(Duration::from_secs(60), 2_048).unwrap();
+        let shorter = planner_config(
+            "http://127.0.0.1:1/v1",
+            DEFAULT_PLANNER_ID,
+            "model",
+            "tokenizer",
+            other,
+            false,
+        )
+        .unwrap();
+        assert_ne!(
+            production.request_profile_digest(),
+            shorter.request_profile_digest(),
+            "timeout is a committed request-profile input, so a different limit is a different profile"
+        );
+    }
+
+    #[test]
+    fn compatibility_probe_config_matches_the_production_planner_profile() {
+        let probe = compatibility_probe_config(
+            "http://127.0.0.1:1/v1",
+            "model",
+            "tokenizer",
+            InferenceLimits::default(),
+        )
+        .expect("probe config should validate");
+        let production = planner_config(
+            "http://127.0.0.1:1/v1",
+            DEFAULT_PLANNER_ID,
+            "model",
+            "tokenizer",
+            InferenceLimits::default(),
             false,
         )
         .expect("production config should validate");
@@ -2586,6 +2656,7 @@ mod tests {
             model: "model".to_owned(),
             tokenizer: "tokenizer".to_owned(),
             credential: None,
+            inference_limits: InferenceLimits::default(),
             allow_files: vec!["README.md".to_owned()],
             allow_dirs: Vec::new(),
             allow_executables: Vec::new(),
@@ -2639,6 +2710,7 @@ mod tests {
             model: "model".to_owned(),
             tokenizer: "tokenizer".to_owned(),
             credential: None,
+            inference_limits: InferenceLimits::default(),
             allow_files: Vec::new(),
             allow_dirs: vec![".".to_owned()],
             allow_executables: vec![specification],
