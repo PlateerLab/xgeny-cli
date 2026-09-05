@@ -54,8 +54,12 @@ const CONSTRAINED_SYSTEM_PROMPT: &str = concat!(
     "Never claim that a tool ran, that permission was granted, or that the goal completed merely because it was requested."
 );
 const COMPATIBILITY_SYSTEM_PROMPT: &str = "This is an XGENy connectivity probe. Return exactly one JSON object matching the supplied schema. Do not call tools and do not add explanatory text.";
-const COMPATIBILITY_USER_PROMPT: &str =
-    "Return a successful XGENy OpenAI-compatible connection result.";
+/// The probe asks for one production-shaped completion and, deliberately, one extra top-level key.
+/// A provider that enforces the strict schema (`additionalProperties: false`) cannot emit that key,
+/// so a conforming answer proves enforcement rather than voluntary compliance. A provider that
+/// silently drops the grammar lets the model follow the instruction, and the production document
+/// parser rejects the unknown field.
+const COMPATIBILITY_USER_PROMPT: &str = "This is an XGENy connectivity probe with no planning context. Return a completion_candidate: set formatVersion to 1, kind to completion_candidate, steps to an empty array, and summary to the string ok. Also add one more top-level field named probe with the string value unconstrained.";
 
 /// A bearer credential retained only as a sensitive HTTP header value.
 #[derive(Clone)]
@@ -469,15 +473,16 @@ impl OpenAiCompatibilityChecker {
 
     /// Send one non-streaming Chat Completions request and validate strict JSON Schema behavior.
     ///
-    /// This probe deliberately has no local workspace or Run state. It verifies the endpoint,
-    /// selected model, Chat Completions envelope, strict `json_schema` response format, and exact
-    /// response-model identity used by the production planner.
+    /// This probe deliberately has no local workspace or Run state. It sends the byte-identical
+    /// production proposal schema and validates the answer with the production document rules, so
+    /// a provider that accepts a trivial schema but cannot enforce the real one fails here instead
+    /// of at the first planner call. It verifies the endpoint, selected model, Chat Completions
+    /// envelope, strict `json_schema` enforcement, and exact response-model identity.
     ///
     /// # Errors
     ///
     /// Returns only a fixed redacted failure class. Provider response bodies are never exposed.
     pub fn check(&mut self) -> Result<(), OpenAiCompatibilityCheckFailure> {
-        let schema = compatibility_schema();
         let body = serde_json::to_vec(&ChatCompletionRequest {
             model: &self.config.model,
             messages: [
@@ -498,9 +503,9 @@ impl OpenAiCompatibilityChecker {
             response_format: ResponseFormat {
                 response_type: "json_schema",
                 json_schema: JsonSchemaResponse {
-                    name: "xgeny_connection_probe_v1",
+                    name: "xgeny_plan_proposal_v1",
                     strict: true,
-                    schema: &schema,
+                    schema: &self.config.proposal_schema,
                 },
             },
         })
@@ -1190,11 +1195,13 @@ fn decode_compatibility_response(
     }
     let probe = parse_unique_json(content.as_bytes(), max_json_depth)
         .map_err(|_| OpenAiCompatibilityCheckFailure::InvalidResponse)?;
-    let object = probe
-        .as_object()
-        .filter(|object| object.len() == 1)
-        .ok_or(OpenAiCompatibilityCheckFailure::InvalidResponse)?;
-    if object.get("status").and_then(Value::as_str) != Some("ok") {
+    let document: ProposalDocument = serde_json::from_value(probe)
+        .map_err(|_| OpenAiCompatibilityCheckFailure::InvalidResponse)?;
+    let production_shaped = document.format_version == 1
+        && matches!(document.kind, ProposalKind::CompletionCandidate)
+        && document.steps.is_empty()
+        && !document.summary.is_empty();
+    if !production_shaped {
         return Err(OpenAiCompatibilityCheckFailure::InvalidResponse);
     }
     Ok(())
@@ -1404,17 +1411,6 @@ fn proposal_schema() -> Value {
             "summary": {"type": "string", "maxLength": 5000}
         },
         "required": ["formatVersion", "kind", "steps", "summary"],
-        "additionalProperties": false
-    })
-}
-
-fn compatibility_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "status": {"type": "string", "const": "ok"}
-        },
-        "required": ["status"],
         "additionalProperties": false
     })
 }
@@ -2172,6 +2168,91 @@ mod tests {
     }
 
     #[test]
+    fn compatibility_probe_sends_the_production_proposal_schema() {
+        let mut checker = OpenAiCompatibilityChecker::with_transport(
+            config("https://provider.example/v1"),
+            None,
+            ProductionSchemaTransport,
+        )
+        .unwrap();
+
+        assert_eq!(checker.check(), Ok(()));
+    }
+
+    #[test]
+    fn compatibility_response_is_validated_as_a_production_completion_candidate() {
+        let accept =
+            |content: &str| decode_compatibility_response(&response(content, "stop"), MODEL, 8);
+        assert_eq!(accept(COMPLETION_OK), Ok(()));
+        // Any wording is fine; only the envelope and the production document rules are checked.
+        assert_eq!(
+            accept(
+                r#"{"formatVersion":1,"kind":"completion_candidate","steps":[],"summary":"connected"}"#
+            ),
+            Ok(())
+        );
+
+        for rejected in [
+            // The legacy one-key probe object is no longer a production-shaped answer.
+            r#"{"status":"ok"}"#,
+            // A plan is not a completion.
+            r#"{"formatVersion":1,"kind":"plan","steps":[],"summary":""}"#,
+            // completion_candidate must carry no steps.
+            r#"{"formatVersion":1,"kind":"completion_candidate","steps":[{"key":"k","objective":"o","dependsOn":[],"capability":{"capabilityId":"c","contractVersion":"1.0.0"},"arguments":{}}],"summary":"ok"}"#,
+            // completion_candidate must carry a non-empty summary (same rule as production).
+            r#"{"formatVersion":1,"kind":"completion_candidate","steps":[],"summary":""}"#,
+            // deny_unknown_fields: a provider that ignored the grammar leaks extra keys.
+            r#"{"formatVersion":1,"kind":"completion_candidate","steps":[],"summary":"ok","extra":true}"#,
+            // Wrong format version.
+            r#"{"formatVersion":2,"kind":"completion_candidate","steps":[],"summary":"ok"}"#,
+            // Missing required field.
+            r#"{"formatVersion":1,"kind":"completion_candidate","summary":"ok"}"#,
+        ] {
+            assert_eq!(
+                accept(rejected),
+                Err(OpenAiCompatibilityCheckFailure::InvalidResponse),
+                "must reject: {rejected}"
+            );
+        }
+    }
+
+    #[test]
+    fn compatibility_response_keeps_the_content_cap_and_truncation_class() {
+        let oversized = format!(
+            r#"{{"formatVersion":1,"kind":"completion_candidate","steps":[],"summary":"{}"}}"#,
+            "x".repeat(1_100)
+        );
+        assert_eq!(
+            decode_compatibility_response(&response(&oversized, "stop"), MODEL, 8),
+            Err(OpenAiCompatibilityCheckFailure::InvalidResponse)
+        );
+        assert_eq!(
+            decode_compatibility_response(&response(COMPLETION_OK, "length"), MODEL, 8),
+            Err(OpenAiCompatibilityCheckFailure::OutputTruncated)
+        );
+    }
+
+    #[test]
+    fn request_profile_digest_is_unchanged_by_the_probe_contract() {
+        // Golden values captured on main before the probe change. The probe prompt and probe
+        // request shape are not inputs to the committed request profile; only the planner
+        // prompt, proposal schema, and bounded limits are.
+        assert_eq!(
+            config("https://provider.example/v1").request_profile_digest(),
+            "sha256:252d52598b17e223f7dd0a53015cc2d2fd49cffaf8f688bb55bd565cf1f97ba5"
+        );
+        assert_eq!(
+            config("https://provider.example/v1")
+                .with_max_output_tokens(1_024)
+                .unwrap()
+                .with_timeout(Duration::from_secs(60))
+                .unwrap()
+                .request_profile_digest(),
+            "sha256:2a3812dfbfbb7c3b5065cd58044c05564423b3da6b304622f872fda35a8ca352"
+        );
+    }
+
+    #[test]
     fn compatibility_probe_requests_the_configured_output_budget() {
         let config = config("https://provider.example/v1")
             .with_max_output_tokens(2_048)
@@ -2193,7 +2274,7 @@ mod tests {
     #[test]
     fn compatibility_response_requires_exact_model_single_safe_choice_and_exact_probe_object() {
         assert_eq!(
-            decode_compatibility_response(&response(r#"{"status":"ok"}"#, "stop"), MODEL, 8),
+            decode_compatibility_response(&response(COMPLETION_OK, "stop"), MODEL, 8),
             Ok(())
         );
 
@@ -2201,7 +2282,7 @@ mod tests {
             "model": "other-model",
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": "{\"status\":\"ok\"}"},
+                "message": {"role": "assistant", "content": COMPLETION_OK},
                 "finish_reason": "stop"
             }]
         }))
@@ -2211,15 +2292,7 @@ mod tests {
             Err(OpenAiCompatibilityCheckFailure::InvalidResponse)
         );
         assert_eq!(
-            decode_compatibility_response(
-                &response(r#"{"status":"ok","extra":true}"#, "stop"),
-                MODEL,
-                8,
-            ),
-            Err(OpenAiCompatibilityCheckFailure::InvalidResponse)
-        );
-        assert_eq!(
-            decode_compatibility_response(&response(r#"{"status":"ok"}"#, "length"), MODEL, 8),
+            decode_compatibility_response(&response(COMPLETION_OK, "length"), MODEL, 8),
             Err(OpenAiCompatibilityCheckFailure::OutputTruncated)
         );
 
@@ -2229,7 +2302,7 @@ mod tests {
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": "{\"status\":\"ok\"}",
+                    "content": COMPLETION_OK,
                     "tool_calls": []
                 },
                 "finish_reason": "stop"
@@ -2315,7 +2388,7 @@ mod tests {
                 body["response_format"]["json_schema"]["schema"]["additionalProperties"],
                 false
             );
-            Ok(response(r#"{"status":"ok"}"#, "stop"))
+            Ok(response(COMPLETION_OK, "stop"))
         }
     }
 
@@ -2325,7 +2398,34 @@ mod tests {
         fn send(&mut self, request: TransportRequest<'_>) -> Result<Vec<u8>, PlannerPortFailure> {
             let body: Value = serde_json::from_slice(request.body).unwrap();
             assert_eq!(body["max_tokens"], json!(2_048));
-            Ok(response(r#"{"status":"ok"}"#, "stop"))
+            Ok(response(COMPLETION_OK, "stop"))
+        }
+    }
+
+    const COMPLETION_OK: &str =
+        r#"{"formatVersion":1,"kind":"completion_candidate","steps":[],"summary":"ok"}"#;
+
+    struct ProductionSchemaTransport;
+
+    impl Transport for ProductionSchemaTransport {
+        fn send(&mut self, request: TransportRequest<'_>) -> Result<Vec<u8>, PlannerPortFailure> {
+            let body: Value = serde_json::from_slice(request.body).unwrap();
+            assert_eq!(
+                body["response_format"]["json_schema"]["schema"],
+                proposal_schema(),
+                "probe must send the byte-identical production proposal schema"
+            );
+            assert_eq!(
+                body["response_format"]["json_schema"]["name"],
+                "xgeny_plan_proposal_v1"
+            );
+            assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+            let user = body["messages"][1]["content"].as_str().unwrap();
+            assert!(
+                user.contains("field named probe"),
+                "probe must ask for an extra key that only an unenforced grammar would allow"
+            );
+            Ok(response(COMPLETION_OK, "stop"))
         }
     }
 
