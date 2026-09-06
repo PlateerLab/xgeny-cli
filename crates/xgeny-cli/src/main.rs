@@ -2,16 +2,17 @@ use std::env;
 use std::io::{BufRead as _, ErrorKind, IsTerminal as _, Read as _, Write as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use url::Url;
 use xgeny_cli::{
-    DriverProgress, DriverProgressControl, LocalCommandResult, LocalProcessSession,
-    LocalResumeRequest, LocalRunRequest, ModelCheckError, ModelCheckRequest, ModelCredentialStore,
-    ModelProfile, ModelProfileError, ModelProfileStore, OsModelCredentialStore, PublicRunError,
-    check_openai_compatibility, check_openai_model, list_openai_models, new_credential_reference,
-    prepare_local_process_session, resume_local, resume_local_with_model_resolver,
-    resume_local_with_model_resolver_and_progress,
+    DriverProgress, DriverProgressControl, InferenceLimits, LocalCommandResult,
+    LocalProcessSession, LocalResumeRequest, LocalRunRequest, ModelCheckError, ModelCheckRequest,
+    ModelCredentialStore, ModelProfile, ModelProfileError, ModelProfileStore,
+    OsModelCredentialStore, PublicRunError, check_openai_compatibility, check_openai_model,
+    list_openai_models, new_credential_reference, prepare_local_process_session, resume_local,
+    resume_local_with_model_resolver, resume_local_with_model_resolver_and_progress,
     resume_local_with_process_session_and_model_resolver_progress,
     run_local_with_process_session_progress, run_local_with_started,
 };
@@ -82,7 +83,7 @@ enum ModelCommand {
 
 #[derive(Debug, Args)]
 #[command(
-    after_long_help = "Resolution order: explicit options, XGENY_OPENAI_BASE_URL / XGENY_OPENAI_MODEL / XGENY_OPENAI_TOKENIZER environment, then the selected/active profile. HTTPS authentication uses --token-stdin, XGENY_OPENAI_API_KEY, then the profile secure store; no token value is accepted as a command argument."
+    after_long_help = "Resolution order: explicit options, XGENY_OPENAI_BASE_URL / XGENY_OPENAI_MODEL / XGENY_OPENAI_TOKENIZER environment, then the selected/active profile. Planner inference limits follow XGENY_OPENAI_INFERENCE_TIMEOUT / XGENY_OPENAI_MAX_OUTPUT_TOKENS, then the profile (default 300s / 1024 tokens). HTTPS authentication uses --token-stdin, XGENY_OPENAI_API_KEY, then the profile secure store; no token value is accepted as a command argument."
 )]
 struct ModelCheckArgs {
     /// OpenAI-compatible API base URL ending in /v1.
@@ -128,6 +129,12 @@ struct ModelSetupArgs {
     /// Persist the supplied stdin/environment token in the platform secure store.
     #[arg(long)]
     store_token: bool,
+    /// Planner inference wall-clock budget in seconds (1..=3600); defaults to the profile value or 300.
+    #[arg(long, value_name = "SECONDS")]
+    inference_timeout: Option<u64>,
+    /// Planner output token budget (1..=65536); defaults to the profile value or 1024.
+    #[arg(long, value_name = "TOKENS")]
+    max_output_tokens: Option<u32>,
 }
 
 #[derive(Debug, Args)]
@@ -151,7 +158,7 @@ struct ModelOptionalNameArgs {
             .multiple(true)
             .args(["allow_files", "allow_dirs"])
     ),
-    after_long_help = "Resolution order: explicit options, XGENY_OPENAI_BASE_URL / XGENY_OPENAI_MODEL / XGENY_OPENAI_TOKENIZER environment, then the selected/active profile. HTTPS authentication uses --token-stdin, XGENY_OPENAI_API_KEY, then the profile secure store. Credentials are ignored for loopback HTTP and cannot be passed as a command-line value."
+    after_long_help = "Resolution order: explicit options, XGENY_OPENAI_BASE_URL / XGENY_OPENAI_MODEL / XGENY_OPENAI_TOKENIZER environment, then the selected/active profile. Planner inference limits follow XGENY_OPENAI_INFERENCE_TIMEOUT / XGENY_OPENAI_MAX_OUTPUT_TOKENS, then the profile (default 300s / 1024 tokens). HTTPS authentication uses --token-stdin, XGENY_OPENAI_API_KEY, then the profile secure store. Credentials are ignored for loopback HTTP and cannot be passed as a command-line value."
 )]
 struct RunArgs {
     /// Goal sent to the bounded planner.
@@ -366,6 +373,7 @@ impl repl::ReplHost for InteractiveHost {
                 model: model.model,
                 tokenizer: model.tokenizer,
                 credential: model.credential,
+                inference_limits: model.inference_limits,
                 allow_files: Vec::new(),
                 allow_dirs: vec![".".to_owned()],
                 allow_executables: Vec::new(),
@@ -394,6 +402,8 @@ impl repl::ReplHost for InteractiveHost {
             workspace: Some(self.workspace.clone()),
             base_url: None,
             credential: None,
+            inference_limits: resolve_inference_limits(None, None, None)
+                .map_err(|error| repl::ReplFailure::new(error.code()))?,
             allow_files: Vec::new(),
             allow_dirs: vec![".".to_owned()],
             allow_executables: if process_session.is_some() {
@@ -481,6 +491,8 @@ fn ensure_interactive_model() -> Result<(), ModelCliError> {
         tokenizer: None,
         token_stdin: false,
         store_token: false,
+        inference_timeout: None,
+        max_output_tokens: None,
     })?;
     println!("XGENy model setup: PASS");
     println!("  profile: {}", profile.name());
@@ -539,6 +551,7 @@ fn run_command(args: RunArgs) -> ExitCode {
             model: resolved.model,
             tokenizer: resolved.tokenizer,
             credential: resolved.credential,
+            inference_limits: resolved.inference_limits,
             allow_files: args.allow_files,
             allow_dirs: args.allow_dirs,
             allow_executables: args.allow_executables,
@@ -568,11 +581,16 @@ fn resume_command(args: ResumeArgs) -> ExitCode {
         allow_execute,
         max_ticks,
     } = args;
+    let inference_limits = match resolve_inference_limits(None, None, None) {
+        Ok(limits) => limits,
+        Err(error) => return present_model_configuration_error(error),
+    };
     let request = LocalResumeRequest {
         run_id,
         workspace,
         base_url: None,
         credential: None,
+        inference_limits,
         allow_files,
         allow_dirs,
         allow_executables,
@@ -609,6 +627,7 @@ struct ResolvedModel {
     model: String,
     tokenizer: String,
     credential: Option<BearerCredential>,
+    inference_limits: InferenceLimits,
 }
 
 struct ResolvedEndpoint {
@@ -639,6 +658,7 @@ enum ModelCliError {
     InputUnavailable,
     InvalidCredential,
     CredentialRequiresHttps,
+    InvalidInferenceLimits,
 }
 
 impl ModelCliError {
@@ -651,6 +671,7 @@ impl ModelCliError {
             Self::InputUnavailable => "input_unavailable",
             Self::InvalidCredential => "api_key_invalid",
             Self::CredentialRequiresHttps => "api_key_requires_https",
+            Self::InvalidInferenceLimits => "inference_limits_invalid",
         }
     }
 
@@ -669,7 +690,8 @@ impl ModelCliError {
             | Self::InvalidEnvironment
             | Self::InputUnavailable
             | Self::InvalidCredential
-            | Self::CredentialRequiresHttps => 64,
+            | Self::CredentialRequiresHttps
+            | Self::InvalidInferenceLimits => 64,
             Self::Check(error) => error.exit_code(),
         }
     }
@@ -695,6 +717,11 @@ fn model_setup(args: ModelSetupArgs) -> ExitCode {
             println!("  model: {}", profile.model());
             println!("  catalog: exact model advertised");
             println!("  chat completions: strict JSON compatible");
+            println!(
+                "  inference limits: timeout={}s max_output_tokens={}",
+                profile.inference_limits().timeout().as_secs(),
+                profile.inference_limits().max_output_tokens()
+            );
             println!(
                 "  authentication: {}",
                 if stored {
@@ -751,6 +778,7 @@ fn try_model_setup(args: ModelSetupArgs) -> Result<(ModelProfile, bool), ModelCl
         model: catalog_identity.clone(),
         tokenizer: catalog_identity,
         credential: credential.clone(),
+        inference_limits: InferenceLimits::default(),
     })?;
     let model = match requested_model {
         Some(model) if models.iter().any(|candidate| candidate == &model) => model,
@@ -769,11 +797,17 @@ fn try_model_setup(args: ModelSetupArgs) -> Result<(ModelProfile, bool), ModelCl
         })
         .unwrap_or_else(|| model.clone());
 
+    let inference_limits = resolve_inference_limits(
+        args.inference_timeout,
+        args.max_output_tokens,
+        existing.as_ref(),
+    )?;
     check_openai_compatibility(ModelCheckRequest {
         base_url: base_url.clone(),
         model: model.clone(),
         tokenizer: tokenizer.clone(),
         credential,
+        inference_limits,
     })?;
 
     let _lock = store.try_lock()?;
@@ -787,6 +821,7 @@ fn try_model_setup(args: ModelSetupArgs) -> Result<(ModelProfile, bool), ModelCl
         .map(str::to_owned);
     let credentials = OsModelCredentialStore;
     let mut profile = ModelProfile::new(&args.name, base_url, model, tokenizer)?;
+    profile.set_inference_limits(inference_limits)?;
     let retain_existing = secret.source == SetupSecretSource::SecureStore;
     let should_store = args.store_token || secret.source == SetupSecretSource::Interactive;
     let mut new_reference = None;
@@ -836,10 +871,12 @@ fn model_list() -> ExitCode {
                 " "
             };
             println!(
-                "{marker} {} model={} tokenizer={} authentication={}",
+                "{marker} {} model={} tokenizer={} timeout={}s max_output_tokens={} authentication={}",
                 profile.name(),
                 profile.model(),
                 profile.tokenizer(),
+                profile.inference_limits().timeout().as_secs(),
+                profile.inference_limits().max_output_tokens(),
                 if profile.has_stored_credential() {
                     "secure_store"
                 } else {
@@ -948,6 +985,7 @@ fn model_check(args: ModelCheckArgs) -> ExitCode {
         model: resolved.model.clone(),
         tokenizer: resolved.tokenizer.clone(),
         credential: resolved.credential.clone(),
+        inference_limits: resolved.inference_limits,
     };
     if let Err(error) = check_openai_model(request) {
         return present_model_check_error(error);
@@ -958,6 +996,7 @@ fn model_check(args: ModelCheckArgs) -> ExitCode {
             model: resolved.model,
             tokenizer: resolved.tokenizer,
             credential: resolved.credential,
+            inference_limits: resolved.inference_limits,
         })
     {
         return present_model_check_error(error);
@@ -1005,12 +1044,48 @@ fn resolve_model(
         })
         .unwrap_or_else(|| model.clone());
     let credential = resolve_credential(&base_url, token_stdin, profile.as_ref())?;
+    let inference_limits = resolve_inference_limits(None, None, profile.as_ref())?;
     Ok(ResolvedModel {
         base_url,
         model,
         tokenizer,
         credential,
+        inference_limits,
     })
+}
+
+/// Resolve planner limits: explicit option, `XGENY_OPENAI_INFERENCE_TIMEOUT` /
+/// `XGENY_OPENAI_MAX_OUTPUT_TOKENS`, the profile, then the ADR-0035 defaults.
+fn resolve_inference_limits(
+    timeout_seconds: Option<u64>,
+    max_output_tokens: Option<u32>,
+    profile: Option<&ModelProfile>,
+) -> Result<InferenceLimits, ModelCliError> {
+    let base = profile
+        .map(ModelProfile::inference_limits)
+        .unwrap_or_default();
+    let timeout_seconds = match timeout_seconds {
+        Some(value) => value,
+        None => match read_environment("XGENY_OPENAI_INFERENCE_TIMEOUT")? {
+            Some(value) => value
+                .trim()
+                .parse()
+                .map_err(|_| ModelCliError::InvalidInferenceLimits)?,
+            None => base.timeout().as_secs(),
+        },
+    };
+    let max_output_tokens = match max_output_tokens {
+        Some(value) => value,
+        None => match read_environment("XGENY_OPENAI_MAX_OUTPUT_TOKENS")? {
+            Some(value) => value
+                .trim()
+                .parse()
+                .map_err(|_| ModelCliError::InvalidInferenceLimits)?,
+            None => base.max_output_tokens(),
+        },
+    };
+    InferenceLimits::new(Duration::from_secs(timeout_seconds), max_output_tokens)
+        .map_err(|_| ModelCliError::InvalidInferenceLimits)
 }
 
 fn resolve_endpoint(
