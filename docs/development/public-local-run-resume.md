@@ -10,7 +10,8 @@ workspace mode는 `list-directory`, `stat`, `search-text`, `read-text`, `write-a
 ## 실행
 
 SQLite 실행 파일이나 server는 필요 없다. 기본 state 위치 대신 격리된 위치를 쓰려면
-`XGENY_STATE_HOME`을 설정한다. API token이 필요한 HTTPS endpoint만
+`XGENY_STATE_HOME`을 설정한다. Model profile 저장소는 별도의 `XGENY_CONFIG_HOME`을 따르며 `XGENY_STATE_HOME`의
+영향을 받지 않는다. API token이 필요한 HTTPS endpoint만
 `XGENY_OPENAI_API_KEY`를 사용한다. token을 CLI argument로 전달하지 않는다. 반복 입력을 줄이려면
 base URL, model과 tokenizer identity를 각각 `XGENY_OPENAI_BASE_URL`, `XGENY_OPENAI_MODEL`,
 `XGENY_OPENAI_TOKENIZER`에 둘 수 있다. Tokenizer를 생략하면 model ID를 같은 identity로 사용한다. Planner 호출의 wall-clock 예산과 출력 token 예산은 활성 프로필의 값(ADR-0035, 기본 300초·1024 token)을 따르며 `XGENY_OPENAI_INFERENCE_TIMEOUT`, `XGENY_OPENAI_MAX_OUTPUT_TOKENS`로 덮어쓸 수 있다. 두 값은 request profile digest에 들어가므로 Run 시작과 resume 사이에 바꾸면 `configuration_mismatch`가 된다.

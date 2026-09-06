@@ -417,6 +417,12 @@ Run state는 별도로 보존된다. Linux는 `$XDG_STATE_HOME/xgeny` 또는 `$H
 macOS는 `$HOME/Library/Application Support/XGENy`, Windows는 `%LOCALAPPDATA%\XGENy`를 사용한다.
 State 삭제는 Run 기록과 durable recovery 정보를 잃으므로 uninstall에 자동 포함하지 않는다.
 
+Model profile 설정 파일(`model-profiles.json`)도 남는다. 위치는 platform config directory로, Linux는
+`$XDG_CONFIG_HOME/xgeny` 또는 `$HOME/.config/xgeny`, macOS는 `$HOME/Library/Application Support/XGENy`,
+Windows는 `%APPDATA%\XGENy`다. `XGENY_STATE_HOME`은 Run state만 옮기고 profile 위치는 바꾸지 않으며,
+profile 저장소를 격리하려면 `XGENY_CONFIG_HOME`을 따로 설정한다. OS 보안 저장소의 credential까지
+지우려면 삭제 전에 `xgeny model remove <name>`을 실행한다.
+
 ## 문제 해결과 지원 정보
 
 | 증상 | 확인과 조치 |
