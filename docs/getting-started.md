@@ -433,8 +433,9 @@ State 삭제는 Run 기록과 durable recovery 정보를 잃으므로 uninstall�
 | `proposal_rejected.*` | 뒤의 class가 Core가 제안을 거부한 이유다. `capability_unavailable`/`capability_unsupported`는 허용하지 않은 capability 선택, `invocation_invalid`는 scope 밖 인자나 스키마 위반, `tool_call_budget_exhausted`는 예산 소진이다. Class는 Core 판정이며 model 출력 원문이 아니다. |
 | `model_rejected.*` | 뒤의 class는 journal의 model call settlement와 같은 값이다. `planner_invalid_response`는 provider가 strict JSON Schema를 지키지 않은 응답(문법 미지원·미적용), `provider_limit`은 출력 예산·요청 크기 초과, `provider_rejected`는 4xx 거부다. Class는 Core 판정이며 model 출력 원문이 아니다. |
 | `configuration_mismatch` | 원래 workspace, file/directory scope, executable와 model profile binding(inference timeout·출력 예산 포함)으로 resume한다. 자동 대체하지 말고 필요하면 새 Run을 시작한다. |
-| `model_call_unknown`이 planner 호출마다 반복 | 프로필의 inference timeout이 model·hardware에 비해 짧다. 로컬 27B는 호출당 60초 안팎이 걸리므로 `--inference-timeout`을 올린다. |
-| `model_call_unknown` 또는 `effect_outcome_unknown` | 불확정 작업을 자동 반복하지 않는다. `/status`와 `/resume`의 고정 진단을 확인하고 외부 상태를 별도로 검증한다. |
+| `model_call_unknown.timeout`이 planner 호출마다 반복 | 프로필의 inference timeout이 model·hardware에 비해 짧다. 로컬 27B는 호출당 60초 안팎이 걸리므로 `--inference-timeout`을 올린다. |
+| `model_call_unknown.transport_unavailable` / `.interrupted` | 요청이 전송됐을 수 있으나 결과를 못 받았다(연결 끊김) 또는 process가 응답 전에 끝났다. 자동 replay하지 않으므로 endpoint 상태를 확인한 뒤 `resume`한다. |
+| `model_call_unknown.*` 또는 `effect_outcome_unknown` | 불확정 작업을 자동 반복하지 않는다. `/status`와 `/resume`의 고정 진단을 확인하고 외부 상태를 별도로 검증한다. |
 
 지원 요청에는 `xgeny --version`, OS/architecture, 설치 채널, 종료 코드와 고정된 오류 코드만 우선 제공한다.
 API key, endpoint 전체 URL, prompt, model 원문 응답, source, process stdout/stderr, state DB와 Run ID는 공개

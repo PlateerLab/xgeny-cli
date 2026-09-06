@@ -2253,6 +2253,41 @@ mod tests {
     }
 
     #[test]
+    fn assistant_reasoning_fields_are_ignored_on_both_decode_paths() {
+        // Ollama returns `reasoning`, vLLM/llama.cpp return `reasoning_content` next to `content`
+        // for thinking models. Both are provider-side fields, not part of the strict document.
+        for field in ["reasoning", "reasoning_content"] {
+            let planner_body = serde_json::to_vec(&json!({
+                "model": MODEL,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": valid_plan(), field: "…thinking…"},
+                    "finish_reason": "stop"
+                }]
+            }))
+            .unwrap();
+            assert!(
+                decode_chat_response(&planner_body, MODEL, 1 << 16, 8).is_ok(),
+                "planner path must ignore `{field}`"
+            );
+            let probe_body = serde_json::to_vec(&json!({
+                "model": MODEL,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": COMPLETION_OK, field: "…thinking…"},
+                    "finish_reason": "stop"
+                }]
+            }))
+            .unwrap();
+            assert_eq!(
+                decode_compatibility_response(&probe_body, MODEL, 8),
+                Ok(()),
+                "probe path must ignore `{field}`"
+            );
+        }
+    }
+
+    #[test]
     fn compatibility_probe_requests_the_configured_output_budget() {
         let config = config("https://provider.example/v1")
             .with_max_output_tokens(2_048)

@@ -46,9 +46,9 @@ use xgeny_runtime::{
     PlanningConstraint, ProposalRejection, RequiredRouteFeatures, RouteRequest,
 };
 use xgeny_workgraph::{
-    CompletionOutputRecord, ModelCallRejectionReason, ModelCallStatus, PlannedExecutionProfile,
-    ReconstructableMaterialReference, RunEvent, RunEventBody, RunState, StepStatus,
-    derive_frontier,
+    CompletionOutputRecord, ModelCallRejectionReason, ModelCallStatus, ModelCallUnknownReason,
+    PlannedExecutionProfile, ReconstructableMaterialReference, RunEvent, RunEventBody, RunState,
+    StepStatus, derive_frontier,
 };
 
 use crate::allow_file::{ALLOW_FILE_PROVIDER_ID, AllowFileCatalog};
@@ -508,7 +508,8 @@ const fn proposal_rejection_code(rejection: ProposalRejection) -> &'static str {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryReason {
-    ModelCallUnknown,
+    /// A model call is durably Unknown. The class is the same value the journal records.
+    ModelCallUnknown(ModelCallUnknownReason),
     EffectOutcomeUnknown,
 }
 
@@ -516,7 +517,13 @@ impl RecoveryReason {
     #[must_use]
     pub const fn code(self) -> &'static str {
         match self {
-            Self::ModelCallUnknown => "model_call_unknown",
+            Self::ModelCallUnknown(ModelCallUnknownReason::Timeout) => "model_call_unknown.timeout",
+            Self::ModelCallUnknown(ModelCallUnknownReason::TransportUnavailable) => {
+                "model_call_unknown.transport_unavailable"
+            }
+            Self::ModelCallUnknown(ModelCallUnknownReason::Interrupted) => {
+                "model_call_unknown.interrupted"
+            }
             Self::EffectOutcomeUnknown => "effect_outcome_unknown",
         }
     }
@@ -880,19 +887,20 @@ where
             summary: output.summary().to_owned(),
         });
     }
-    if has_unknown_model_call(&state) {
+    if let Some(reason) = unknown_model_call_reason(&state) {
         return Ok(LocalCommandResult::RecoveryRequired {
             run_id: state.run_id,
-            reason: RecoveryReason::ModelCallUnknown,
+            reason: RecoveryReason::ModelCallUnknown(reason),
         });
     }
     if has_reserved_model_call(&state) {
         drop(store);
         let mut store = reopen_writable_verified(&layout, &manifest, &state)?;
         mark_reserved_model_call_unknown(&mut store, &lease, &manifest)?;
+        // A reservation found without its outcome after a process boundary is Interrupted.
         return Ok(LocalCommandResult::RecoveryRequired {
             run_id: state.run_id,
-            reason: RecoveryReason::ModelCallUnknown,
+            reason: RecoveryReason::ModelCallUnknown(ModelCallUnknownReason::Interrupted),
         });
     }
     if let Some(step_id) = executing_step_id(&state) {
@@ -1238,8 +1246,12 @@ fn classify_durable_boundary_after_driver_error(
         .map_err(|_| PublicRunError::Integrity)?
         .ok_or(PublicRunError::Integrity)?;
     verify_manifest_state(manifest, &state)?;
-    let reason = if has_unknown_model_call(&state) || has_reserved_model_call(&state) {
-        Some(RecoveryReason::ModelCallUnknown)
+    let reason = if let Some(reason) = unknown_model_call_reason(&state) {
+        Some(RecoveryReason::ModelCallUnknown(reason))
+    } else if has_reserved_model_call(&state) {
+        Some(RecoveryReason::ModelCallUnknown(
+            ModelCallUnknownReason::Interrupted,
+        ))
     } else if executing_step_id(&state).is_some() || has_effect_uncertainty(&state) {
         Some(RecoveryReason::EffectOutcomeUnknown)
     } else {
@@ -1379,13 +1391,17 @@ fn verify_manifest_state(manifest: &RunManifest, state: &RunState) -> Result<(),
     Ok(())
 }
 
-fn has_unknown_model_call(state: &RunState) -> bool {
+/// The durable Unknown class of the active model call, if any.
+fn unknown_model_call_reason(state: &RunState) -> Option<ModelCallUnknownReason> {
     state
         .agent_loop
         .as_ref()
         .and_then(|agent| agent.model_calls.as_ref())
         .and_then(|lifecycle| lifecycle.active_call.as_ref())
-        .is_some_and(|call| matches!(call.status, ModelCallStatus::Unknown { .. }))
+        .and_then(|call| match call.status {
+            ModelCallStatus::Unknown { reason } => Some(reason),
+            ModelCallStatus::Reserved => None,
+        })
 }
 
 fn has_reserved_model_call(state: &RunState) -> bool {
@@ -1628,10 +1644,18 @@ fn map_layout_create(error: crate::run_layout::RunLayoutError) -> PublicRunError
 /// durable `ModelCallRejectionReason` class so callers never see a bare `model_rejected`.
 fn map_planner_unavailable(run_id: String, failure: PlannerPortFailure) -> LocalCommandResult {
     let reason = match failure {
-        PlannerPortFailure::Timeout | PlannerPortFailure::Unavailable => {
+        PlannerPortFailure::Timeout => {
             return LocalCommandResult::RecoveryRequired {
                 run_id,
-                reason: RecoveryReason::ModelCallUnknown,
+                reason: RecoveryReason::ModelCallUnknown(ModelCallUnknownReason::Timeout),
+            };
+        }
+        PlannerPortFailure::Unavailable => {
+            return LocalCommandResult::RecoveryRequired {
+                run_id,
+                reason: RecoveryReason::ModelCallUnknown(
+                    ModelCallUnknownReason::TransportUnavailable,
+                ),
             };
         }
         PlannerPortFailure::InvalidResponse => ModelCallRejectionReason::PlannerInvalidResponse,
@@ -1717,10 +1741,12 @@ fn map_driver_outcome(
             reason: RejectionReason::MaterialRejected,
         },
         DriverOutcome::PlannerUnavailable(failure) => map_planner_unavailable(run_id, failure),
-        DriverOutcome::ModelCallRecoveryRequired { .. } => LocalCommandResult::RecoveryRequired {
-            run_id,
-            reason: RecoveryReason::ModelCallUnknown,
-        },
+        DriverOutcome::ModelCallRecoveryRequired { reason, .. } => {
+            LocalCommandResult::RecoveryRequired {
+                run_id,
+                reason: RecoveryReason::ModelCallUnknown(reason),
+            }
+        }
         DriverOutcome::ModelCallRejected(reason) => LocalCommandResult::Rejected {
             run_id,
             reason: RejectionReason::ModelRejected(reason),
@@ -2558,6 +2584,59 @@ mod tests {
             probe.request_profile_digest(),
             production.request_profile_digest(),
             "probe must commit the same non-secret request semantics the production planner uses"
+        );
+    }
+
+    #[test]
+    fn model_call_unknown_class_reaches_the_public_result_code() {
+        // Journaled path: the driver carries the durable ModelCallUnknownReason.
+        assert_eq!(
+            map_driver_outcome(
+                "run-unknown",
+                DriverOutcome::ModelCallRecoveryRequired {
+                    call_id: "model-call-x".to_owned(),
+                    reason: ModelCallUnknownReason::Timeout,
+                },
+            )
+            .unwrap(),
+            LocalCommandResult::RecoveryRequired {
+                run_id: "run-unknown".to_owned(),
+                reason: RecoveryReason::ModelCallUnknown(ModelCallUnknownReason::Timeout),
+            }
+        );
+        // Un-journaled planner port failures map onto the same durable classes.
+        assert_eq!(
+            map_driver_outcome(
+                "run-unknown",
+                DriverOutcome::PlannerUnavailable(PlannerPortFailure::Unavailable),
+            )
+            .unwrap(),
+            LocalCommandResult::RecoveryRequired {
+                run_id: "run-unknown".to_owned(),
+                reason: RecoveryReason::ModelCallUnknown(
+                    ModelCallUnknownReason::TransportUnavailable
+                ),
+            }
+        );
+        for (reason, code) in [
+            (
+                ModelCallUnknownReason::Timeout,
+                "model_call_unknown.timeout",
+            ),
+            (
+                ModelCallUnknownReason::TransportUnavailable,
+                "model_call_unknown.transport_unavailable",
+            ),
+            (
+                ModelCallUnknownReason::Interrupted,
+                "model_call_unknown.interrupted",
+            ),
+        ] {
+            assert_eq!(RecoveryReason::ModelCallUnknown(reason).code(), code);
+        }
+        assert_eq!(
+            RecoveryReason::EffectOutcomeUnknown.code(),
+            "effect_outcome_unknown"
         );
     }
 

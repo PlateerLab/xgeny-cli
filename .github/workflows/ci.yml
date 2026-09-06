@@ -136,7 +136,7 @@ jobs:
         run: rustup show active-toolchain
 
       - name: Test workspace
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
 
       - name: Lint platform-specific filesystem adapter
         run: cargo clippy --locked -p xgeny-adapter-filesystem --all-targets -- -D warnings
