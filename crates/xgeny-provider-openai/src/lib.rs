@@ -20,7 +20,7 @@ use xgeny_runtime::{
 };
 
 const REQUEST_PROFILE_DOMAIN: &str = "xgeny.openai-request-profile/v1";
-const REQUEST_ENVELOPE_PROFILE: &str = "xgeny.planner-request/v1";
+const REQUEST_ENVELOPE_PROFILE: &str = "xgeny.planner-request/v2";
 const PLANNING_CONTEXT_PROFILE: &str = "xgeny.planning-context/v3";
 const PROPOSAL_SCHEMA_REVISION: &str = "xgeny.plan-proposal/v1";
 const PROMPT_TEMPLATE_REVISION: &str = "xgeny.openai-planner-prompt/v3-chronology";
@@ -727,13 +727,15 @@ struct RequestProfileDescriptor<'a> {
     retries: u8,
 }
 
+/// Wire order is a contract (ADR-0036): the stable planning context precedes the per-call
+/// identifiers so provider prefix caches can reuse the catalog across calls.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PlannerPrompt<'a> {
     profile_version: &'static str,
+    planning_context: &'a xgeny_runtime::PlanningContext,
     call_id: &'a str,
     request_digest: &'a str,
-    planning_context: &'a xgeny_runtime::PlanningContext,
 }
 
 #[derive(Serialize)]
@@ -1601,7 +1603,7 @@ mod tests {
         );
         assert_eq!(
             first.request_profile_digest(),
-            "sha256:252d52598b17e223f7dd0a53015cc2d2fd49cffaf8f688bb55bd565cf1f97ba5"
+            "sha256:7978f2340e181f28d3ce9c2c24574085f3d11236ebd2b1840c44feccacd7706f"
         );
         assert_eq!(
             first.request_profile_digest(),
@@ -2234,12 +2236,13 @@ mod tests {
 
     #[test]
     fn request_profile_digest_is_unchanged_by_the_probe_contract() {
-        // Golden values captured on main before the probe change. The probe prompt and probe
+        // Golden values re-captured for envelope profile v2 (ADR-0036); an envelope revision is a
+        // committed request-profile input, so this change is intentional. The probe prompt and probe
         // request shape are not inputs to the committed request profile; only the planner
         // prompt, proposal schema, and bounded limits are.
         assert_eq!(
             config("https://provider.example/v1").request_profile_digest(),
-            "sha256:252d52598b17e223f7dd0a53015cc2d2fd49cffaf8f688bb55bd565cf1f97ba5"
+            "sha256:7978f2340e181f28d3ce9c2c24574085f3d11236ebd2b1840c44feccacd7706f"
         );
         assert_eq!(
             config("https://provider.example/v1")
@@ -2248,7 +2251,7 @@ mod tests {
                 .with_timeout(Duration::from_secs(60))
                 .unwrap()
                 .request_profile_digest(),
-            "sha256:2a3812dfbfbb7c3b5065cd58044c05564423b3da6b304622f872fda35a8ca352"
+            "sha256:abc5c1c4ad5cd340bf4a0d0cbc3d42ea49669c179c3876111243a8a0c6460ccc"
         );
     }
 
