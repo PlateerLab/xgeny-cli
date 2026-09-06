@@ -68,6 +68,15 @@ xgeny model remove qwen-xgen
 `--token-stdin`, `XGENY_OPENAI_API_KEY`, profile secure store 순서다. Profile credential은 profile URL과
 최종 URL이 정확히 같을 때만 사용한다.
 
+Profile 파일 `model-profiles.json`은 platform config directory 아래 app-owned private directory에 둔다.
+Linux는 `$XDG_CONFIG_HOME/xgeny` 또는 `$HOME/.config/xgeny`, macOS는
+`$HOME/Library/Application Support/XGENy`, Windows는 `%APPDATA%\XGENy`다. `XGENY_CONFIG_HOME`으로 위치를
+바꿀 수 있으며 state root와 같은 규칙(절대경로, home/config base directory 자체와 `.`/`..` 거부, Unix
+`0700`)을 적용한다. `XGENY_STATE_HOME`은 Run state만 옮기므로, 격리된 test나 measurement에서
+`XGENY_STATE_HOME`만 설정하고 `model setup`/`use`/`remove`를 실행하면 사용자의 실제 profile 저장소가
+바뀐다. 저장소를 건드리지 않으려면 `XGENY_CONFIG_HOME`을 함께 설정하거나 `run`/`model check`에
+`--base-url`, `--model`, `--tokenizer`를 명시한다.
+
 Compatibility probe는 production planner와 같은 proposal JSON Schema와 프로필의 출력 token 예산·inference timeout(ADR-0035, 기본 1024 token·300초)을 사용하고 응답을 production과 같은 document 규칙으로 검증한다. Probe는 model에게 schema 밖의 top-level field를 하나 더 넣으라고 요구하므로, strict schema를 실제로 강제하는 provider만 통과한다. Schema를 받아들이지만 강제하지 못하는 provider(예: 문법 컴파일에 실패하고도 200을 반환하는 서버)는 첫 planner call 대신 `model setup`에서 실패한다. Catalog GET만 더 짧은 timeout을 유지한다. Reasoning을 많이 쓰는 model이 최종 JSON 전에 예산을 소진하면 `provider_output_truncated`로 닫으며, rate limit과 구분한다.
 
 `model check`는 기본적으로 기존 계약인 catalog GET만 보낸다. `--compatibility`는 strict JSON Schema
