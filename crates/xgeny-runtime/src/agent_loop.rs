@@ -393,26 +393,30 @@ pub enum PlanningConstraintError {
     DuplicateIdentifier,
 }
 
+/// Field order is the wire order (ADR-0036): the catalog and goal are stable for a Run, `steps`
+/// and `tool_outputs` only grow at their tails between turns, and the per-call identifiers come
+/// last, so a provider prefix cache can reuse the leading tokens across calls. The canonical
+/// `context_digest` is RFC 8785 and therefore independent of this order.
 #[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PlanningContextPayload {
     profile_version: &'static str,
+    capabilities: Vec<PlanningCapabilitySummary>,
+    omitted_capabilities: usize,
+    catalog_digest: String,
+    goal: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    planning_constraints: Vec<PlanningConstraint>,
+    steps: Vec<PlanningStepSummary>,
+    omitted_steps: usize,
+    tool_outputs: Vec<PlanningToolOutput>,
+    total_steps: usize,
+    verified_completed_steps: usize,
     run_id: String,
     authority: String,
     authority_epoch: u64,
     journal_sequence: u64,
     journal_head_digest: String,
-    goal: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    planning_constraints: Vec<PlanningConstraint>,
-    total_steps: usize,
-    verified_completed_steps: usize,
-    tool_outputs: Vec<PlanningToolOutput>,
-    steps: Vec<PlanningStepSummary>,
-    omitted_steps: usize,
-    catalog_digest: String,
-    capabilities: Vec<PlanningCapabilitySummary>,
-    omitted_capabilities: usize,
 }
 
 /// Deterministic provider-neutral input for one planner call.
@@ -3283,6 +3287,60 @@ mod tests {
             ),
             Err(ContextBuildError::OutputBinding)
         ));
+    }
+
+    #[test]
+    fn planning_context_wire_order_is_stable_first_and_volatile_last() {
+        // ADR-0036: provider prefix caches reuse only a leading run of identical tokens, so the
+        // catalog must precede everything that changes per turn or per call, and the per-call
+        // identifiers must come last. The canonical digest is order-independent (RFC 8785).
+        let state = state(vec![step("step-a", StepStatus::Planned, Vec::new())]);
+        let frontier = derive_frontier(&state).expect("frontier should derive");
+        let context = build_context(
+            &state,
+            &BTreeMap::new(),
+            &frontier,
+            &CapabilityRegistry::new(),
+            &[],
+            &test_budget(),
+        )
+        .expect("context should fit");
+        assert_eq!(
+            context.context_digest(),
+            "sha256:5e0c6d87c79008e207f0b1b19738e13cd21bad93ee67c739ed4d9ac0702e2e79",
+            "canonical digest must not depend on wire order"
+        );
+        let raw = serde_json::to_string(&context).expect("context should serialize");
+        let position = |key: &str| {
+            raw.find(&format!("\"{key}\""))
+                .unwrap_or_else(|| panic!("{key} missing from serialized context"))
+        };
+        assert!(position("profileVersion") < position("capabilities"));
+        assert!(position("capabilities") < position("goal"));
+        assert!(position("goal") < position("steps"));
+        assert!(position("steps") < position("toolOutputs"));
+        assert!(position("toolOutputs") < position("runId"));
+        assert!(position("runId") < position("journalHeadDigest"));
+        let last_key = [
+            "profileVersion",
+            "capabilities",
+            "goal",
+            "steps",
+            "toolOutputs",
+            "runId",
+            "authority",
+            "journalSequence",
+            "catalogDigest",
+            "totalSteps",
+        ]
+        .into_iter()
+        .map(position)
+        .max()
+        .unwrap();
+        assert!(
+            position("journalHeadDigest") > last_key,
+            "volatile head digest must be last"
+        );
     }
 
     #[test]
