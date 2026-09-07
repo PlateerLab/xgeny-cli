@@ -120,7 +120,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test workspace
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
 
       - name: Check third-party license notices
         run: sh scripts/check-third-party-licenses.sh --check

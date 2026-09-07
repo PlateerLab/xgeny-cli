@@ -22,9 +22,9 @@ use xgeny_workgraph::{
     AgentLoopBudget, AgentLoopState, AuthorizationBinding, AuthorizationUse,
     CompletionOutputRecord, EffectClass as WorkEffectClass, EffectIntent, EventRecord,
     InvocationBinding, ModelCallBudget, ModelCallLifecycleState, ModelCallRejectionReason,
-    ModelCallReservation, ModelCallSettlement, ReceiptPlacement, ReceiptProvenance,
-    ReconstructableMaterialReference, RunEvent, RunEventBody, RunState, SinkGuarantee, StepState,
-    StepStatus, TOOL_OUTPUT_PROFILE_V1, ToolOutputRecord, apply_record,
+    ModelCallReservation, ModelCallSettlement, ModelCallUnknownReason, ReceiptPlacement,
+    ReceiptProvenance, ReconstructableMaterialReference, RunEvent, RunEventBody, RunState,
+    SinkGuarantee, StepState, StepStatus, TOOL_OUTPUT_PROFILE_V1, ToolOutputRecord, apply_record,
 };
 
 const AUTHORITY: &str = "local:test";
@@ -802,6 +802,82 @@ fn deterministic_provider_rejection_is_closed_without_raw_error_body() {
         serde_json::to_string(&snapshot.state).unwrap()
     );
     assert!(!durable.contains(RAW_RESPONSE_SENTINEL));
+}
+
+/// A provider that accepts the request and then stalls longer than the planner budget.
+fn spawn_stalling_server(stall: Duration) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener address should resolve");
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("one request should connect");
+        let _request = read_http_request(&mut stream);
+        thread::sleep(stall);
+        // Whatever we write now is too late; the client has already given up.
+        let _ =
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    });
+    (format!("http://{address}/v1"), handle)
+}
+
+#[test]
+fn slow_provider_becomes_a_durable_timeout_without_retry() {
+    // Measured in the wild: a 27B local model needs ~60s per planner call; when the configured
+    // budget is shorter the call must close as model_call_unknown(timeout), not as a rejection,
+    // and the client must not retry.
+    let (base_url, handle) = spawn_stalling_server(Duration::from_secs(2));
+    let config = OpenAiPlannerConfig::new(
+        &base_url,
+        "xgeny.test.go50902",
+        "qwen3.8-27b",
+        "Qwen/Qwen3.8-27B-FP8",
+    )
+    .expect("planner config should validate")
+    .with_max_output_tokens(512)
+    .expect("output limit should validate")
+    .with_timeout(Duration::from_secs(1))
+    .expect("timeout should validate");
+    let mut planner = OpenAiPlanner::new(config, None).expect("planner should build");
+    let mut store = seed_store();
+    let loop_runtime = configured_loop(&mut store, &mut planner);
+    let mut events = DeterministicEvents;
+    let mut materializer = EphemeralMaterializer;
+    let started = std::time::Instant::now();
+    let tick = loop_runtime
+        .tick(
+            &mut store,
+            &mut events,
+            &FixedLease,
+            &synthetic_registry(),
+            &IdentityResolver::default(),
+            &mut planner,
+            &mut materializer,
+        )
+        .expect("timeout should settle durably");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "client must give up at its own budget, not wait for the provider"
+    );
+    // The first tick after a transport timeout reports the port failure; the reservation is
+    // durably marked Unknown(timeout) so a later tick or resume never replays the call.
+    assert!(matches!(
+        tick,
+        AgentLoopTick::PlannerUnavailable {
+            failure: PlannerPortFailure::Timeout,
+            ..
+        }
+    ));
+    let snapshot = store.load().unwrap().unwrap();
+    let last = snapshot.records.last().expect("unknown event should exist");
+    assert!(matches!(
+        &last.event.body,
+        RunEventBody::ModelCallBecameUnknown {
+            reason: ModelCallUnknownReason::Timeout,
+            ..
+        }
+    ));
+    handle.join().expect("server should finish");
 }
 
 #[test]
