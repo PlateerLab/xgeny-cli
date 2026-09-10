@@ -1,6 +1,6 @@
 # ADR-0037: 모델용 proposal 스키마를 이식 가능하게 줄이고 compact 출력을 요구한다
 
-- 상태: 제안
+- 상태: Accepted
 - 날짜: 2026-09-06
 - 관련: ADR-0015 durable planner contract, ADR-0017 OpenAI-compatible provider adapter, ADR-0036 planner prompt prefix order
 

@@ -1,6 +1,6 @@
 # ADR-0035: planner inference timeout과 출력 예산을 모델 프로필 설정으로 옮긴다
 
-- 상태: 제안
+- 상태: Accepted
 - 날짜: 2026-09-05
 - 관련: ADR-0016 durable model call lifecycle, ADR-0017 OpenAI-compatible provider adapter, ADR-0032 모델 프로필
 
