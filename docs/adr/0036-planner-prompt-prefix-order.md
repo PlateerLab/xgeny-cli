@@ -1,6 +1,6 @@
 # ADR-0036: planner prompt는 고정 부분을 앞에, 가변 식별자를 뒤에 둔다
 
-- 상태: 제안
+- 상태: Accepted
 - 날짜: 2026-09-05
 - 관련: ADR-0017 OpenAI-compatible provider adapter, ADR-0030 chronological planning context v3, ADR-0035 model profile inference limits
 
