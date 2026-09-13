@@ -1,4 +1,4 @@
-# ADR-0038: planner 출력 잘림을 provider limit과 다른 rejection class로 기록한다
+# ADR-0039: planner 출력 잘림을 provider limit과 다른 rejection class로 기록한다
 
 - 상태: Accepted
 - 날짜: 2026-09-14

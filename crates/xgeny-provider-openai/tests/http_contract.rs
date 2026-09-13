@@ -806,7 +806,7 @@ fn deterministic_provider_rejection_is_closed_without_raw_error_body() {
 
 #[test]
 fn truncated_planner_output_is_closed_as_output_truncated_not_provider_limit() {
-    // ADR-0038: a 200 whose choice ended at the output token budget is a budget problem the user
+    // ADR-0039: a 200 whose choice ended at the output token budget is a budget problem the user
     // fixes with --max-output-tokens, not a rate limit. The journal must keep that distinction.
     let body = serde_json::to_vec(&json!({
         "id": RAW_RESPONSE_SENTINEL,
