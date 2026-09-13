@@ -685,6 +685,9 @@ pub enum PlannerPortFailure {
     InvalidResponse,
     #[error("planner request exceeded provider limits")]
     ProviderLimit,
+    /// The provider stopped at the output token budget before the proposal was complete.
+    #[error("planner output was truncated by the output token budget")]
+    OutputTruncated,
     #[error("planner provider rejected the request")]
     ProviderRejected,
 }
@@ -1703,6 +1706,16 @@ impl AgentLoop {
                     reserved_state,
                     call_id,
                     ModelCallRejectionReason::ProviderLimit,
+                ),
+                ModelCallConflictIntent::RejectStale,
+            ),
+            PlannerPortFailure::OutputTruncated => (
+                append_model_call_rejection(
+                    store,
+                    events,
+                    reserved_state,
+                    call_id,
+                    ModelCallRejectionReason::OutputTruncated,
                 ),
                 ModelCallConflictIntent::RejectStale,
             ),

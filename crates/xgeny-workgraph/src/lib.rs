@@ -1462,6 +1462,8 @@ pub enum ModelCallUnknownReason {
 pub enum ModelCallRejectionReason {
     PlannerInvalidResponse,
     ProviderLimit,
+    /// The provider stopped at the output token budget before the proposal was complete.
+    OutputTruncated,
     ProviderRejected,
     ProposalRejected,
     MaterializationFailed,
