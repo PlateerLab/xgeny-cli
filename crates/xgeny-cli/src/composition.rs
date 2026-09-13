@@ -445,6 +445,16 @@ pub enum RejectionReason {
 
 impl RejectionReason {
     #[must_use]
+    pub const fn invocation_diagnostic(self) -> Option<xgeny_runtime::InvocationDiagnostic> {
+        match self {
+            Self::ProposalRejected(ProposalRejection::InvocationDiagnosed(diagnostic)) => {
+                Some(diagnostic)
+            }
+            _ => None,
+        }
+    }
+
+    #[must_use]
     pub const fn code(self) -> &'static str {
         match self {
             Self::ApprovalDenied => "approval_denied",
@@ -489,7 +499,9 @@ const fn proposal_rejection_code(rejection: ProposalRejection) -> &'static str {
         ProposalRejection::DependencyCycle => "proposal_rejected.dependency_cycle",
         ProposalRejection::CapabilityUnavailable => "proposal_rejected.capability_unavailable",
         ProposalRejection::CapabilityUnsupported => "proposal_rejected.capability_unsupported",
-        ProposalRejection::InvocationInvalid => "proposal_rejected.invocation_invalid",
+        ProposalRejection::InvocationInvalid | ProposalRejection::InvocationDiagnosed(_) => {
+            "proposal_rejected.invocation_invalid"
+        }
         ProposalRejection::DuplicateSemanticAction => "proposal_rejected.duplicate_semantic_action",
         ProposalRejection::PlannedStepBudgetExceeded => {
             "proposal_rejected.planned_step_budget_exceeded"
