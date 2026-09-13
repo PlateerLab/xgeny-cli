@@ -872,6 +872,8 @@ pub enum ProposalRejection {
     CapabilityUnavailable,
     CapabilityUnsupported,
     InvocationInvalid,
+    /// Same coarse rejection with optional fixed, value-free terminal metadata.
+    InvocationDiagnosed(crate::InvocationDiagnostic),
     /// Two Steps in the same proposal resolve to one canonical semantic action.
     DuplicateSemanticAction,
     PlannedStepBudgetExceeded,
@@ -2640,7 +2642,9 @@ fn prepare_plan<R: ResourceResolver>(
             registry,
             resolver,
         )
-        .map_err(|error| map_invocation_rejection(&error))?;
+        .map_err(|error| {
+            map_invocation_rejection(&error, &definition.spec.input_schema, &step.arguments)
+        })?;
         if !proposed_semantic_action_digests.insert(facts.semantic_action_digest.clone()) {
             return Err(ProposalRejection::DuplicateSemanticAction);
         }
@@ -2689,7 +2693,17 @@ fn prepare_plan<R: ResourceResolver>(
             registry,
             resolver,
         )
-        .map_err(|error| map_invocation_rejection(&error))?;
+        .map_err(|error| {
+            map_invocation_rejection(
+                &error,
+                &registry
+                    .definition(&step.capability)
+                    .expect("validated definition")
+                    .spec
+                    .input_schema,
+                &step.normalized_arguments,
+            )
+        })?;
         if final_facts.normalized_arguments != step.normalized_arguments
             || final_facts.definition_digest != step.definition_digest
             || final_facts.semantic_action_digest != step.semantic_action_digest
@@ -2847,7 +2861,15 @@ fn validate_proposal_structure(
     Ok(())
 }
 
-fn map_invocation_rejection(error: &AdmissionError) -> ProposalRejection {
+fn map_invocation_rejection(
+    error: &AdmissionError,
+    schema: &Value,
+    arguments: &Value,
+) -> ProposalRejection {
+    if let Some(diagnostic) = crate::InvocationDiagnostic::from_admission(error, schema, arguments)
+    {
+        return ProposalRejection::InvocationDiagnosed(diagnostic);
+    }
     match error {
         AdmissionError::DefinitionNotFound { .. } => ProposalRejection::CapabilityUnavailable,
         AdmissionError::UnsupportedEffectClass { .. }

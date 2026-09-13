@@ -20,6 +20,89 @@ const COMPLETION: &str = "workspace discovery completed";
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(180);
 
+#[test]
+fn invocation_diagnostics_distinguish_schema_and_resource_failures_without_values() {
+    let cases = [
+        (
+            json!({"path":"DECISION.json","content":"PRIVATE"}),
+            "schema_required",
+            "expectedDigest",
+        ),
+        (
+            json!({"path":"DECISION.json","content":{"SECRET":"PRIVATE"},"expectedDigest":null}),
+            "schema_type",
+            "content",
+        ),
+        (
+            json!({"path":"DECISION.json","content":"PRIVATE","expectedDigest":null,"SECRET":"PRIVATE"}),
+            "schema_additional_property",
+            "other",
+        ),
+        (
+            json!({"path":"","content":"PRIVATE","expectedDigest":null}),
+            "schema_min_length",
+            "path",
+        ),
+        (
+            json!({"path":"../SECRET","content":"PRIVATE","expectedDigest":null}),
+            "resource_resolution",
+            "other",
+        ),
+        (
+            json!({"path":"DECISION.json","content":"PRIVATE","expectedDigest":"SECRET"}),
+            "schema_one_of",
+            "expectedDigest",
+        ),
+    ];
+    for (arguments, category, field) in cases {
+        let fixture = tempdir().unwrap();
+        let state_root = fixture.path().join("state");
+        let workspace = fixture.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let server = SequentialServer::spawn_responses(vec![plan_response(
+            "write",
+            "Write fixture",
+            "xgeny.fs/write-atomic",
+            &arguments,
+        )]);
+        let output = bounded_output(xgeny(&state_root).args([
+            "run",
+            "--workspace",
+            path_text(&workspace),
+            "--base-url",
+            &server.base_url,
+            "--model",
+            MODEL,
+            "--tokenizer",
+            TOKENIZER,
+            "--allow-dir",
+            ".",
+            "--allow-write",
+            "--allow-remote-model-egress",
+            "Write a fixture.",
+        ]))
+        .unwrap();
+        let text = stderr(&output);
+        assert_eq!(output.status.code(), Some(20), "{text}");
+        let run_id = extract_run_id(&text);
+        assert!(text.contains(&format!(
+            "XGENY_REJECTED run_id={run_id} reason=proposal_rejected.invocation_invalid"
+        )));
+        assert!(text.contains(&format!("XGENY_INVOCATION_DIAGNOSTIC run_id={run_id} version=1 category={category} field={field}")), "{text}");
+        for secret in ["SECRET", "PRIVATE", path_text(&workspace)] {
+            assert!(!text.contains(secret));
+        }
+        assert_eq!(fs::read_dir(&workspace).unwrap().count(), 0);
+        assert!(!fixture.path().join("SECRET").exists());
+        let db = state_root.join("runs").join(run_id).join("run.sqlite3");
+        let store = SqliteRunStore::open_existing(db).unwrap();
+        assert!(store.load_execution_receipts().unwrap().is_empty());
+        server.requests.recv_timeout(TEST_TIMEOUT).unwrap();
+        server.handle.join().unwrap();
+        assert!(server.requests.try_recv().is_err());
+    }
+}
+
 struct SequentialServer {
     base_url: String,
     requests: Receiver<Vec<u8>>,

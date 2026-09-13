@@ -107,6 +107,11 @@ strict JSON Schema response와 응답의 exact model ID를 지원하는 서버�
 Project, Cargo dependency, Rust standard library, Linux musl과 LLVM libunwind의 배포 고지는
 binary에 포함되어 있어 network나 별도 파일 없이 `xgeny licenses`로 확인할 수 있다.
 
+Headless `run`/`resume`에서 도구 인자 검증이 거절되면 기존 verdict와 exit code를 유지하면서
+허용된 오류 범주·필드 이름만 담은 `XGENY_INVOCATION_DIAGNOSTIC` 한 줄을 추가할 수 있다.
+값·실제 경로·원문 오류는 출력하지 않으며, 이 정보는 자동 재시도 권한이나 durable 증빙이 아니다.
+호스트 연동 계약과 제한은 [ADR-0038](docs/adr/0038-safe-invocation-diagnostics.md)을 따른다.
+
 ## 제품 원칙
 
 - 사용자는 `xgeny` 하나만 설치합니다.
