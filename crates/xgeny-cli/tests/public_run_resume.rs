@@ -143,6 +143,10 @@ impl BlockingServer {
 
 impl OneTurnServer {
     fn spawn(response: Vec<u8>) -> Self {
+        Self::spawn_status(200, response)
+    }
+
+    fn spawn_status(status: u16, response: Vec<u8>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
         let address = listener
             .local_addr()
@@ -153,7 +157,7 @@ impl OneTurnServer {
             let observed = read_http_request(&mut stream);
             let _ = request_sender.send(observed);
             let headers = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 response.len()
             );
             stream
@@ -570,6 +574,10 @@ fn interrupted_reserved_model_call_becomes_unknown_without_egress_or_retry() {
     server.release.send(()).expect("server should release");
     server.handle.join().expect("server should finish");
 
+    let inspected = recovery_report(&state_root, &run_id);
+    assert_eq!(inspected["active_call"]["status"]["status"], "reserved");
+    assert_eq!(inspected["reserved_calls"], 1);
+
     let first_recovery = xgeny(&state_root)
         .args(["resume", &run_id])
         .bounded_output()
@@ -608,6 +616,412 @@ fn interrupted_reserved_model_call_becomes_unknown_without_egress_or_retry() {
         .expect("snapshot should still exist");
     assert_eq!(after_repeat.state, after_mark.state);
     assert_eq!(after_repeat.records, after_mark.records);
+}
+
+fn recovery_report(state_root: &Path, run_id: &str) -> Value {
+    let output = xgeny(state_root)
+        // Offline recovery must not parse or resolve model configuration.
+        .env("XGENY_OPENAI_INFERENCE_TIMEOUT", "invalid-unused-value")
+        .env("XGENY_MODEL_PROFILE", "missing-unused-profile")
+        .args(["recover", run_id])
+        .bounded_output()
+        .expect("recovery inspection should return");
+    assert_exit(&output, 0);
+    serde_json::from_slice(&output.stdout).expect("bounded recovery report should be JSON")
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn explicit_discard_of_reserved_call_is_offline_and_lease_guarded() {
+    let fixture = tempdir().expect("test directory should exist");
+    let state_root = fixture.path().join("state");
+    let workspace = fixture.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace should create");
+    fs::write(workspace.join("README.md"), FILE_MARKER).expect("fixture should write");
+    let server = BlockingServer::spawn();
+    let mut child = ChildGuard::new(
+        xgeny(&state_root)
+            .args([
+                "run",
+                "goal",
+                "--workspace",
+                path_text(&workspace),
+                "--base-url",
+                &server.base_url,
+                "--model",
+                MODEL,
+                "--tokenizer",
+                TOKENIZER,
+                "--allow-file",
+                "README.md",
+                "--allow-remote-model-egress",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("blocked process starts"),
+    );
+    server
+        .request
+        .recv_timeout(TEST_TIMEOUT)
+        .expect("request arrives");
+    child.terminate();
+    let run_id = extract_run_id(&child.stderr_text());
+    server.release.send(()).expect("server releases");
+    server.handle.join().expect("server stops");
+    let database = run_database(&state_root, &run_id);
+    let before = SqliteRunStore::open_existing_read_only(&database)
+        .expect("store opens")
+        .load()
+        .expect("snapshot loads")
+        .expect("run exists");
+    let report = recovery_report(&state_root, &run_id);
+    assert_eq!(report["active_call"]["status"]["status"], "reserved");
+    let call_id = report["active_call"]["call_id"].as_str().expect("call ID");
+    let lease = xgeny_runtime::LocalRunLease::try_acquire(
+        &run_id,
+        state_root.join("runs").join(&run_id).join("run.lock"),
+    )
+    .expect("test holds lease");
+    for options in [
+        vec!["recover", &run_id],
+        vec!["recover", &run_id, "--discard-model-call", call_id],
+    ] {
+        let busy = xgeny(&state_root)
+            .args(options)
+            .bounded_output()
+            .expect("busy returns");
+        assert_exit(&busy, 75);
+    }
+    drop(lease);
+
+    // Integrity preflight cannot mutate the journal or overwrite a damaged manifest.
+    let manifest_path = state_root.join("runs").join(&run_id).join("manifest.json");
+    let manifest = fs::read(&manifest_path).expect("manifest readable");
+    fs::write(&manifest_path, b"{}").expect("corrupt fixture manifest");
+    let corrupt = xgeny(&state_root)
+        .args(["recover", &run_id, "--discard-model-call", call_id])
+        .bounded_output()
+        .expect("corrupt returns");
+    assert_exit(&corrupt, 70);
+    assert_eq!(fs::read(&manifest_path).expect("manifest readable"), b"{}");
+    fs::write(&manifest_path, manifest).expect("restore fixture manifest");
+    let unchanged = SqliteRunStore::open_existing_read_only(&database)
+        .expect("store opens")
+        .load()
+        .expect("snapshot loads")
+        .expect("run exists");
+    assert_eq!(unchanged, before);
+
+    // Recovery does not require or recreate a missing physical workspace.
+    fs::rename(&workspace, fixture.path().join("moved-workspace")).expect("fixture moves");
+    let result = xgeny(&state_root)
+        .args(["recover", &run_id, "--discard-model-call", call_id])
+        .bounded_output()
+        .expect("discard returns");
+    assert_exit(&result, 0);
+    let after = SqliteRunStore::open_existing_read_only(&database)
+        .expect("store opens")
+        .load()
+        .expect("snapshot loads")
+        .expect("run exists");
+    assert_eq!(after.records.len(), before.records.len() + 1);
+    assert!(after.state.steps.is_empty());
+    let closed = recovery_report(&state_root, &run_id);
+    assert_eq!(closed["reserved_calls"], 1);
+    assert_eq!(closed["settled_calls"], 1);
+    assert_eq!(closed["unknown_calls"], 0);
+    assert!(closed["active_call"].is_null());
+    assert!(!workspace.exists());
+}
+
+#[test]
+fn recovery_rejects_missing_runs_without_creating_state_or_echoing_arguments() {
+    let fixture = tempdir().expect("test directory should exist");
+    let state_root = fixture.path().join("missing-state");
+    for run_id in ["../invalid-run", "run-00000000000000000000000000000000"] {
+        let result = xgeny(&state_root)
+            .args(["recover", run_id, "--discard-model-call", "invalid-call"])
+            .bounded_output()
+            .expect("invalid recovery returns");
+        assert_exit(&result, 64);
+        assert!(result.stdout.is_empty());
+        assert_eq!(
+            stderr(&result).trim(),
+            "XGENY_ERROR code=configuration_mismatch"
+        );
+    }
+    assert!(!state_root.exists());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn explicit_recovery_never_refunds_exhausted_budget_or_discards_a_newer_call() {
+    let fixture = tempdir().expect("test directory should exist");
+    let state_root = fixture.path().join("state");
+    let workspace = fixture.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace creates");
+    fs::write(workspace.join("README.md"), FILE_MARKER).expect("source writes");
+    let unavailable = OneTurnServer::spawn_status(503, Vec::new());
+    let base_url = unavailable.base_url.clone();
+    let first = xgeny(&state_root)
+        .args([
+            "run",
+            "goal",
+            "--workspace",
+            path_text(&workspace),
+            "--base-url",
+            &base_url,
+            "--model",
+            MODEL,
+            "--tokenizer",
+            TOKENIZER,
+            "--allow-file",
+            "README.md",
+            "--allow-remote-model-egress",
+        ])
+        .bounded_output()
+        .expect("unavailable call returns");
+    assert_exit(&first, 30);
+    unavailable
+        .request
+        .recv_timeout(TEST_TIMEOUT)
+        .expect("first request arrives");
+    unavailable.handle.join().expect("first server finishes");
+    let run_id = extract_run_id(&stderr(&first));
+    let initial = recovery_report(&state_root, &run_id);
+    assert_eq!(initial["max_model_calls"], 4);
+    let mut previous_id = String::new();
+    for count in 1..=4 {
+        let active = recovery_report(&state_root, &run_id);
+        assert_eq!(active["reserved_calls"], count);
+        let id = active["active_call"]["call_id"]
+            .as_str()
+            .expect("active call");
+        assert_ne!(id, previous_id);
+        if !previous_id.is_empty() {
+            let stale = xgeny(&state_root)
+                .args(["recover", &run_id, "--discard-model-call", &previous_id])
+                .bounded_output()
+                .expect("stale request returns");
+            assert_exit(&stale, 64);
+            assert_eq!(recovery_report(&state_root, &run_id), active);
+        }
+        let discard = xgeny(&state_root)
+            .args(["recover", &run_id, "--discard-model-call", id])
+            .bounded_output()
+            .expect("explicit discard returns");
+        assert_exit(&discard, 0);
+        let closed = recovery_report(&state_root, &run_id);
+        assert_eq!(closed["reserved_calls"], count);
+        assert_eq!(closed["settled_calls"], count);
+        previous_id = id.to_owned();
+        if count < 4 {
+            let next_server = OneTurnServer::spawn_status(503, Vec::new());
+            let next = resume_process(
+                &state_root,
+                &run_id,
+                &workspace,
+                &next_server.base_url,
+                "README.md",
+            );
+            assert_exit(&next, 30);
+            next_server
+                .request
+                .recv_timeout(TEST_TIMEOUT)
+                .expect("one fresh request arrives");
+            next_server.handle.join().expect("next server finishes");
+        }
+    }
+    let exhausted = recovery_report(&state_root, &run_id);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("new endpoint listens");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let fresh_endpoint = format!(
+        "http://{}/v1",
+        listener.local_addr().expect("local address")
+    );
+    let stopped = resume_process(
+        &state_root,
+        &run_id,
+        &workspace,
+        &fresh_endpoint,
+        "README.md",
+    );
+    assert_exit(&stopped, 10);
+    assert_eq!(
+        listener
+            .accept()
+            .expect_err("exhausted budget sends no request")
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(recovery_report(&state_root, &run_id), exhausted);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn explicit_recovery_preserves_budget_and_verified_effect_before_separate_resume() {
+    let fixture = tempdir().expect("test directory should exist");
+    let state_root = fixture.path().join("state");
+    let workspace = fixture.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace should create");
+    fs::write(workspace.join("README.md"), FILE_MARKER).expect("fixture should write");
+    let server = OneTurnServer::spawn(plan_response());
+    let output = xgeny(&state_root)
+        .args([
+            "run",
+            "goal",
+            "--workspace",
+            path_text(&workspace),
+            "--base-url",
+            &server.base_url,
+            "--model",
+            MODEL,
+            "--tokenizer",
+            TOKENIZER,
+            "--allow-file",
+            "README.md",
+            "--allow-read",
+            "--allow-remote-model-egress",
+        ])
+        .bounded_output()
+        .expect("one verified read then unavailable provider should return");
+    assert_exit(&output, 30);
+    server
+        .request
+        .recv_timeout(TEST_TIMEOUT)
+        .expect("first request should arrive");
+    server.handle.join().expect("server should finish");
+    let run_id = extract_run_id(&stderr(&output));
+    let database = run_database(&state_root, &run_id);
+    let before = SqliteRunStore::open_existing_read_only(&database)
+        .expect("store should open")
+        .load()
+        .expect("snapshot should load")
+        .expect("run exists");
+    assert_eq!(before.state.steps.len(), 1);
+    assert!(
+        before
+            .state
+            .steps
+            .values()
+            .all(|step| step.status == xgeny_workgraph::StepStatus::Completed)
+    );
+    let report = recovery_report(&state_root, &run_id);
+    assert_eq!(report["reserved_calls"], 2);
+    assert_eq!(report["settled_calls"], 1);
+    assert_eq!(report["active_call"]["status"]["status"], "unknown");
+    let call_id = report["active_call"]["call_id"]
+        .as_str()
+        .expect("active ID exists");
+    for wrong_id in [
+        "",
+        "not-a-call",
+        "control\nvalue",
+        &"x".repeat(4096),
+        &format!("model-call-{}", "0".repeat(64)),
+    ] {
+        let wrong = xgeny(&state_root)
+            .args(["recover", &run_id, "--discard-model-call", wrong_id])
+            .bounded_output()
+            .expect("wrong ID returns");
+        assert_exit(&wrong, 64);
+        assert_eq!(
+            stderr(&wrong).trim(),
+            "XGENY_ERROR code=configuration_mismatch"
+        );
+        assert!(wrong.stdout.is_empty());
+    }
+    let unchanged = SqliteRunStore::open_existing_read_only(&database)
+        .expect("store should open")
+        .load()
+        .expect("snapshot loads")
+        .expect("run exists");
+    assert_eq!(unchanged, before);
+
+    let discarded = xgeny(&state_root)
+        .env("XGENY_OPENAI_INFERENCE_TIMEOUT", "unused-invalid")
+        .args(["recover", &run_id, "--discard-model-call", call_id])
+        .bounded_output()
+        .expect("discard returns");
+    assert_exit(&discarded, 0);
+    let closed: Value = serde_json::from_slice(&discarded.stdout).expect("JSON report");
+    assert_eq!(closed["discarded_call_id"], call_id);
+    assert_eq!(closed["reserved_calls"], 2);
+    assert_eq!(closed["settled_calls"], 2);
+    assert_eq!(closed["max_model_calls"], report["max_model_calls"]);
+    assert!(closed["active_call"].is_null());
+    let after = SqliteRunStore::open_existing_read_only(&database)
+        .expect("store should open")
+        .load()
+        .expect("snapshot loads")
+        .expect("run exists");
+    assert_eq!(after.records.len(), before.records.len() + 1);
+    assert_eq!(after.state.steps, before.state.steps);
+    assert!(matches!(
+        after.records.last().expect("settlement exists").event.body,
+        RunEventBody::ModelCallSettled {
+            settlement: xgeny_workgraph::ModelCallSettlement::Abandoned {
+                reason: xgeny_workgraph::ModelCallAbandonmentReason::RecoveryDiscarded
+            },
+            ..
+        }
+    ));
+    let repeated = xgeny(&state_root)
+        .args(["recover", &run_id, "--discard-model-call", call_id])
+        .bounded_output()
+        .expect("repeat returns");
+    assert_exit(&repeated, 64);
+    let no_egress = xgeny(&state_root)
+        .args(["resume", &run_id])
+        .bounded_output()
+        .expect("resume requires separate consent");
+    assert_exit(&no_egress, 10);
+    let unchanged = SqliteRunStore::open_existing_read_only(&database)
+        .expect("store should open")
+        .load()
+        .expect("snapshot loads")
+        .expect("run exists");
+    assert_eq!(unchanged, after);
+
+    // Remove the source to prove the already verified effect is not re-executed.
+    fs::remove_file(workspace.join("README.md")).expect("fixture source can be removed");
+    let completion = OneTurnServer::spawn(completion_response());
+    let resumed = resume_process(
+        &state_root,
+        &run_id,
+        &workspace,
+        &completion.base_url,
+        "README.md",
+    );
+    assert_exit(&resumed, 0);
+    let request = completion
+        .request
+        .recv_timeout(TEST_TIMEOUT)
+        .expect("fresh reservation calls provider");
+    assert!(String::from_utf8_lossy(&request).contains(FILE_MARKER));
+    completion
+        .handle
+        .join()
+        .expect("completion server should finish");
+    let final_report = recovery_report(&state_root, &run_id);
+    assert_eq!(final_report["reserved_calls"], 3);
+    assert_eq!(final_report["settled_calls"], 3);
+    let store = SqliteRunStore::open_existing_read_only(&database).expect("final store opens");
+    assert_eq!(
+        store
+            .load_execution_receipts()
+            .expect("receipts load")
+            .len(),
+        1
+    );
+    let stale = xgeny(&state_root)
+        .args(["recover", &run_id, "--discard-model-call", call_id])
+        .bounded_output()
+        .expect("completed run cannot discard");
+    assert_exit(&stale, 64);
 }
 
 #[test]
@@ -715,6 +1129,10 @@ fn outcome_commit_failure_is_immediately_uncertain_and_offline_resume_never_reex
         .expect("offline effect recovery should run");
     assert_exit(&recovered, 30);
     assert!(stderr(&recovered).contains("reason=effect_outcome_unknown"));
+    assert_eq!(
+        recovery_report(&state_root, &run_id)["effect_recovery_required"],
+        true
+    );
     let after_mark_store =
         SqliteRunStore::open_existing(&database).expect("unknown store should reopen");
     let after_mark = after_mark_store

@@ -11,7 +11,8 @@ use xgeny_cli::{
     LocalProcessSession, LocalResumeRequest, LocalRunRequest, ModelCheckError, ModelCheckRequest,
     ModelCredentialStore, ModelProfile, ModelProfileError, ModelProfileStore,
     OsModelCredentialStore, PublicRunError, check_openai_compatibility, check_openai_model,
-    list_openai_models, new_credential_reference, prepare_local_process_session, resume_local,
+    discard_local_model_call, inspect_local_model_call, list_openai_models,
+    new_credential_reference, prepare_local_process_session, resume_local,
     resume_local_with_model_resolver, resume_local_with_model_resolver_and_progress,
     resume_local_with_process_session_and_model_resolver_progress,
     run_local_with_process_session_progress, run_local_with_started,
@@ -57,6 +58,20 @@ enum Command {
     Run(RunArgs),
     /// Continue an existing Run, or replay its durable completion without model access.
     Resume(ResumeArgs),
+    /// Inspect or explicitly discard an unresolved model call offline; never resumes the Run.
+    Recover(RecoverArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(
+    after_long_help = "Without --discard-model-call this command only inspects verified journal state. Discard stops accepting the exact call's response; it does NOT prove non-delivery or refund consumed budget. Neither form calls a model or tool. Continue separately with resume and the original workspace, catalogs, profile, permissions and remaining budget. Output is a bounded JSON report, not a completion result."
+)]
+struct RecoverArgs {
+    /// Durable Run identifier printed by `xgeny run`.
+    run_id: String,
+    /// Explicitly discard this exact active call ID obtained from a prior inspection.
+    #[arg(long, value_name = "CALL_ID")]
+    discard_model_call: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -284,6 +299,7 @@ fn main() -> ExitCode {
         Some(Command::Model { command }) => run_model_command(command),
         Some(Command::Run(args)) => run_command(args),
         Some(Command::Resume(args)) => resume_command(args),
+        Some(Command::Recover(args)) => recover_command(&args),
     }
 }
 
@@ -617,6 +633,27 @@ fn resume_command(args: ResumeArgs) -> ExitCode {
         present_model_configuration_error(error)
     } else {
         present(result)
+    }
+}
+
+fn recover_command(args: &RecoverArgs) -> ExitCode {
+    let result = match &args.discard_model_call {
+        Some(call_id) => discard_local_model_call(&args.run_id, call_id),
+        None => inspect_local_model_call(&args.run_id),
+    };
+    match result {
+        Ok(report) => {
+            // A failed stdout write can follow a committed discard. Inspect before retrying.
+            let mut stdout = std::io::stdout().lock();
+            if serde_json::to_writer(&mut stdout, &report).is_err()
+                || stdout.write_all(b"\n").is_err()
+                || stdout.flush().is_err()
+            {
+                return present(Err(PublicRunError::Internal));
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => present(Err(error)),
     }
 }
 
