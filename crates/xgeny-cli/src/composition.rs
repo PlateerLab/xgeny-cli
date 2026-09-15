@@ -549,6 +549,128 @@ pub enum PublicRunError {
     Internal,
 }
 
+/// Bounded offline recovery view, never a provider response or a completion claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ModelCallRecoveryReport {
+    pub format_version: u32,
+    pub run_id: String,
+    pub journal_sequence: u64,
+    pub journal_head_digest: String,
+    pub active_call: Option<RecoveryModelCall>,
+    pub lifecycle_configured: bool,
+    pub reserved_calls: u32,
+    pub max_model_calls: u32,
+    pub settled_calls: u32,
+    pub unknown_calls: u32,
+    pub effect_recovery_required: bool,
+    pub discarded_call_id: Option<String>,
+}
+
+/// Only a Core-generated identity and the durable closed status taxonomy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecoveryModelCall {
+    pub call_id: String,
+    pub status: ModelCallStatus,
+}
+
+/// Inspect model-call recovery under the Run lease without changing journal state.
+/// Does not resolve credentials, open the workspace, or invoke providers/tools.
+///
+/// # Errors
+/// Returns a closed public error for an invalid layout, held lease, or corrupt state.
+pub fn inspect_local_model_call(run_id: &str) -> Result<ModelCallRecoveryReport, PublicRunError> {
+    local_model_call_recovery(run_id, None)
+}
+
+/// Explicitly stop accepting the exact active call's response. Never refunds a slot,
+/// asserts non-delivery, retries a request, or resumes the Run.
+///
+/// # Errors
+/// Also fails before mutation for a missing/stale call ID or a completed Run.
+pub fn discard_local_model_call(
+    run_id: &str,
+    call_id: &str,
+) -> Result<ModelCallRecoveryReport, PublicRunError> {
+    local_model_call_recovery(run_id, Some(call_id))
+}
+
+fn local_model_call_recovery(
+    run_id: &str,
+    discard_call_id: Option<&str>,
+) -> Result<ModelCallRecoveryReport, PublicRunError> {
+    let state_root = discover_state_root().map_err(|_| PublicRunError::Configuration)?;
+    let layout =
+        RunLayout::existing(&state_root, run_id).map_err(|_| PublicRunError::Configuration)?;
+    let lease = acquire_lease(&layout, run_id)?;
+    let manifest = layout
+        .read_manifest()
+        .map_err(|_| PublicRunError::Integrity)?;
+    let store = SqliteRunStore::open_existing_read_only(layout.database_path())
+        .map_err(|_| PublicRunError::Integrity)?;
+    let mut state = store
+        .load_current()
+        .map_err(|_| PublicRunError::Integrity)?
+        .ok_or(PublicRunError::Integrity)?;
+    verify_manifest_state(&manifest, &state)?;
+    let completed = load_offline_completion(&store, &state)?.is_some();
+    if let Some(call_id) = discard_call_id {
+        let active = state
+            .agent_loop
+            .as_ref()
+            .and_then(|agent| agent.model_calls.as_ref())
+            .and_then(|calls| calls.active_call.as_ref());
+        if completed || active.is_none_or(|call| call.reservation.call_id() != call_id) {
+            return Err(PublicRunError::Configuration);
+        }
+        drop(store);
+        let mut store = reopen_writable_verified(&layout, &manifest, &state)?;
+        let runtime = AgentLoop::with_model_call_budget(
+            manifest
+                .budget()
+                .agent_loop()
+                .map_err(|_| PublicRunError::Integrity)?,
+            manifest
+                .budget()
+                .model_calls()
+                .map_err(|_| PublicRunError::Integrity)?,
+        );
+        let tick = runtime
+            .abandon_model_call(&mut store, &mut HostEventFactory, &lease, call_id)
+            .map_err(|_| PublicRunError::Integrity)?;
+        if !matches!(tick, AgentLoopTick::ModelCallAbandoned { .. }) {
+            return Err(PublicRunError::Integrity);
+        }
+        state = store
+            .load_current()
+            .map_err(|_| PublicRunError::Integrity)?
+            .ok_or(PublicRunError::Integrity)?;
+    }
+    let calls = state
+        .agent_loop
+        .as_ref()
+        .and_then(|agent| agent.model_calls.as_ref());
+    Ok(ModelCallRecoveryReport {
+        format_version: 1,
+        run_id: state.run_id.clone(),
+        journal_sequence: state.journal_sequence,
+        journal_head_digest: state.journal_head_digest.clone(),
+        active_call: calls
+            .and_then(|calls| calls.active_call.as_ref())
+            .map(|call| RecoveryModelCall {
+                call_id: call.reservation.call_id().to_owned(),
+                status: call.status,
+            }),
+        lifecycle_configured: calls.is_some(),
+        reserved_calls: calls.map_or(0, |calls| calls.reserved_calls),
+        max_model_calls: manifest.budget().max_model_calls,
+        settled_calls: calls.map_or(0, |calls| calls.settled_calls),
+        unknown_calls: calls.map_or(0, |calls| calls.unknown_calls),
+        effect_recovery_required: executing_step_id(&state).is_some()
+            || has_effect_uncertainty(&state),
+        discarded_call_id: discard_call_id.map(str::to_owned),
+    })
+}
+
 impl PublicRunError {
     #[must_use]
     pub const fn code(self) -> &'static str {

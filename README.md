@@ -112,6 +112,12 @@ Headless `run`/`resume`에서 도구 인자 검증이 거절되면 기존 verdic
 값·실제 경로·원문 오류는 출력하지 않으며, 이 정보는 자동 재시도 권한이나 durable 증빙이 아니다.
 호스트 연동 계약과 제한은 [ADR-0038](docs/adr/0038-safe-invocation-diagnostics.md)을 따른다.
 
+불확정 모델 호출은 `xgeny recover RUN_ID`로 오프라인 조회할 수 있습니다. 응답 수락을 명시적으로
+포기하려면 조회한 정확한 ID로 `xgeny recover RUN_ID --discard-model-call CALL_ID`를 실행합니다.
+소비한 호출 예산은 복구되지 않으며 이 명령은 모델·도구를 호출하거나 Run을 재개하지 않습니다.
+이후 재개에도 원래 workspace·권한·남은 예산이 필요합니다.
+[복구 절차와 호스트 연동 경계](docs/development/local-model-call-recovery.md)를 먼저 확인하세요.
+
 ## 제품 원칙
 
 - 사용자는 `xgeny` 하나만 설치합니다.

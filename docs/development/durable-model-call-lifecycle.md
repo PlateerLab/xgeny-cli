@@ -204,6 +204,11 @@ Explicit discard는 previous request가 전송되지 않았다는 증명이 아�
 
 현재 public recovery entry point는 `AgentLoop::abandon_model_call(..., call_id)`다. Exact active call만 `ModelCallSettlement::Abandoned { reason: ModelCallAbandonmentReason::RecoveryDiscarded }`를 담은 `ModelCallSettled` event로 닫고 `ModelCallAbandoned` tick을 반환한다. 자동 timeout worker나 implicit retry가 이 API를 대신 호출해서는 안 된다.
 
+CLI에서는 `xgeny recover RUN_ID`로 오프라인 조회하고, 정확한 active call ID를 명시한
+`xgeny recover RUN_ID --discard-model-call CALL_ID`로 같은 Core API를 호출한다.
+모델·도구 실행과 별도이며 [복구 절차](local-model-call-recovery.md)의 기존 예산·권한·workspace
+보존 조건을 따른다. Default `resume`의 자동 재시도 금지는 변하지 않는다.
+
 ### Timeout과 unavailable
 
 기존 port failure 이름만 보고 전송 여부를 추정하지 않는다. Timeout과 delivery가 불명확한 unavailable은 Unknown이다. Provider adapter가 request가 전송되기 전에 실패했음을 future contract로 증명하더라도 이번 기본형의 보수적 상한을 약화하지 않는다.
