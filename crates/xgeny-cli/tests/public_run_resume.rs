@@ -716,7 +716,14 @@ fn explicit_discard_of_reserved_call_is_offline_and_lease_guarded() {
     // Recovery does not require or recreate a missing physical workspace.
     fs::rename(&workspace, fixture.path().join("moved-workspace")).expect("fixture moves");
     let result = xgeny(&state_root)
-        .args(["recover", &run_id, "--discard-model-call", call_id])
+        .args([
+            "recover",
+            &run_id,
+            "--discard-model-call",
+            call_id,
+            "--expected-journal-head",
+            report["journal_head_digest"].as_str().expect("head"),
+        ])
         .bounded_output()
         .expect("discard returns");
     assert_exit(&result, 0);
@@ -733,6 +740,160 @@ fn explicit_discard_of_reserved_call_is_offline_and_lease_guarded() {
     assert_eq!(closed["unknown_calls"], 0);
     assert!(closed["active_call"].is_null());
     assert!(!workspace.exists());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn guarded_discard_rejects_changed_head_even_when_call_id_is_unchanged() {
+    let fixture = tempdir().expect("fixture");
+    let state_root = fixture.path().join("state");
+    let workspace = fixture.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::write(workspace.join("README.md"), FILE_MARKER).expect("source");
+    let server = BlockingServer::spawn();
+    let mut child = ChildGuard::new(
+        xgeny(&state_root)
+            .args([
+                "run",
+                "goal",
+                "--workspace",
+                path_text(&workspace),
+                "--base-url",
+                &server.base_url,
+                "--model",
+                MODEL,
+                "--tokenizer",
+                TOKENIZER,
+                "--allow-file",
+                "README.md",
+                "--allow-remote-model-egress",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run starts"),
+    );
+    server.request.recv_timeout(TEST_TIMEOUT).expect("request");
+    child.terminate();
+    let run_id = extract_run_id(&child.stderr_text());
+    server.release.send(()).expect("release");
+    server.handle.join().expect("server stops");
+    let reserved = recovery_report(&state_root, &run_id);
+    let call_id = reserved["active_call"]["call_id"]
+        .as_str()
+        .expect("call ID");
+    let old_head = reserved["journal_head_digest"].as_str().expect("head");
+    let recovered = xgeny(&state_root)
+        .args(["resume", &run_id])
+        .bounded_output()
+        .expect("classify interruption without calling provider");
+    assert_exit(&recovered, 30);
+    let current = recovery_report(&state_root, &run_id);
+    assert_eq!(current["active_call"]["call_id"], call_id);
+    assert_ne!(current["journal_head_digest"], old_head);
+    let current_head = current["journal_head_digest"].as_str().expect("head");
+    let database = run_database(&state_root, &run_id);
+    let before = SqliteRunStore::open_existing_read_only(&database)
+        .expect("store")
+        .load()
+        .expect("load")
+        .expect("run");
+    for head in [old_head, "", "invalid-private-value", "sha256:abc"] {
+        let denied = xgeny(&state_root)
+            .args([
+                "recover",
+                &run_id,
+                "--discard-model-call",
+                call_id,
+                "--expected-journal-head",
+                head,
+            ])
+            .bounded_output()
+            .expect("guard returns");
+        assert_exit(&denied, 64);
+        assert_eq!(
+            stderr(&denied).trim(),
+            "XGENY_ERROR code=configuration_mismatch"
+        );
+        assert!(denied.stdout.is_empty());
+        assert_eq!(recovery_report(&state_root, &run_id), current);
+    }
+    let lease = xgeny_runtime::LocalRunLease::try_acquire(
+        &run_id,
+        state_root.join("runs").join(&run_id).join("run.lock"),
+    )
+    .expect("lease");
+    let busy = xgeny(&state_root)
+        .args([
+            "recover",
+            &run_id,
+            "--discard-model-call",
+            call_id,
+            "--expected-journal-head",
+            current_head,
+        ])
+        .bounded_output()
+        .expect("busy");
+    assert_exit(&busy, 75);
+    drop(lease);
+    let untouched = SqliteRunStore::open_existing_read_only(&database)
+        .expect("store")
+        .load()
+        .expect("load")
+        .expect("run");
+    assert_eq!(untouched, before);
+    let discard = xgeny(&state_root)
+        .args([
+            "recover",
+            &run_id,
+            "--discard-model-call",
+            call_id,
+            "--expected-journal-head",
+            current_head,
+        ])
+        .bounded_output()
+        .expect("discard");
+    assert_exit(&discard, 0);
+    let closed: Value = serde_json::from_slice(&discard.stdout).expect("report");
+    assert_eq!(closed["discarded_call_id"], call_id);
+    assert_eq!(closed["reserved_calls"], current["reserved_calls"]);
+    assert_eq!(closed["max_model_calls"], current["max_model_calls"]);
+    assert_eq!(closed["settled_calls"], 1);
+    assert!(closed["active_call"].is_null());
+    let after = SqliteRunStore::open_existing_read_only(&database)
+        .expect("store")
+        .load()
+        .expect("load")
+        .expect("run");
+    assert_eq!(after.records.len(), before.records.len() + 1);
+    assert_eq!(after.state.steps, before.state.steps);
+    let repeated = xgeny(&state_root)
+        .args([
+            "recover",
+            &run_id,
+            "--discard-model-call",
+            call_id,
+            "--expected-journal-head",
+            current_head,
+        ])
+        .bounded_output()
+        .expect("repeat");
+    assert_exit(&repeated, 64);
+    let unchanged = SqliteRunStore::open_existing_read_only(&database)
+        .expect("store")
+        .load()
+        .expect("load")
+        .expect("run");
+    assert_eq!(unchanged, after);
+    let inspect_with_guard = xgeny(&state_root)
+        .args(["recover", &run_id, "--expected-journal-head", current_head])
+        .bounded_output()
+        .expect("guard without action");
+    assert_exit(&inspect_with_guard, 2);
+    assert_eq!(
+        recovery_report(&state_root, &run_id)["journal_sequence"],
+        closed["journal_sequence"]
+    );
 }
 
 #[test]

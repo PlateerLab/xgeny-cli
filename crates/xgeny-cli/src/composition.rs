@@ -579,7 +579,7 @@ pub struct RecoveryModelCall {
 /// # Errors
 /// Returns a closed public error for an invalid layout, held lease, or corrupt state.
 pub fn inspect_local_model_call(run_id: &str) -> Result<ModelCallRecoveryReport, PublicRunError> {
-    local_model_call_recovery(run_id, None)
+    local_model_call_recovery(run_id, None, None)
 }
 
 /// Explicitly stop accepting the exact active call's response. Never refunds a slot,
@@ -591,12 +591,26 @@ pub fn discard_local_model_call(
     run_id: &str,
     call_id: &str,
 ) -> Result<ModelCallRecoveryReport, PublicRunError> {
-    local_model_call_recovery(run_id, Some(call_id))
+    local_model_call_recovery(run_id, Some(call_id), None)
+}
+
+/// Discard only if the verified journal still matches the host's inspected head.
+/// The comparison and settlement both hold the same exclusive Run lease.
+///
+/// # Errors
+/// Fails without mutation for a stale/malformed head, stale call, or held lease.
+pub fn discard_local_model_call_at_head(
+    run_id: &str,
+    call_id: &str,
+    expected_head: &str,
+) -> Result<ModelCallRecoveryReport, PublicRunError> {
+    local_model_call_recovery(run_id, Some(call_id), Some(expected_head))
 }
 
 fn local_model_call_recovery(
     run_id: &str,
     discard_call_id: Option<&str>,
+    expected_head: Option<&str>,
 ) -> Result<ModelCallRecoveryReport, PublicRunError> {
     let state_root = discover_state_root().map_err(|_| PublicRunError::Configuration)?;
     let layout =
@@ -612,6 +626,12 @@ fn local_model_call_recovery(
         .map_err(|_| PublicRunError::Integrity)?
         .ok_or(PublicRunError::Integrity)?;
     verify_manifest_state(&manifest, &state)?;
+    // Compare under the native lease, before opening writable state. The verified
+    // head is canonical; malformed input cannot match. Never drop this condition
+    // and retry an unconditional discard on behalf of the caller.
+    if expected_head.is_some_and(|head| head != state.journal_head_digest) {
+        return Err(PublicRunError::Configuration);
+    }
     let completed = load_offline_completion(&store, &state)?.is_some();
     if let Some(call_id) = discard_call_id {
         let active = state

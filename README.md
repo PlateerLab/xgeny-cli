@@ -116,6 +116,8 @@ Headless `run`/`resume`에서 도구 인자 검증이 거절되면 기존 verdic
 포기하려면 조회한 정확한 ID로 `xgeny recover RUN_ID --discard-model-call CALL_ID`를 실행합니다.
 소비한 호출 예산은 복구되지 않으며 이 명령은 모델·도구를 호출하거나 Run을 재개하지 않습니다.
 이후 재개에도 원래 workspace·권한·남은 예산이 필요합니다.
+호스트의 승인 시점과 상태를 묶으려면 discard에 `--expected-journal-head sha256:HEX`를
+함께 전달합니다. 같은 호출 ID라도 조회 후 기록이 바뀌었으면 native lease 안에서 거부합니다.
 [복구 절차와 호스트 연동 경계](docs/development/local-model-call-recovery.md)를 먼저 확인하세요.
 
 ## 제품 원칙

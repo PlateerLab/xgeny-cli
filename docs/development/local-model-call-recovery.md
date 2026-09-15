@@ -12,6 +12,20 @@ xgeny recover RUN_ID
 xgeny recover RUN_ID --discard-model-call CALL_ID_FROM_INSPECTION
 ```
 
+For host-managed approval, bind the action to the inspected journal head as well:
+
+```text
+xgeny recover RUN_ID --discard-model-call CALL_ID_FROM_INSPECTION --expected-journal-head sha256:HEAD_FROM_INSPECTION
+```
+
+The expected-head comparison happens under the exclusive Run lease, before any
+writable store is opened. A stale or malformed head fails with exit 64 and does
+not settle the call, even when its ID is unchanged. Inspect again and re-evaluate
+approval; never automatically omit the flag on error or for an older binary.
+The flag requires a discard action. The unguarded manual form remains compatible
+but does not bind an earlier host approval to the whole journal state.
+See [ADR-0041](../adr/0041-recovery-expected-journal-head.md).
+
 The first command never appends journal events, including for Reserved calls.
 Both forms hold the exclusive Run lease; a live owner returns exit 75 rather than
 being interrupted. They need neither the model endpoint/credentials nor workspace.
@@ -62,7 +76,8 @@ this command neither restores it nor relaxes physical-identity checks.
 `crates/xgeny-cli/tests/public_run_resume.rs` exercises separate binary processes
 with loopback fixture providers, including an actual process kill. It checks
 read-only inspection, exact discard, lease/integrity errors, consumed reservations,
-and a verified read followed by failed inference, discard, and fresh completion
+same-ID/stale-head denial and exactly-once guarded discard, and a verified read
+followed by failed inference, discard, and fresh completion
 without repeating the read. These are not real-provider/ML recovery claims.
 
 Run format, clippy, workspace tests, protocol check and release build using the
@@ -88,3 +103,26 @@ rollout require their own tests; macOS/Windows are checked by repository CI.
 - No real provider call, ML training, production binary replacement, or actual
   failed-project continuation was performed. macOS/Windows and remote PR CI are
   separate checks, not included in these local results.
+
+### 2026-09-16 expected-head verification (Linux x86_64 / Rust 1.98.0)
+
+- Based on merged `37ac177` (#65). Red: the new public process test failed on
+  the baseline because `--expected-journal-head` was not recognized (exit 2).
+- Green: all 11 public run/resume tests pass. A killed Reserved call becomes
+  Unknown through ordinary offline resume, keeping its ID but changing its head.
+  The old head is refused without mutation; the new head settles exactly once.
+  The tests also check malformed heads, held lease, a guarded Reserved discard,
+  missing action, unchanged reservation limits, and repeated discard denial.
+- Full `cargo test --locked --offline --workspace --quiet` passed with the
+  existing four ignored tests still ignored. These are not all-platform results.
+- Workspace clippy (`--all-targets -- -D warnings`), formatting and offline
+  protocol check passed (9 schemas, 28 fixtures, 26 semantic checks).
+- Optimized `cargo build --locked --offline --release -p xgeny-cli` passed;
+  the release binary also passed the offline protocol check and exposes the new
+  recovery option in help. Remote Linux/macOS/Windows CI remains a separate gate.
+- Builds and temporary fixtures use task-specific executable tmpfs directories
+  and at most two compiler jobs.
+- No real LLM, production journal mutation, deployment or actual ML recovery was
+  performed. The platform still needs approval/receipt persistence and bounded
+  continuation. An existing Run's binary-identity checks are not bypassed by
+  introducing this new binary; binary migration is a separate host decision.
