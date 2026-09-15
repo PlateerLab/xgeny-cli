@@ -11,8 +11,8 @@ use xgeny_cli::{
     LocalProcessSession, LocalResumeRequest, LocalRunRequest, ModelCheckError, ModelCheckRequest,
     ModelCredentialStore, ModelProfile, ModelProfileError, ModelProfileStore,
     OsModelCredentialStore, PublicRunError, check_openai_compatibility, check_openai_model,
-    discard_local_model_call, inspect_local_model_call, list_openai_models,
-    new_credential_reference, prepare_local_process_session, resume_local,
+    discard_local_model_call, discard_local_model_call_at_head, inspect_local_model_call,
+    list_openai_models, new_credential_reference, prepare_local_process_session, resume_local,
     resume_local_with_model_resolver, resume_local_with_model_resolver_and_progress,
     resume_local_with_process_session_and_model_resolver_progress,
     run_local_with_process_session_progress, run_local_with_started,
@@ -72,6 +72,9 @@ struct RecoverArgs {
     /// Explicitly discard this exact active call ID obtained from a prior inspection.
     #[arg(long, value_name = "CALL_ID")]
     discard_model_call: Option<String>,
+    /// Require the inspected journal head to still match under the Run lease.
+    #[arg(long, value_name = "SHA256_HEAD", requires = "discard_model_call")]
+    expected_journal_head: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -638,7 +641,10 @@ fn resume_command(args: ResumeArgs) -> ExitCode {
 
 fn recover_command(args: &RecoverArgs) -> ExitCode {
     let result = match &args.discard_model_call {
-        Some(call_id) => discard_local_model_call(&args.run_id, call_id),
+        Some(call_id) => match &args.expected_journal_head {
+            Some(head) => discard_local_model_call_at_head(&args.run_id, call_id, head),
+            None => discard_local_model_call(&args.run_id, call_id),
+        },
         None => inspect_local_model_call(&args.run_id),
     };
     match result {
