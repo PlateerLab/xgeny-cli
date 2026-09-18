@@ -960,6 +960,7 @@ const fn map_compatibility_transport_failure(
         PlannerPortFailure::Unavailable => OpenAiCompatibilityCheckFailure::Unavailable,
         PlannerPortFailure::InvalidResponse => OpenAiCompatibilityCheckFailure::InvalidResponse,
         PlannerPortFailure::ProviderLimit => OpenAiCompatibilityCheckFailure::ProviderLimit,
+        PlannerPortFailure::OutputTruncated => OpenAiCompatibilityCheckFailure::OutputTruncated,
         PlannerPortFailure::ProviderRejected => OpenAiCompatibilityCheckFailure::RequestRejected,
     }
 }
@@ -1059,7 +1060,7 @@ fn decode_chat_response(
         return Err(PlannerPortFailure::InvalidResponse);
     }
     if choice.finish_reason == "length" {
-        return Err(PlannerPortFailure::ProviderLimit);
+        return Err(PlannerPortFailure::OutputTruncated);
     }
     if choice.finish_reason != "stop"
         || choice.message.refusal.is_some()
@@ -1768,7 +1769,7 @@ mod tests {
         }
         assert_eq!(
             decode_chat_response(&response(&valid_plan(), "length"), MODEL, 256 * 1024, 64,),
-            Err(PlannerPortFailure::ProviderLimit)
+            Err(PlannerPortFailure::OutputTruncated)
         );
         assert_eq!(
             decode_chat_response(&response(&valid_plan(), "stop"), MODEL, 8, 64),

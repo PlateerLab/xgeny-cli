@@ -804,6 +804,74 @@ fn deterministic_provider_rejection_is_closed_without_raw_error_body() {
     assert!(!durable.contains(RAW_RESPONSE_SENTINEL));
 }
 
+#[test]
+fn truncated_planner_output_is_closed_as_output_truncated_not_provider_limit() {
+    // ADR-0039: a 200 whose choice ended at the output token budget is a budget problem the user
+    // fixes with --max-output-tokens, not a rate limit. The journal must keep that distinction.
+    let body = serde_json::to_vec(&json!({
+        "id": RAW_RESPONSE_SENTINEL,
+        "model": "qwen3.8-27b",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "{\"objective\":\"partial"},
+            "finish_reason": "length"
+        }]
+    }))
+    .unwrap();
+    let server = TestServer::spawn("200 OK", body);
+    let mut planner = planner(&server.base_url);
+    let mut store = seed_store();
+    let loop_runtime = configured_loop(&mut store, &mut planner);
+    let mut events = DeterministicEvents;
+    let mut materializer = EphemeralMaterializer;
+    let tick = loop_runtime
+        .tick(
+            &mut store,
+            &mut events,
+            &FixedLease,
+            &synthetic_registry(),
+            &IdentityResolver::default(),
+            &mut planner,
+            &mut materializer,
+        )
+        .expect("truncation should settle as a rejection");
+    assert!(matches!(
+        tick,
+        AgentLoopTick::PlannerUnavailable {
+            failure: PlannerPortFailure::OutputTruncated,
+            ..
+        }
+    ));
+    let request = server.finish();
+    assert_eq!(
+        std::str::from_utf8(&request)
+            .unwrap()
+            .matches("POST /v1/chat/completions")
+            .count(),
+        1,
+        "a truncated response must not be retried"
+    );
+    let snapshot = store.load().unwrap().unwrap();
+    let last = snapshot.records.last().expect("settlement should exist");
+    assert!(matches!(
+        &last.event.body,
+        RunEventBody::ModelCallSettled {
+            settlement: ModelCallSettlement::Rejected {
+                reason: ModelCallRejectionReason::OutputTruncated
+            },
+            ..
+        }
+    ));
+    let durable = format!(
+        "{}{}",
+        serde_json::to_string(&snapshot.records).unwrap(),
+        serde_json::to_string(&snapshot.state).unwrap()
+    );
+    assert!(durable.contains("\"output_truncated\""));
+    assert!(!durable.contains(RAW_RESPONSE_SENTINEL));
+    assert!(!durable.contains("partial"));
+}
+
 /// A provider that accepts the request and then stalls longer than the planner budget.
 fn spawn_stalling_server(stall: Duration) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");

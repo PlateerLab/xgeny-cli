@@ -169,6 +169,7 @@ Port 안에서 retry, fallback model, secondary endpoint 또는 response-repair 
 | valid Plan + Core/materialization 성공 | `PlanAccepted`와 모든 input sidecar가 success settlement | +1 |
 | valid Completion + Core gate 성공 | `CompletionCandidateRecorded`가 success settlement | +1 |
 | `PlannerPortFailure::ProviderLimit` | closed `ProviderLimit` settlement | 변화 없음 |
+| `PlannerPortFailure::OutputTruncated` | closed `OutputTruncated` settlement (ADR-0039) | 변화 없음 |
 | `PlannerPortFailure::ProviderRejected` | closed `ProviderRejected` settlement | 변화 없음 |
 | invalid response/decode | closed rejection settlement | 변화 없음 |
 | proposal/context/graph/Core validation 실패 | closed rejection settlement | 변화 없음 |
