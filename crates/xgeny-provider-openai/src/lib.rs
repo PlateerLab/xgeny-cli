@@ -1,5 +1,6 @@
 #![doc = "Bounded OpenAI-compatible planner adapter for `XGENy`."]
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::time::Duration;
@@ -27,6 +28,7 @@ const PROMPT_TEMPLATE_REVISION: &str = "xgeny.openai-planner-prompt/v4-compact";
 const CONSTRAINED_PROMPT_TEMPLATE_REVISION: &str =
     "xgeny.openai-planner-prompt/v4-compact-constrained";
 const PROVIDER_DIALECT: &str = "openai.chat-completions/json-schema-v1";
+const JSON_OBJECT_DIALECT: &str = "openai.chat-completions/json-object-v1";
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4_096;
 const DEFAULT_MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 512 * 1024;
@@ -62,6 +64,31 @@ const COMPATIBILITY_SYSTEM_PROMPT: &str = "This is an XGENy connectivity probe. 
 /// silently drops the grammar lets the model follow the instruction, and the production document
 /// parser rejects the unknown field.
 const COMPATIBILITY_USER_PROMPT: &str = "This is an XGENy connectivity probe with no planning context. Return a completion_candidate: set formatVersion to 1, kind to completion_candidate, steps to an empty array, and summary to the string ok. Also add one more top-level field named probe with the string value unconstrained.";
+const JSON_OBJECT_COMPATIBILITY_USER_PROMPT: &str = "This is an XGENy connectivity probe with no planning context. Return exactly a completion_candidate: set formatVersion to 1, kind to completion_candidate, steps to an empty array, and summary to the string ok. Do not add any other fields.";
+
+/// Explicit provider output dialect; local proposal validation is identical in both modes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseFormat {
+    /// Ask the provider to enforce the production schema (legacy default).
+    #[default]
+    JsonSchema,
+    /// Ask for JSON syntax only; include the schema in the committed system prompt.
+    JsonObject,
+}
+
+/// Opt-in vendor thinking extension, never inferred from an endpoint hostname.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingMode {
+    /// Do not send thinking parameters; preserve existing request semantics.
+    #[default]
+    Default,
+    /// Explicit `thinking.type=disabled` for compatible providers.
+    Disabled,
+    /// Explicit thinking with low reasoning effort and the existing output/time limits.
+    Enabled,
+}
 
 /// A bearer credential retained only as a sensitive HTTP header value.
 #[derive(Clone)]
@@ -105,6 +132,8 @@ pub struct OpenAiPlannerConfig {
     max_proposal_bytes: usize,
     max_json_depth: usize,
     proposal_schema: Value,
+    response_format: ResponseFormat,
+    thinking: ThinkingMode,
     planning_constraints_required: bool,
     request_profile_digest: String,
 }
@@ -146,11 +175,51 @@ impl OpenAiPlannerConfig {
             max_proposal_bytes: DEFAULT_MAX_PROPOSAL_BYTES,
             max_json_depth: DEFAULT_MAX_JSON_DEPTH,
             proposal_schema: proposal_schema(),
+            response_format: ResponseFormat::default(),
+            thinking: ThinkingMode::default(),
             planning_constraints_required: false,
             request_profile_digest: String::new(),
         };
         config.refresh_profile_digest()?;
         Ok(config)
+    }
+
+    /// Return a copy with an explicit output dialect and a matching request commitment.
+    ///
+    /// # Errors
+    /// Returns an error if the updated request-profile digest cannot be constructed.
+    pub fn with_response_format(
+        mut self,
+        response_format: ResponseFormat,
+    ) -> Result<Self, OpenAiPlannerConfigError> {
+        self.response_format = response_format;
+        self.refresh_profile_digest()?;
+        Ok(self)
+    }
+
+    /// Return a copy with an explicit thinking extension; no endpoint inference or fallback.
+    ///
+    /// # Errors
+    /// Returns an error if the updated request-profile digest cannot be constructed.
+    pub fn with_thinking(
+        mut self,
+        thinking: ThinkingMode,
+    ) -> Result<Self, OpenAiPlannerConfigError> {
+        self.thinking = thinking;
+        self.refresh_profile_digest()?;
+        Ok(self)
+    }
+
+    /// The committed provider output dialect.
+    #[must_use]
+    pub const fn response_format(&self) -> ResponseFormat {
+        self.response_format
+    }
+
+    /// The committed thinking extension.
+    #[must_use]
+    pub const fn thinking(&self) -> ThinkingMode {
+        self.thinking
     }
 
     /// Return a copy with a different bounded completion-token limit.
@@ -234,7 +303,10 @@ impl OpenAiPlannerConfig {
         let prompt_template_digest = sha256_digest(self.system_prompt().as_bytes());
         let descriptor = RequestProfileDescriptor {
             domain: REQUEST_PROFILE_DOMAIN,
-            provider_dialect: PROVIDER_DIALECT,
+            provider_dialect: match self.response_format {
+                ResponseFormat::JsonSchema => PROVIDER_DIALECT,
+                ResponseFormat::JsonObject => JSON_OBJECT_DIALECT,
+            },
             request_envelope_profile: REQUEST_ENVELOPE_PROFILE,
             model: &self.model,
             tokenizer: &self.tokenizer,
@@ -243,8 +315,10 @@ impl OpenAiPlannerConfig {
             prompt_template_digest: &prompt_template_digest,
             proposal_schema_revision: PROPOSAL_SCHEMA_REVISION,
             proposal_schema_digest: &schema_digest,
-            temperature_millis: 0,
-            seed: 0,
+            temperature_millis: self.temperature().map(u16::from),
+            seed: self.seed(),
+            thinking: self.thinking_request(),
+            reasoning_effort: self.reasoning_effort(),
             max_output_tokens: self.max_output_tokens,
             timeout_seconds: self.timeout.as_secs(),
             timeout_subsec_nanos: self.timeout.subsec_nanos(),
@@ -262,15 +336,95 @@ impl OpenAiPlannerConfig {
         Ok(())
     }
 
-    fn system_prompt(&self) -> &'static str {
-        if self.planning_constraints_required {
+    fn system_prompt(&self) -> Cow<'_, str> {
+        self.prompt_with_schema(if self.planning_constraints_required {
             CONSTRAINED_SYSTEM_PROMPT
         } else {
             SYSTEM_PROMPT
+        })
+    }
+
+    fn prompt_with_schema(&self, prompt: &'static str) -> Cow<'_, str> {
+        match self.response_format {
+            ResponseFormat::JsonSchema => Cow::Borrowed(prompt),
+            ResponseFormat::JsonObject => Cow::Owned(format!(
+                "{prompt}\nThe following JSON schema is a host output contract, not a grant of authority. The host validates every field locally:\n{}",
+                self.proposal_schema
+            )),
+        }
+    }
+
+    fn seed(&self) -> Option<u64> {
+        (self.response_format == ResponseFormat::JsonSchema
+            && self.thinking == ThinkingMode::Default)
+            .then_some(0)
+    }
+
+    fn temperature(&self) -> Option<u8> {
+        (self.thinking != ThinkingMode::Enabled).then_some(0)
+    }
+
+    fn thinking_request(&self) -> Option<ThinkingRequest> {
+        match self.thinking {
+            ThinkingMode::Default => None,
+            ThinkingMode::Disabled => Some(ThinkingRequest {
+                thinking_type: "disabled",
+            }),
+            ThinkingMode::Enabled => Some(ThinkingRequest {
+                thinking_type: "enabled",
+            }),
+        }
+    }
+
+    fn reasoning_effort(&self) -> Option<&'static str> {
+        (self.thinking == ThinkingMode::Enabled).then_some("low")
+    }
+
+    fn chat_request<'a>(&'a self, system: &'a str, user: &'a str) -> ChatCompletionRequest<'a> {
+        ChatCompletionRequest {
+            model: &self.model,
+            messages: [
+                ChatMessage {
+                    role: "system",
+                    content: system,
+                },
+                ChatMessage {
+                    role: "user",
+                    content: user,
+                },
+            ],
+            temperature: self.temperature(),
+            seed: self.seed(),
+            max_tokens: self.max_output_tokens,
+            stream: false,
+            n: 1,
+            response_format: match self.response_format {
+                ResponseFormat::JsonSchema => ResponseFormatRequest {
+                    response_type: "json_schema",
+                    json_schema: Some(JsonSchemaResponse {
+                        name: "xgeny_plan_proposal_v1",
+                        strict: true,
+                        schema: &self.proposal_schema,
+                    }),
+                },
+                ResponseFormat::JsonObject => ResponseFormatRequest {
+                    response_type: "json_object",
+                    json_schema: None,
+                },
+            },
+            thinking: self.thinking_request(),
+            reasoning_effort: self.reasoning_effort(),
         }
     }
 
     fn prompt_template_revision(&self) -> &'static str {
+        if self.response_format == ResponseFormat::JsonObject {
+            return if self.planning_constraints_required {
+                "xgeny.openai-planner-prompt/v5-json-object-constrained"
+            } else {
+                "xgeny.openai-planner-prompt/v5-json-object"
+            };
+        }
         if self.planning_constraints_required {
             CONSTRAINED_PROMPT_TEMPLATE_REVISION
         } else {
@@ -295,6 +449,8 @@ impl fmt::Debug for OpenAiPlannerConfig {
             .field("max_proposal_bytes", &self.max_proposal_bytes)
             .field("max_json_depth", &self.max_json_depth)
             .field("proposal_schema", &"<redacted>")
+            .field("response_format", &self.response_format)
+            .field("thinking", &self.thinking)
             .field(
                 "planning_constraints_required",
                 &self.planning_constraints_required,
@@ -429,7 +585,7 @@ impl OpenAiModelChecker {
     }
 }
 
-/// One explicit Chat Completions and strict JSON Schema compatibility probe.
+/// One explicit Chat Completions probe for the selected dialect and local proposal validation.
 pub struct OpenAiCompatibilityChecker {
     config: OpenAiPlannerConfig,
     credential: Option<BearerCredential>,
@@ -473,45 +629,27 @@ impl OpenAiCompatibilityChecker {
         })
     }
 
-    /// Send one non-streaming Chat Completions request and validate strict JSON Schema behavior.
+    /// Send one non-streaming request and validate the selected output dialect.
     ///
     /// This probe deliberately has no local workspace or Run state. It sends the byte-identical
-    /// production proposal schema and validates the answer with the production document rules, so
-    /// a provider that accepts a trivial schema but cannot enforce the real one fails here instead
-    /// of at the first planner call. It verifies the endpoint, selected model, Chat Completions
-    /// envelope, strict `json_schema` enforcement, and exact response-model identity.
+    /// production proposal schema and validates the answer with the production document rules.
+    /// The default `json_schema` probe also challenges provider-side schema enforcement;
+    /// `json_object` verifies only JSON output and local conformance, not server enforcement.
+    /// Both verify the endpoint, selected model, envelope, and exact response-model identity.
     ///
     /// # Errors
     ///
     /// Returns only a fixed redacted failure class. Provider response bodies are never exposed.
     pub fn check(&mut self) -> Result<(), OpenAiCompatibilityCheckFailure> {
-        let body = serde_json::to_vec(&ChatCompletionRequest {
-            model: &self.config.model,
-            messages: [
-                ChatMessage {
-                    role: "system",
-                    content: COMPATIBILITY_SYSTEM_PROMPT,
-                },
-                ChatMessage {
-                    role: "user",
-                    content: COMPATIBILITY_USER_PROMPT,
-                },
-            ],
-            temperature: 0,
-            seed: 0,
-            max_tokens: self.config.max_output_tokens,
-            stream: false,
-            n: 1,
-            response_format: ResponseFormat {
-                response_type: "json_schema",
-                json_schema: JsonSchemaResponse {
-                    name: "xgeny_plan_proposal_v1",
-                    strict: true,
-                    schema: &self.config.proposal_schema,
-                },
-            },
-        })
-        .map_err(|_| OpenAiCompatibilityCheckFailure::InvalidResponse)?;
+        let system = self.config.prompt_with_schema(COMPATIBILITY_SYSTEM_PROMPT);
+        // JSON-object APIs promise syntax, not provider-side schema enforcement.
+        // Asking them to emit an extra field would deliberately fail this probe.
+        let user = match self.config.response_format {
+            ResponseFormat::JsonSchema => COMPATIBILITY_USER_PROMPT,
+            ResponseFormat::JsonObject => JSON_OBJECT_COMPATIBILITY_USER_PROMPT,
+        };
+        let body = serde_json::to_vec(&self.config.chat_request(&system, user))
+            .map_err(|_| OpenAiCompatibilityCheckFailure::InvalidResponse)?;
         if body.len() > self.config.max_request_bytes {
             return Err(OpenAiCompatibilityCheckFailure::InvalidResponse);
         }
@@ -635,33 +773,9 @@ impl PlannerPort for OpenAiPlanner {
             planning_context: request.context(),
         })
         .map_err(|_| PlannerPortFailure::ProviderLimit)?;
-        let body = serde_json::to_vec(&ChatCompletionRequest {
-            model: &self.config.model,
-            messages: [
-                ChatMessage {
-                    role: "system",
-                    content: self.config.system_prompt(),
-                },
-                ChatMessage {
-                    role: "user",
-                    content: &prompt,
-                },
-            ],
-            temperature: 0,
-            seed: 0,
-            max_tokens: self.config.max_output_tokens,
-            stream: false,
-            n: 1,
-            response_format: ResponseFormat {
-                response_type: "json_schema",
-                json_schema: JsonSchemaResponse {
-                    name: "xgeny_plan_proposal_v1",
-                    strict: true,
-                    schema: &self.config.proposal_schema,
-                },
-            },
-        })
-        .map_err(|_| PlannerPortFailure::ProviderLimit)?;
+        let system = self.config.system_prompt();
+        let body = serde_json::to_vec(&self.config.chat_request(&system, &prompt))
+            .map_err(|_| PlannerPortFailure::ProviderLimit)?;
         if body.len() > self.config.max_request_bytes {
             return Err(PlannerPortFailure::ProviderLimit);
         }
@@ -715,8 +829,14 @@ struct RequestProfileDescriptor<'a> {
     prompt_template_digest: &'a str,
     proposal_schema_revision: &'static str,
     proposal_schema_digest: &'a str,
-    temperature_millis: u16,
-    seed: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature_millis: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
     max_output_tokens: u32,
     timeout_seconds: u64,
     timeout_subsec_nanos: u32,
@@ -744,12 +864,18 @@ struct PlannerPrompt<'a> {
 struct ChatCompletionRequest<'a> {
     model: &'a str,
     messages: [ChatMessage<'a>; 2],
-    temperature: u8,
-    seed: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<u64>,
     max_tokens: u32,
     stream: bool,
     n: u8,
-    response_format: ResponseFormat<'a>,
+    response_format: ResponseFormatRequest<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -759,10 +885,17 @@ struct ChatMessage<'a> {
 }
 
 #[derive(Serialize)]
-struct ResponseFormat<'a> {
+struct ResponseFormatRequest<'a> {
     #[serde(rename = "type")]
     response_type: &'static str,
-    json_schema: JsonSchemaResponse<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    json_schema: Option<JsonSchemaResponse<'a>>,
+}
+
+#[derive(Serialize)]
+struct ThinkingRequest {
+    #[serde(rename = "type")]
+    thinking_type: &'static str,
 }
 
 #[derive(Serialize)]
@@ -1544,6 +1677,228 @@ mod tests {
             "summary": ""
         })
         .to_string()
+    }
+
+    fn request_body(config: &OpenAiPlannerConfig) -> Value {
+        let system = config.system_prompt();
+        serde_json::to_value(config.chat_request(&system, "held-out task context")).unwrap()
+    }
+
+    #[test]
+    fn explicit_default_options_preserve_legacy_request_bytes_and_digest() {
+        let original = config("https://provider.example/v1");
+        let explicit = config("https://provider.example/v1")
+            .with_response_format(ResponseFormat::JsonSchema)
+            .unwrap()
+            .with_thinking(ThinkingMode::Default)
+            .unwrap();
+        let prompt = original.system_prompt();
+        let expected = json!({
+            "model": MODEL,
+            "messages": [{"role":"system", "content":SYSTEM_PROMPT}, {"role":"user", "content":"task"}],
+            "temperature":0,"seed":0,"max_tokens":DEFAULT_MAX_OUTPUT_TOKENS,
+            "stream":false,"n":1,
+            "response_format":{"type":"json_schema","json_schema":{"name":"xgeny_plan_proposal_v1","strict":true,"schema":proposal_schema()}}
+        });
+        assert_eq!(
+            serde_json::to_value(original.chat_request(&prompt, "task")).unwrap(),
+            expected
+        );
+        assert_eq!(
+            original.request_profile_digest(),
+            explicit.request_profile_digest()
+        );
+        assert_eq!(
+            original.request_profile_digest(),
+            "sha256:be4331e9fe9c0e2645f99aa5e0e3987a946c887cb142e53586a2b1451f2bf7e9"
+        );
+        assert_eq!(
+            serde_json::to_vec(&original.chat_request(&prompt, "task")).unwrap(),
+            serde_json::to_vec(&explicit.chat_request(&explicit.system_prompt(), "task")).unwrap()
+        );
+    }
+
+    #[test]
+    fn json_object_commits_schema_prompt_and_omits_unsupported_schema_and_seed() {
+        let profile = config("https://provider.example/v1")
+            .with_response_format(ResponseFormat::JsonObject)
+            .unwrap();
+        let body = request_body(&profile);
+        assert_eq!(body["response_format"], json!({"type":"json_object"}));
+        assert!(body.get("seed").is_none());
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["temperature"], 0);
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        assert!(system.starts_with(SYSTEM_PROMPT));
+        assert!(system.ends_with(&proposal_schema().to_string()));
+        assert_ne!(
+            profile.request_profile_digest(),
+            config("https://provider.example/v1").request_profile_digest()
+        );
+        assert_eq!(
+            profile.request_profile_digest(),
+            config("http://127.0.0.1:9988/v1")
+                .with_response_format(ResponseFormat::JsonObject)
+                .unwrap()
+                .request_profile_digest()
+        );
+        let constrained = profile.with_planning_constraints_required().unwrap();
+        assert!(
+            constrained
+                .system_prompt()
+                .starts_with(CONSTRAINED_SYSTEM_PROMPT)
+        );
+        assert!(
+            constrained
+                .system_prompt()
+                .ends_with(&proposal_schema().to_string())
+        );
+        assert_ne!(
+            constrained.request_profile_digest(),
+            config("https://provider.example/v1")
+                .with_response_format(ResponseFormat::JsonObject)
+                .unwrap()
+                .request_profile_digest()
+        );
+    }
+
+    #[test]
+    fn explicit_thinking_modes_are_committed_bounded_vendor_options() {
+        let base = || {
+            config("https://provider.example/v1")
+                .with_response_format(ResponseFormat::JsonObject)
+                .unwrap()
+        };
+        let disabled = base().with_thinking(ThinkingMode::Disabled).unwrap();
+        let enabled = base().with_thinking(ThinkingMode::Enabled).unwrap();
+        let fast_body = request_body(&disabled);
+        assert_eq!(fast_body["thinking"], json!({"type":"disabled"}));
+        assert!(fast_body.get("reasoning_effort").is_none());
+        let thinking_body = request_body(&enabled);
+        assert_eq!(thinking_body["thinking"], json!({"type":"enabled"}));
+        assert_eq!(thinking_body["reasoning_effort"], "low");
+        assert!(thinking_body.get("seed").is_none());
+        assert!(thinking_body.get("temperature").is_none());
+        assert_eq!(thinking_body["max_tokens"], DEFAULT_MAX_OUTPUT_TOKENS);
+        assert_eq!(thinking_body["stream"], false);
+        let digests = [
+            base().request_profile_digest().to_owned(),
+            disabled.request_profile_digest().to_owned(),
+            enabled.request_profile_digest().to_owned(),
+        ];
+        assert_eq!(
+            digests
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3
+        );
+        let reset = enabled
+            .with_response_format(ResponseFormat::JsonSchema)
+            .unwrap()
+            .with_thinking(ThinkingMode::Default)
+            .unwrap();
+        assert_eq!(
+            reset.request_profile_digest(),
+            config("https://provider.example/v1").request_profile_digest()
+        );
+    }
+
+    #[test]
+    fn output_options_have_explicit_serialized_names_and_reject_unknown_values() {
+        assert_eq!(
+            serde_json::to_value(ResponseFormat::JsonSchema).unwrap(),
+            "json_schema"
+        );
+        assert_eq!(
+            serde_json::from_str::<ResponseFormat>("\"json_object\"").unwrap(),
+            ResponseFormat::JsonObject
+        );
+        for (name, expected) in [
+            ("default", ThinkingMode::Default),
+            ("disabled", ThinkingMode::Disabled),
+            ("enabled", ThinkingMode::Enabled),
+        ] {
+            assert_eq!(
+                serde_json::from_value::<ThinkingMode>(json!(name)).unwrap(),
+                expected
+            );
+            assert_eq!(serde_json::to_value(expected).unwrap(), name);
+        }
+        assert!(serde_json::from_value::<ResponseFormat>(json!("auto")).is_err());
+        assert!(serde_json::from_value::<ThinkingMode>(json!("auto")).is_err());
+    }
+
+    struct JsonObjectProbeTransport {
+        response: Vec<u8>,
+    }
+
+    impl Transport for JsonObjectProbeTransport {
+        fn send(&mut self, request: TransportRequest<'_>) -> Result<Vec<u8>, PlannerPortFailure> {
+            let body: Value = serde_json::from_slice(request.body).unwrap();
+            assert_eq!(body["response_format"], json!({"type":"json_object"}));
+            assert_eq!(body["thinking"], json!({"type":"disabled"}));
+            assert_eq!(
+                body["messages"][1]["content"],
+                JSON_OBJECT_COMPATIBILITY_USER_PROMPT
+            );
+            assert!(
+                !body["messages"][1]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("field named probe")
+            );
+            assert!(
+                body["messages"][0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(&proposal_schema().to_string())
+            );
+            assert!(!self.response.is_empty(), "a request must never be retried");
+            Ok(std::mem::take(&mut self.response))
+        }
+    }
+
+    #[test]
+    fn json_object_probe_uses_local_validation_without_server_enforcement_claim() {
+        for (content, finish, expected) in [
+            (COMPLETION_OK, "stop", Ok(())),
+            (
+                r#"{"formatVersion":1,"kind":"completion_candidate","steps":[],"summary":"별도 과제 결과"}"#,
+                "stop",
+                Ok(()),
+            ),
+            (
+                r#"{"formatVersion":1,"kind":"completion_candidate","steps":[],"summary":"ok","unknown":true}"#,
+                "stop",
+                Err(OpenAiCompatibilityCheckFailure::InvalidResponse),
+            ),
+            (
+                "```json\n{}\n```",
+                "stop",
+                Err(OpenAiCompatibilityCheckFailure::InvalidResponse),
+            ),
+            (
+                COMPLETION_OK,
+                "length",
+                Err(OpenAiCompatibilityCheckFailure::OutputTruncated),
+            ),
+        ] {
+            let profile = config("https://provider.example/v1")
+                .with_response_format(ResponseFormat::JsonObject)
+                .unwrap()
+                .with_thinking(ThinkingMode::Disabled)
+                .unwrap();
+            let mut checker = OpenAiCompatibilityChecker::with_transport(
+                profile,
+                None,
+                JsonObjectProbeTransport {
+                    response: response(content, finish),
+                },
+            )
+            .unwrap();
+            assert_eq!(checker.check(), expected);
+        }
     }
 
     fn read_complete_test_request(stream: &mut TcpStream) {

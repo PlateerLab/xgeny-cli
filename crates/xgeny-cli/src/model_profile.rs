@@ -12,7 +12,7 @@ use keyring::{Entry, Error as KeyringError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use xgeny_provider_openai::OpenAiPlannerConfig;
+use xgeny_provider_openai::{OpenAiPlannerConfig, ResponseFormat, ThinkingMode};
 use zeroize::Zeroizing;
 
 const PROFILE_FILE: &str = "model-profiles.json";
@@ -83,6 +83,13 @@ impl Default for InferenceLimits {
     }
 }
 
+/// Explicit, non-secret provider wire options bound into a Run's request profile digest.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequestOptions {
+    pub response_format: ResponseFormat,
+    pub thinking: ThinkingMode,
+}
+
 /// One non-secret OpenAI-compatible model profile.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ModelProfile {
@@ -92,6 +99,7 @@ pub struct ModelProfile {
     tokenizer: String,
     credential_ref: Option<String>,
     inference_limits: InferenceLimits,
+    request_options: RequestOptions,
 }
 
 impl ModelProfile {
@@ -113,6 +121,7 @@ impl ModelProfile {
             tokenizer: tokenizer.into(),
             credential_ref: None,
             inference_limits: InferenceLimits::default(),
+            request_options: RequestOptions::default(),
         };
         profile.validate()?;
         Ok(profile)
@@ -121,6 +130,26 @@ impl ModelProfile {
     #[must_use]
     pub const fn inference_limits(&self) -> InferenceLimits {
         self.inference_limits
+    }
+
+    #[must_use]
+    pub const fn request_options(&self) -> RequestOptions {
+        self.request_options
+    }
+
+    /// Replace explicit provider wire options after validating them.
+    ///
+    /// # Errors
+    /// Returns `InvalidProfile` if the provider configuration rejects the options.
+    pub fn set_request_options(
+        &mut self,
+        options: RequestOptions,
+    ) -> Result<(), ModelProfileError> {
+        let mut candidate = self.clone();
+        candidate.request_options = options;
+        candidate.validate()?;
+        self.request_options = options;
+        Ok(())
     }
 
     /// Replace the planner inference limits.
@@ -203,6 +232,8 @@ impl ModelProfile {
         )
         .and_then(|config| config.with_timeout(self.inference_limits.timeout))
         .and_then(|config| config.with_max_output_tokens(self.inference_limits.max_output_tokens))
+        .and_then(|config| config.with_response_format(self.request_options.response_format))
+        .and_then(|config| config.with_thinking(self.request_options.thinking))
         .map(|_| ())
         .map_err(|_| ModelProfileError::InvalidProfile)
     }
@@ -221,6 +252,7 @@ impl std::fmt::Debug for ModelProfile {
                 &self.credential_ref.as_ref().map(|_| "<present>"),
             )
             .field("inference_limits", &self.inference_limits)
+            .field("request_options", &self.request_options)
             .finish()
     }
 }
@@ -716,6 +748,10 @@ struct StoredProfile {
     inference_timeout_seconds: u64,
     #[serde(default = "default_max_output_tokens")]
     max_output_tokens: u32,
+    #[serde(default)]
+    response_format: ResponseFormat,
+    #[serde(default)]
+    thinking: ThinkingMode,
 }
 
 fn default_inference_timeout_seconds() -> u64 {
@@ -736,6 +772,8 @@ impl StoredProfile {
             credential_ref: profile.credential_ref.clone(),
             inference_timeout_seconds: profile.inference_limits.timeout.as_secs(),
             max_output_tokens: profile.inference_limits.max_output_tokens,
+            response_format: profile.request_options.response_format,
+            thinking: profile.request_options.thinking,
         }
     }
 
@@ -752,6 +790,10 @@ impl StoredProfile {
             tokenizer: self.tokenizer,
             credential_ref: self.credential_ref,
             inference_limits,
+            request_options: RequestOptions {
+                response_format: self.response_format,
+                thinking: self.thinking,
+            },
         };
         profile
             .validate()
@@ -1116,6 +1158,32 @@ mod tests {
     }
 
     #[test]
+    fn request_options_round_trip_and_reject_unknown_modes() {
+        for response_format in [ResponseFormat::JsonSchema, ResponseFormat::JsonObject] {
+            for thinking in [
+                ThinkingMode::Default,
+                ThinkingMode::Disabled,
+                ThinkingMode::Enabled,
+            ] {
+                let mut original = profile("wire");
+                let options = RequestOptions {
+                    response_format,
+                    thinking,
+                };
+                original.set_request_options(options).unwrap();
+                let encoded = serde_json::to_value(StoredProfile::from_profile(&original)).unwrap();
+                let decoded: StoredProfile = serde_json::from_value(encoded.clone()).unwrap();
+                assert_eq!(decoded.into_profile().unwrap().request_options(), options);
+                for field in ["responseFormat", "thinking"] {
+                    let mut malformed = encoded.clone();
+                    malformed[field] = serde_json::json!("auto-detect");
+                    assert!(serde_json::from_value::<StoredProfile>(malformed).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn inference_limits_round_trip_and_legacy_files_load_with_defaults() {
         let directory = tempdir().unwrap();
         let root = directory.path().join("config");
@@ -1167,6 +1235,10 @@ mod tests {
         assert_eq!(
             legacy_loaded.active().unwrap().inference_limits(),
             InferenceLimits::default()
+        );
+        assert_eq!(
+            legacy_loaded.active().unwrap().request_options(),
+            RequestOptions::default()
         );
 
         // Out-of-range stored values fail closed like any other invalid profile field.

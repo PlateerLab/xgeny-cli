@@ -12,7 +12,7 @@ use xgeny_local_store::{
     Commit, ExpectedHead, MemoryRunStore, RunPlanningSnapshot, RunSnapshot, RunStore, StoreError,
 };
 use xgeny_policy::{ResourceResolutionFailure, ResourceResolver};
-use xgeny_provider_openai::{OpenAiPlanner, OpenAiPlannerConfig};
+use xgeny_provider_openai::{OpenAiPlanner, OpenAiPlannerConfig, ResponseFormat, ThinkingMode};
 use xgeny_runtime::{
     AgentLoop, AgentLoopTick, CapabilityRegistry, EventFactory, EventFactoryError, EventMetadata,
     PlanMaterializationRequest, PlanMaterializer, PlanMaterializerFailure, PlannerPortFailure,
@@ -475,6 +475,144 @@ fn planner(base_url: &str) -> OpenAiPlanner {
     .with_max_output_tokens(512)
     .expect("output limit should validate");
     OpenAiPlanner::new(config, None).expect("planner should build")
+}
+
+fn json_object_planner(base_url: &str, timeout: Duration) -> OpenAiPlanner {
+    let config = OpenAiPlannerConfig::new(
+        base_url,
+        "xgeny.test.json-object",
+        "qwen3.8-27b",
+        "test-tokenizer",
+    )
+    .unwrap()
+    .with_response_format(ResponseFormat::JsonObject)
+    .unwrap()
+    .with_thinking(ThinkingMode::Disabled)
+    .unwrap()
+    .with_max_output_tokens(512)
+    .unwrap()
+    .with_timeout(timeout)
+    .unwrap();
+    OpenAiPlanner::new(config, None).unwrap()
+}
+
+#[test]
+fn json_object_native_calls_still_reserve_validate_and_settle_exactly_once() {
+    let valid = json!({
+        "formatVersion":1,"kind":"plan","steps":[{
+            "key":"record_sample","objective":"Record a held-out sample path","dependsOn":[],
+            "capability":{"capabilityId":"xgeny.test/record-path","contractVersion":"1.0.0"},
+            "arguments":{"path":"/workspace/sample.csv"}
+        }],"summary":""
+    });
+    let mut invalid = valid.clone();
+    invalid["untrusted_extra"] = json!(true);
+    for (content, finish, expected_failure) in [
+        (valid.clone(), "stop", None),
+        (invalid, "stop", Some(PlannerPortFailure::InvalidResponse)),
+        (valid, "length", Some(PlannerPortFailure::ProviderLimit)),
+    ] {
+        let mut envelope: Value = serde_json::from_slice(&provider_response(&content)).unwrap();
+        envelope["choices"][0]["finish_reason"] = json!(finish);
+        envelope["choices"][0]["message"]["reasoning_content"] = json!(RAW_RESPONSE_SENTINEL);
+        let server = TestServer::spawn("200 OK", serde_json::to_vec(&envelope).unwrap());
+        let mut planner = json_object_planner(&server.base_url, Duration::from_secs(3));
+        let mut store = seed_store();
+        let loop_runtime = configured_loop(&mut store, &mut planner);
+        let tick = loop_runtime
+            .tick(
+                &mut store,
+                &mut DeterministicEvents,
+                &FixedLease,
+                &synthetic_registry(),
+                &IdentityResolver::default(),
+                &mut planner,
+                &mut EphemeralMaterializer,
+            )
+            .unwrap();
+        match expected_failure {
+            None => assert!(matches!(tick, AgentLoopTick::PlanAccepted { .. })),
+            Some(expected) => assert!(
+                matches!(tick, AgentLoopTick::PlannerUnavailable { failure, .. } if failure == expected)
+            ),
+        }
+        let request = server.finish();
+        let offset = find_header_end(&request).unwrap() + 4;
+        let body: Value = serde_json::from_slice(&request[offset..]).unwrap();
+        assert_eq!(body["response_format"], json!({"type":"json_object"}));
+        assert_eq!(body["thinking"], json!({"type":"disabled"}));
+        assert!(body.get("seed").is_none());
+        assert!(
+            body["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("additionalProperties")
+        );
+        let snapshot = store.load().unwrap().unwrap();
+        let lifecycle = snapshot
+            .state
+            .agent_loop
+            .as_ref()
+            .unwrap()
+            .model_calls
+            .as_ref()
+            .unwrap();
+        assert_eq!(lifecycle.reserved_calls, 1);
+        assert_eq!(lifecycle.settled_calls, 1);
+        assert_eq!(lifecycle.unknown_calls, 0);
+        assert!(lifecycle.active_call.is_none());
+        assert!(
+            !serde_json::to_string(&snapshot.records)
+                .unwrap()
+                .contains(RAW_RESPONSE_SENTINEL)
+        );
+    }
+}
+
+#[test]
+fn json_object_timeout_retains_unknown_call_without_automatic_replay() {
+    let (base_url, handle) = spawn_stalling_server(Duration::from_millis(150));
+    let mut planner = json_object_planner(&base_url, Duration::from_millis(40));
+    let mut store = seed_store();
+    let loop_runtime = configured_loop(&mut store, &mut planner);
+    let tick = loop_runtime
+        .tick(
+            &mut store,
+            &mut DeterministicEvents,
+            &FixedLease,
+            &synthetic_registry(),
+            &IdentityResolver::default(),
+            &mut planner,
+            &mut EphemeralMaterializer,
+        )
+        .unwrap();
+    assert!(matches!(
+        tick,
+        AgentLoopTick::PlannerUnavailable {
+            failure: PlannerPortFailure::Timeout,
+            ..
+        }
+    ));
+    let snapshot = store.load().unwrap().unwrap();
+    assert!(matches!(
+        snapshot.records.last().unwrap().event.body,
+        RunEventBody::ModelCallBecameUnknown {
+            reason: ModelCallUnknownReason::Timeout,
+            ..
+        }
+    ));
+    let lifecycle = snapshot
+        .state
+        .agent_loop
+        .as_ref()
+        .unwrap()
+        .model_calls
+        .as_ref()
+        .unwrap();
+    assert_eq!(lifecycle.reserved_calls, 1);
+    assert_eq!(lifecycle.unknown_calls, 1);
+    assert_eq!(lifecycle.settled_calls, 0);
+    handle.join().unwrap();
 }
 
 fn assert_strict_request_contract(request: &[u8]) -> Value {

@@ -69,7 +69,7 @@ use crate::material_catalog::{
     WORKSPACE_READ_MATERIAL_PROVIDER_ID, WORKSPACE_READ_RECIPE_DOMAIN,
     WORKSPACE_READ_RECIPE_FORMAT_VERSION, WorkspaceReadMaterialProvider, WorkspaceReadMaterializer,
 };
-use crate::model_profile::InferenceLimits;
+use crate::model_profile::{InferenceLimits, RequestOptions};
 use crate::run_layout::{RunLayout, discover_state_root, generate_run_id};
 
 const WORKSPACE_ID: &str = "primary";
@@ -111,6 +111,7 @@ pub struct LocalRunRequest {
     pub tokenizer: String,
     pub credential: Option<BearerCredential>,
     pub inference_limits: InferenceLimits,
+    pub request_options: RequestOptions,
     pub allow_files: Vec<String>,
     pub allow_dirs: Vec<String>,
     pub allow_executables: Vec<String>,
@@ -140,6 +141,7 @@ impl LocalRunRequest {
             tokenizer,
             credential: None,
             inference_limits: InferenceLimits::default(),
+            request_options: RequestOptions::default(),
             allow_files,
             allow_dirs: Vec::new(),
             allow_executables: Vec::new(),
@@ -160,6 +162,7 @@ pub struct LocalResumeRequest {
     pub base_url: Option<String>,
     pub credential: Option<BearerCredential>,
     pub inference_limits: InferenceLimits,
+    pub request_options: RequestOptions,
     pub allow_files: Vec<String>,
     pub allow_dirs: Vec<String>,
     pub allow_executables: Vec<String>,
@@ -168,6 +171,15 @@ pub struct LocalResumeRequest {
     pub allow_write: bool,
     pub allow_execute: bool,
     pub max_ticks: u32,
+}
+
+/// Deferred provider settings resolved only when an incomplete Run needs model access.
+/// The resumed request digest must match the immutable manifest before any inference.
+pub struct ResolvedModelEndpoint {
+    pub base_url: String,
+    pub credential: Option<BearerCredential>,
+    pub inference_limits: InferenceLimits,
+    pub request_options: RequestOptions,
 }
 
 /// Process executable/environment snapshot reused by one interactive host session.
@@ -227,6 +239,7 @@ pub struct ModelCheckRequest {
     pub tokenizer: String,
     pub credential: Option<BearerCredential>,
     pub inference_limits: InferenceLimits,
+    pub request_options: RequestOptions,
 }
 
 /// Stable, redacted failure classes returned by `xgeny model check`.
@@ -335,6 +348,7 @@ pub fn check_openai_model(request: ModelCheckRequest) -> Result<(), ModelCheckEr
         tokenizer,
         credential,
         inference_limits: _,
+        request_options: _,
     } = request;
     let config = OpenAiPlannerConfig::new(&base_url, DEFAULT_PLANNER_ID, &model, &tokenizer)
         .and_then(|config| config.with_timeout(MODEL_CHECK_TIMEOUT))
@@ -357,6 +371,7 @@ pub fn list_openai_models(request: ModelCheckRequest) -> Result<Vec<String>, Mod
         tokenizer,
         credential,
         inference_limits: _,
+        request_options: _,
     } = request;
     let config = OpenAiPlannerConfig::new(&base_url, DEFAULT_PLANNER_ID, &model, &tokenizer)
         .and_then(|config| config.with_timeout(MODEL_CHECK_TIMEOUT))
@@ -367,7 +382,7 @@ pub fn list_openai_models(request: ModelCheckRequest) -> Result<Vec<String>, Mod
         .map_err(map_model_check_failure)
 }
 
-/// Send one explicit strict-JSON Chat Completions compatibility probe without Run state.
+/// Send one explicit, host-validated Chat Completions compatibility probe without Run state.
 ///
 /// # Errors
 ///
@@ -379,8 +394,15 @@ pub fn check_openai_compatibility(request: ModelCheckRequest) -> Result<(), Mode
         tokenizer,
         credential,
         inference_limits,
+        request_options,
     } = request;
-    let config = compatibility_probe_config(&base_url, &model, &tokenizer, inference_limits)?;
+    let config = compatibility_probe_config(
+        &base_url,
+        &model,
+        &tokenizer,
+        inference_limits,
+        request_options,
+    )?;
     OpenAiCompatibilityChecker::new(config, credential)
         .map_err(map_model_check_config)?
         .check()
@@ -398,10 +420,13 @@ fn compatibility_probe_config(
     model: &str,
     tokenizer: &str,
     limits: InferenceLimits,
+    options: RequestOptions,
 ) -> Result<OpenAiPlannerConfig, ModelCheckError> {
     OpenAiPlannerConfig::new(base_url, DEFAULT_PLANNER_ID, model, tokenizer)
         .and_then(|config| config.with_max_output_tokens(limits.max_output_tokens()))
         .and_then(|config| config.with_timeout(limits.timeout()))
+        .and_then(|config| config.with_response_format(options.response_format))
+        .and_then(|config| config.with_thinking(options.thinking))
         .map_err(map_model_check_config)
 }
 
@@ -878,6 +903,7 @@ where
         &request.model,
         &request.tokenizer,
         request.inference_limits,
+        request.request_options,
         planning_constraints_required,
     )?;
     let local_execution_profile_digest =
@@ -958,7 +984,7 @@ pub fn resume_local_with_model_resolver<F>(
     resolve_model: F,
 ) -> Result<LocalCommandResult, PublicRunError>
 where
-    F: FnOnce() -> Result<(String, Option<BearerCredential>), PublicRunError>,
+    F: FnOnce() -> Result<ResolvedModelEndpoint, PublicRunError>,
 {
     resume_local_with_model_resolver_and_progress(request, resolve_model, |_| {
         DriverProgressControl::Continue
@@ -980,7 +1006,7 @@ pub fn resume_local_with_model_resolver_and_progress<F, O>(
     on_progress: O,
 ) -> Result<LocalCommandResult, PublicRunError>
 where
-    F: FnOnce() -> Result<(String, Option<BearerCredential>), PublicRunError>,
+    F: FnOnce() -> Result<ResolvedModelEndpoint, PublicRunError>,
     O: FnMut(DriverProgress) -> DriverProgressControl,
 {
     resume_local_composed(request, None, resolve_model, on_progress)
@@ -1002,7 +1028,7 @@ pub fn resume_local_with_process_session_and_model_resolver_progress<F, O>(
     on_progress: O,
 ) -> Result<LocalCommandResult, PublicRunError>
 where
-    F: FnOnce() -> Result<(String, Option<BearerCredential>), PublicRunError>,
+    F: FnOnce() -> Result<ResolvedModelEndpoint, PublicRunError>,
     O: FnMut(DriverProgress) -> DriverProgressControl,
 {
     resume_local_composed(request, Some(process_session), resolve_model, on_progress)
@@ -1016,7 +1042,7 @@ fn resume_local_composed<F, O>(
     mut on_progress: O,
 ) -> Result<LocalCommandResult, PublicRunError>
 where
-    F: FnOnce() -> Result<(String, Option<BearerCredential>), PublicRunError>,
+    F: FnOnce() -> Result<ResolvedModelEndpoint, PublicRunError>,
     O: FnMut(DriverProgress) -> DriverProgressControl,
 {
     validate_max_ticks(request.max_ticks)?;
@@ -1124,22 +1150,28 @@ where
         return Err(PublicRunError::Configuration);
     }
     let planner = if request.allow_remote_model_egress {
-        let (base_url, credential) = match request.base_url.as_ref() {
-            Some(base_url) => (base_url.clone(), request.credential.clone()),
+        let resolved = match request.base_url.as_ref() {
+            Some(base_url) => ResolvedModelEndpoint {
+                base_url: base_url.clone(),
+                credential: request.credential.clone(),
+                inference_limits: request.inference_limits,
+                request_options: request.request_options,
+            },
             None => resolve_model()?,
         };
         let config = planner_config(
-            &base_url,
+            &resolved.base_url,
             manifest.planner_id(),
             manifest.model(),
             manifest.tokenizer(),
-            request.inference_limits,
+            resolved.inference_limits,
+            resolved.request_options,
             catalog.workspace_discovery() || process.is_some(),
         )?;
         if manifest.request_profile_digest() != config.request_profile_digest() {
             return Err(PublicRunError::Configuration);
         }
-        Some(remote_planner(config, credential)?)
+        Some(remote_planner(config, resolved.credential)?)
     } else {
         None
     };
@@ -1688,11 +1720,14 @@ fn planner_config(
     model: &str,
     tokenizer: &str,
     limits: InferenceLimits,
+    options: RequestOptions,
     planning_constraints_required: bool,
 ) -> Result<OpenAiPlannerConfig, PublicRunError> {
     let config = OpenAiPlannerConfig::new(base_url, planner_id, model, tokenizer)
         .and_then(|config| config.with_max_output_tokens(limits.max_output_tokens()))
         .and_then(|config| config.with_timeout(limits.timeout()))
+        .and_then(|config| config.with_response_format(options.response_format))
+        .and_then(|config| config.with_thinking(options.thinking))
         .map_err(map_provider_config)?;
     if planning_constraints_required {
         config
@@ -2681,15 +2716,21 @@ mod tests {
     #[test]
     fn probe_and_planner_follow_the_profile_limits_and_stay_digest_identical() {
         let limits = InferenceLimits::new(Duration::from_secs(300), 2_048).unwrap();
-        let probe =
-            compatibility_probe_config("http://127.0.0.1:1/v1", "model", "tokenizer", limits)
-                .unwrap();
+        let probe = compatibility_probe_config(
+            "http://127.0.0.1:1/v1",
+            "model",
+            "tokenizer",
+            limits,
+            RequestOptions::default(),
+        )
+        .unwrap();
         let production = planner_config(
             "http://127.0.0.1:1/v1",
             DEFAULT_PLANNER_ID,
             "model",
             "tokenizer",
             limits,
+            RequestOptions::default(),
             false,
         )
         .unwrap();
@@ -2705,6 +2746,7 @@ mod tests {
             "model",
             "tokenizer",
             other,
+            RequestOptions::default(),
             false,
         )
         .unwrap();
@@ -2722,6 +2764,7 @@ mod tests {
             "model",
             "tokenizer",
             InferenceLimits::default(),
+            RequestOptions::default(),
         )
         .expect("probe config should validate");
         let production = planner_config(
@@ -2730,6 +2773,7 @@ mod tests {
             "model",
             "tokenizer",
             InferenceLimits::default(),
+            RequestOptions::default(),
             false,
         )
         .expect("production config should validate");
@@ -2739,6 +2783,45 @@ mod tests {
             production.request_profile_digest(),
             "probe must commit the same non-secret request semantics the production planner uses"
         );
+    }
+
+    #[test]
+    fn explicit_wire_options_have_identical_probe_and_planner_digests() {
+        use xgeny_provider_openai::{ResponseFormat, ThinkingMode};
+        for response_format in [ResponseFormat::JsonSchema, ResponseFormat::JsonObject] {
+            for thinking in [
+                ThinkingMode::Default,
+                ThinkingMode::Disabled,
+                ThinkingMode::Enabled,
+            ] {
+                let options = RequestOptions {
+                    response_format,
+                    thinking,
+                };
+                let probe = compatibility_probe_config(
+                    "https://provider.example/v1",
+                    "model",
+                    "tokenizer",
+                    InferenceLimits::default(),
+                    options,
+                )
+                .unwrap();
+                let planner = planner_config(
+                    "https://provider.example/v1",
+                    DEFAULT_PLANNER_ID,
+                    "model",
+                    "tokenizer",
+                    InferenceLimits::default(),
+                    options,
+                    false,
+                )
+                .unwrap();
+                assert_eq!(
+                    probe.request_profile_digest(),
+                    planner.request_profile_digest()
+                );
+            }
+        }
     }
 
     #[test]
@@ -2890,6 +2973,7 @@ mod tests {
             tokenizer: "tokenizer".to_owned(),
             credential: None,
             inference_limits: InferenceLimits::default(),
+            request_options: RequestOptions::default(),
             allow_files: vec!["README.md".to_owned()],
             allow_dirs: Vec::new(),
             allow_executables: Vec::new(),
@@ -2944,6 +3028,7 @@ mod tests {
             tokenizer: "tokenizer".to_owned(),
             credential: None,
             inference_limits: InferenceLimits::default(),
+            request_options: RequestOptions::default(),
             allow_files: Vec::new(),
             allow_dirs: vec![".".to_owned()],
             allow_executables: vec![specification],

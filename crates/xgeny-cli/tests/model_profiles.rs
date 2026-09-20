@@ -301,8 +301,180 @@ fn xgeny(config: &Path, state: &Path) -> Command {
         .env_remove("XGENY_OPENAI_BASE_URL")
         .env_remove("XGENY_OPENAI_MODEL")
         .env_remove("XGENY_OPENAI_TOKENIZER")
+        .env_remove("XGENY_OPENAI_RESPONSE_FORMAT")
+        .env_remove("XGENY_OPENAI_THINKING")
+        .env_remove("XGENY_OPENAI_INFERENCE_TIMEOUT")
+        .env_remove("XGENY_OPENAI_MAX_OUTPUT_TOKENS")
         .env_remove("XGENY_OPENAI_API_KEY");
     command
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // One vertical setup/run/resume fixture checks both wire modes.
+fn explicit_wire_profiles_round_trip_and_resume_with_committed_settings() {
+    // Independent transport/thinking pairs, not hostname- or model-name-specific behavior.
+    for (format, thinking) in [("json_object", "disabled"), ("json_schema", "enabled")] {
+        let fixture = tempdir().unwrap();
+        let config = fixture.path().join("config");
+        let state = fixture.path().join("state");
+        let workspace = fixture.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(workspace.join("README.md"), "wire profile fixture").unwrap();
+        let server = ModelServer::spawn(3, true);
+        let setup = xgeny(&config, &state)
+            .args([
+                "model",
+                "setup",
+                "--base-url",
+                &server.base_url,
+                "--model",
+                MODEL,
+                "--response-format",
+                format,
+                "--thinking",
+                thinking,
+                "--inference-timeout",
+                "600",
+                "--max-output-tokens",
+                "2048",
+            ])
+            .output()
+            .unwrap();
+        assert_success(&setup);
+        let output = String::from_utf8_lossy(&setup.stdout);
+        if format == "json_object" {
+            assert!(output.contains("host-validated; no server schema guarantee"));
+            assert!(!output.contains("strict JSON compatible"));
+        }
+        let profiles: Value =
+            serde_json::from_slice(&fs::read(config.join("model-profiles.json")).unwrap()).unwrap();
+        assert_eq!(profiles["profiles"][0]["responseFormat"], format);
+        assert_eq!(profiles["profiles"][0]["thinking"], thinking);
+        let run = xgeny(&config, &state)
+            .current_dir(&workspace)
+            .args([
+                "run",
+                "--allow-file",
+                "README.md",
+                "--allow-remote-model-egress",
+                "read profile fixture",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            run.status.code(),
+            Some(10),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        let run_id = stderr
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix("run_id="))
+            .unwrap();
+        // A changed option is rejected before model invocation or journal mutation.
+        for override_args in [
+            [
+                "--response-format",
+                if format == "json_object" {
+                    "json_schema"
+                } else {
+                    "json_object"
+                },
+            ],
+            ["--thinking", "default"],
+        ] {
+            let changed = xgeny(&config, &state)
+                .current_dir(&workspace)
+                .args([
+                    "resume",
+                    run_id,
+                    "--allow-file",
+                    "README.md",
+                    "--allow-remote-model-egress",
+                ])
+                .args(override_args)
+                .output()
+                .unwrap();
+            assert_eq!(changed.status.code(), Some(64));
+            assert!(String::from_utf8_lossy(&changed.stderr).contains("configuration_mismatch"));
+        }
+        let resumed = xgeny(&config, &state)
+            .current_dir(&workspace)
+            .args([
+                "resume",
+                run_id,
+                "--allow-file",
+                "README.md",
+                "--allow-remote-model-egress",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            resumed.status.code(),
+            Some(10),
+            "{}",
+            String::from_utf8_lossy(&resumed.stderr)
+        );
+        assert!(String::from_utf8_lossy(&resumed.stderr).contains("read_approval_required"));
+        let requests = server.handle.join().unwrap();
+        for request in &requests[1..] {
+            let body = request_body(request);
+            assert_eq!(body["response_format"]["type"], format);
+            assert_eq!(body["thinking"]["type"], thinking);
+            assert_eq!(body["max_tokens"], 2048);
+            assert!(body.get("seed").is_none());
+            if thinking == "enabled" {
+                assert!(body.get("temperature").is_none());
+                assert_eq!(body["reasoning_effort"], "low");
+            }
+        }
+    }
+}
+
+#[test]
+fn request_option_precedence_and_invalid_values_are_explicit() {
+    let fixture = tempdir().unwrap();
+    let config = fixture.path().join("config");
+    let state = fixture.path().join("state");
+    let server = ModelServer::spawn(2, false);
+    let checked = xgeny(&config, &state)
+        .env("XGENY_OPENAI_RESPONSE_FORMAT", "json_schema")
+        .env("XGENY_OPENAI_THINKING", "enabled")
+        .args([
+            "model",
+            "check",
+            "--base-url",
+            &server.base_url,
+            "--model",
+            MODEL,
+            "--compatibility",
+            "--response-format",
+            "json_object",
+            "--thinking",
+            "disabled",
+        ])
+        .output()
+        .unwrap();
+    assert_success(&checked);
+    let requests = server.handle.join().unwrap();
+    let probe = request_body(&requests[1]);
+    assert_eq!(probe["response_format"]["type"], "json_object");
+    assert_eq!(probe["thinking"]["type"], "disabled");
+    let invalid = xgeny(&config, &state)
+        .env("XGENY_OPENAI_RESPONSE_FORMAT", "auto")
+        .args([
+            "model",
+            "check",
+            "--base-url",
+            "http://127.0.0.1:1/v1",
+            "--model",
+            MODEL,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(invalid.status.code(), Some(64));
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("request_options_invalid"));
 }
 
 fn assert_success(output: &Output) {
