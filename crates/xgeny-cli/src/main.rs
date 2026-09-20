@@ -10,14 +10,15 @@ use xgeny_cli::{
     DriverProgress, DriverProgressControl, InferenceLimits, LocalCommandResult,
     LocalProcessSession, LocalResumeRequest, LocalRunRequest, ModelCheckError, ModelCheckRequest,
     ModelCredentialStore, ModelProfile, ModelProfileError, ModelProfileStore,
-    OsModelCredentialStore, PublicRunError, check_openai_compatibility, check_openai_model,
-    discard_local_model_call, discard_local_model_call_at_head, inspect_local_model_call,
-    list_openai_models, new_credential_reference, prepare_local_process_session, resume_local,
+    OsModelCredentialStore, PublicRunError, RequestOptions, ResolvedModelEndpoint,
+    check_openai_compatibility, check_openai_model, discard_local_model_call,
+    discard_local_model_call_at_head, inspect_local_model_call, list_openai_models,
+    new_credential_reference, prepare_local_process_session, resume_local,
     resume_local_with_model_resolver, resume_local_with_model_resolver_and_progress,
     resume_local_with_process_session_and_model_resolver_progress,
     run_local_with_process_session_progress, run_local_with_started,
 };
-use xgeny_provider_openai::BearerCredential;
+use xgeny_provider_openai::{BearerCredential, ResponseFormat, ThinkingMode};
 use zeroize::Zeroizing;
 
 mod repl;
@@ -104,6 +105,8 @@ enum ModelCommand {
     after_long_help = "Resolution order: explicit options, XGENY_OPENAI_BASE_URL / XGENY_OPENAI_MODEL / XGENY_OPENAI_TOKENIZER environment, then the selected/active profile. Planner inference limits follow XGENY_OPENAI_INFERENCE_TIMEOUT / XGENY_OPENAI_MAX_OUTPUT_TOKENS, then the profile (default 300s / 1024 tokens). HTTPS authentication uses --token-stdin, XGENY_OPENAI_API_KEY, then the profile secure store; no token value is accepted as a command argument."
 )]
 struct ModelCheckArgs {
+    #[command(flatten)]
+    request_options: RequestOptionArgs,
     /// OpenAI-compatible API base URL ending in /v1.
     #[arg(long)]
     base_url: Option<String>,
@@ -119,7 +122,7 @@ struct ModelCheckArgs {
     /// Read one API token line from standard input; the value is never persisted.
     #[arg(long)]
     token_stdin: bool,
-    /// Also send one strict JSON Schema Chat Completions compatibility probe.
+    /// Also send one host-validated Chat Completions probe using the selected response format.
     #[arg(long)]
     compatibility: bool,
 }
@@ -129,6 +132,8 @@ struct ModelCheckArgs {
     after_long_help = "Interactive setup hides token input and stores it only in the platform secure store. In automation, --token-stdin or XGENY_OPENAI_API_KEY is ephemeral unless --store-token is explicitly supplied."
 )]
 struct ModelSetupArgs {
+    #[command(flatten)]
+    request_options: RequestOptionArgs,
     /// Profile name to create or replace.
     #[arg(long, default_value = "default")]
     name: String,
@@ -179,6 +184,8 @@ struct ModelOptionalNameArgs {
     after_long_help = "Resolution order: explicit options, XGENY_OPENAI_BASE_URL / XGENY_OPENAI_MODEL / XGENY_OPENAI_TOKENIZER environment, then the selected/active profile. Planner inference limits follow XGENY_OPENAI_INFERENCE_TIMEOUT / XGENY_OPENAI_MAX_OUTPUT_TOKENS, then the profile (default 300s / 1024 tokens). HTTPS authentication uses --token-stdin, XGENY_OPENAI_API_KEY, then the profile secure store. Credentials are ignored for loopback HTTP and cannot be passed as a command-line value."
 )]
 struct RunArgs {
+    #[command(flatten)]
+    request_options: RequestOptionArgs,
     /// Goal sent to the bounded planner.
     goal: String,
     /// Workspace root opened as the local filesystem capability.
@@ -234,6 +241,8 @@ struct RunArgs {
     after_long_help = "For an incomplete Run, endpoint resolution is explicit --base-url, XGENY_OPENAI_BASE_URL, then the selected/active profile. HTTPS authentication uses --token-stdin, XGENY_OPENAI_API_KEY, then the matching profile secure store. Credentials are ignored for loopback HTTP."
 )]
 struct ResumeArgs {
+    #[command(flatten)]
+    request_options: RequestOptionArgs,
     /// Durable Run identifier printed by `xgeny run`.
     run_id: String,
     /// Original physical workspace root; unnecessary for completed replay.
@@ -272,6 +281,16 @@ struct ResumeArgs {
     /// Bound work performed by this process invocation.
     #[arg(long, default_value_t = 32)]
     max_ticks: u32,
+}
+
+#[derive(Debug, Args, Default)]
+struct RequestOptionArgs {
+    /// Structured output transport; `json_object` is validated by `XGENy`, not server-enforced schema.
+    #[arg(long, value_parser = ["json_schema", "json_object"])]
+    response_format: Option<String>,
+    /// Explicit provider thinking setting; default omits the provider-specific setting.
+    #[arg(long, value_parser = ["default", "disabled", "enabled"])]
+    thinking: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -380,7 +399,7 @@ impl repl::ReplHost for InteractiveHost {
         grants: repl::InvocationGrants,
         progress: &mut dyn FnMut(DriverProgress) -> DriverProgressControl,
     ) -> Result<LocalCommandResult, repl::ReplFailure> {
-        let model = resolve_model(None, None, None, None, false)
+        let model = resolve_model(None, None, None, None, false, RequestOptionArgs::default())
             .map_err(|error| repl::ReplFailure::new(error.code()))?;
         let process_session = self.process_session()?;
         run_local_with_process_session_progress(
@@ -393,6 +412,7 @@ impl repl::ReplHost for InteractiveHost {
                 tokenizer: model.tokenizer,
                 credential: model.credential,
                 inference_limits: model.inference_limits,
+                request_options: model.request_options,
                 allow_files: Vec::new(),
                 allow_dirs: vec![".".to_owned()],
                 allow_executables: Vec::new(),
@@ -421,8 +441,8 @@ impl repl::ReplHost for InteractiveHost {
             workspace: Some(self.workspace.clone()),
             base_url: None,
             credential: None,
-            inference_limits: resolve_inference_limits(None, None, None)
-                .map_err(|error| repl::ReplFailure::new(error.code()))?,
+            inference_limits: InferenceLimits::default(),
+            request_options: RequestOptions::default(),
             allow_files: Vec::new(),
             allow_dirs: vec![".".to_owned()],
             allow_executables: if process_session.is_some() {
@@ -442,12 +462,10 @@ impl repl::ReplHost for InteractiveHost {
                 if !grants.model {
                     return Err(PublicRunError::Configuration);
                 }
-                resolve_endpoint(None, None, false)
-                    .map(|resolved| (resolved.base_url, resolved.credential))
-                    .map_err(|error| {
-                        resolution_error = Some(error);
-                        PublicRunError::Configuration
-                    })
+                resolve_endpoint(None, None, false, RequestOptionArgs::default()).map_err(|error| {
+                    resolution_error = Some(error);
+                    PublicRunError::Configuration
+                })
             };
             if let Some(process_session) = process_session.as_ref() {
                 resume_local_with_process_session_and_model_resolver_progress(
@@ -504,6 +522,7 @@ fn ensure_interactive_model() -> Result<(), ModelCliError> {
         return Ok(());
     }
     let (profile, stored) = try_model_setup(ModelSetupArgs {
+        request_options: RequestOptionArgs::default(),
         name: "default".to_owned(),
         base_url: None,
         model: None,
@@ -557,6 +576,7 @@ fn run_command(args: RunArgs) -> ExitCode {
         args.tokenizer,
         args.profile,
         args.token_stdin,
+        args.request_options,
     ) {
         Ok(resolved) => resolved,
         Err(error) => return present_model_configuration_error(error),
@@ -571,6 +591,7 @@ fn run_command(args: RunArgs) -> ExitCode {
             tokenizer: resolved.tokenizer,
             credential: resolved.credential,
             inference_limits: resolved.inference_limits,
+            request_options: resolved.request_options,
             allow_files: args.allow_files,
             allow_dirs: args.allow_dirs,
             allow_executables: args.allow_executables,
@@ -586,6 +607,7 @@ fn run_command(args: RunArgs) -> ExitCode {
 
 fn resume_command(args: ResumeArgs) -> ExitCode {
     let ResumeArgs {
+        request_options,
         run_id,
         workspace,
         base_url,
@@ -600,16 +622,13 @@ fn resume_command(args: ResumeArgs) -> ExitCode {
         allow_execute,
         max_ticks,
     } = args;
-    let inference_limits = match resolve_inference_limits(None, None, None) {
-        Ok(limits) => limits,
-        Err(error) => return present_model_configuration_error(error),
-    };
     let request = LocalResumeRequest {
         run_id,
         workspace,
         base_url: None,
         credential: None,
-        inference_limits,
+        inference_limits: InferenceLimits::default(),
+        request_options: RequestOptions::default(),
         allow_files,
         allow_dirs,
         allow_executables,
@@ -625,12 +644,10 @@ fn resume_command(args: ResumeArgs) -> ExitCode {
 
     let mut resolution_error = None;
     let result = resume_local_with_model_resolver(request, || {
-        resolve_endpoint(base_url, profile, token_stdin)
-            .map(|resolved| (resolved.base_url, resolved.credential))
-            .map_err(|error| {
-                resolution_error = Some(error);
-                PublicRunError::Configuration
-            })
+        resolve_endpoint(base_url, profile, token_stdin, request_options).map_err(|error| {
+            resolution_error = Some(error);
+            PublicRunError::Configuration
+        })
     });
     if let Some(error) = resolution_error {
         present_model_configuration_error(error)
@@ -671,11 +688,7 @@ struct ResolvedModel {
     tokenizer: String,
     credential: Option<BearerCredential>,
     inference_limits: InferenceLimits,
-}
-
-struct ResolvedEndpoint {
-    base_url: String,
-    credential: Option<BearerCredential>,
+    request_options: RequestOptions,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -702,6 +715,7 @@ enum ModelCliError {
     InvalidCredential,
     CredentialRequiresHttps,
     InvalidInferenceLimits,
+    InvalidRequestOptions,
 }
 
 impl ModelCliError {
@@ -715,6 +729,7 @@ impl ModelCliError {
             Self::InvalidCredential => "api_key_invalid",
             Self::CredentialRequiresHttps => "api_key_requires_https",
             Self::InvalidInferenceLimits => "inference_limits_invalid",
+            Self::InvalidRequestOptions => "request_options_invalid",
         }
     }
 
@@ -734,7 +749,8 @@ impl ModelCliError {
             | Self::InputUnavailable
             | Self::InvalidCredential
             | Self::CredentialRequiresHttps
-            | Self::InvalidInferenceLimits => 64,
+            | Self::InvalidInferenceLimits
+            | Self::InvalidRequestOptions => 64,
             Self::Check(error) => error.exit_code(),
         }
     }
@@ -759,7 +775,14 @@ fn model_setup(args: ModelSetupArgs) -> ExitCode {
             println!("  profile: {}", profile.name());
             println!("  model: {}", profile.model());
             println!("  catalog: exact model advertised");
-            println!("  chat completions: strict JSON compatible");
+            println!(
+                "  chat completions: {}",
+                compatibility_label(profile.request_options())
+            );
+            println!(
+                "  thinking: {}",
+                thinking_label(profile.request_options().thinking)
+            );
             println!(
                 "  inference limits: timeout={}s max_output_tokens={}",
                 profile.inference_limits().timeout().as_secs(),
@@ -822,6 +845,7 @@ fn try_model_setup(args: ModelSetupArgs) -> Result<(ModelProfile, bool), ModelCl
         tokenizer: catalog_identity,
         credential: credential.clone(),
         inference_limits: InferenceLimits::default(),
+        request_options: RequestOptions::default(),
     })?;
     let model = match requested_model {
         Some(model) if models.iter().any(|candidate| candidate == &model) => model,
@@ -845,12 +869,14 @@ fn try_model_setup(args: ModelSetupArgs) -> Result<(ModelProfile, bool), ModelCl
         args.max_output_tokens,
         existing.as_ref(),
     )?;
+    let request_options = resolve_request_options(args.request_options, existing.as_ref())?;
     check_openai_compatibility(ModelCheckRequest {
         base_url: base_url.clone(),
         model: model.clone(),
         tokenizer: tokenizer.clone(),
         credential,
         inference_limits,
+        request_options,
     })?;
 
     let _lock = store.try_lock()?;
@@ -865,6 +891,7 @@ fn try_model_setup(args: ModelSetupArgs) -> Result<(ModelProfile, bool), ModelCl
     let credentials = OsModelCredentialStore;
     let mut profile = ModelProfile::new(&args.name, base_url, model, tokenizer)?;
     profile.set_inference_limits(inference_limits)?;
+    profile.set_request_options(request_options)?;
     let retain_existing = secret.source == SetupSecretSource::SecureStore;
     let should_store = args.store_token || secret.source == SetupSecretSource::Interactive;
     let mut new_reference = None;
@@ -914,12 +941,14 @@ fn model_list() -> ExitCode {
                 " "
             };
             println!(
-                "{marker} {} model={} tokenizer={} timeout={}s max_output_tokens={} authentication={}",
+                "{marker} {} model={} tokenizer={} timeout={}s max_output_tokens={} response_format={} thinking={} authentication={}",
                 profile.name(),
                 profile.model(),
                 profile.tokenizer(),
                 profile.inference_limits().timeout().as_secs(),
                 profile.inference_limits().max_output_tokens(),
+                response_format_label(profile.request_options().response_format),
+                thinking_label(profile.request_options().thinking),
                 if profile.has_stored_credential() {
                     "secure_store"
                 } else {
@@ -1019,6 +1048,7 @@ fn model_check(args: ModelCheckArgs) -> ExitCode {
         args.tokenizer,
         args.profile,
         args.token_stdin,
+        args.request_options,
     ) {
         Ok(resolved) => resolved,
         Err(error) => return present_model_command_error("check", error),
@@ -1029,6 +1059,7 @@ fn model_check(args: ModelCheckArgs) -> ExitCode {
         tokenizer: resolved.tokenizer.clone(),
         credential: resolved.credential.clone(),
         inference_limits: resolved.inference_limits,
+        request_options: resolved.request_options,
     };
     if let Err(error) = check_openai_model(request) {
         return present_model_check_error(error);
@@ -1040,6 +1071,7 @@ fn model_check(args: ModelCheckArgs) -> ExitCode {
             tokenizer: resolved.tokenizer,
             credential: resolved.credential,
             inference_limits: resolved.inference_limits,
+            request_options: resolved.request_options,
         })
     {
         return present_model_check_error(error);
@@ -1049,7 +1081,7 @@ fn model_check(args: ModelCheckArgs) -> ExitCode {
     println!(
         "  chat completions: {}",
         if args.compatibility {
-            "strict JSON compatible"
+            compatibility_label(resolved.request_options)
         } else {
             "not requested"
         }
@@ -1064,6 +1096,7 @@ fn resolve_model(
     tokenizer: Option<String>,
     profile_name: Option<String>,
     token_stdin: bool,
+    request_options: RequestOptionArgs,
 ) -> Result<ResolvedModel, ModelCliError> {
     let profile = select_profile(profile_name)?;
     let base_url = base_url
@@ -1088,12 +1121,14 @@ fn resolve_model(
         .unwrap_or_else(|| model.clone());
     let credential = resolve_credential(&base_url, token_stdin, profile.as_ref())?;
     let inference_limits = resolve_inference_limits(None, None, profile.as_ref())?;
+    let request_options = resolve_request_options(request_options, profile.as_ref())?;
     Ok(ResolvedModel {
         base_url,
         model,
         tokenizer,
         credential,
         inference_limits,
+        request_options,
     })
 }
 
@@ -1135,7 +1170,8 @@ fn resolve_endpoint(
     base_url: Option<String>,
     profile_name: Option<String>,
     token_stdin: bool,
-) -> Result<ResolvedEndpoint, ModelCliError> {
+    request_options: RequestOptionArgs,
+) -> Result<ResolvedModelEndpoint, ModelCliError> {
     let profile = select_profile(profile_name)?;
     let base_url = base_url
         .or(read_environment("XGENY_OPENAI_BASE_URL")?)
@@ -1146,10 +1182,70 @@ fn resolve_endpoint(
         })
         .ok_or(ModelCliError::MissingConfiguration)?;
     let credential = resolve_credential(&base_url, token_stdin, profile.as_ref())?;
-    Ok(ResolvedEndpoint {
+    Ok(ResolvedModelEndpoint {
         base_url,
         credential,
+        inference_limits: resolve_inference_limits(None, None, profile.as_ref())?,
+        request_options: resolve_request_options(request_options, profile.as_ref())?,
     })
+}
+
+fn resolve_request_options(
+    explicit: RequestOptionArgs,
+    profile: Option<&ModelProfile>,
+) -> Result<RequestOptions, ModelCliError> {
+    let base = profile
+        .map(ModelProfile::request_options)
+        .unwrap_or_default();
+    let response_format = match explicit
+        .response_format
+        .or(read_environment("XGENY_OPENAI_RESPONSE_FORMAT")?)
+        .as_deref()
+    {
+        None => base.response_format,
+        Some("json_schema") => ResponseFormat::JsonSchema,
+        Some("json_object") => ResponseFormat::JsonObject,
+        Some(_) => return Err(ModelCliError::InvalidRequestOptions),
+    };
+    let thinking = match explicit
+        .thinking
+        .or(read_environment("XGENY_OPENAI_THINKING")?)
+        .as_deref()
+    {
+        None => base.thinking,
+        Some("default") => ThinkingMode::Default,
+        Some("disabled") => ThinkingMode::Disabled,
+        Some("enabled") => ThinkingMode::Enabled,
+        Some(_) => return Err(ModelCliError::InvalidRequestOptions),
+    };
+    Ok(RequestOptions {
+        response_format,
+        thinking,
+    })
+}
+
+const fn response_format_label(format: ResponseFormat) -> &'static str {
+    match format {
+        ResponseFormat::JsonSchema => "json_schema",
+        ResponseFormat::JsonObject => "json_object",
+    }
+}
+
+const fn thinking_label(thinking: ThinkingMode) -> &'static str {
+    match thinking {
+        ThinkingMode::Default => "default",
+        ThinkingMode::Disabled => "disabled",
+        ThinkingMode::Enabled => "enabled",
+    }
+}
+
+const fn compatibility_label(options: RequestOptions) -> &'static str {
+    match options.response_format {
+        ResponseFormat::JsonSchema => "strict JSON compatible",
+        ResponseFormat::JsonObject => {
+            "JSON object compatible (host-validated; no server schema guarantee)"
+        }
+    }
 }
 
 fn select_profile(name: Option<String>) -> Result<Option<ModelProfile>, ModelCliError> {

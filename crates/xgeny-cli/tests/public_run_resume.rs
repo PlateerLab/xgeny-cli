@@ -401,6 +401,9 @@ fn separate_processes_read_once_continue_with_exact_output_and_replay_offline() 
         .args(["resume", &run_id, "--allow-remote-model-egress"])
         .env("XGENY_OPENAI_BASE_URL", "not-a-provider-url")
         .env("XGENY_OPENAI_API_KEY", "invalid\ncredential")
+        .env("XGENY_OPENAI_RESPONSE_FORMAT", "invalid-format")
+        .env("XGENY_OPENAI_THINKING", "invalid-thinking")
+        .env("XGENY_OPENAI_INFERENCE_TIMEOUT", "invalid-timeout")
         .bounded_output()
         .expect("offline replay process should run");
     assert_exit(&replay, 0);
