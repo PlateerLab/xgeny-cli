@@ -457,6 +457,68 @@ fn non_utf8_https_credential_is_rejected_before_any_run_state_is_created() {
     assert_configuration_before_state(&output, &state);
 }
 
+#[test]
+fn extended_utf8_goal_reaches_provider_intact_with_unchanged_approval_boundary() {
+    for unit in ["classification evidence ", "회귀 근거 🧪 "] {
+        let fixture = tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        let state = fixture.path().join("state");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(workspace.join("README.md"), "fixture").unwrap();
+        let mut goal = unit.repeat(xgeny_cli::MAX_GOAL_BYTES / unit.len());
+        goal.push_str(&"x".repeat(xgeny_cli::MAX_GOAL_BYTES - goal.len()));
+        let server = CompletionServer::spawn();
+        let output = xgeny(&state)
+            .current_dir(&workspace)
+            .env("XGENY_OPENAI_BASE_URL", &server.base_url)
+            .env("XGENY_OPENAI_MODEL", MODEL)
+            .args([
+                "run",
+                "--allow-file",
+                "README.md",
+                "--allow-remote-model-egress",
+                &goal,
+            ])
+            .output()
+            .unwrap();
+        assert_read_approval_pause(&output);
+        let request = server.handle.join().unwrap();
+        let body = request_body(&request);
+        assert!(body["messages"].as_array().unwrap().iter().any(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains(&goal))
+        }));
+    }
+}
+
+#[test]
+fn advertised_goal_bound_matches_validation_and_oversize_creates_no_state() {
+    let fixture = tempdir().unwrap();
+    let state = fixture.path().join("state");
+    let help = xgeny(&state).args(["run", "--help"]).output().unwrap();
+    assert!(help.status.success());
+    assert!(String::from_utf8(help.stdout).unwrap().contains(&format!(
+        "XGENY_MAX_GOAL_BYTES={}",
+        xgeny_cli::MAX_GOAL_BYTES
+    )));
+    let goal = "x".repeat(xgeny_cli::MAX_GOAL_BYTES + 1);
+    let output = xgeny(&state)
+        .current_dir(fixture.path())
+        .env("XGENY_OPENAI_BASE_URL", "http://127.0.0.1:1/v1")
+        .env("XGENY_OPENAI_MODEL", MODEL)
+        .args([
+            "run",
+            "--allow-dir",
+            ".",
+            "--allow-remote-model-egress",
+            &goal,
+        ])
+        .output()
+        .unwrap();
+    assert_configuration_before_state(&output, &state);
+}
+
 fn xgeny(state: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_xgeny"));
     command

@@ -75,7 +75,13 @@ use crate::run_layout::{RunLayout, discover_state_root, generate_run_id};
 const WORKSPACE_ID: &str = "primary";
 const WORKSPACE_IDENTITY_PROFILE: &str = "xgeny.fs.workspace-root-identity.v1";
 const DEFAULT_PLANNER_ID: &str = "xgeny.cli.openai";
-const MAX_GOAL_BYTES: usize = 16 * 1024;
+/// Maximum UTF-8 goal size for headless runs. Independent of the planner's
+/// bounded context, model-call budget, and capability permissions.
+#[cfg(not(windows))]
+pub const MAX_GOAL_BYTES: usize = 64 * 1024;
+/// Windows command lines have a lower OS bound; retain the legacy allowance.
+#[cfg(windows)]
+pub const MAX_GOAL_BYTES: usize = 16 * 1024;
 const MAX_TICKS: u32 = 1_024;
 const MODEL_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCAL_EXECUTION_PROFILE_DOMAIN: &str = "xgeny.cli.local-execution-profile/v1";
@@ -2657,6 +2663,24 @@ mod tests {
     use xgeny_policy::PermissionRequestResolver;
 
     use super::*;
+
+    #[test]
+    fn goal_bound_counts_utf8_bytes_without_truncation() {
+        for unit in ["a", "한", "🧪"] {
+            let mut goal = unit.repeat(MAX_GOAL_BYTES / unit.len());
+            goal.push_str(&"x".repeat(MAX_GOAL_BYTES - goal.len()));
+            let original = goal.clone();
+            assert!(validate_goal(&goal).is_ok());
+            assert_eq!(goal, original);
+            goal.push('x');
+            assert!(matches!(
+                validate_goal(&goal),
+                Err(PublicRunError::Configuration)
+            ));
+        }
+        assert!(validate_goal("").is_err());
+        assert!(validate_goal("valid\0invalid").is_err());
+    }
 
     #[test]
     fn local_route_profile_gate_accepts_new_occurrences_and_legacy_resume_profiles() {
