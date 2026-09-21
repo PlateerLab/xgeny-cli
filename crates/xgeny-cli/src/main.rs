@@ -187,6 +187,7 @@ struct RunArgs {
     #[command(flatten)]
     request_options: RequestOptionArgs,
     /// Goal sent to the bounded planner.
+    #[arg(help = format!("Goal sent to the bounded planner. XGENY_MAX_GOAL_BYTES={}", xgeny_cli::MAX_GOAL_BYTES))]
     goal: String,
     /// Workspace root opened as the local filesystem capability.
     #[arg(long, default_value = ".")]
