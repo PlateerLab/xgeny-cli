@@ -77,7 +77,11 @@ const WORKSPACE_IDENTITY_PROFILE: &str = "xgeny.fs.workspace-root-identity.v1";
 const DEFAULT_PLANNER_ID: &str = "xgeny.cli.openai";
 /// Maximum UTF-8 goal size for headless runs. Independent of the planner's
 /// bounded context, model-call budget, and capability permissions.
+#[cfg(not(windows))]
 pub const MAX_GOAL_BYTES: usize = 64 * 1024;
+/// Windows command lines have a lower OS bound; retain the legacy allowance.
+#[cfg(windows)]
+pub const MAX_GOAL_BYTES: usize = 16 * 1024;
 const MAX_TICKS: u32 = 1_024;
 const MODEL_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCAL_EXECUTION_PROFILE_DOMAIN: &str = "xgeny.cli.local-execution-profile/v1";

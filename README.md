@@ -104,7 +104,8 @@ summary 전에는 model call·plan commit·effect·verification 같은 redacted 
 strict JSON Schema response와 응답의 exact model ID를 지원하는 서버다. 설치·검증·삭제와 OS별 제약은
 [시작하기](docs/getting-started.md)와 [모델 온보딩](docs/development/model-onboarding.md)을 따른다.
 
-Headless `run`의 goal은 최대 65,536 UTF-8 바이트입니다. 호스트는 모델 호출 없는
+Unix headless `run`의 goal은 최대 65,536 UTF-8 바이트입니다. Windows는 OS command-line
+한도 때문에 기존 16,384 바이트를 유지하며 도움말에도 실제 한도를 표시합니다. 호스트는 모델 호출 없는
 `run --help`의 `XGENY_MAX_GOAL_BYTES=65536` 표기로 설치된 실행기의 한도를 확인할 수
 있습니다. 이 표기가 없는 이전 실행기는 16,384 바이트로 취급하세요. 초과 입력은 잘라내지
 않고 실행 전에 거절합니다. 모델 context·호출 예산·도구 권한은 확장하지 않으며, 대화형
