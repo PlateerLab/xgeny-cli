@@ -131,6 +131,7 @@ pub enum DriverProgress {
     VerificationStarting,
     VerificationCommitted,
     CompletionCommitted,
+    ResponseCommitted,
 }
 
 /// Cooperative control returned by an interactive progress observer.
@@ -473,7 +474,13 @@ impl RunDriver {
                 AgentLoopTick::CompletionCandidate {
                     candidate, output, ..
                 } => {
-                    let _ = observer(DriverProgress::CompletionCommitted);
+                    let progress =
+                        if candidate.response_kind == xgen_workgraph::ResponseKind::Conversation {
+                            DriverProgress::ResponseCommitted
+                        } else {
+                            DriverProgress::CompletionCommitted
+                        };
+                    let _ = observer(progress);
                     return Ok(DriverOutcome::CompletionCandidate { candidate, output });
                 }
                 AgentLoopTick::Quiescent { reason, .. } => {

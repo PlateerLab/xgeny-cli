@@ -2472,6 +2472,134 @@ fn omitted_capability_and_step_cannot_be_guessed_by_proposal() {
 }
 
 #[test]
+fn conversation_response_survives_sqlite_reopen_without_tools_or_another_model_call() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("conversation.db");
+    let run_id = "run-conversation-replay";
+    let loop_budget = budget(2, 2, 2, 32_768);
+    let mut store = SqliteRunStore::open(&path).unwrap();
+    create_run_with_goal(&mut store, run_id, "Explain the previous function name");
+    let agent_loop = configure(&mut store, run_id, &loop_budget);
+    let mut planner =
+        ScriptedPlanner::returning(PlanProposal::response_candidate("함수 이름은 convert야."));
+    let mut materializer = RecordingMaterializer::default();
+    let first = agent_loop
+        .tick(
+            &mut store,
+            &mut DeterministicEvents,
+            &FixedLease(run_id.to_owned()),
+            &xgen_runtime::CapabilityRegistry::new(),
+            &CanonicalResolver::default(),
+            &mut planner,
+            &mut materializer,
+        )
+        .unwrap();
+    let AgentLoopTick::CompletionCandidate {
+        candidate,
+        output: Some(output),
+        newly_recorded: true,
+        ..
+    } = first
+    else {
+        panic!("expected response")
+    };
+    assert_eq!(
+        candidate.response_kind,
+        xgen_workgraph::ResponseKind::Conversation
+    );
+    assert_eq!(output.response_kind(), candidate.response_kind);
+    assert!(store.load_current().unwrap().unwrap().steps.is_empty());
+    assert_eq!(planner.calls, 1);
+    assert_eq!(materializer.calls, 0);
+    let snapshot = store.load().unwrap().unwrap();
+    let mut before_response = None;
+    for record in &snapshot.records[..snapshot.records.len() - 1] {
+        before_response = Some(apply_record(before_response.as_ref(), record).unwrap());
+    }
+    let mut malformed = snapshot.records.last().unwrap().event.clone();
+    if let RunEventBody::CompletionCandidateRecorded {
+        completion_output_record_digest,
+        ..
+    } = &mut malformed.body
+    {
+        *completion_output_record_digest = None;
+    }
+    let malformed =
+        EventRecord::next(snapshot.records.get(snapshot.records.len() - 2), malformed).unwrap();
+    assert!(matches!(
+        apply_record(before_response.as_ref(), &malformed),
+        Err(xgen_workgraph::TransitionError::ConversationResponseRequiresOutput)
+    ));
+    drop(store);
+    let mut store = SqliteRunStore::open_existing(&path).unwrap();
+    let replay = agent_loop
+        .tick(
+            &mut store,
+            &mut DeterministicEvents,
+            &FixedLease(run_id.to_owned()),
+            &xgen_runtime::CapabilityRegistry::new(),
+            &CanonicalResolver::default(),
+            &mut planner,
+            &mut materializer,
+        )
+        .unwrap();
+    let AgentLoopTick::CompletionCandidate {
+        candidate: replayed,
+        output: Some(replayed_output),
+        newly_recorded: false,
+        ..
+    } = replay
+    else {
+        panic!("expected replay")
+    };
+    assert_eq!(replayed, candidate);
+    assert_eq!(replayed_output, output);
+    assert_eq!(planner.calls, 1);
+    assert_eq!(materializer.calls, 0);
+}
+
+#[test]
+fn conversation_response_cannot_replace_a_receipt_completed_task() {
+    let run_id = "run-response-task-boundary";
+    let loop_budget = budget(2, 2, 2, 32_768);
+    let mut store = ProjectionStore::new(projected_state(
+        run_id,
+        loop_budget.clone(),
+        0,
+        vec![manual_step("step-done", StepStatus::Completed, 1)],
+    ));
+    let mut planner = ScriptedPlanner::returning(PlanProposal::response_candidate(
+        "Do not reclassify the task",
+    ));
+    let result = AgentLoop::new(loop_budget)
+        .tick(
+            &mut store,
+            &mut DeterministicEvents,
+            &FixedLease(run_id.to_owned()),
+            &xgen_runtime::CapabilityRegistry::new(),
+            &CanonicalResolver::default(),
+            &mut planner,
+            &mut RecordingMaterializer::default(),
+        )
+        .unwrap();
+    assert!(matches!(
+        result,
+        AgentLoopTick::ProposalRejected {
+            reason: ProposalRejection::ConversationResponseWithPlan,
+            ..
+        }
+    ));
+    assert!(
+        store
+            .state
+            .agent_loop
+            .unwrap()
+            .completion_candidate
+            .is_none()
+    );
+}
+
+#[test]
 fn completion_candidate_is_durable_and_does_not_complete_run() {
     const SUMMARY: &str = "FINAL-RUNTIME-SUMMARY \"quote\" \\ slash\n\t- 한글 결과";
     let run_id = "run-agent-loop-completion";

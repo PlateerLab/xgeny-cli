@@ -15,7 +15,7 @@ API key는 OS credential store에 저장한다. 저장소를 쓸 수 없으면 �
 메모리에만 두고 다음 실행 때 다시 묻는다. 평문 key file이나 tool process 환경변수로 옮기지 않는다.
 자동화의 `--store-token`은 여전히 저장 실패를 오류로 반환한다.
 
-기본 approval mode는 모두 `ask`다. Model prompt에는 현재 goal, 직전 durable result와 이후 tool
+기본 approval mode는 모두 `ask`다. Model prompt에는 현재 goal, 제한된 이전 요청·답변과 이후 tool
 observation이 포함될 수 있다. Read, write와 process execute는 각각 별도로 묻는다.
 한 goal을 처리하는 동안 승인한 종류는 이후 continuation에서도 유지하며, 다음 goal이나 명시적인
 `/resume`에서는 다시 기본 approval mode를 적용한다. `deny`는 계속 실행을 차단한다.
@@ -54,11 +54,13 @@ Core authorization을 거친다. Catalog snapshot은 첫 실제 goal에서 만�
 
 ## 세션과 재개
 
-한 goal은 하나의 durable Run이다. 완료 summary는 다음 goal에 비신뢰 context로 이어지지만 전체 transcript
-또는 장기 memory는 저장하지 않는다. 현재 Core는 새로운 Run에도 receipt-completed Step을 요구하므로,
-직전 응답만으로 답할 수 있는 대화형 후속 질문은 `completion_without_receipt_completed_plan`으로
-거절될 수 있다. 순수 대화 응답을 작업 완료와 구분하는 계약은 후속 설계가 필요하다. `/clear`는 이 연결과 active/last pointer만 제거하며 SQLite Run을
-삭제하지 않는다.
+한 goal은 하나의 durable Run이다. 일반 질문이나 이전 설명에 대한 후속 질문은 도구 실행 없이 답할 수 있다.
+이 경우 `/status`는 `responded`를 표시하고 파일·process 실행 승인을 묻지 않는다. 도구 Step을 계획한 Run은
+대화 응답으로 종료할 수 없고, 기존대로 Receipt 검증 뒤 작업 완료 응답을 출력한다.
+
+최근 요청·답변은 최대 8 turn, JSON 기준 12 KiB의 비신뢰 context로 이어진다. 현재 요청은 유지하고 한도에
+맞지 않는 오래된 문맥부터 생략한다. 별도 장기 transcript는 저장하지 않지만 다음 Run에 전달한 문맥은
+그 Run의 goal에 포함된다. `/clear`는 문맥과 active/last pointer만 제거하며 SQLite Run을 삭제하지 않는다.
 
 같은 세션에서는 `/resume`으로 현재/마지막 Run을 재개한다. 다른 process에서 재개하려면 `/status`의
 Run ID를 기록한다. `--debug` 또는 pipe 모드에서는 stderr의 `XGEN_STARTED run_id=...`도 사용할 수 있다.
@@ -67,7 +69,7 @@ Run ID를 기록한다. `--debug` 또는 pipe 모드에서는 stderr의 `XGEN_ST
 xgen> /resume run-0123456789abcdef0123456789abcdef
 ```
 
-완료된 Run은 model, workspace 또는 tool effect 없이 summary를 offline replay한다. Approval 대기 Run은
+작업 완료와 대화 응답을 저장한 Run은 model, workspace 또는 tool effect 없이 summary를 offline replay한다. Approval 대기 Run은
 동일한 physical workspace와 자동 catalog snapshot이 필요하다. 도구 binary, PATH 또는 safe environment가
 바뀌어 execution profile이 달라지면 configuration mismatch로 fail-closed할 수 있다.
 
@@ -102,3 +104,5 @@ printf '/status\n/exit\n' | xgen
 
 실제 goal을 pipe로 실행할 때 원격 HTTPS credential은 `XGEN_OPENAI_API_KEY` 같은 외부 secret injection을
 사용한다. 일반 자동화는 exit code와 고정 stderr 계약이 더 단순한 기존 `xgen run/resume`을 권장한다.
+
+대화 응답의 저장·검증 계약은 [ADR-0047](../adr/0047-conversation-response-and-bounded-session-context.md)을 따른다.

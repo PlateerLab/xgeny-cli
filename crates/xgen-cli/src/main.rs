@@ -17,7 +17,7 @@ use xgen_cli::{
     new_credential_reference, prepare_local_process_session, resume_local,
     resume_local_with_model_resolver, resume_local_with_model_resolver_and_progress,
     resume_local_with_process_session_and_model_resolver_progress,
-    run_local_with_process_session_progress, run_local_with_started,
+    run_interactive_with_process_session_progress, run_local_with_started,
 };
 use xgen_provider_openai::{BearerCredential, ResponseFormat, ThinkingMode};
 use zeroize::Zeroizing;
@@ -428,7 +428,7 @@ impl repl::ReplHost for InteractiveHost {
         let model = resolve_model(None, None, None, None, false, RequestOptionArgs::default())
             .map_err(|error| repl::ReplFailure::new(error.code()))?;
         let process_session = self.process_session()?;
-        run_local_with_process_session_progress(
+        run_interactive_with_process_session_progress(
             LocalRunRequest {
                 goal,
                 workspace: self.workspace.clone(),
@@ -1672,6 +1672,14 @@ fn print_licenses() -> ExitCode {
 
 fn present(result: Result<LocalCommandResult, PublicRunError>) -> ExitCode {
     match result {
+        Ok(LocalCommandResult::Responded { run_id, summary }) => {
+            eprintln!("XGEN_RESPONDED run_id={run_id}");
+            if std::io::stdout().write_all(summary.as_bytes()).is_err() {
+                eprintln!("XGEN_ERROR code={}", PublicRunError::Internal.code());
+                return ExitCode::from(PublicRunError::Internal.exit_code());
+            }
+            ExitCode::SUCCESS
+        }
         Ok(LocalCommandResult::Completed { run_id, summary }) => {
             eprintln!("XGEN_COMPLETED run_id={run_id}");
             if std::io::stdout().write_all(summary.as_bytes()).is_err() {

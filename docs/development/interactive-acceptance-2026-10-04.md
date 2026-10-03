@@ -45,3 +45,6 @@ API key는 숨김 입력했고 OS credential store에 저장했다. 이 문서�
 - 이름 변경에 대한 npm 테스트 14개, 5개 platform distribution 검사, native installer와 npm 설치·재설치·제거 smoke 통과.
 - 기존 binary가 만든 profile과 Run을 새 binary가 읽고 완료 replay·approval resume하는 검증은
   `json_object`, `json_schema` 두 형식에서 통과했다. 내부 durable namespace와 credential service ID는 유지했다.
+
+후속 변경: 순수 대화 응답 계약은 [ADR-0047](../adr/0047-conversation-response-and-bounded-session-context.md)에서
+구현했다. 위 거절 결과는 변경 전 실측 기록이며 새 계약의 결과는 별도 검증 기록을 따른다.

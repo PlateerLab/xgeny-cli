@@ -323,6 +323,10 @@ impl ModelCheckError {
 /// Stable, path-free result returned to the binary presentation layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalCommandResult {
+    Responded {
+        run_id: String,
+        summary: String,
+    },
     Completed {
         run_id: String,
         summary: String,
@@ -549,6 +553,9 @@ const fn proposal_rejection_code(rejection: ProposalRejection) -> &'static str {
         }
         ProposalRejection::CompletionWithoutReceiptCompletedPlan => {
             "proposal_rejected.completion_without_receipt_completed_plan"
+        }
+        ProposalRejection::ConversationResponseWithPlan => {
+            "proposal_rejected.conversation_response_with_plan"
         }
         ProposalRejection::InvalidCompletionSummary => {
             "proposal_rejected.invalid_completion_summary"
@@ -838,7 +845,7 @@ where
     F: FnOnce(&str),
     O: FnMut(DriverProgress) -> DriverProgressControl,
 {
-    run_local_composed(request, None, on_started, on_progress)
+    run_local_composed(request, None, false, on_started, on_progress)
 }
 
 /// Create and drive a new Run with a reusable process snapshot and redacted durable progress.
@@ -860,12 +867,41 @@ where
     F: FnOnce(&str),
     O: FnMut(DriverProgress) -> DriverProgressControl,
 {
-    run_local_composed(request, Some(process_session), on_started, on_progress)
+    run_local_composed(
+        request,
+        Some(process_session),
+        false,
+        on_started,
+        on_progress,
+    )
+}
+
+/// Start a REPL request with the distinct conversation-response contract enabled.
+/// # Errors
+/// Returns a fixed public failure class; all model/tool authorization remains unchanged.
+pub fn run_interactive_with_process_session_progress<F, O>(
+    request: LocalRunRequest,
+    process_session: &LocalProcessSession,
+    on_started: F,
+    on_progress: O,
+) -> Result<LocalCommandResult, PublicRunError>
+where
+    F: FnOnce(&str),
+    O: FnMut(DriverProgress) -> DriverProgressControl,
+{
+    run_local_composed(
+        request,
+        Some(process_session),
+        true,
+        on_started,
+        on_progress,
+    )
 }
 
 fn run_local_composed<F, O>(
     request: LocalRunRequest,
     process_session: Option<&LocalProcessSession>,
+    conversation_responses: bool,
     on_started: F,
     mut on_progress: O,
 ) -> Result<LocalCommandResult, PublicRunError>
@@ -919,6 +955,7 @@ where
         request.request_options,
         planning_constraints_required,
     )?;
+    let config = response_contract(config, conversation_responses)?;
     let local_execution_profile_digest =
         local_execution_profile_digest(&workspace, &catalog, process.as_ref())?;
     let run_id = generate_run_id().map_err(|_| PublicRunError::Internal)?;
@@ -936,6 +973,13 @@ where
         manifest_budget(planning_constraints_required, request.max_model_turns)?,
     )
     .map_err(|_| PublicRunError::Configuration)?;
+    let manifest = if conversation_responses {
+        manifest
+            .with_conversation_responses()
+            .map_err(|_| PublicRunError::Configuration)?
+    } else {
+        manifest
+    };
     let planner = remote_planner(config, request.credential)?;
     let state_root = discover_state_root().map_err(|_| PublicRunError::Configuration)?;
     let layout = RunLayout::create(&state_root, manifest.run_id()).map_err(map_layout_create)?;
@@ -1071,10 +1115,7 @@ where
     verify_manifest_state(&manifest, &state)?;
 
     if let Some(output) = load_offline_completion(&store, &state)? {
-        return Ok(LocalCommandResult::Completed {
-            run_id: state.run_id,
-            summary: output.summary().to_owned(),
-        });
+        return Ok(final_output_result(state.run_id, &output));
     }
     if let Some(reason) = unknown_model_call_reason(&state) {
         return Ok(LocalCommandResult::RecoveryRequired {
@@ -1177,6 +1218,7 @@ where
             resolved.request_options,
             catalog.workspace_discovery() || process.is_some(),
         )?;
+        let config = response_contract(config, manifest.conversation_responses())?;
         if manifest.request_profile_digest() != config.request_profile_digest() {
             return Err(PublicRunError::Configuration);
         }
@@ -1526,6 +1568,7 @@ fn load_offline_completion(
         )
         .map_err(|_| PublicRunError::Integrity)?;
     if output.record_digest() != expected_record_digest
+        || output.response_kind() != candidate.response_kind
         || output.context_digest() != candidate.context_digest
         || output.proposal_digest() != candidate.proposal_digest
     {
@@ -1723,6 +1766,19 @@ impl PlanMaterializer for RejectMaterializer {
     }
 }
 
+fn response_contract(
+    config: OpenAiPlannerConfig,
+    conversation_responses: bool,
+) -> Result<OpenAiPlannerConfig, PublicRunError> {
+    if conversation_responses {
+        config
+            .with_conversation_responses()
+            .map_err(map_provider_config)
+    } else {
+        Ok(config)
+    }
+}
+
 fn planner_config(
     base_url: &str,
     planner_id: &str,
@@ -1901,6 +1957,18 @@ fn map_planner_unavailable(run_id: String, failure: PlannerPortFailure) -> Local
     }
 }
 
+fn final_output_result(run_id: String, output: &CompletionOutputRecord) -> LocalCommandResult {
+    let summary = output.summary().to_owned();
+    match output.response_kind() {
+        xgen_workgraph::ResponseKind::TaskCompletion => {
+            LocalCommandResult::Completed { run_id, summary }
+        }
+        xgen_workgraph::ResponseKind::Conversation => {
+            LocalCommandResult::Responded { run_id, summary }
+        }
+    }
+}
+
 fn map_driver_outcome(
     run_id: &str,
     outcome: DriverOutcome,
@@ -1910,10 +1978,7 @@ fn map_driver_outcome(
         DriverOutcome::CompletionCandidate {
             output: Some(output),
             ..
-        } => LocalCommandResult::Completed {
-            run_id,
-            summary: output.summary().to_owned(),
-        },
+        } => final_output_result(run_id, &output),
         DriverOutcome::ApprovalPending {
             effect_class: EffectClass::ReadOnly,
             ..

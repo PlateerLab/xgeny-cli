@@ -611,6 +611,7 @@ fn completion_candidate_atomically_settles_exact_reserved_call() {
         Some(&reserved),
         "completion-candidate",
         RunEventBody::CompletionCandidateRecorded {
+            response_kind: xgen_workgraph::ResponseKind::TaskCompletion,
             decision: model_decision(&call, &proposal_digest),
             candidate_id: "completion-candidate-1".to_owned(),
             summary_digest: digest('s'),

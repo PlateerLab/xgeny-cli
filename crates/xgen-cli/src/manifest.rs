@@ -32,6 +32,8 @@ struct RunManifestRecord {
     allow_file_catalog_digest: String,
     local_execution_profile_digest: String,
     budget: ManifestBudget,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    conversation_responses: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +142,7 @@ impl RunManifest {
             allow_file_catalog_digest: allow_file_catalog_digest.to_owned(),
             local_execution_profile_digest: local_execution_profile_digest.to_owned(),
             budget,
+            conversation_responses: false,
         };
         validate_record(&record)?;
         let record_digest = digest_record(&record)?;
@@ -147,6 +150,16 @@ impl RunManifest {
             record,
             record_digest,
         })
+    }
+
+    pub(crate) fn with_conversation_responses(mut self) -> Result<Self, ManifestError> {
+        self.record.conversation_responses = true;
+        self.record_digest = digest_record(&self.record)?;
+        Ok(self)
+    }
+
+    pub(crate) fn conversation_responses(&self) -> bool {
+        self.record.conversation_responses
     }
 
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, ManifestError> {

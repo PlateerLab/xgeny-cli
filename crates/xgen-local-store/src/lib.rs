@@ -251,6 +251,7 @@ struct ToolOutputEventAnchor {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CompletionOutputEventAnchor {
+    response_kind: xgen_workgraph::ResponseKind,
     event_sequence: u64,
     run_id: String,
     candidate_id: String,
@@ -1251,10 +1252,13 @@ fn verify_completion_output_bundle(
         (
             RunEventBody::CompletionCandidateRecorded {
                 completion_output_record_digest: Some(expected),
+                response_kind,
                 ..
             },
             Some(output),
-        ) if expected == output.record_digest() => Ok(()),
+        ) if expected == output.record_digest() && *response_kind == output.response_kind() => {
+            Ok(())
+        }
         (RunEventBody::CompletionCandidateRecorded { .. }, Some(_)) => {
             Err(StoreError::CompletionOutputBindingMismatch)
         }
@@ -1297,7 +1301,9 @@ fn verify_completion_output_candidate(
             &anchor.summary_digest,
         )
         .map_err(|_| StoreError::CompletionOutputBindingMismatch)?;
-    if output.record_digest() != anchor.record_digest {
+    if output.record_digest() != anchor.record_digest
+        || output.response_kind() != anchor.response_kind
+    {
         return Err(StoreError::CompletionOutputBindingMismatch);
     }
     Ok(anchor)
@@ -1314,6 +1320,9 @@ fn verify_stored_completion_output(
         return Err(StoreError::Corrupt(
             "completion output differs from its journal binding".to_owned(),
         ));
+    }
+    if stored.record.response_kind() != anchor.response_kind {
+        return Err(StoreError::CompletionOutputBindingMismatch);
     }
     let decision = completion_anchor_decision(anchor)?;
     stored
@@ -1899,6 +1908,7 @@ impl VerifiedRunIndex {
         record: &EventRecord,
     ) -> Result<CompletionOutputEventAnchor, StoreError> {
         let RunEventBody::CompletionCandidateRecorded {
+            response_kind,
             decision,
             candidate_id,
             summary_digest,
@@ -1913,6 +1923,7 @@ impl VerifiedRunIndex {
             )
         })?;
         Ok(CompletionOutputEventAnchor {
+            response_kind: *response_kind,
             event_sequence: record.sequence,
             run_id: record.event.run_id.clone(),
             candidate_id: candidate_id.clone(),
@@ -4400,6 +4411,7 @@ mod tests {
         let event = event(
             "completion-candidate-recorded",
             RunEventBody::CompletionCandidateRecorded {
+                response_kind: xgen_workgraph::ResponseKind::TaskCompletion,
                 decision: output.decision().expect("decision should reconstruct"),
                 candidate_id: output.candidate_id().to_owned(),
                 summary_digest: output.summary_digest().to_owned(),
@@ -4407,6 +4419,54 @@ mod tests {
             },
         );
         (reserved, event, output)
+    }
+
+    #[test]
+    fn response_kind_cannot_be_swapped_or_bypass_core_task_completion_rules() {
+        let mut store = MemoryRunStore::new();
+        let (reserved, mut swapped_event, output) = prepare_completion_output(&mut store, "answer");
+        if let RunEventBody::CompletionCandidateRecorded { response_kind, .. } =
+            &mut swapped_event.body
+        {
+            *response_kind = xgen_workgraph::ResponseKind::Conversation;
+        }
+        assert!(matches!(
+            store.append_with_completion_output(
+                ExpectedHead::from_state(&reserved.state),
+                swapped_event,
+                output.clone()
+            ),
+            Err(StoreError::CompletionOutputBindingMismatch)
+        ));
+        assert_eq!(store.load_current().unwrap().unwrap(), reserved.state);
+        let response = CompletionOutputRecord::bind_response(
+            &reserved.state.run_id,
+            output.turn_index(),
+            output.model_call_id(),
+            output.context_digest(),
+            "conversation cannot replace task",
+        )
+        .unwrap();
+        let event = event(
+            "forged-response-after-task",
+            RunEventBody::CompletionCandidateRecorded {
+                response_kind: xgen_workgraph::ResponseKind::Conversation,
+                decision: response.decision().unwrap(),
+                candidate_id: response.candidate_id().to_owned(),
+                summary_digest: response.summary_digest().to_owned(),
+                completion_output_record_digest: Some(response.record_digest().to_owned()),
+            },
+        );
+        assert!(
+            store
+                .append_with_completion_output(
+                    ExpectedHead::from_state(&reserved.state),
+                    event,
+                    response
+                )
+                .is_err()
+        );
+        assert_eq!(store.load_current().unwrap().unwrap(), reserved.state);
     }
 
     #[test]

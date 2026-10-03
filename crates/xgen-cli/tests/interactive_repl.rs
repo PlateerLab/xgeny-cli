@@ -73,11 +73,6 @@ impl DelayedServer {
 
 impl SequentialServer {
     fn spawn() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
-        let address = listener
-            .local_addr()
-            .expect("listener address should resolve");
-        let (sender, requests) = mpsc::channel();
         let responses = [
             plan_response(
                 "read_readme",
@@ -100,6 +95,15 @@ impl SequentialServer {
             ),
             completion_response(),
         ];
+        Self::with_responses(responses.to_vec())
+    }
+
+    fn with_responses(responses: Vec<Vec<u8>>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener address should resolve");
+        let (sender, requests) = mpsc::channel();
         let handle = thread::spawn(move || {
             for response in responses {
                 let mut stream =
@@ -235,6 +239,126 @@ fn bare_xgen_streams_durable_progress_prompts_separate_approvals_and_replays_off
         !config_root.exists(),
         "environment-only model use must not persist a profile"
     );
+}
+
+#[test]
+fn headless_run_keeps_the_legacy_contract_and_rejects_conversation_proposals() {
+    let fixture = tempdir().unwrap();
+    let server = SequentialServer::with_responses(vec![provider_response(&json!({
+        "formatVersion": 1, "kind": "response_candidate", "steps": [], "summary": "not a task completion"
+    }))]);
+    let output = Command::new(env!("CARGO_BIN_EXE_xgen"))
+        .args([
+            "run",
+            "Answer without tools",
+            "--allow-dir",
+            ".",
+            "--allow-remote-model-egress",
+        ])
+        .current_dir(fixture.path())
+        .env("XGEN_STATE_HOME", fixture.path().join("state"))
+        .env("XGEN_CONFIG_HOME", fixture.path().join("config"))
+        .env("XGEN_OPENAI_BASE_URL", &server.base_url)
+        .env("XGEN_OPENAI_MODEL", MODEL)
+        .env("XGEN_OPENAI_TOKENIZER", TOKENIZER)
+        .env("XGEN_OPENAI_RESPONSE_FORMAT", "json_object")
+        .env_remove("XGEN_OPENAI_API_KEY")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(20), "{}", stderr(&output));
+    let request = server.requests.recv_timeout(TEST_TIMEOUT).unwrap();
+    server.handle.join().unwrap();
+    assert!(stderr(&output).contains("model_rejected.planner_invalid_response"));
+    assert!(!stderr(&output).contains("XGEN_RESPONDED"));
+    assert!(
+        !request_body(&request)["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("CONVERSATION_RESPONSE_V1")
+    );
+}
+
+#[test]
+fn conversation_only_requests_need_no_tool_approvals_and_replay_offline() {
+    let fixture = tempdir().unwrap();
+    let state_root = fixture.path().join("state");
+    let config_root = fixture.path().join("config");
+    let workspace = fixture.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let answers = [
+        "A queue is first-in first-out.",
+        "The earlier topic was a queue.",
+        "Fresh conversation.",
+    ];
+    let server = SequentialServer::with_responses(
+        answers
+            .iter()
+            .map(|answer| {
+                provider_response(&json!({
+                    "formatVersion": 1, "kind": "response_candidate", "steps": [], "summary": answer
+                }))
+            })
+            .collect(),
+    );
+    let output = bounded_scripted_output(Command::new(env!("CARGO_BIN_EXE_xgen"))
+        .current_dir(&workspace).env("XGEN_STATE_HOME", &state_root).env("XGEN_CONFIG_HOME", &config_root)
+        .env("XGEN_OPENAI_BASE_URL", &server.base_url).env("XGEN_OPENAI_MODEL", MODEL)
+        .env("XGEN_OPENAI_TOKENIZER", TOKENIZER).env_remove("XGEN_OPENAI_API_KEY"),
+        b"Explain a queue.\ny\nWhat topic did I ask about?\ny\n/status\n/resume\n/clear\nNew question.\ny\n/exit\n").unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("status: responded"), "{stdout}");
+    assert!(stdout.contains("progress: response_committed"));
+    assert!(!stdout.contains("progress: completion_committed"));
+    assert!(!stdout.contains("Allow read"));
+    assert!(!stdout.contains("Allow write"));
+    assert!(!stdout.contains("Allow execute"));
+    assert!(!stdout.contains("completed:"));
+    assert_eq!(stdout.matches(answers[1]).count(), 2);
+    let first = server.requests.recv_timeout(TEST_TIMEOUT).unwrap();
+    let second = server.requests.recv_timeout(TEST_TIMEOUT).unwrap();
+    let third = server.requests.recv_timeout(TEST_TIMEOUT).unwrap();
+    server.handle.join().unwrap();
+    assert!(
+        planning_context(&first)["steps"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        planning_context(&second)["goal"]
+            .as_str()
+            .unwrap()
+            .contains("Explain a queue.")
+    );
+    assert!(
+        planning_context(&second)["goal"]
+            .as_str()
+            .unwrap()
+            .contains(answers[0])
+    );
+    assert_eq!(planning_context(&third)["goal"], "New question.");
+    let run_id = extract_run_id(&stderr(&output));
+    let store =
+        SqliteRunStore::open_existing(state_root.join("runs").join(&run_id).join("run.sqlite3"))
+            .unwrap();
+    assert!(store.load_current().unwrap().unwrap().steps.is_empty());
+    assert!(store.load_execution_receipts().unwrap().is_empty());
+    drop(store);
+    let replay = Command::new(env!("CARGO_BIN_EXE_xgen"))
+        .args(["resume", &run_id])
+        .current_dir(&workspace)
+        .env("XGEN_STATE_HOME", &state_root)
+        .env("XGEN_CONFIG_HOME", &config_root)
+        .env_remove("XGEN_OPENAI_BASE_URL")
+        .env_remove("XGEN_OPENAI_MODEL")
+        .env_remove("XGEN_OPENAI_API_KEY")
+        .output()
+        .unwrap();
+    assert!(replay.status.success(), "{}", stderr(&replay));
+    assert_eq!(String::from_utf8_lossy(&replay.stdout), answers[0]);
+    assert!(stderr(&replay).contains("XGEN_RESPONDED"));
+    assert!(!stderr(&replay).contains("XGEN_COMPLETED"));
 }
 
 #[cfg(unix)]

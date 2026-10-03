@@ -766,6 +766,7 @@ fn completion_candidate_seals_legacy_planning() {
         Some(&verified),
         "completion-candidate",
         RunEventBody::CompletionCandidateRecorded {
+            response_kind: xgen_workgraph::ResponseKind::TaskCompletion,
             decision: ExpectedPlanningTurn::new(2, digest('5'), digest('4'))
                 .expect("turn should bind"),
             candidate_id: "completion-done".to_owned(),

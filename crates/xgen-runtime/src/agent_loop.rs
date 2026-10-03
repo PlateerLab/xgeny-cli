@@ -642,12 +642,20 @@ impl fmt::Debug for ProposedPlanStep {
 pub enum PlanProposal {
     Plan { steps: Vec<ProposedPlanStep> },
     CompletionCandidate { summary: String },
+    ResponseCandidate { summary: String },
 }
 
 impl PlanProposal {
     #[must_use]
     pub fn plan(steps: Vec<ProposedPlanStep>) -> Self {
         Self::Plan { steps }
+    }
+
+    #[must_use]
+    pub fn response_candidate(summary: impl Into<String>) -> Self {
+        Self::ResponseCandidate {
+            summary: summary.into(),
+        }
     }
 
     #[must_use]
@@ -665,6 +673,10 @@ impl fmt::Debug for PlanProposal {
                 .debug_struct("PlanProposal::Plan")
                 .field("step_count", &steps.len())
                 .field("steps", &"<redacted>")
+                .finish(),
+            Self::ResponseCandidate { .. } => formatter
+                .debug_struct("PlanProposal::ResponseCandidate")
+                .field("summary", &"<redacted>")
                 .finish(),
             Self::CompletionCandidate { .. } => formatter
                 .debug_struct("PlanProposal::CompletionCandidate")
@@ -885,6 +897,7 @@ pub enum ProposalRejection {
     PlannedStepBudgetExceeded,
     ToolCallBudgetExhausted,
     CompletionWithoutReceiptCompletedPlan,
+    ConversationResponseWithPlan,
     InvalidCompletionSummary,
 }
 
@@ -1137,6 +1150,7 @@ impl AgentLoop {
                     &candidate.summary_digest,
                 )?;
                 if output.record_digest() != expected_record_digest
+                    || output.response_kind() != candidate.response_kind
                     || output.context_digest() != candidate.context_digest
                     || output.proposal_digest() != candidate.proposal_digest
                 {
@@ -1447,6 +1461,18 @@ impl AgentLoop {
                 context,
                 call_id,
                 &summary,
+                xgen_workgraph::ResponseKind::TaskCompletion,
+            ),
+            PlanProposal::ResponseCandidate { summary } => Self::record_completion_candidate(
+                store,
+                events,
+                base_state,
+                reserved_state,
+                frontier,
+                context,
+                call_id,
+                &summary,
+                xgen_workgraph::ResponseKind::Conversation,
             ),
             PlanProposal::Plan { steps } => {
                 if tool_calls >= self.budget.max_tool_calls {
@@ -1557,18 +1583,27 @@ impl AgentLoop {
         context: &PlanningContext,
         call_id: &str,
         summary: &str,
+        response_kind: xgen_workgraph::ResponseKind,
     ) -> Result<AgentLoopTick, AgentLoopError>
     where
         S: RunStore,
         F: EventFactory,
     {
-        if !frontier.all_steps_receipt_completed() {
+        if (response_kind == xgen_workgraph::ResponseKind::TaskCompletion
+            && !frontier.all_steps_receipt_completed())
+            || (response_kind == xgen_workgraph::ResponseKind::Conversation
+                && frontier.total_steps != 0)
+        {
             return Self::record_proposal_rejection(
                 store,
                 events,
                 reserved_state,
                 call_id,
-                ProposalRejection::CompletionWithoutReceiptCompletedPlan,
+                if response_kind == xgen_workgraph::ResponseKind::Conversation {
+                    ProposalRejection::ConversationResponseWithPlan
+                } else {
+                    ProposalRejection::CompletionWithoutReceiptCompletedPlan
+                },
             );
         }
         if validate_completion_summary_candidate(summary).is_err() {
@@ -1580,7 +1615,11 @@ impl AgentLoop {
                 ProposalRejection::InvalidCompletionSummary,
             );
         }
-        let completion_output = CompletionOutputRecord::bind(
+        let bind = match response_kind {
+            xgen_workgraph::ResponseKind::TaskCompletion => CompletionOutputRecord::bind,
+            xgen_workgraph::ResponseKind::Conversation => CompletionOutputRecord::bind_response,
+        };
+        let completion_output = bind(
             &base_state.run_id,
             next_turn_index(base_state)?,
             call_id,
@@ -1594,6 +1633,7 @@ impl AgentLoop {
             events,
             reserved_state,
             RunEventBody::CompletionCandidateRecorded {
+                response_kind,
                 decision,
                 candidate_id: candidate_id.clone(),
                 summary_digest: summary_digest.clone(),

@@ -50,6 +50,8 @@ pub enum RunEventBody {
         steps: Vec<AcceptedPlanStep>,
     },
     CompletionCandidateRecorded {
+        #[serde(default, skip_serializing_if = "ResponseKind::is_task_completion")]
+        response_kind: ResponseKind,
         decision: ExpectedPlanningTurn,
         candidate_id: String,
         summary_digest: String,
@@ -264,6 +266,22 @@ pub const COMPLETION_OUTPUT_FORMAT_VERSION: u32 = 1;
 /// Maximum UTF-8 bytes retained for one final completion summary.
 pub const MAX_COMPLETION_SUMMARY_BYTES: usize = 5_000;
 
+/// Distinguishes an assistant answer from receipt-backed task completion.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseKind {
+    #[default]
+    TaskCompletion,
+    Conversation,
+}
+
+impl ResponseKind {
+    #[allow(clippy::trivially_copy_pass_by_ref)] // Serde skip predicates require a reference.
+    fn is_task_completion(&self) -> bool {
+        *self == Self::TaskCompletion
+    }
+}
+
 /// Self-verifying local sidecar for one exact final model summary.
 ///
 /// The raw summary is intentionally absent from the journal and `RunState`. Its custom `Debug`
@@ -271,6 +289,8 @@ pub const MAX_COMPLETION_SUMMARY_BYTES: usize = 5_000;
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CompletionOutputRecord {
+    #[serde(default, skip_serializing_if = "ResponseKind::is_task_completion")]
+    response_kind: ResponseKind,
     format_version: u32,
     candidate_id: String,
     run_id: String,
@@ -298,6 +318,44 @@ impl CompletionOutputRecord {
         context_digest: impl Into<String>,
         summary: impl Into<String>,
     ) -> Result<Self, CompletionOutputError> {
+        Self::bind_with_kind(
+            run_id,
+            turn_index,
+            model_call_id,
+            context_digest,
+            summary,
+            ResponseKind::TaskCompletion,
+        )
+    }
+
+    /// Bind a conversation response to its successful model call, without a task claim.
+    /// # Errors
+    /// Returns the same bounded-content and identity errors as `bind`.
+    pub fn bind_response(
+        run_id: impl Into<String>,
+        turn_index: u32,
+        model_call_id: impl Into<String>,
+        context_digest: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Result<Self, CompletionOutputError> {
+        Self::bind_with_kind(
+            run_id,
+            turn_index,
+            model_call_id,
+            context_digest,
+            summary,
+            ResponseKind::Conversation,
+        )
+    }
+
+    fn bind_with_kind(
+        run_id: impl Into<String>,
+        turn_index: u32,
+        model_call_id: impl Into<String>,
+        context_digest: impl Into<String>,
+        summary: impl Into<String>,
+        response_kind: ResponseKind,
+    ) -> Result<Self, CompletionOutputError> {
         let run_id = run_id.into();
         let model_call_id = model_call_id.into();
         let context_digest = context_digest.into();
@@ -305,7 +363,7 @@ impl CompletionOutputRecord {
         validate_completion_summary_candidate(&summary)?;
         require_planning_identifier("run_id", &run_id)?;
         require_planning_digest("context_digest", &context_digest)?;
-        let proposal_digest = completion_proposal_digest(&context_digest, &summary)?;
+        let proposal_digest = completion_proposal_digest(&context_digest, &summary, response_kind)?;
         let decision = ExpectedPlanningTurn::for_model_call(
             turn_index,
             model_call_id,
@@ -314,7 +372,14 @@ impl CompletionOutputRecord {
         )?;
         let candidate_id = completion_candidate_id(&run_id, &context_digest, &proposal_digest)?;
         let summary_digest = completion_summary_digest(&summary)?;
-        Self::new(run_id, &decision, candidate_id, summary_digest, summary)
+        Self::new_with_kind(
+            run_id,
+            &decision,
+            candidate_id,
+            summary_digest,
+            summary,
+            response_kind,
+        )
     }
 
     /// Bind one bounded summary to the exact accepted completion decision.
@@ -330,12 +395,31 @@ impl CompletionOutputRecord {
         summary_digest: impl Into<String>,
         summary: impl Into<String>,
     ) -> Result<Self, CompletionOutputError> {
+        Self::new_with_kind(
+            run_id,
+            decision,
+            candidate_id,
+            summary_digest,
+            summary,
+            ResponseKind::TaskCompletion,
+        )
+    }
+
+    fn new_with_kind(
+        run_id: impl Into<String>,
+        decision: &ExpectedPlanningTurn,
+        candidate_id: impl Into<String>,
+        summary_digest: impl Into<String>,
+        summary: impl Into<String>,
+        response_kind: ResponseKind,
+    ) -> Result<Self, CompletionOutputError> {
         let model_call_id = decision
             .model_call_id()
             .ok_or(CompletionOutputError::MissingModelCallBinding)?
             .to_owned();
         let summary = summary.into();
         let mut record = Self {
+            response_kind,
             format_version: COMPLETION_OUTPUT_FORMAT_VERSION,
             candidate_id: candidate_id.into(),
             run_id: run_id.into(),
@@ -414,7 +498,7 @@ impl CompletionOutputRecord {
             return Err(CompletionOutputError::SummaryDigestMismatch);
         }
         let expected_proposal_digest =
-            completion_proposal_digest(&self.context_digest, &self.summary)?;
+            completion_proposal_digest(&self.context_digest, &self.summary, self.response_kind)?;
         if self.proposal_digest != expected_proposal_digest {
             return Err(CompletionOutputError::ProposalDigestMismatch);
         }
@@ -427,6 +511,11 @@ impl CompletionOutputRecord {
             return Err(CompletionOutputError::RecordDigestMismatch);
         }
         Ok(())
+    }
+
+    #[must_use]
+    pub fn response_kind(&self) -> ResponseKind {
+        self.response_kind
     }
 
     #[must_use]
@@ -498,6 +587,7 @@ impl std::fmt::Debug for CompletionOutputRecord {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("CompletionOutputRecord")
+            .field("response_kind", &self.response_kind)
             .field("format_version", &self.format_version)
             .field("candidate_id", &self.candidate_id)
             .field("run_id", &self.run_id)
@@ -568,6 +658,8 @@ struct CompletionCandidateIdDigestInput<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CompletionOutputRecordDigestInput<'a> {
+    #[serde(skip_serializing_if = "ResponseKind::is_task_completion")]
+    response_kind: ResponseKind,
     domain: &'static str,
     format_version: u32,
     candidate_id: &'a str,
@@ -614,9 +706,13 @@ fn completion_summary_digest(summary: &str) -> Result<String, CompletionOutputEr
 fn completion_proposal_digest(
     context_digest: &str,
     summary: &str,
+    response_kind: ResponseKind,
 ) -> Result<String, CompletionOutputError> {
     serde_jcs::to_vec(&CompletionProposalDigestInput {
-        domain: "xgeny.completion-proposal/v1",
+        domain: match response_kind {
+            ResponseKind::TaskCompletion => "xgeny.completion-proposal/v1",
+            ResponseKind::Conversation => "xgen.conversation-proposal/v1",
+        },
         context_digest,
         summary,
     })
@@ -647,6 +743,7 @@ fn completion_output_record_digest(
     record: &CompletionOutputRecord,
 ) -> Result<String, CompletionOutputError> {
     serde_jcs::to_vec(&CompletionOutputRecordDigestInput {
+        response_kind: record.response_kind,
         domain: "xgeny.completion-output.record/v1",
         format_version: record.format_version,
         candidate_id: &record.candidate_id,
@@ -2012,6 +2109,8 @@ pub struct AcceptedPlanStep {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CompletionCandidateState {
+    #[serde(default, skip_serializing_if = "ResponseKind::is_task_completion")]
+    pub response_kind: ResponseKind,
     pub candidate_id: String,
     pub context_digest: String,
     pub proposal_digest: String,
@@ -3483,12 +3582,14 @@ fn apply_body(state: &mut RunState, body: &RunEventBody) -> Result<(), Transitio
             accept_plan(state, decision, steps)?;
         }
         RunEventBody::CompletionCandidateRecorded {
+            response_kind,
             decision,
             candidate_id,
             summary_digest,
             completion_output_record_digest,
         } => record_completion_candidate(
             state,
+            *response_kind,
             decision,
             candidate_id,
             summary_digest,
@@ -4024,6 +4125,7 @@ fn validate_accepted_objective(objective: &str) -> Result<(), TransitionError> {
 
 fn record_completion_candidate(
     state: &mut RunState,
+    response_kind: ResponseKind,
     decision: &ExpectedPlanningTurn,
     candidate_id: &str,
     summary_digest: &str,
@@ -4033,12 +4135,21 @@ fn record_completion_candidate(
     validate_model_call_success(state, decision)?;
     require_planning_identifier("candidate_id", candidate_id)?;
     require_planning_digest("summary_digest", summary_digest)?;
+    if response_kind == ResponseKind::Conversation && completion_output_record_digest.is_none() {
+        return Err(TransitionError::ConversationResponseRequiresOutput);
+    }
     if let Some(record_digest) = completion_output_record_digest {
         require_planning_digest("completion_output_record_digest", record_digest)?;
     }
     let frontier = derive_frontier(state).map_err(map_plan_frontier_error)?;
-    if !frontier.all_steps_receipt_completed() {
-        return Err(TransitionError::CompletionCandidateRequiresReceiptCompletedPlan);
+    match response_kind {
+        ResponseKind::TaskCompletion if !frontier.all_steps_receipt_completed() => {
+            return Err(TransitionError::CompletionCandidateRequiresReceiptCompletedPlan);
+        }
+        ResponseKind::Conversation if frontier.total_steps != 0 => {
+            return Err(TransitionError::ConversationResponseRequiresEmptyPlan);
+        }
+        _ => {}
     }
     let loop_state = state
         .agent_loop
@@ -4062,6 +4173,7 @@ fn record_completion_candidate(
     }
     loop_state.accepted_model_turns = expected_turn;
     loop_state.completion_candidate = Some(CompletionCandidateState {
+        response_kind,
         candidate_id: candidate_id.to_owned(),
         context_digest: decision.context_digest.clone(),
         proposal_digest: decision.proposal_digest.clone(),
@@ -4949,6 +5061,10 @@ pub enum TransitionError {
     CompletionCandidateAlreadyRecorded,
     #[error("a completion candidate requires a non-empty Receipt-completed current plan")]
     CompletionCandidateRequiresReceiptCompletedPlan,
+    #[error("conversation response requires an empty plan")]
+    ConversationResponseRequiresEmptyPlan,
+    #[error("conversation response requires a bound output record")]
+    ConversationResponseRequiresOutput,
     #[error("event sequence mismatch: expected {expected}, got {actual}")]
     UnexpectedSequence { expected: u64, actual: u64 },
     #[error("event {sequence} previous digest mismatch")]
@@ -6403,8 +6519,9 @@ mod tests {
 
     fn completion_output_fixture(summary: &str) -> CompletionOutputRecord {
         let context_digest = format!("sha256:{}", "c".repeat(64));
-        let proposal_digest = completion_proposal_digest(&context_digest, summary)
-            .expect("proposal digest should canonicalize");
+        let proposal_digest =
+            completion_proposal_digest(&context_digest, summary, ResponseKind::TaskCompletion)
+                .expect("proposal digest should canonicalize");
         let decision = ExpectedPlanningTurn::for_model_call(
             2,
             format!("model-call-{}", "a".repeat(64)),
@@ -6418,6 +6535,41 @@ mod tests {
             completion_summary_digest(summary).expect("summary digest should canonicalize");
         CompletionOutputRecord::new(RUN_ID, &decision, candidate_id, summary_digest, summary)
             .expect("completion output should validate")
+    }
+
+    #[test]
+    fn response_kind_is_digest_bound_and_legacy_completion_bytes_omit_it() {
+        let summary = "same answer";
+        let completion = completion_output_fixture(summary);
+        let response = CompletionOutputRecord::bind_response(
+            RUN_ID,
+            completion.turn_index,
+            &completion.model_call_id,
+            &completion.context_digest,
+            summary,
+        )
+        .unwrap();
+        assert_ne!(completion.proposal_digest(), response.proposal_digest());
+        assert_ne!(completion.record_digest(), response.record_digest());
+        let encoded = serde_json::to_value(&completion).unwrap();
+        assert!(encoded.get("responseKind").is_none());
+        let mut tampered = serde_json::to_value(&response).unwrap();
+        tampered["responseKind"] = serde_json::json!("task_completion");
+        let decoded: CompletionOutputRecord = serde_json::from_value(tampered).unwrap();
+        assert!(
+            decoded
+                .verify_for(
+                    RUN_ID,
+                    &response.decision().unwrap(),
+                    response.candidate_id(),
+                    response.summary_digest()
+                )
+                .is_err()
+        );
+        let restored: CompletionOutputRecord =
+            serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+        assert_eq!(restored, response);
+        assert!(!format!("{response:?}").contains(summary));
     }
 
     #[test]
