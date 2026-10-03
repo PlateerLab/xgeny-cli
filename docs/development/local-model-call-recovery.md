@@ -5,17 +5,17 @@ the CLI. It does not add a provider retry policy. See [ADR-0040](../adr/0040-exp
 
 ## Inspect, decide, then act on one exact call
 
-Use the same private `XGENY_STATE_HOME` as the original Run:
+Use the same private `XGEN_STATE_HOME` as the original Run:
 
 ```text
-xgeny recover RUN_ID
-xgeny recover RUN_ID --discard-model-call CALL_ID_FROM_INSPECTION
+xgen recover RUN_ID
+xgen recover RUN_ID --discard-model-call CALL_ID_FROM_INSPECTION
 ```
 
 For host-managed approval, bind the action to the inspected journal head as well:
 
 ```text
-xgeny recover RUN_ID --discard-model-call CALL_ID_FROM_INSPECTION --expected-journal-head sha256:HEAD_FROM_INSPECTION
+xgen recover RUN_ID --discard-model-call CALL_ID_FROM_INSPECTION --expected-journal-head sha256:HEAD_FROM_INSPECTION
 ```
 
 The expected-head comparison happens under the exclusive Run lease, before any
@@ -73,7 +73,7 @@ this command neither restores it nor relaxes physical-identity checks.
 
 ## Local verification
 
-`crates/xgeny-cli/tests/public_run_resume.rs` exercises separate binary processes
+`crates/xgen-cli/tests/public_run_resume.rs` exercises separate binary processes
 with loopback fixture providers, including an actual process kill. It checks
 read-only inspection, exact discard, lease/integrity errors, consumed reservations,
 same-ID/stale-head denial and exactly-once guarded discard, and a verified read
@@ -117,7 +117,7 @@ rollout require their own tests; macOS/Windows are checked by repository CI.
   existing four ignored tests still ignored. These are not all-platform results.
 - Workspace clippy (`--all-targets -- -D warnings`), formatting and offline
   protocol check passed (9 schemas, 28 fixtures, 26 semantic checks).
-- Optimized `cargo build --locked --offline --release -p xgeny-cli` passed;
+- Optimized `cargo build --locked --offline --release -p xgen-cli` passed;
   the release binary also passed the offline protocol check and exposes the new
   recovery option in help. Remote Linux/macOS/Windows CI remains a separate gate.
 - Builds and temporary fixtures use task-specific executable tmpfs directories

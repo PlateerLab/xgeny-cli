@@ -1,6 +1,6 @@
-# XGENy 개발 방법론과 테스트 전략
+# XGEN 개발 방법론과 테스트 전략
 
-이 문서는 1인 개발 단계부터 XGENy의 구현 속도와 신뢰성을 함께 유지하기 위한 기본 작업 규칙이다. 테스트 개수나 line coverage 자체가 목적이 아니라, 로컬 실행·장기 작업·권한·XGEN 호환성에서 발생할 수 있는 실패를 병합 전에 발견하는 것이 목적이다.
+이 문서는 1인 개발 단계부터 XGEN의 구현 속도와 신뢰성을 함께 유지하기 위한 기본 작업 규칙이다. 테스트 개수나 line coverage 자체가 목적이 아니라, 로컬 실행·장기 작업·권한·XGEN 호환성에서 발생할 수 있는 실패를 병합 전에 발견하는 것이 목적이다.
 
 ## 기본 개발 흐름
 
@@ -16,7 +16,7 @@
 
 안정된 요구사항에는 Red–Green–Refactor를 기본으로 적용한다. 다만 문제를 아직 정의할 수 없는 연구 작업은 time-boxed spike를 허용한다. spike 코드는 제품 경로에 그대로 병합하지 않고, 얻은 결론을 ADR·계약·실패 테스트로 변환한 뒤 다시 구현한다.
 
-기존 XGEN 또는 Connector 동작을 바꾸는 경우에는 현재 동작을 고정하는 characterization test와 양쪽 구현이 함께 실행할 contract test를 먼저 만든다. XGENy가 기존 구현에 의존하지 않더라도 호환성은 실행 가능한 테스트 자산으로 유지한다.
+기존 XGEN 또는 Connector 동작을 바꾸는 경우에는 현재 동작을 고정하는 characterization test와 양쪽 구현이 함께 실행할 contract test를 먼저 만든다. XGEN가 기존 구현에 의존하지 않더라도 호환성은 실행 가능한 테스트 자산으로 유지한다.
 
 ## 테스트 계층
 
@@ -53,7 +53,7 @@
 
 ### 6. XGEN·Connector compatibility E2E
 
-- 버전별 contract fixture를 XGENy와 서버 호환 계층 양쪽에 실행한다.
+- 버전별 contract fixture를 XGEN와 서버 호환 계층 양쪽에 실행한다.
 - 서버가 없을 때 local-only 기능이 유지되고, 연결 후에도 기존 XGEN 경로가 깨지지 않는지 확인한다.
 - 실제 개발 환경 연동은 release gate로 관리하되 unit test의 필수 조건으로 만들지 않는다.
 

@@ -112,7 +112,7 @@ async function main() {
   assert.equal(specification.os, process.platform, 'smoke target must match the runner OS');
   assert.equal(specification.cpu, process.arch, 'smoke target must match the runner architecture');
 
-  const temporary = await mkdtemp(path.join(os.tmpdir(), 'xgeny-npm-smoke.'));
+  const temporary = await mkdtemp(path.join(os.tmpdir(), 'xgen-npm-smoke.'));
   const requestedTarballs = [];
   let server;
   try {
@@ -218,12 +218,12 @@ async function main() {
       ...process.env,
       HOME: home,
       USERPROFILE: home,
-      XGENY_STATE_HOME: state,
+      XGEN_STATE_HOME: state,
     };
     let versionResult;
     let interactiveResult;
     if (process.platform === 'win32') {
-      const shim = path.join(installRoot, 'xgeny.cmd');
+      const shim = path.join(installRoot, 'xgen.cmd');
       const invocation = windowsShimVersionInvocation(shim);
       versionResult = await run(invocation.command, invocation.args, {
         env: executionEnvironment,
@@ -236,15 +236,15 @@ async function main() {
         windowsVerbatimArguments: interactive.windowsVerbatimArguments,
       });
     } else {
-      const shim = path.join(installRoot, 'bin', 'xgeny');
+      const shim = path.join(installRoot, 'bin', 'xgen');
       versionResult = await run(shim, ['--version'], { env: executionEnvironment });
       interactiveResult = await run(shim, [], {
         env: executionEnvironment,
         input: '/status\n/exit\n',
       });
     }
-    assert.equal(versionResult.stdout.trim(), `xgeny ${version}`);
-    assert.match(interactiveResult.stdout, /XGENy Developer Preview/);
+    assert.equal(versionResult.stdout.trim(), `xgen ${version}`);
+    assert.match(interactiveResult.stdout, /XGEN Developer Preview/);
     assert.match(interactiveResult.stdout, /status: idle/);
     assert.match(interactiveResult.stdout, /bye/);
     await assert.rejects(lstat(state), (error) => error.code === 'ENOENT');
@@ -272,8 +272,8 @@ async function main() {
     await assert.rejects(lstat(installedLauncher), (error) => error.code === 'ENOENT');
     await assert.rejects(lstat(installedPlatform), (error) => error.code === 'ENOENT');
     const installedShims = process.platform === 'win32'
-      ? ['xgeny', 'xgeny.cmd', 'xgeny.ps1'].map((name) => path.join(installRoot, name))
-      : [path.join(installRoot, 'bin', 'xgeny')];
+      ? ['xgen', 'xgen.cmd', 'xgen.ps1'].map((name) => path.join(installRoot, name))
+      : [path.join(installRoot, 'bin', 'xgen')];
     for (const installedShim of installedShims) {
       await assert.rejects(lstat(installedShim), (error) => error.code === 'ENOENT');
     }

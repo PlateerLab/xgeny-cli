@@ -175,7 +175,7 @@ Durable 값은 opaque ID, bounded closed enum, count, supported identifier와 we
 
 Core lifecycle에는 XGEN workflow/node/interaction ID, Connector 타입, PostgreSQL/MinIO key, OpenAI/Anthropic request type 또는 특정 model 이름을 넣지 않는다. Planner identity와 request profile은 provider-neutral bounded commitment다.
 
-향후 local model, OpenAI-compatible endpoint 또는 XGEN Model Gateway adapter는 같은 reservation/request 계약을 구현한다. XGEN/Connector가 없어도 Memory/SQLite fake-port tests가 전부 통과해야 한다. XGEN을 연결할 때도 XGENy Core가 XGEN package나 저장소에 의존하지 않으며, adapter가 provider dialect와 request-status reconciliation을 소유한다.
+향후 local model, OpenAI-compatible endpoint 또는 XGEN Model Gateway adapter는 같은 reservation/request 계약을 구현한다. XGEN/Connector가 없어도 Memory/SQLite fake-port tests가 전부 통과해야 한다. XGEN을 연결할 때도 XGEN Core가 XGEN package나 저장소에 의존하지 않으며, adapter가 provider dialect와 request-status reconciliation을 소유한다.
 
 ## Failure matrix
 
@@ -260,6 +260,6 @@ Credential, 사용자 데이터와 hidden reasoning을 local journal에 영구 �
 
 ## 결과
 
-XGENy는 실제 provider가 없어도 model request를 보내기 전에 bounded possible-send slot을 durable하게 소비하고, 성공·closed rejection·Unknown을 재시작 뒤 같은 journal에서 복원할 수 있다. Accepted Plan과 Completion은 기존 원자 commit 경계를 유지하고 stale response는 새 head에 적용되지 않는다. Unknown call은 자동 재호출하지 않지만 effect recovery와 Core verification은 계속 진행할 수 있다.
+XGEN는 실제 provider가 없어도 model request를 보내기 전에 bounded possible-send slot을 durable하게 소비하고, 성공·closed rejection·Unknown을 재시작 뒤 같은 journal에서 복원할 수 있다. Accepted Plan과 Completion은 기존 원자 commit 경계를 유지하고 stale response는 새 head에 적용되지 않는다. Unknown call은 자동 재호출하지 않지만 effect recovery와 Core verification은 계속 진행할 수 있다.
 
 이 보장은 실제 청구 건수나 exactly-once network delivery가 아니다. 실제 provider adapter는 reservation당 outbound 최대 한 번, raw logging 금지와 provider-specific reconciliation을 별도 integration gate로 증명해야 한다.

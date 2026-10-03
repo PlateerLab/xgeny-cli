@@ -4,7 +4,7 @@
 
 ## 사용자 시나리오
 
-XGENy가 effectful Capability를 실행하기 전에 호스트가 실제 resource를 정규화하고, host·사용자 profile·선택적 조직 정책의 교집합이 전체 요청을 허용하는지 provisional 판정을 얻는다. 한 계층이라도 거부하거나 일부 resource만 허용하면 요청 전체를 실행하지 않으며, critical action은 넓은 로컬 profile에서도 자동 허용하지 않는다. 현재 Allow 결과 자체는 Executor가 소비할 실행 권한이 아니다.
+XGEN가 effectful Capability를 실행하기 전에 호스트가 실제 resource를 정규화하고, host·사용자 profile·선택적 조직 정책의 교집합이 전체 요청을 허용하는지 provisional 판정을 얻는다. 한 계층이라도 거부하거나 일부 resource만 허용하면 요청 전체를 실행하지 않으며, critical action은 넓은 로컬 profile에서도 자동 허용하지 않는다. 현재 Allow 결과 자체는 Executor가 소비할 실행 권한이 아니다.
 
 ## 구성과 의존 방향
 
@@ -24,7 +24,7 @@ host boundary ∩ user profile [∩ managed lease]
        deny > ask > allow
 ```
 
-`xgeny-policy`는 `xgeny-domain`, `serde_json`, `thiserror`에만 의존하는 I/O 없는 crate다. XGEN, Connector, DB, MinIO, local store, WorkGraph, OS API와 filesystem/process 구현에 의존하지 않는다.
+`xgen-policy`는 `xgen-domain`, `serde_json`, `thiserror`에만 의존하는 I/O 없는 crate다. XGEN, Connector, DB, MinIO, local store, WorkGraph, OS API와 filesystem/process 구현에 의존하지 않는다.
 
 ## Resource 권위 경계
 
@@ -54,7 +54,7 @@ resolver 결과는 `(scope, canonical_resource)` exact identity로만 비교한�
 
 lifetime은 `once < run < session < project < persistent` 같은 크기 비교를 하지 않는다. 각 계층이 현재 요청 lifetime을 명시적으로 포함해야 한다. 특히 run과 session의 의미 범위가 항상 포함 관계라고 가정하지 않는다.
 
-ADR-0005의 완성형 교집합에는 current Run grant가 포함된다. `xgeny-policy` 자체는 Run/action binding과 소비 예산을 발행하지 않으며 Allow는 여전히 provisional 결과다. 후단의 제한된 [Run-bound Invocation Admission 기본형](invocation-admission.md)이 exact invocation에서 request를 만들고 local one-shot allow만 current Run/Step/action/Instance와 결합해 `EffectIntent`와 원자적으로 소비한다. managed lease, critical approval와 reusable Run grant는 아직 지원하지 않는다.
+ADR-0005의 완성형 교집합에는 current Run grant가 포함된다. `xgen-policy` 자체는 Run/action binding과 소비 예산을 발행하지 않으며 Allow는 여전히 provisional 결과다. 후단의 제한된 [Run-bound Invocation Admission 기본형](invocation-admission.md)이 exact invocation에서 request를 만들고 local one-shot allow만 current Run/Step/action/Instance와 결합해 `EffectIntent`와 원자적으로 소비한다. managed lease, critical approval와 reusable Run grant는 아직 지원하지 않는다.
 
 ## Critical action
 

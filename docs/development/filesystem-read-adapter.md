@@ -1,6 +1,6 @@
 # Capability-confined filesystem read adapter
 
-`xgeny-adapter-filesystem`은 한 user-selected workspace 안에서 bounded read/list/stat/search를 수행하는
+`xgen-adapter-filesystem`은 한 user-selected workspace 안에서 bounded read/list/stat/search를 수행하는
 제품 leaf adapter다. 이 문서는 그중 exact UTF-8 `read-text` 경계를 다루며 query 계약은
 [workspace filesystem discovery](workspace-filesystem-discovery.md)에 정리한다. XGEN, Connector, DB
 server, MinIO, daemon 또는 특정 model provider가 필요하지 않는다. SQLite와 마찬가지로 필요한 Rust
@@ -12,7 +12,7 @@ Trusted host가 workspace root를 한 번 열고 같은 객체에서 resolver, r
 adapter와 verifier를 만든다.
 
 ```rust,no_run
-use xgeny_adapter_filesystem::{ReadTextLimits, WorkspaceId, WorkspaceRoot};
+use xgen_adapter_filesystem::{ReadTextLimits, WorkspaceId, WorkspaceRoot};
 
 let workspace = WorkspaceRoot::open_ambient(
     "/user-selected/project",
@@ -85,8 +85,8 @@ Journal, projection, Receipt, Artifact name과 adapter의 `Debug`/error에는
 ## 현재 검증 명령
 
 ```bash
-cargo test -p xgeny-adapter-filesystem --all-targets --locked
-cargo test -p xgeny-cli --test durable_driver \
+cargo test -p xgen-adapter-filesystem --all-targets --locked
+cargo test -p xgen-cli --test durable_driver \
   real_filesystem_adapter_reaches_next_turn_and_replays_after_sqlite_reopen \
   -- --exact
 cargo clippy --workspace --all-targets -- -D warnings

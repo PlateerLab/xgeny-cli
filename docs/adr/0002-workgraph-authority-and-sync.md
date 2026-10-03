@@ -5,15 +5,15 @@
 
 ## Context
 
-XGENy는 모델 context보다 긴 작업을 여러 턴에 걸쳐 지속해야 한다. XGEN 서버와 연결되면 같은 Run을 관찰·실행·감사할 수 있어야 하지만, 로컬과 서버가 동시에 그래프를 수정하면 충돌과 중복 side effect가 발생한다.
+XGEN는 모델 context보다 긴 작업을 여러 턴에 걸쳐 지속해야 한다. XGEN 서버와 연결되면 같은 Run을 관찰·실행·감사할 수 있어야 하지만, 로컬과 서버가 동시에 그래프를 수정하면 충돌과 중복 side effect가 발생한다.
 
 ## Decision
 
 WorkGraph는 Run마다 단일 authority를 가진다.
 
-- 로컬에서 만든 Run: XGENy authority, XGEN은 선택적 mirror
-- XGEN이 만든 Run: XGEN authority, XGENy는 edge executor
-- 외부 harness가 만든 Parent session/Run: 외부 harness가 native plan을 소유하며 canonical XGENy WorkGraph는 만들지 않음
+- 로컬에서 만든 Run: XGEN authority, XGEN은 선택적 mirror
+- XGEN이 만든 Run: XGEN authority, XGEN는 edge executor
+- 외부 harness가 만든 Parent session/Run: 외부 harness가 native plan을 소유하며 canonical XGEN WorkGraph는 만들지 않음
 - 외부 Parent가 XGEN capability를 호출해 만든 bounded child Run: XGEN authority
 
 동기화는 append-only `EventEnvelope`와 sequence cursor를 사용한다. mutation은 `expected_revision`과 `idempotency_key`를 요구한다. authority 변경은 명시적 handoff event다.

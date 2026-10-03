@@ -126,4 +126,4 @@ Frontier derivation은 recursion을 사용하지 않고 validation phase와 clas
 
 ## 결과
 
-XGENy는 이제 모델 context와 분리된 durable dependency DAG를 재시작 뒤 같은 current projection에서 복원하고, 미확정 effect와 검증을 먼저 처리하며, Core Receipt로 증명된 선행 Step만 다음 작업을 해제할 수 있다. 다음 수직 slice는 이 frontier의 `Admit` action이 사용할 durable 계획 입력과 bounded model loop를 정의하는 일이며, 실제 모델 연결은 그 경계와 함께 별도 평가 gate로 검증한다.
+XGEN는 이제 모델 context와 분리된 durable dependency DAG를 재시작 뒤 같은 current projection에서 복원하고, 미확정 effect와 검증을 먼저 처리하며, Core Receipt로 증명된 선행 Step만 다음 작업을 해제할 수 있다. 다음 수직 slice는 이 frontier의 `Admit` action이 사용할 durable 계획 입력과 bounded model loop를 정의하는 일이며, 실제 모델 연결은 그 경계와 함께 별도 평가 gate로 검증한다.

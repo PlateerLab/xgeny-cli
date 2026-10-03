@@ -123,7 +123,7 @@ Search query와 directory descendant path는 미리 열거한 allow-file catalog
 mode의 PlanMaterializer는 accepted plan commit 전에 exact normalized arguments를 Run directory의
 `materials.sqlite3`에 저장한다.
 
-- `materials.sqlite3`는 XGENy binary에 link된 bundled SQLite library를 사용하며 별도 설치나 daemon이
+- `materials.sqlite3`는 XGEN binary에 link된 bundled SQLite library를 사용하며 별도 설치나 daemon이
   필요 없다.
 - core `run.sqlite3` schema와 table을 수정하지 않는다.
 - recipe는 run/step/proposal/capability/material digest와 arguments를 JCS로 묶는다.
@@ -182,7 +182,7 @@ junction/reparse test의 platform-specific 보장은 해당 runner에서 실행�
 
 ## 결과
 
-XGENy는 사용자가 파일명을 미리 알려주지 않아도 명시적으로 허용된 workspace를 스스로 관찰할 수 있다.
+XGEN는 사용자가 파일명을 미리 알려주지 않아도 명시적으로 허용된 workspace를 스스로 관찰할 수 있다.
 이 기능은 Core나 XGEN에 filesystem/SQLite 의존성을 추가하지 않고 leaf adapter와 CLI composition 안에
 머문다. 다음 vertical slice는 이 read-only 관찰 위에 `write-atomic/patch`를 올리고, 그 다음
 `process execute`로 수정 결과의 test/lint/build를 검증하는 것이다.

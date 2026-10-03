@@ -109,7 +109,7 @@ Started commit 실패 시 prepared session을 폐기하고 execute하지 않는�
 
 ## Public-port reference adapter
 
-`xgeny-adapter-reference`는 `publish = false`인 비제품 crate다. Runtime private API 없이 `EffectAdapter`와 `PreparedAdapterInvocation`을 구현하고, trusted composition root가 미리 연 격리 파일 handle만 받는다. Invocation에는 OS path 대신 exact opaque target reference가 들어간다.
+`xgen-adapter-reference`는 `publish = false`인 비제품 crate다. Runtime private API 없이 `EffectAdapter`와 `PreparedAdapterInvocation`을 구현하고, trusted composition root가 미리 연 격리 파일 handle만 받는다. Invocation에는 OS path 대신 exact opaque target reference가 들어간다.
 
 `prepare`는 target을 변경하지 않는다. Started commit 뒤 `execute`가 canonical evidence marker를 seek·truncate·write·sync하고 bounded read-back으로 확인한다. Raw marker와 target reference는 기록하지 않으며 partial write·sync를 포함한 I/O 오류는 OS 문자열을 내보내지 않고 `ResponseUnverifiable` unknown으로 처리한다. 별도 process를 write·sync·read-back 뒤 outcome commit 전에 종료하는 SQLite test는 재시작 때 adapter/provider 없이 `EffectUnknown`으로 수렴하고 adapter execute가 0회인지 확인한다.
 
@@ -121,7 +121,7 @@ Adapter outcome의 `evidence_digest`는 물리 evidence byte의 digest이며 pro
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
-cargo run --locked --quiet -p xgeny-cli -- protocol check
+cargo run --locked --quiet -p xgen-cli -- protocol check
 cargo build --workspace --release --locked
 ```
 

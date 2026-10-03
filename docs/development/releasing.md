@@ -1,18 +1,18 @@
 # Native 및 npm release 운영 절차
 
-이 문서는 XGENy prototype native artifact와 npm package의 생성·검증·게시 경계를 고정한다. Package
+이 문서는 XGEN prototype native artifact와 npm package의 생성·검증·게시 경계를 고정한다. Package
 manager formula, MSI, background updater와 OS code signing은 이 단계에 포함하지 않는다. npm은 native
 binary를 감싸는 선택형 설치 채널이며 제품 runtime을 다시 구현하지 않는다.
 
 ## Release 전 조건
 
 - release 대상 commit이 현재 `origin/main`의 head다.
-- workspace와 `xgeny-cli` version이 release tag와 정확히 같다.
+- workspace와 `xgen-cli` version이 release tag와 정확히 같다.
 - tag는 `vMAJOR.MINOR.PATCH` 또는 SemVer prerelease 형식이다.
 - 새 stable tag는 이미 게시된 가장 높은 stable SemVer보다 커야 한다.
 - GitHub repository의 immutable releases와 tag 보호 설정을 첫 release 전에 활성화한다.
 - 활성화 사실을 관리자가 확인한 뒤 Actions repository variable
-  `XGENY_IMMUTABLE_RELEASES_ENABLED=true`를 설정한다. Workflow에 administration token은 저장하지 않는다.
+  `XGEN_IMMUTABLE_RELEASES_ENABLED=true`를 설정한다. Workflow에 administration token은 저장하지 않는다.
 - `refs/tags/v*` 또는 모든 tag의 update와 deletion을 막는 active repository ruleset을
   exclude와 bypass actor 없이 활성화한다.
 - `main`에 PR, deletion과 non-fast-forward 차단을 적용하는 active branch ruleset을 exclude와
@@ -26,14 +26,14 @@ binary를 감싸는 선택형 설치 채널이며 제품 runtime을 다시 구�
   - `Platform / aarch64-apple-darwin`
   - `Platform / x86_64-pc-windows-msvc`
   설정 후
-  `XGENY_MAIN_PROTECTION_ENABLED=true`를 둔다.
+  `XGEN_MAIN_PROTECTION_ENABLED=true`를 둔다.
 - Bypass actor가 없음을 관리자가 확인한 뒤 Actions repository variable
-  `XGENY_RELEASE_RULESET_NO_BYPASS=true`를 설정한다. Read-only ruleset API는 bypass 목록을 숨길 수 있다.
+  `XGEN_RELEASE_RULESET_NO_BYPASS=true`를 설정한다. Read-only ruleset API는 bypass 목록을 숨길 수 있다.
 - npm의 `@xgen` scope에 여섯 package를 게시할 owner 권한을 확인한다. Package read/write와 `bypass 2FA`
   권한이 있는 granular token을 repository secret `NPM_TOKEN`에 저장하고 source, artifact와 명령 출력에는
   넣지 않는다. 실행 파일이 없는 bootstrap version을 같은 정책으로 먼저 게시한다. 전체 절차는
   [npm granular token 게시와 provenance](npm-distribution.md)를 따른다.
-- token의 scope와 권한을 확인한 뒤 repository variable `XGENY_NPM_PUBLISH_ENABLED=true`를 둔다. 값이
+- token의 scope와 권한을 확인한 뒤 repository variable `XGEN_NPM_PUBLISH_ENABLED=true`를 둔다. 값이
   없거나 exact `true`가 아니면 native build 전에 release가 fail-closed한다.
 - macOS notarization과 Windows Authenticode가 없는 build는 SemVer와 별개로 prototype이라고 명시하고
   OS 경고 가능성을 안내한다.
@@ -57,7 +57,7 @@ sh scripts/check-npm-distribution-workflow.sh
 `sh scripts/check-third-party-licenses.sh --write`를 실행하고 diff를 사람이 검토한다. Script는
 host별 `cargo-about 0.9.2` artifact의 고정 SHA-256을 확인한 뒤 실행한다. 공식 prebuilt artifact가
 없는 Intel macOS에서는 이 유지보수 명령 대신 Linux CI 또는 지원되는 개발 host를 사용한다. 최종 사용자용
-XGENy Intel macOS binary와 installer 검증 범위에는 영향이 없다.
+XGEN Intel macOS binary와 installer 검증 범위에는 영향이 없다.
 
 Version을 올린 변경을 먼저 PR로 merge한 뒤 main head에 tag를 만든다. `main`에는 직접 push하지 않는다.
 
@@ -65,7 +65,7 @@ Version을 올린 변경을 먼저 PR로 merge한 뒤 main head에 tag를 만든
 release_version=0.1.0-rc.3
 release_tag="v$release_version"
 git fetch origin main
-git tag -a "$release_tag" origin/main -m "XGENy $release_version"
+git tag -a "$release_tag" origin/main -m "XGEN $release_version"
 git push origin "$release_tag"
 ```
 
@@ -79,7 +79,7 @@ checkout한다. Request workflow의 code, cache나 artifact는 publisher 입력�
 
 Publish 이전에는 다음을 다시 확인한다.
 
-1. tag grammar, Cargo package version과 `xgeny --version` 일치
+1. tag grammar, Cargo package version과 `xgen --version` 일치
 2. tag commit과 현재 `origin/main` head 일치, stable version의 단조 증가
 3. format, clippy와 전체 workspace test
 4. pinned `cargo-about`으로 `Cargo.lock` 기반 제3자 고지 최신성, Rust 1.98.0 standard library와
@@ -126,13 +126,13 @@ Action은 mutable tag가 아니라 full commit SHA로 고정한다.
 
 ## 게시 artifact
 
-- `xgeny-x86_64-unknown-linux-musl`
-- `xgeny-aarch64-unknown-linux-musl`
-- `xgeny-x86_64-apple-darwin`
-- `xgeny-aarch64-apple-darwin`
-- `xgeny-x86_64-pc-windows-msvc.exe`
-- `xgeny-installer.sh`
-- `xgeny-installer.ps1`
+- `xgen-x86_64-unknown-linux-musl`
+- `xgen-aarch64-unknown-linux-musl`
+- `xgen-x86_64-apple-darwin`
+- `xgen-aarch64-apple-darwin`
+- `xgen-x86_64-pc-windows-msvc.exe`
+- `xgen-installer.sh`
+- `xgen-installer.ps1`
 - `xgen-cli.tgz`
 - `xgen-cli-linux-x64-musl.tgz`
 - `xgen-cli-linux-arm64-musl.tgz`
@@ -150,7 +150,7 @@ symlink/hardlink entry 해석이 설치 경로에 존재하지 않는다. Releas
 확인한다.
 
 ```bash
-gh attestation verify PATH_TO_ASSET --repo PlateerLab/xgeny-cli
+gh attestation verify PATH_TO_ASSET --repo PlateerLab/xgen-cli
 ```
 
 GitHub Release 게시 전 실패하면 기존 tag나 asset을 교체해 재사용하지 않는다. 원인을 수정하고 version을

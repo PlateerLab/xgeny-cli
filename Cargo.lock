@@ -2622,7 +2622,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
-name = "xgeny-adapter-filesystem"
+name = "xgen-adapter-filesystem"
 version = "0.1.0-rc.3"
 dependencies = [
  "cap-fs-ext",
@@ -2633,14 +2633,14 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
- "xgeny-domain",
- "xgeny-policy",
- "xgeny-runtime",
- "xgeny-workgraph",
+ "xgen-domain",
+ "xgen-policy",
+ "xgen-runtime",
+ "xgen-workgraph",
 ]
 
 [[package]]
-name = "xgeny-adapter-process"
+name = "xgen-adapter-process"
 version = "0.1.0-rc.3"
 dependencies = [
  "cap-fs-ext",
@@ -2653,14 +2653,14 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
- "xgeny-domain",
- "xgeny-policy",
- "xgeny-runtime",
- "xgeny-workgraph",
+ "xgen-domain",
+ "xgen-policy",
+ "xgen-runtime",
+ "xgen-workgraph",
 ]
 
 [[package]]
-name = "xgeny-adapter-reference"
+name = "xgen-adapter-reference"
 version = "0.1.0-rc.3"
 dependencies = [
  "jsonschema",
@@ -2670,15 +2670,15 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
- "xgeny-domain",
- "xgeny-local-store",
- "xgeny-policy",
- "xgeny-runtime",
- "xgeny-workgraph",
+ "xgen-domain",
+ "xgen-local-store",
+ "xgen-policy",
+ "xgen-runtime",
+ "xgen-workgraph",
 ]
 
 [[package]]
-name = "xgeny-cli"
+name = "xgen-cli"
 version = "0.1.0-rc.3"
 dependencies = [
  "cap-fs-ext",
@@ -2697,20 +2697,20 @@ dependencies = [
  "thiserror",
  "time",
  "url",
- "xgeny-adapter-filesystem",
- "xgeny-adapter-process",
- "xgeny-domain",
- "xgeny-local-store",
- "xgeny-policy",
- "xgeny-protocol",
- "xgeny-provider-openai",
- "xgeny-runtime",
- "xgeny-workgraph",
+ "xgen-adapter-filesystem",
+ "xgen-adapter-process",
+ "xgen-domain",
+ "xgen-local-store",
+ "xgen-policy",
+ "xgen-protocol",
+ "xgen-provider-openai",
+ "xgen-runtime",
+ "xgen-workgraph",
  "zeroize",
 ]
 
 [[package]]
-name = "xgeny-domain"
+name = "xgen-domain"
 version = "0.1.0-rc.3"
 dependencies = [
  "serde",
@@ -2718,7 +2718,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "xgeny-local-store"
+name = "xgen-local-store"
 version = "0.1.0-rc.3"
 dependencies = [
  "libc",
@@ -2730,22 +2730,22 @@ dependencies = [
  "thiserror",
  "time",
  "url",
- "xgeny-domain",
- "xgeny-protocol",
- "xgeny-workgraph",
+ "xgen-domain",
+ "xgen-protocol",
+ "xgen-workgraph",
 ]
 
 [[package]]
-name = "xgeny-policy"
+name = "xgen-policy"
 version = "0.1.0-rc.3"
 dependencies = [
  "serde_json",
  "thiserror",
- "xgeny-domain",
+ "xgen-domain",
 ]
 
 [[package]]
-name = "xgeny-protocol"
+name = "xgen-protocol"
 version = "0.1.0-rc.3"
 dependencies = [
  "jsonschema",
@@ -2754,11 +2754,11 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
- "xgeny-domain",
+ "xgen-domain",
 ]
 
 [[package]]
-name = "xgeny-provider-openai"
+name = "xgen-provider-openai"
 version = "0.1.0-rc.3"
 dependencies = [
  "jsonschema",
@@ -2769,15 +2769,15 @@ dependencies = [
  "thiserror",
  "ureq",
  "url",
- "xgeny-domain",
- "xgeny-local-store",
- "xgeny-policy",
- "xgeny-runtime",
- "xgeny-workgraph",
+ "xgen-domain",
+ "xgen-local-store",
+ "xgen-policy",
+ "xgen-runtime",
+ "xgen-workgraph",
 ]
 
 [[package]]
-name = "xgeny-runtime"
+name = "xgen-runtime"
 version = "0.1.0-rc.3"
 dependencies = [
  "jsonschema",
@@ -2788,15 +2788,15 @@ dependencies = [
  "tempfile",
  "thiserror",
  "time",
- "xgeny-domain",
- "xgeny-local-store",
- "xgeny-policy",
- "xgeny-protocol",
- "xgeny-workgraph",
+ "xgen-domain",
+ "xgen-local-store",
+ "xgen-policy",
+ "xgen-protocol",
+ "xgen-workgraph",
 ]
 
 [[package]]
-name = "xgeny-workgraph"
+name = "xgen-workgraph"
 version = "0.1.0-rc.3"
 dependencies = [
  "proptest",

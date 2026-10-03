@@ -143,12 +143,12 @@ export async function verifyRelease(directory, tag) {
     (await distributionMetadata()).catalog,
   );
   assert.equal(
-    await hashMember(launcherTarball, 'bin/xgeny.cjs'),
-    await hashFile(path.join(launcherRoot, 'bin', 'xgeny.cjs')),
+    await hashMember(launcherTarball, 'bin/xgen.cjs'),
+    await hashFile(path.join(launcherRoot, 'bin', 'xgen.cjs')),
   );
   assert.deepEqual(
     launcherReport.files.map(({ path: filename }) => filename).sort(),
-    ['LICENSE', 'README.md', 'bin/xgeny.cjs', 'lib/platform.cjs', 'package.json', 'platforms.json'],
+    ['LICENSE', 'README.md', 'bin/xgen.cjs', 'lib/platform.cjs', 'package.json', 'platforms.json'],
   );
 
   const reports = [];
@@ -180,7 +180,7 @@ export async function verifyRelease(directory, tag) {
       ['LICENSE', path.join(repoRoot, 'LICENSE')],
       [
         'NATIVE_RUNTIME_PROVENANCE.md',
-        path.join(repoRoot, 'crates', 'xgeny-cli', 'licenses', 'NATIVE_RUNTIME_PROVENANCE.md'),
+        path.join(repoRoot, 'crates', 'xgen-cli', 'licenses', 'NATIVE_RUNTIME_PROVENANCE.md'),
       ],
       ['THIRD_PARTY_LICENSES.txt', path.join(repoRoot, 'THIRD_PARTY_LICENSES.txt')],
     ]) {

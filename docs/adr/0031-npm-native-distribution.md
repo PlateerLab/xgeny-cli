@@ -1,4 +1,4 @@
-# ADR-0031: npm은 네이티브 XGENy의 무스크립트 배포 계층이다
+# ADR-0031: npm은 네이티브 XGEN의 무스크립트 배포 계층이다
 
 - 상태: Accepted (`npm` 게시 인증 결정은 [ADR-0034](0034-npm-token-publishing-policy.md)가 대체)
 - 날짜: 2026-09-01
@@ -9,14 +9,14 @@
 GitHub Release installer는 Node.js 없이 단일 binary를 설치하지만, 이미 Node.js를 쓰는 개발자에게는
 `npm install -g`가 더 익숙하다. 반대로 npm 설치 시 native binary를 내려받거나 source build를 수행하는
 lifecycle script를 두면 registry 외부 network, compiler와 실행 가능한 install hook이 새 공급망 경계가
-된다. XGENy core가 npm 또는 Node.js에 종속되어서도 안 된다.
+된다. XGEN core가 npm 또는 Node.js에 종속되어서도 안 된다.
 
 ## 결정
 
 ### 1. 제품은 계속 하나의 Rust binary다
 
 `@xgen/cli`는 JavaScript로 구현된 얇은 launcher다. `process.platform`과 `process.arch`로 정확히 하나의
-platform package를 선택하고, 그 package에 들어 있는 `xgeny` binary를 argv 그대로 shell 없이 실행한다.
+platform package를 선택하고, 그 package에 들어 있는 `xgen` binary를 argv 그대로 shell 없이 실행한다.
 AgentLoop, WorkGraph, embedded SQLite, model/provider와 tool 구현은 npm package에 존재하지 않는다.
 
 직접 GitHub installer를 사용하면 Node.js가 필요 없다. npm 설치 경로만 Node.js 22.14 이상을 요구한다.

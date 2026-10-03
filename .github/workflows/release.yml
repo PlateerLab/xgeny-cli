@@ -40,7 +40,7 @@ jobs:
           test "$(gh api "repos/$GITHUB_REPOSITORY" --jq '.default_branch')" = "main"
           canonical_workflow_id=$(gh api \
             "repos/$GITHUB_REPOSITORY/actions/workflows/release-request.yml" --jq '.id')
-          source_run="$RUNNER_TEMP/xgeny-release-source-run.json"
+          source_run="$RUNNER_TEMP/xgen-release-source-run.json"
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RELEASE_RUN_ID" > "$source_run"
           jq -e \
             --argjson workflow_id "$canonical_workflow_id" \
@@ -93,13 +93,13 @@ jobs:
           test "$(git rev-parse refs/remotes/origin/release-main)" = "$RELEASE_SHA"
           test "$(git rev-parse "$verification_ref^{commit}")" = "$RELEASE_SHA"
           package_version=$(cargo metadata --locked --no-deps --format-version 1 \
-            | jq -r '[.packages[] | select(.name == "xgeny-cli") | .version] | if length == 1 then .[0] else empty end')
+            | jq -r '[.packages[] | select(.name == "xgen-cli") | .version] | if length == 1 then .[0] else empty end')
           test -n "$package_version"
           test "$RELEASE_TAG" = "v$package_version"
 
       - name: Require npm token publishing readiness
         env:
-          NPM_PUBLISH_ENABLED: ${{ vars.XGENY_NPM_PUBLISH_ENABLED }}
+          NPM_PUBLISH_ENABLED: ${{ vars.XGEN_NPM_PUBLISH_ENABLED }}
         shell: bash
         run: |
           set -euo pipefail
@@ -144,30 +144,30 @@ jobs:
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
-            asset: xgeny-x86_64-unknown-linux-musl
-            binary: target/x86_64-unknown-linux-musl/release/xgeny
+            asset: xgen-x86_64-unknown-linux-musl
+            binary: target/x86_64-unknown-linux-musl/release/xgen
             npm_tarball: xgen-cli-linux-x64-musl.tgz
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
-            asset: xgeny-aarch64-unknown-linux-musl
-            binary: target/aarch64-unknown-linux-musl/release/xgeny
+            asset: xgen-aarch64-unknown-linux-musl
+            binary: target/aarch64-unknown-linux-musl/release/xgen
             npm_tarball: xgen-cli-linux-arm64-musl.tgz
           - os: macos-15-intel
             target: x86_64-apple-darwin
-            asset: xgeny-x86_64-apple-darwin
-            binary: target/x86_64-apple-darwin/release/xgeny
+            asset: xgen-x86_64-apple-darwin
+            binary: target/x86_64-apple-darwin/release/xgen
             npm_tarball: xgen-cli-darwin-x64.tgz
             developer_dir: /Applications/Xcode_16.4.app/Contents/Developer
           - os: macos-15
             target: aarch64-apple-darwin
-            asset: xgeny-aarch64-apple-darwin
-            binary: target/aarch64-apple-darwin/release/xgeny
+            asset: xgen-aarch64-apple-darwin
+            binary: target/aarch64-apple-darwin/release/xgen
             npm_tarball: xgen-cli-darwin-arm64.tgz
             developer_dir: /Applications/Xcode_16.4.app/Contents/Developer
           - os: windows-2025-vs2026
             target: x86_64-pc-windows-msvc
-            asset: xgeny-x86_64-pc-windows-msvc.exe
-            binary: target/x86_64-pc-windows-msvc/release/xgeny.exe
+            asset: xgen-x86_64-pc-windows-msvc.exe
+            binary: target/x86_64-pc-windows-msvc/release/xgen.exe
             npm_tarball: xgen-cli-win32-x64.tgz
     runs-on: ${{ matrix.os }}
     steps:
@@ -208,7 +208,7 @@ jobs:
       - name: Build release CLI
         env:
           DEVELOPER_DIR: ${{ matrix.developer_dir }}
-        run: cargo build --locked --release -p xgeny-cli --target ${{ matrix.target }}
+        run: cargo build --locked --release -p xgen-cli --target ${{ matrix.target }}
 
       - name: Run release CLI process tests
         env:
@@ -216,19 +216,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked --release -p xgeny-cli \
+          cargo test --locked --release -p xgen-cli \
             --test public_run_resume \
             --target "${{ matrix.target }}"
-          cargo test --locked --release -p xgeny-cli \
+          cargo test --locked --release -p xgen-cli \
             --test environment_onboarding \
             --target "${{ matrix.target }}"
-          cargo test --locked --release -p xgeny-cli \
+          cargo test --locked --release -p xgen-cli \
             --test model_profiles \
             --target "${{ matrix.target }}"
-          cargo test --locked --release -p xgeny-cli \
+          cargo test --locked --release -p xgen-cli \
             --test interactive_repl \
             --target "${{ matrix.target }}"
-          cargo test --locked --release -p xgeny-cli \
+          cargo test --locked --release -p xgen-cli \
             --test workspace_discovery \
             --target "${{ matrix.target }}"
 
@@ -264,7 +264,7 @@ jobs:
         run: |
           set -euo pipefail
           npm ci --ignore-scripts --prefix npm
-          npm_output="$RUNNER_TEMP/xgeny-npm-launcher"
+          npm_output="$RUNNER_TEMP/xgen-npm-launcher"
           mkdir -p "$npm_output"
           node npm/scripts/pack.mjs \
             --launcher \
@@ -282,17 +282,17 @@ jobs:
       - name: Smoke shell installer against staged asset
         if: runner.os != 'Windows'
         shell: bash
-        run: sh scripts/smoke-installer.sh "release/${{ matrix.asset }}" "${{ matrix.asset }}" install/xgeny-installer.sh
+        run: sh scripts/smoke-installer.sh "release/${{ matrix.asset }}" "${{ matrix.asset }}" install/xgen-installer.sh
 
       - name: Smoke PowerShell installer against staged asset
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ./scripts/smoke-installer.ps1 -Binary "release/${{ matrix.asset }}" -Asset "${{ matrix.asset }}" -Installer install/xgeny-installer.ps1
+        run: ./scripts/smoke-installer.ps1 -Binary "release/${{ matrix.asset }}" -Asset "${{ matrix.asset }}" -Installer install/xgen-installer.ps1
 
       - name: Smoke Windows PowerShell 5.1 installer against staged asset
         if: runner.os == 'Windows'
         shell: powershell
-        run: ./scripts/smoke-installer.ps1 -Binary "release/${{ matrix.asset }}" -Asset "${{ matrix.asset }}" -Installer install/xgeny-installer.ps1
+        run: ./scripts/smoke-installer.ps1 -Binary "release/${{ matrix.asset }}" -Asset "${{ matrix.asset }}" -Installer install/xgen-installer.ps1
 
       - name: Upload verified release asset
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -336,11 +336,11 @@ jobs:
           set -euo pipefail
           node npm/scripts/pack.mjs --launcher --output-dir release
           expected=(
-            xgeny-x86_64-unknown-linux-musl
-            xgeny-aarch64-unknown-linux-musl
-            xgeny-x86_64-apple-darwin
-            xgeny-aarch64-apple-darwin
-            xgeny-x86_64-pc-windows-msvc.exe
+            xgen-x86_64-unknown-linux-musl
+            xgen-aarch64-unknown-linux-musl
+            xgen-x86_64-apple-darwin
+            xgen-aarch64-apple-darwin
+            xgen-x86_64-pc-windows-msvc.exe
             xgen-cli.tgz
             xgen-cli-linux-x64-musl.tgz
             xgen-cli-linux-arm64-musl.tgz
@@ -353,30 +353,30 @@ jobs:
             test -f "release/$asset" && test ! -L "release/$asset"
           done
           chmod 0755 \
-            release/xgeny-x86_64-unknown-linux-musl \
-            release/xgeny-aarch64-unknown-linux-musl \
-            release/xgeny-x86_64-apple-darwin \
-            release/xgeny-aarch64-apple-darwin
+            release/xgen-x86_64-unknown-linux-musl \
+            release/xgen-aarch64-unknown-linux-musl \
+            release/xgen-x86_64-apple-darwin \
+            release/xgen-aarch64-apple-darwin
           node npm/scripts/verify-release.mjs \
             --directory release \
             --tag "$RELEASE_TAG"
-          install -m 0755 install/xgeny-installer.sh release/xgeny-installer.sh
-          install -m 0644 install/xgeny-installer.ps1 release/xgeny-installer.ps1
+          install -m 0755 install/xgen-installer.sh release/xgen-installer.sh
+          install -m 0644 install/xgen-installer.ps1 release/xgen-installer.ps1
           install -m 0644 LICENSE release/LICENSE.txt
-          install -m 0644 crates/xgeny-cli/licenses/NATIVE_RUNTIME_PROVENANCE.md \
+          install -m 0644 crates/xgen-cli/licenses/NATIVE_RUNTIME_PROVENANCE.md \
             release/NATIVE_RUNTIME_PROVENANCE.md
           install -m 0644 THIRD_PARTY_LICENSES.txt release/THIRD_PARTY_LICENSES.txt
           (
             cd release
             export LC_ALL=C
             sha256sum LICENSE.txt NATIVE_RUNTIME_PROVENANCE.md THIRD_PARTY_LICENSES.txt \
-              xgen-*.tgz xgeny-* \
+              xgen-*.tgz xgen-* \
               > checksums.sha256
             sha256sum -c checksums.sha256
           )
           expected+=(
-            xgeny-installer.sh
-            xgeny-installer.ps1
+            xgen-installer.sh
+            xgen-installer.ps1
             LICENSE.txt
             NATIVE_RUNTIME_PROVENANCE.md
             THIRD_PARTY_LICENSES.txt
@@ -387,9 +387,9 @@ jobs:
             test -f "release/$asset" && test ! -L "release/$asset"
           done
           sh scripts/smoke-installer.sh \
-            release/xgeny-x86_64-unknown-linux-musl \
-            xgeny-x86_64-unknown-linux-musl \
-            release/xgeny-installer.sh
+            release/xgen-x86_64-unknown-linux-musl \
+            xgen-x86_64-unknown-linux-musl \
+            release/xgen-installer.sh
 
       - name: Upload assembled release bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -420,13 +420,13 @@ jobs:
         run: |
           set -euo pipefail
           expected=(
-            xgeny-x86_64-unknown-linux-musl
-            xgeny-aarch64-unknown-linux-musl
-            xgeny-x86_64-apple-darwin
-            xgeny-aarch64-apple-darwin
-            xgeny-x86_64-pc-windows-msvc.exe
-            xgeny-installer.sh
-            xgeny-installer.ps1
+            xgen-x86_64-unknown-linux-musl
+            xgen-aarch64-unknown-linux-musl
+            xgen-x86_64-apple-darwin
+            xgen-aarch64-apple-darwin
+            xgen-x86_64-pc-windows-msvc.exe
+            xgen-installer.sh
+            xgen-installer.ps1
             xgen-cli.tgz
             xgen-cli-linux-x64-musl.tgz
             xgen-cli-linux-arm64-musl.tgz
@@ -444,18 +444,18 @@ jobs:
           done
           (cd release && sha256sum -c checksums.sha256)
           chmod 0755 \
-            release/xgeny-x86_64-unknown-linux-musl \
-            release/xgeny-aarch64-unknown-linux-musl \
-            release/xgeny-x86_64-apple-darwin \
-            release/xgeny-aarch64-apple-darwin \
-            release/xgeny-installer.sh
+            release/xgen-x86_64-unknown-linux-musl \
+            release/xgen-aarch64-unknown-linux-musl \
+            release/xgen-x86_64-apple-darwin \
+            release/xgen-aarch64-apple-darwin \
+            release/xgen-installer.sh
 
       - name: Recheck tag binding and repository release policy
         env:
           GH_TOKEN: ${{ github.token }}
-          IMMUTABLE_RELEASES_ENABLED: ${{ vars.XGENY_IMMUTABLE_RELEASES_ENABLED }}
-          MAIN_PROTECTION_ENABLED: ${{ vars.XGENY_MAIN_PROTECTION_ENABLED }}
-          RELEASE_RULESET_NO_BYPASS: ${{ vars.XGENY_RELEASE_RULESET_NO_BYPASS }}
+          IMMUTABLE_RELEASES_ENABLED: ${{ vars.XGEN_IMMUTABLE_RELEASES_ENABLED }}
+          MAIN_PROTECTION_ENABLED: ${{ vars.XGEN_MAIN_PROTECTION_ENABLED }}
+          RELEASE_RULESET_NO_BYPASS: ${{ vars.XGEN_RELEASE_RULESET_NO_BYPASS }}
           RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
           RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
         shell: bash
@@ -467,7 +467,7 @@ jobs:
           test "$GITHUB_REF" = "refs/heads/main"
           test "$GITHUB_SHA" = "$RELEASE_SHA"
           test "$(gh api "repos/$GITHUB_REPOSITORY" --jq '.default_branch')" = "main"
-          verification_repo="$RUNNER_TEMP/xgeny-release-verification"
+          verification_repo="$RUNNER_TEMP/xgen-release-verification"
           mkdir "$verification_repo"
           git -C "$verification_repo" init --quiet
           git -C "$verification_repo" remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
@@ -483,7 +483,7 @@ jobs:
           github_actions_integration_id=$(gh api /apps/github-actions --jq '.id')
           [[ "$github_actions_integration_id" =~ ^[1-9][0-9]*$ ]]
           if [[ "$RELEASE_TAG" != *-* ]]; then
-            stable_tags="$RUNNER_TEMP/xgeny-stable-release-tags.txt"
+            stable_tags="$RUNNER_TEMP/xgen-stable-release-tags.txt"
             gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
               --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
               > "$stable_tags"
@@ -579,7 +579,7 @@ jobs:
           set -euo pipefail
           semver_tag_regex='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?$'
           [[ "$RELEASE_TAG" =~ $semver_tag_regex ]]
-          publish_repo="$RUNNER_TEMP/xgeny-release-immediate-verification"
+          publish_repo="$RUNNER_TEMP/xgen-release-immediate-verification"
           mkdir "$publish_repo"
           git -C "$publish_repo" init --quiet
           git -C "$publish_repo" remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
@@ -601,9 +601,9 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --generate-notes \
-            --title "XGENy ${RELEASE_TAG#v}" \
+            --title "XGEN ${RELEASE_TAG#v}" \
             "${release_flags[@]}"
-          created_release="$RUNNER_TEMP/xgeny-created-release.json"
+          created_release="$RUNNER_TEMP/xgen-created-release.json"
           gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > "$created_release"
           jq -e \
             --arg release_tag "$RELEASE_TAG" \
@@ -624,7 +624,7 @@ jobs:
             done
             test "$latest_ok" = "true"
           fi
-          post_publish_repo="$RUNNER_TEMP/xgeny-release-post-verification"
+          post_publish_repo="$RUNNER_TEMP/xgen-release-post-verification"
           mkdir "$post_publish_repo"
           git -C "$post_publish_repo" init --quiet
           git -C "$post_publish_repo" remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
@@ -645,19 +645,19 @@ jobs:
       matrix:
         include:
           - os: ubuntu-24.04
-            executable: xgeny
+            executable: xgen
             verify_latest: true
           - os: ubuntu-24.04-arm
-            executable: xgeny
+            executable: xgen
             verify_latest: false
           - os: macos-15-intel
-            executable: xgeny
+            executable: xgen
             verify_latest: false
           - os: macos-15
-            executable: xgeny
+            executable: xgen
             verify_latest: false
           - os: windows-2025-vs2026
-            executable: xgeny.exe
+            executable: xgen.exe
             verify_latest: true
     runs-on: ${{ matrix.os }}
     steps:
@@ -671,22 +671,22 @@ jobs:
           set -euo pipefail
           semver_tag_regex='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?$'
           [[ "$RELEASE_TAG" =~ $semver_tag_regex ]]
-          test_root=$(mktemp -d "${TMPDIR:-/tmp}/xgeny-published.XXXXXX")
+          test_root=$(mktemp -d "${TMPDIR:-/tmp}/xgen-published.XXXXXX")
           trap 'rm -rf "$test_root"' EXIT HUP INT TERM
           mkdir -p "$test_root/home"
-          installer="$test_root/xgeny-installer.sh"
+          installer="$test_root/xgen-installer.sh"
           curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 \
             --connect-timeout 15 --max-time 60 --max-filesize 1048576 \
             --retry 5 --retry-delay 2 --retry-all-errors -fsSLo "$installer" \
-            "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/xgeny-installer.sh"
+            "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/xgen-installer.sh"
           HOME="$test_root/home" \
-          XGENY_INSTALL_DIR="$test_root/install" \
-          XGENY_STATE_HOME="$test_root/state" \
+          XGEN_INSTALL_DIR="$test_root/install" \
+          XGEN_STATE_HOME="$test_root/state" \
             sh "$installer" --version "$RELEASE_TAG" >/dev/null
           installed="$test_root/install/${{ matrix.executable }}"
-          test "$("$installed" --version)" = "xgeny ${RELEASE_TAG#v}"
+          test "$("$installed" --version)" = "xgen ${RELEASE_TAG#v}"
           "$installed" licenses > "$test_root/licenses.txt"
-          grep -Fq 'XGENy CLI Third-Party License Notices' "$test_root/licenses.txt"
+          grep -Fq 'XGEN CLI Third-Party License Notices' "$test_root/licenses.txt"
           grep -Fq 'Copyright notices for The Rust Standard Library' "$test_root/licenses.txt"
           grep -Fq '===== musl C runtime notices =====' "$test_root/licenses.txt"
           grep -Fq '===== LLVM libunwind notices =====' "$test_root/licenses.txt"
@@ -694,35 +694,35 @@ jobs:
 
           printf '/status\n/exit\n' \
             | HOME="$test_root/home" \
-              XGENY_STATE_HOME="$test_root/state" \
+              XGEN_STATE_HOME="$test_root/state" \
                 "$installed" > "$test_root/repl.txt"
-          grep -Fq 'XGENy Developer Preview' "$test_root/repl.txt"
+          grep -Fq 'XGEN Developer Preview' "$test_root/repl.txt"
           grep -Fq 'status: idle' "$test_root/repl.txt"
           grep -Fq 'bye' "$test_root/repl.txt"
           test ! -e "$test_root/state"
 
           HOME="$test_root/home" \
-          XGENY_INSTALL_DIR="$test_root/install" \
-          XGENY_STATE_HOME="$test_root/state" \
+          XGEN_INSTALL_DIR="$test_root/install" \
+          XGEN_STATE_HOME="$test_root/state" \
             sh "$installer" --version "$RELEASE_TAG" >/dev/null
           test -f "$installed" && test ! -L "$installed"
-          test "$("$installed" --version)" = "xgeny ${RELEASE_TAG#v}"
+          test "$("$installed" --version)" = "xgen ${RELEASE_TAG#v}"
           test "$(find "$test_root/install" -mindepth 1 -maxdepth 1 | wc -l)" -eq 1
           test ! -e "$test_root/state"
 
           if [[ "$VERIFY_LATEST" == "true" && "$RELEASE_TAG" != *-* ]]; then
             latest_ok=false
-            latest_installer="$test_root/xgeny-installer-latest.sh"
+            latest_installer="$test_root/xgen-installer-latest.sh"
             for _ in {1..12}; do
               if curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 \
                 --connect-timeout 15 --max-time 30 --max-filesize 1048576 \
                 -fsSLo "$latest_installer" \
-                "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/xgeny-installer.sh" && \
+                "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/xgen-installer.sh" && \
                 HOME="$test_root/home" \
-                XGENY_INSTALL_DIR="$test_root/install" \
-                XGENY_STATE_HOME="$test_root/state" \
+                XGEN_INSTALL_DIR="$test_root/install" \
+                XGEN_STATE_HOME="$test_root/state" \
                   sh "$latest_installer" >/dev/null 2>&1 && \
-                [[ "$("$test_root/install/${{ matrix.executable }}" --version)" == "xgeny ${RELEASE_TAG#v}" ]]; then
+                [[ "$("$test_root/install/${{ matrix.executable }}" --version)" == "xgen ${RELEASE_TAG#v}" ]]; then
                 latest_ok=true
                 break
               fi
@@ -749,28 +749,28 @@ jobs:
           if ($Tag -notmatch $SemVerTagPattern) {
               throw "release tag is invalid"
           }
-          $TestRoot = Join-Path ([System.IO.Path]::GetTempPath()) "xgeny-published-$([Guid]::NewGuid().ToString('N'))"
-          $Installer = Join-Path $TestRoot "xgeny-installer.ps1"
-          $LatestInstaller = Join-Path $TestRoot "xgeny-installer-latest.ps1"
+          $TestRoot = Join-Path ([System.IO.Path]::GetTempPath()) "xgen-published-$([Guid]::NewGuid().ToString('N'))"
+          $Installer = Join-Path $TestRoot "xgen-installer.ps1"
+          $LatestInstaller = Join-Path $TestRoot "xgen-installer-latest.ps1"
           $InstallRoot = Join-Path $TestRoot "install"
           $StateRoot = Join-Path $TestRoot "state"
-          $PreviousState = $env:XGENY_STATE_HOME
-          $PreviousBase = $env:XGENY_DOWNLOAD_BASE_URL
-          $PreviousTesting = $env:XGENY_INSTALLER_TESTING
+          $PreviousState = $env:XGEN_STATE_HOME
+          $PreviousBase = $env:XGEN_DOWNLOAD_BASE_URL
+          $PreviousTesting = $env:XGEN_INSTALLER_TESTING
           try {
               New-Item -ItemType Directory -Path $TestRoot | Out-Null
               curl.exe -q --proto "=https" --proto-redir "=https" --tlsv1.2 `
                 --connect-timeout 15 --max-time 60 --max-filesize 1048576 `
                 --retry 5 --retry-delay 2 --retry-all-errors -fsSLo $Installer `
-                "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$Tag/xgeny-installer.ps1"
+                "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$Tag/xgen-installer.ps1"
               if ($LASTEXITCODE -ne 0) { throw "installer download failed" }
-              $env:XGENY_STATE_HOME = $StateRoot
-              $env:XGENY_DOWNLOAD_BASE_URL = $null
-              $env:XGENY_INSTALLER_TESTING = $null
+              $env:XGEN_STATE_HOME = $StateRoot
+              $env:XGEN_DOWNLOAD_BASE_URL = $null
+              $env:XGEN_INSTALLER_TESTING = $null
               & $Installer -Version $Tag -InstallDir $InstallRoot | Out-Null
               $Installed = Join-Path $InstallRoot "${{ matrix.executable }}"
               $Observed = (& $Installed --version | Out-String).Trim()
-              if ($LASTEXITCODE -ne 0 -or $Observed -ne "xgeny $($Tag.Substring(1))") {
+              if ($LASTEXITCODE -ne 0 -or $Observed -ne "xgen $($Tag.Substring(1))") {
                   throw "published binary version is wrong"
               }
               if (Test-Path -LiteralPath $StateRoot) {
@@ -780,7 +780,7 @@ jobs:
               $ReplExitCode = $LASTEXITCODE
               if (
                   $ReplExitCode -ne 0 -or
-                  -not $ReplOutput.Contains("XGENy Developer Preview") -or
+                  -not $ReplOutput.Contains("XGEN Developer Preview") -or
                   -not $ReplOutput.Contains("status: idle") -or
                   -not $ReplOutput.Contains("bye")
               ) {
@@ -800,7 +800,7 @@ jobs:
                   throw "published reinstall left an unexpected install layout"
               }
               $ReinstalledVersion = (& $Installed --version | Out-String).Trim()
-              if ($LASTEXITCODE -ne 0 -or $ReinstalledVersion -ne "xgeny $($Tag.Substring(1))") {
+              if ($LASTEXITCODE -ne 0 -or $ReinstalledVersion -ne "xgen $($Tag.Substring(1))") {
                   throw "published reinstall produced the wrong version"
               }
               if (Test-Path -LiteralPath $StateRoot) {
@@ -809,7 +809,7 @@ jobs:
               $LicenseOutput = (& $Installed licenses | Out-String)
               if (
                   $LASTEXITCODE -ne 0 -or
-                  -not $LicenseOutput.Contains("XGENy CLI Third-Party License Notices") -or
+                  -not $LicenseOutput.Contains("XGEN CLI Third-Party License Notices") -or
                   -not $LicenseOutput.Contains("Copyright notices for The Rust Standard Library") -or
                   -not $LicenseOutput.Contains("===== musl C runtime notices =====") -or
                   -not $LicenseOutput.Contains("===== LLVM libunwind notices =====")
@@ -823,11 +823,11 @@ jobs:
                           curl.exe -q --proto "=https" --proto-redir "=https" --tlsv1.2 `
                             --connect-timeout 15 --max-time 30 --max-filesize 1048576 `
                             -fsSLo $LatestInstaller `
-                            "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download/xgeny-installer.ps1"
+                            "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download/xgen-installer.ps1"
                           if ($LASTEXITCODE -ne 0) { throw "latest installer download failed" }
                           & $LatestInstaller -InstallDir $InstallRoot | Out-Null
                           $LatestObserved = (& $Installed --version | Out-String).Trim()
-                          if ($LASTEXITCODE -eq 0 -and $LatestObserved -eq "xgeny $($Tag.Substring(1))") {
+                          if ($LASTEXITCODE -eq 0 -and $LatestObserved -eq "xgen $($Tag.Substring(1))") {
                               $LatestOk = $true
                               break
                           }
@@ -849,9 +849,9 @@ jobs:
                   throw "published binary removal left install artifacts"
               }
           } finally {
-              $env:XGENY_STATE_HOME = $PreviousState
-              $env:XGENY_DOWNLOAD_BASE_URL = $PreviousBase
-              $env:XGENY_INSTALLER_TESTING = $PreviousTesting
+              $env:XGEN_STATE_HOME = $PreviousState
+              $env:XGEN_DOWNLOAD_BASE_URL = $PreviousBase
+              $env:XGEN_INSTALLER_TESTING = $PreviousTesting
               Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -LiteralPath $TestRoot
           }
 
@@ -880,7 +880,7 @@ jobs:
       - name: Recheck immutable GitHub Release binding
         env:
           GH_TOKEN: ${{ github.token }}
-          NPM_PUBLISH_ENABLED: ${{ vars.XGENY_NPM_PUBLISH_ENABLED }}
+          NPM_PUBLISH_ENABLED: ${{ vars.XGEN_NPM_PUBLISH_ENABLED }}
           RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
           RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
         shell: bash
@@ -888,7 +888,7 @@ jobs:
           set -euo pipefail
           test "$NPM_PUBLISH_ENABLED" = "true"
           test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
-          release_json="$RUNNER_TEMP/xgeny-published-release.json"
+          release_json="$RUNNER_TEMP/xgen-published-release.json"
           gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > "$release_json"
           jq -e \
             --arg repository "$GITHUB_REPOSITORY" \
@@ -917,13 +917,13 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --dir release
           expected=(
-            xgeny-x86_64-unknown-linux-musl
-            xgeny-aarch64-unknown-linux-musl
-            xgeny-x86_64-apple-darwin
-            xgeny-aarch64-apple-darwin
-            xgeny-x86_64-pc-windows-msvc.exe
-            xgeny-installer.sh
-            xgeny-installer.ps1
+            xgen-x86_64-unknown-linux-musl
+            xgen-aarch64-unknown-linux-musl
+            xgen-x86_64-apple-darwin
+            xgen-aarch64-apple-darwin
+            xgen-x86_64-pc-windows-msvc.exe
+            xgen-installer.sh
+            xgen-installer.ps1
             xgen-cli.tgz
             xgen-cli-linux-x64-musl.tgz
             xgen-cli-linux-arm64-musl.tgz
@@ -1008,7 +1008,7 @@ jobs:
         run: |
           set -euo pipefail
           version=${RELEASE_TAG#v}
-          test_root=$(mktemp -d "${TMPDIR:-/tmp}/xgeny-npm-published.XXXXXX")
+          test_root=$(mktemp -d "${TMPDIR:-/tmp}/xgen-npm-published.XXXXXX")
           trap 'rm -rf "$test_root"' EXIT HUP INT TERM
           mkdir -p "$test_root/home" "$test_root/cache"
           for attempt in 1 2 3; do
@@ -1027,20 +1027,20 @@ jobs:
           test -f "$global_root/@xgen/cli/package.json"
           test -f "$global_root/@xgen/$PLATFORM_PACKAGE/package.json"
           HOME="$test_root/home" \
-          XGENY_STATE_HOME="$test_root/state" \
-            "$test_root/install/bin/xgeny" --version > "$test_root/version.txt"
-          test "$(cat "$test_root/version.txt")" = "xgeny $version"
+          XGEN_STATE_HOME="$test_root/state" \
+            "$test_root/install/bin/xgen" --version > "$test_root/version.txt"
+          test "$(cat "$test_root/version.txt")" = "xgen $version"
           HOME="$test_root/home" \
-          XGENY_STATE_HOME="$test_root/state" \
-            "$test_root/install/bin/xgeny" licenses > "$test_root/licenses.txt"
-          grep -Fq 'XGENy CLI Third-Party License Notices' "$test_root/licenses.txt"
+          XGEN_STATE_HOME="$test_root/state" \
+            "$test_root/install/bin/xgen" licenses > "$test_root/licenses.txt"
+          grep -Fq 'XGEN CLI Third-Party License Notices' "$test_root/licenses.txt"
           test ! -e "$test_root/state"
 
           printf '/status\n/exit\n' \
             | HOME="$test_root/home" \
-              XGENY_STATE_HOME="$test_root/state" \
-                "$test_root/install/bin/xgeny" > "$test_root/repl.txt"
-          grep -Fq 'XGENy Developer Preview' "$test_root/repl.txt"
+              XGEN_STATE_HOME="$test_root/state" \
+                "$test_root/install/bin/xgen" > "$test_root/repl.txt"
+          grep -Fq 'XGEN Developer Preview' "$test_root/repl.txt"
           grep -Fq 'status: idle' "$test_root/repl.txt"
           grep -Fq 'bye' "$test_root/repl.txt"
           test ! -e "$test_root/state"
@@ -1053,8 +1053,8 @@ jobs:
               "@xgen/cli@$version"
           test -f "$global_root/@xgen/cli/package.json"
           test -f "$global_root/@xgen/$PLATFORM_PACKAGE/package.json"
-          test "$(HOME="$test_root/home" XGENY_STATE_HOME="$test_root/state" \
-            "$test_root/install/bin/xgeny" --version)" = "xgeny $version"
+          test "$(HOME="$test_root/home" XGEN_STATE_HOME="$test_root/state" \
+            "$test_root/install/bin/xgen" --version)" = "xgen $version"
           test ! -e "$test_root/state"
 
           HOME="$test_root/home" \
@@ -1063,7 +1063,7 @@ jobs:
               --ignore-scripts --no-audit --no-fund '@xgen/cli'
           test ! -e "$global_root/@xgen/cli"
           test ! -e "$global_root/@xgen/$PLATFORM_PACKAGE"
-          test ! -e "$test_root/install/bin/xgeny"
+          test ! -e "$test_root/install/bin/xgen"
 
       - name: Install and verify exact npm package on Windows
         if: runner.os == 'Windows'
@@ -1074,19 +1074,19 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $Version = $env:RELEASE_TAG.Substring(1)
-          $TestRoot = Join-Path ([System.IO.Path]::GetTempPath()) "xgeny-npm-published-$([Guid]::NewGuid().ToString('N'))"
+          $TestRoot = Join-Path ([System.IO.Path]::GetTempPath()) "xgen-npm-published-$([Guid]::NewGuid().ToString('N'))"
           $InstallRoot = Join-Path $TestRoot "install"
           $StateRoot = Join-Path $TestRoot "state"
           $PreviousHome = $env:HOME
           $PreviousUserProfile = $env:USERPROFILE
           $PreviousCache = $env:npm_config_cache
-          $PreviousState = $env:XGENY_STATE_HOME
+          $PreviousState = $env:XGEN_STATE_HOME
           try {
               New-Item -ItemType Directory -Path $TestRoot | Out-Null
               $env:HOME = Join-Path $TestRoot "home"
               $env:USERPROFILE = $env:HOME
               $env:npm_config_cache = Join-Path $TestRoot "cache"
-              $env:XGENY_STATE_HOME = $StateRoot
+              $env:XGEN_STATE_HOME = $StateRoot
               $Installed = $false
               foreach ($Attempt in 1..3) {
                   & npm.cmd install --global --prefix $InstallRoot `
@@ -1107,13 +1107,13 @@ jobs:
               if (-not (Test-Path -LiteralPath (Join-Path $GlobalRoot "@xgen/$env:PLATFORM_PACKAGE/package.json"))) {
                   throw "platform package is missing"
               }
-              $Shim = Join-Path $InstallRoot "xgeny.cmd"
+              $Shim = Join-Path $InstallRoot "xgen.cmd"
               $Observed = (& $Shim --version | Out-String).Trim()
-              if ($LASTEXITCODE -ne 0 -or $Observed -ne "xgeny $Version") {
+              if ($LASTEXITCODE -ne 0 -or $Observed -ne "xgen $Version") {
                   throw "npm-installed binary version is wrong"
               }
               $LicenseOutput = (& $Shim licenses | Out-String)
-              if ($LASTEXITCODE -ne 0 -or -not $LicenseOutput.Contains("XGENy CLI Third-Party License Notices")) {
+              if ($LASTEXITCODE -ne 0 -or -not $LicenseOutput.Contains("XGEN CLI Third-Party License Notices")) {
                   throw "npm-installed binary is missing license notices"
               }
               if (Test-Path -LiteralPath $StateRoot) {
@@ -1123,7 +1123,7 @@ jobs:
               $ReplExitCode = $LASTEXITCODE
               if (
                   $ReplExitCode -ne 0 -or
-                  -not $ReplOutput.Contains("XGENy Developer Preview") -or
+                  -not $ReplOutput.Contains("XGEN Developer Preview") -or
                   -not $ReplOutput.Contains("status: idle") -or
                   -not $ReplOutput.Contains("bye")
               ) {
@@ -1139,7 +1139,7 @@ jobs:
                 "@xgen/cli@$Version"
               if ($LASTEXITCODE -ne 0) { throw "npm reinstall failed" }
               $Reinstalled = (& $Shim --version | Out-String).Trim()
-              if ($LASTEXITCODE -ne 0 -or $Reinstalled -ne "xgeny $Version") {
+              if ($LASTEXITCODE -ne 0 -or $Reinstalled -ne "xgen $Version") {
                   throw "npm reinstall produced the wrong version"
               }
               if (
@@ -1161,7 +1161,7 @@ jobs:
               ) {
                   throw "npm uninstall left package artifacts"
               }
-              foreach ($ShimName in @("xgeny", "xgeny.cmd", "xgeny.ps1")) {
+              foreach ($ShimName in @("xgen", "xgen.cmd", "xgen.ps1")) {
                   if (Test-Path -LiteralPath (Join-Path $InstallRoot $ShimName)) {
                       throw "npm uninstall left an executable shim"
                   }
@@ -1170,6 +1170,6 @@ jobs:
               $env:HOME = $PreviousHome
               $env:USERPROFILE = $PreviousUserProfile
               $env:npm_config_cache = $PreviousCache
-              $env:XGENY_STATE_HOME = $PreviousState
+              $env:XGEN_STATE_HOME = $PreviousState
               Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -LiteralPath $TestRoot
           }

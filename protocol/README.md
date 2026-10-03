@@ -1,6 +1,6 @@
-# XGENy Protocol v0.1
+# XGEN Protocol v0.1
 
-이 디렉터리는 XGENy core와 adapter 사이의 언어 중립 정본 계약이다. Rust, TypeScript, Python 구현은 제품 내부 타입을 직접 공유하지 않고 이 schema와 fixture로 conformance를 검증한다.
+이 디렉터리는 XGEN core와 adapter 사이의 언어 중립 정본 계약이다. Rust, TypeScript, Python 구현은 제품 내부 타입을 직접 공유하지 않고 이 schema와 fixture로 conformance를 검증한다.
 
 ## 정본
 
@@ -37,7 +37,7 @@ fixtures/v1alpha1/
 Rust 정본 타입과 bundled/offline validator를 포함한 전체 conformance 검사는 저장소 루트에서 실행한다.
 
 ```bash
-cargo run --locked --quiet -p xgeny-cli -- protocol check
+cargo run --locked --quiet -p xgen-cli -- protocol check
 ```
 
 ## 호환 규칙

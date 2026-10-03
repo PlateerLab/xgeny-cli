@@ -102,7 +102,7 @@ expected_invocation = [
     '--repo "$GITHUB_REPOSITORY" \\',
     "--verify-tag \\",
     "--generate-notes \\",
-    '--title "XGENy ${RELEASE_TAG#v}" \\',
+    '--title "XGEN ${RELEASE_TAG#v}" \\',
     '"${release_flags[@]}"',
 ]
 actual_lines = lines[command_index : command_index + len(expected_invocation)]

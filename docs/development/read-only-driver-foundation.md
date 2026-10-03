@@ -10,13 +10,13 @@
 - Adapter의 bounded typed JSON은 exact Definition output schema 검증 뒤 event-anchored `ToolOutputRecord`로 schema 7에 원자 저장되며, verifier는 같은-generation snapshot을 받는다.
 - PlanningContext v3는 Step의 plan journal 순서와 Receipt-completed exact output의 관찰 순서를 보존해 다음 model turn에 전달하고, schema 8 `CompletionOutputRecord`는 그 turn의 exact UTF-8 summary를 별도 process 재시작 뒤 모델 재호출 없이 복원한다.
 - Memory/SQLite store가 v1 empty-artifact와 v2 artifact-bearing 의미를 각각 다시 검증한다.
-- `xgeny-cli` library의 `RunDriver`가 기존 AgentLoop, admission, executor와 verifier를 bounded 순서로 조합한다.
+- `xgen-cli` library의 `RunDriver`가 기존 AgentLoop, admission, executor와 verifier를 bounded 순서로 조합한다.
 - test-only fake planner/adapter로 approval pending/deny 무효과, IntentCommitted·Validating SQLite 재개, 완료와 no-call replay를 검증한다.
-- `xgeny-adapter-filesystem`이 root-bound resolver, component별 no-follow, 64 KiB strict UTF-8 read와 durable-output-only verifier를 제공한다. 실제 SQLite driver 회귀는 파일을 한 번 읽어 다음 planning turn에 전달하고 원본 삭제·재open 뒤 추가 file/model/verifier 호출 없이 completion을 복원한다.
+- `xgen-adapter-filesystem`이 root-bound resolver, component별 no-follow, 64 KiB strict UTF-8 read와 durable-output-only verifier를 제공한다. 실제 SQLite driver 회귀는 파일을 한 번 읽어 다음 planning turn에 전달하고 원본 삭제·재open 뒤 추가 file/model/verifier 호출 없이 completion을 복원한다.
 
 ## 현재 공개 범위 밖
 
-Public `xgeny run/resume`은 실제 model provider와 제품 filesystem `read-text` adapter를 한 bounded
+Public `xgen run/resume`은 실제 model provider와 제품 filesystem `read-text` adapter를 한 bounded
 composition으로 연결한다. 다만 승인은 invocation flag이고 interactive UI, 일반 process/write/network
 도구와 plugin sandbox는 아직 없다. 따라서 이 수직 slice를 “Claude Code/Codex와 같은 사용자용 CLI
 완성” 또는 “untrusted plugin/host 전체 sandbox”로 설명하면 안 된다.
@@ -43,10 +43,10 @@ Core Receipt-completed된 뒤에는 ADR-0029의 Core-derived Run/Step occurrence
 ## 검증
 
 ```bash
-cargo test -p xgeny-workgraph --test durable_plan
-cargo test -p xgeny-runtime --test durable_agent_loop
-cargo test -p xgeny-runtime --test verification_artifacts
-cargo test -p xgeny-cli --test durable_driver
+cargo test -p xgen-workgraph --test durable_plan
+cargo test -p xgen-runtime --test durable_agent_loop
+cargo test -p xgen-runtime --test verification_artifacts
+cargo test -p xgen-cli --test durable_driver
 cargo test --workspace --locked
 ```
 

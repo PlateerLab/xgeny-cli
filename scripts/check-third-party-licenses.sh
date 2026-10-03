@@ -49,7 +49,7 @@ case "$mode" in
         ;;
 esac
 
-tool_root=$(mktemp -d "${TMPDIR:-/tmp}/xgeny-cargo-about.XXXXXX")
+tool_root=$(mktemp -d "${TMPDIR:-/tmp}/xgen-cargo-about.XXXXXX")
 cleanup() {
     rm -rf "$tool_root"
 }

@@ -259,12 +259,12 @@ restart no-model-recall E2E를 완료했다. 남은 항목은 다음과 같다.
 - At-rest encryption, DLP 또는 secret 분류
 - Streaming/chunked output과 effect당 여러 final output
 - 동일 ReadOnly action 반복 관찰(당시 비목표, ADR-0029에서 후속 구현)
-- 실제 filesystem confinement와 public `xgeny run`
+- 실제 filesystem confinement와 public `xgen run`
 - durable completion 본문(당시 비목표이며 ADR-0021에서 local sidecar로 후속 구현)
 - write/process/network/MCP/XGEN adapter
 
 ## 결과
 
-XGENy는 adapter가 반환한 bounded typed JSON을 exact Definition, intent와 execution attempt에 결합하고, `EffectSucceeded`, sidecar와 projection을 한 SQLite transaction으로 보존할 수 있다. Journal과 Receipt는 raw body 대신 검증 가능한 commitment만 유지한다. Schema 3~6 history는 재작성하거나 output을 발명하지 않고 schema 7로 이동한다.
+XGEN는 adapter가 반환한 bounded typed JSON을 exact Definition, intent와 execution attempt에 결합하고, `EffectSucceeded`, sidecar와 projection을 한 SQLite transaction으로 보존할 수 있다. Journal과 Receipt는 raw body 대신 검증 가능한 commitment만 유지한다. Schema 3~6 history는 재작성하거나 output을 발명하지 않고 schema 7로 이동한다.
 
 이 결정이 닫는 범위는 **durable tool observation과 verification continuity**다. 다음 model turn 전달은 ADR-0020에서 이어서 닫았고, 최종 사용자 답변의 restart 복원은 completion durability가 완료되어야 성립한다.

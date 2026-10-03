@@ -7,11 +7,11 @@
 
 ## 목적
 
-`xgeny-runtime` 내부 fake만으로 검증하던 Direct Executor 계약을 워크스페이스의 별도 crate가 공개 API만 사용해 실제 OS I/O까지 지킬 수 있는지 확인한다. 사용자 시나리오는 다음 한 문장으로 제한한다.
+`xgen-runtime` 내부 fake만으로 검증하던 Direct Executor 계약을 워크스페이스의 별도 crate가 공개 API만 사용해 실제 OS I/O까지 지킬 수 있는지 확인한다. 사용자 시나리오는 다음 한 문장으로 제한한다.
 
 > 신뢰된 host가 격리된 일반 파일을 미리 열어 주면, 참조 adapter는 durable Started 이후에만 비민감 evidence marker를 한 번 기록하고 결과 기록이 유실된 재시작에서는 파일을 다시 쓰지 않는다.
 
-`xgeny-adapter-reference`는 `publish = false`다. 제품용 filesystem capability, CLI 명령 또는 plugin SDK가 아니다.
+`xgen-adapter-reference`는 `publish = false`다. 제품용 filesystem capability, CLI 명령 또는 plugin SDK가 아니다.
 
 ## 경계
 
@@ -91,8 +91,8 @@ Public-port integration test와 adapter 내부 fault-injection unit test는 다�
 검증 명령은 다음과 같다.
 
 ```bash
-cargo test -p xgeny-adapter-reference --locked
-cargo clippy -p xgeny-adapter-reference --all-targets -- -D warnings
+cargo test -p xgen-adapter-reference --locked
+cargo clippy -p xgen-adapter-reference --all-targets -- -D warnings
 ```
 
 Workspace CI가 Linux, macOS, Windows에서 이 integration test를 함께 실행한다. 테스트는 임시 디렉터리 안의 전용 파일만 생성한다. Process-crash gate는 완전한 file write와 검증 뒤 outcome이 durable해지기 전 경계이며, truncate/write/sync 각각의 중간 process 종료나 power-loss matrix는 아직 포함하지 않는다.

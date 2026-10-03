@@ -70,6 +70,6 @@ Core의 step key 규칙(letters, digits, `.`, `_`, `-`만; `/`와 공백 금지)
 
 - 단위 테스트: 스키마에 `maxLength`/`maxItems`/`pattern`이 없고, 두 system prompt에 compact 문장과
   key 규칙 문장이 있으며, revision 문자열이 올라갔다. Request profile golden은 의도적으로 재채취한다.
-- 실측: llama.cpp(27B GGUF) `model setup` PASS와 읽기 Run `XGENY_COMPLETED`(이전: setup
+- 실측: llama.cpp(27B GGUF) `model setup` PASS와 읽기 Run `XGEN_COMPLETED`(이전: setup
   `chat_completions_incompatible`), Ollama 27B 쓰기 Run 회귀 없음, 8B 쓰기 카탈로그 prompt 잘림
   0/3.

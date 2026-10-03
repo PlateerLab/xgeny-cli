@@ -12,7 +12,7 @@ Bounded `AgentLoop`가 provider-neutral planner port를 호출하기 전에 한 
 
 현재 구현의 보장은 **실제 provider 청구 횟수**가 아니라 보수적인 possible-send 상한이다. Reservation commit 직후 network send 전에 crash할 수 있으므로 예약 수가 실제 outbound/청구 수보다 클 수 있다. 반대로 adapter가 reservation 하나당 outbound request를 최대 한 번만 보내고 hidden retry를 하지 않으면 lifecycle configuration 이후 실제 outbound 수가 그 구간의 durable reservation 수를 넘지는 않는다. Legacy Run의 configuration 이전 호출은 아래 upgrade 경계처럼 이 상한에 포함되지 않는다.
 
-`xgeny-provider-openai`가 immutable model/tokenizer/template profile, strict structured proposal과 retry/redirect 없는 HTTP POST를 이 port에 연결한다. Fake/injected port의 lifecycle·store 회귀와 loopback HTTP contract는 기본 CI에서 함께 실행한다. Public `xgeny run/resume`은 기존 exact-file `read-text` mode와 opt-in workspace `list/stat/search/read/write-atomic/apply-patch` mode를 bounded composition으로 연결한다. 이 문서가 정의한 lifecycle 이후 process dispatcher와 interactive 승인 UI는 ADR-0028·0033에서 같은 composition 위에 추가됐다. Network dispatcher는 아직 없다.
+`xgen-provider-openai`가 immutable model/tokenizer/template profile, strict structured proposal과 retry/redirect 없는 HTTP POST를 이 port에 연결한다. Fake/injected port의 lifecycle·store 회귀와 loopback HTTP contract는 기본 CI에서 함께 실행한다. Public `xgen run/resume`은 기존 exact-file `read-text` mode와 opt-in workspace `list/stat/search/read/write-atomic/apply-patch` mode를 bounded composition으로 연결한다. 이 문서가 정의한 lifecycle 이후 process dispatcher와 interactive 승인 UI는 ADR-0028·0033에서 같은 composition 위에 추가됐다. Network dispatcher는 아직 없다.
 
 ```mermaid
 flowchart LR
@@ -87,7 +87,7 @@ Reducer는 `accepted_model_turns <= settled_calls <= reserved_calls`와 `unknown
 
 ## Request profile과 deterministic identity
 
-Model-call을 예약하려면 adapter/composition root가 bounded request profile commitment를 제공해야 한다. `xgeny-provider-openai`를 포함한 모든 실제 adapter는 최소한 다음 request 의미가 바뀔 때 digest도 바뀌어야 한다.
+Model-call을 예약하려면 adapter/composition root가 bounded request profile commitment를 제공해야 한다. `xgen-provider-openai`를 포함한 모든 실제 adapter는 최소한 다음 request 의미가 바뀔 때 digest도 바뀌어야 한다.
 
 - provider/model identity
 - system/developer prompt template와 revision
@@ -204,8 +204,8 @@ Explicit discard는 previous request가 전송되지 않았다는 증명이 아�
 
 현재 public recovery entry point는 `AgentLoop::abandon_model_call(..., call_id)`다. Exact active call만 `ModelCallSettlement::Abandoned { reason: ModelCallAbandonmentReason::RecoveryDiscarded }`를 담은 `ModelCallSettled` event로 닫고 `ModelCallAbandoned` tick을 반환한다. 자동 timeout worker나 implicit retry가 이 API를 대신 호출해서는 안 된다.
 
-CLI에서는 `xgeny recover RUN_ID`로 오프라인 조회하고, 정확한 active call ID를 명시한
-`xgeny recover RUN_ID --discard-model-call CALL_ID`로 같은 Core API를 호출한다.
+CLI에서는 `xgen recover RUN_ID`로 오프라인 조회하고, 정확한 active call ID를 명시한
+`xgen recover RUN_ID --discard-model-call CALL_ID`로 같은 Core API를 호출한다.
 모델·도구 실행과 별도이며 [복구 절차](local-model-call-recovery.md)의 기존 예산·권한·workspace
 보존 조건을 따른다. Default `resume`의 자동 재시도 금지는 변하지 않는다.
 
@@ -292,14 +292,14 @@ provider-neutral reserved request
   -> provider-neutral transient proposal or closed failure
 ```
 
-XGEN Model Gateway를 붙여도 model call ID와 Core request digest의 권위는 XGENy에 남는다. XGEN의 request/interaction ID가 필요하면 adapter-private correlation 또는 versioned optional metadata로 다루고 Core identity를 대체하지 않는다. XGEN/Connector 없이 동일 lifecycle/store test가 통과해야 한다.
+XGEN Model Gateway를 붙여도 model call ID와 Core request digest의 권위는 XGEN에 남는다. XGEN의 request/interaction ID가 필요하면 adapter-private correlation 또는 versioned optional metadata로 다루고 Core identity를 대체하지 않는다. XGEN/Connector 없이 동일 lifecycle/store test가 통과해야 한다.
 
-Claude Code, Codex 또는 OpenClaw가 Parent orchestrator인 observer mode에서는 XGENy `AgentLoop` 자체를 호출하지 않으므로 model-call reservation도 만들지 않는다. Parent harness planning을 관찰하는 것과 XGENy runtime-mode provider call을 혼합하지 않는다.
+Claude Code, Codex 또는 OpenClaw가 Parent orchestrator인 observer mode에서는 XGEN `AgentLoop` 자체를 호출하지 않으므로 model-call reservation도 만들지 않는다. Parent harness planning을 관찰하는 것과 XGEN runtime-mode provider call을 혼합하지 않는다.
 
 ## Failure-first 검증
 
 ```text
-xgeny-workgraph
+xgen-workgraph
   deterministic call/request identity and monotonic call index
   lifecycle configuration, call budget and counter separation
   exact active call success/rejection/unknown/discard transitions
@@ -308,7 +308,7 @@ xgeny-workgraph
   historical accepted floor, below-floor budget rejection, pre-lifecycle failure non-synthesis
   safety effect lifecycle allowed while model response becomes stale
 
-xgeny-local-store
+xgen-local-store
   model-call-specific Memory/SQLite Unknown reopen parity
   model-call-specific reservation/Unknown Event + Projection fault rollback
   model-call-specific active reservation + PlanAccepted sidecar fault rollback
@@ -316,7 +316,7 @@ xgeny-local-store
   shared warm append historical scan zero and cold replay event-once
   migration to current schema version 8 and all pre-existing row/blob preservation
 
-xgeny-runtime
+xgen-runtime
   reservation commit before planner invocation
   one reservation -> PlannerPort at most once
   budget/config/unresolved state -> planner call zero
@@ -338,7 +338,7 @@ Merge 전 전체 gate:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
-cargo run --locked --quiet -p xgeny-cli -- protocol check
+cargo run --locked --quiet -p xgen-cli -- protocol check
 cargo build --workspace --release --locked
 ```
 

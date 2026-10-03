@@ -5,7 +5,7 @@
 
 ## 문맥
 
-XGENy는 내장 기능, 로컬 CLI, MCP, Connector, XGEN에서 같은 의미의 기능을 실행할 수 있다. 의미 계약과 현재 실행 상태를 하나의 manifest에 섞으면 credential·health·placement가 정본 계약에 침투하고, 같은 기능을 실행 위치별로 중복 정의하게 된다.
+XGEN는 내장 기능, 로컬 CLI, MCP, Connector, XGEN에서 같은 의미의 기능을 실행할 수 있다. 의미 계약과 현재 실행 상태를 하나의 manifest에 섞으면 credential·health·placement가 정본 계약에 침투하고, 같은 기능을 실행 위치별로 중복 정의하게 된다.
 
 ## 결정
 
@@ -18,7 +18,7 @@ XGENy는 내장 기능, 로컬 CLI, MCP, Connector, XGEN에서 같은 의미의 
 
 ## 결과
 
-- XGENy core는 XGEN과 Connector에 의존하지 않고도 같은 계약으로 실행 위치를 선택할 수 있다.
+- XGEN core는 XGEN과 Connector에 의존하지 않고도 같은 계약으로 실행 위치를 선택할 수 있다.
 - runtime availability가 변해도 Definition과 WorkGraph 의미가 바뀌지 않는다.
 - adapter별 schema mapping과 conformance fixture가 필요하다.
 

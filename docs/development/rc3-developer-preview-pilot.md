@@ -22,7 +22,7 @@
 
 | Pilot | Project | 진입 경로 | 허용 executable | 필수 관찰 |
 | --- | --- | --- | --- | --- |
-| `rust-bare` | 작은 Cargo project | bare `xgeny` | `cargo` | 탐색, 수정, 실패 test 관찰, 교정, test/build 성공, `/status`, `/exit` |
+| `rust-bare` | 작은 Cargo project | bare `xgen` | `cargo` | 탐색, 수정, 실패 test 관찰, 교정, test/build 성공, `/status`, `/exit` |
 | `node-resume` | Node.js built-in test fixture | `run` → `resume` | `node` | read/write와 분리된 execute 승인, `node --test`, `node --check`, offline replay |
 | `python-resume` | 표준 `unittest` fixture | `run` → `resume` | `python3` 또는 `python` | 별도 execute 승인, 실패 분석, `-m unittest`, `-m compileall`, offline replay |
 
@@ -37,10 +37,10 @@ repository 밖의 깨끗한 home/state에서 실행한다.
 
 ```text
 install exact version
-  -> xgeny --version
-  -> xgeny model setup
-  -> xgeny model check --compatibility
-  -> bare xgeny
+  -> xgen --version
+  -> xgen model setup
+  -> xgen model check --compatibility
+  -> bare xgen
   -> /status
   -> /exit
   -> same-version reinstall
@@ -53,7 +53,7 @@ argument나 결과 ledger에 복사하지 않는다. `model setup`이 catalog와
 
 ## 대화형 Rust 절차
 
-1. 폐기 가능한 Rust fixture root에서 `xgeny`를 실행하고 `/status`로 active model과 idle 상태를 확인한다.
+1. 폐기 가능한 Rust fixture root에서 `xgen`를 실행하고 `/status`로 active model과 idle 상태를 확인한다.
 2. 기존 실패 test를 유지하면서 project를 탐색하고 원인을 수정한 뒤 test/build하도록 요청한다.
 3. Model egress, read, write와 execute 승인이 각각 별도로 나타나는지 확인한다.
 4. 첫 실행 실패가 있으면 bounded durable output을 다음 turn이 관찰해 교정하는지 확인한다.
@@ -68,7 +68,7 @@ argument나 결과 ledger에 복사하지 않는다. `model setup`이 catalog와
 `python`이고 `EXE`는 operator가 신뢰한 executable의 absolute path다. Model에는 logical ID만 보인다.
 
 ```bash
-xgeny run \
+xgen run \
   --workspace . \
   --allow-dir . \
   --allow-executable RUNTIME_ID="EXE" \
@@ -82,7 +82,7 @@ xgeny run \
 재개한다.
 
 ```bash
-xgeny resume RUN_ID \
+xgen resume RUN_ID \
   --workspace . \
   --allow-dir . \
   --allow-executable RUNTIME_ID="EXE" \
@@ -94,7 +94,7 @@ xgeny resume RUN_ID \
 
 Node.js fixture는 shell script나 package lifecycle hook 대신 `node --test`와 `node --check`만 사용한다.
 Python fixture는 추가 package 설치 없이 `python -m unittest`와 `python -m compileall`만 사용한다. 완료 뒤
-model credential, workspace와 executable 없이 `xgeny resume RUN_ID`가 같은 completion을 offline
+model credential, workspace와 executable 없이 `xgen resume RUN_ID`가 같은 completion을 offline
 replay해야 한다.
 
 ## 복구·중단 안전성 확인

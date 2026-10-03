@@ -1,8 +1,8 @@
-# XGENy 보안 정책
+# XGEN 보안 정책
 
 ## 지원 범위
 
-XGENy는 Developer Preview다. 새 보안 수정은 원칙적으로 가장 최근에 게시된 immutable preview version에
+XGEN는 Developer Preview다. 새 보안 수정은 원칙적으로 가장 최근에 게시된 immutable preview version에
 더 높은 새 version으로 제공한다. 이미 게시된 GitHub tag, Release asset 또는 npm package version을
 이동·교체·재사용하지 않는다.
 
@@ -13,11 +13,11 @@ XGENy는 Developer Preview다. 새 보안 수정은 원칙적으로 가장 최�
 ## 비공개 신고
 
 민감한 취약점은 public issue, discussion 또는 pull request에 작성하지 말고 GitHub의
-[비공개 취약점 신고](https://github.com/PlateerLab/xgeny-cli/security/advisories/new)를 사용한다.
+[비공개 취약점 신고](https://github.com/PlateerLab/xgen-cli/security/advisories/new)를 사용한다.
 
 다음과 같은 최소 정보만 먼저 제공한다.
 
-- 영향을 받는 exact XGENy version과 설치 채널
+- 영향을 받는 exact XGEN version과 설치 채널
 - OS family와 architecture
 - 고정된 오류 코드 또는 민감정보를 제거한 재현 단계
 - 예상한 보안 경계와 실제 관찰의 차이
@@ -29,7 +29,7 @@ advisory에서 먼저 조율한다. 기존 immutable version은 수정하지 않
 대응한다.
 
 일반 설치·사용 오류와 민감정보 없는 버그는
-[GitHub Issues](https://github.com/PlateerLab/xgeny-cli/issues)를 사용한다.
+[GitHub Issues](https://github.com/PlateerLab/xgen-cli/issues)를 사용한다.
 
 ## 주요 보안 경계
 

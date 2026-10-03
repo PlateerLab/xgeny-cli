@@ -18,7 +18,7 @@ output을 같은 generation의 다음 model turn에 전달한다. 그러나 모�
 일반 replay, export, `Debug`와 projection read 전체에 본문이 확산된다. 따라서 completion도
 tool output과 마찬가지로 **journal commitment에 결합된 원자 local sidecar**로 보존한다.
 
-이번 결정은 최종 candidate를 terminal `Completed` Run으로 승인하는 의미나 사용자용 `xgeny
+이번 결정은 최종 candidate를 terminal `Completed` Run으로 승인하는 의미나 사용자용 `xgen
 run/resume` 명령을 추가하지 않는다. Candidate는 계속 검증·사용자 확인 전의 비종결 결과다.
 
 ## 결정
@@ -189,11 +189,11 @@ schema 7 binary가 새 DB를 열어 completion commitment를 모른 채 쓰지 �
 
 ## 호환성과 비목표
 
-- Public XGEN/XGENy protocol v0.1은 바뀌지 않는다.
+- Public XGEN/XGEN protocol v0.1은 바뀌지 않는다.
 - XGEN, Connector, PostgreSQL, MinIO 또는 특정 model/provider 의존성을 Core에 추가하지 않는다.
 - `DriverOutcome`은 새 candidate에는 `Some(CompletionOutputRecord)`, legacy에는 `None`을 반환한다.
 - Candidate 검증, terminal Run completion과 사용자 승인 의미는 후속이다.
-- Public `xgeny run/resume`, filesystem/process adapter와 설치 패키지는 후속이다.
+- Public `xgen run/resume`, filesystem/process adapter와 설치 패키지는 후속이다.
 - Streaming/chunked completion, 여러 candidate generation, retention/GC와 암호화는 후속 schema다.
 - Raw provider envelope, hidden reasoning과 chain-of-thought는 저장하지 않는다.
 

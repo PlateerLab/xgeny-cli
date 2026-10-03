@@ -53,7 +53,7 @@ test('Unix npm invocation retains the PATH executable fallback', () => {
 test('Windows command shim invocation preserves cmd outer and path quotes verbatim', () => {
   assert.deepEqual(
     windowsShimVersionInvocation(
-      'C:\\Users\\Example User\\install\\xgeny.cmd',
+      'C:\\Users\\Example User\\install\\xgen.cmd',
       'C:\\Windows\\System32\\cmd.exe',
     ),
     {
@@ -62,7 +62,7 @@ test('Windows command shim invocation preserves cmd outer and path quotes verbat
         '/d',
         '/s',
         '/c',
-        '""C:\\Users\\Example User\\install\\xgeny.cmd" --version"',
+        '""C:\\Users\\Example User\\install\\xgen.cmd" --version"',
       ],
       windowsVerbatimArguments: true,
     },
@@ -72,7 +72,7 @@ test('Windows command shim invocation preserves cmd outer and path quotes verbat
 test('Windows interactive shim invocation keeps the absolute shim as the only command', () => {
   assert.deepEqual(
     windowsShimInteractiveInvocation(
-      'C:\\Users\\Example User\\install\\xgeny.cmd',
+      'C:\\Users\\Example User\\install\\xgen.cmd',
       'C:\\Windows\\System32\\cmd.exe',
     ),
     {
@@ -81,7 +81,7 @@ test('Windows interactive shim invocation keeps the absolute shim as the only co
         '/d',
         '/s',
         '/c',
-        '""C:\\Users\\Example User\\install\\xgeny.cmd""',
+        '""C:\\Users\\Example User\\install\\xgen.cmd""',
       ],
       windowsVerbatimArguments: true,
     },

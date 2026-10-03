@@ -5,7 +5,7 @@
 
 ## Context
 
-XGEN은 기존 workflow/SSE/interaction/execution_io 계약과 광범위한 웹·Connector 소비자를 갖는다. 새 XGENy 의미 모델을 기존 응답에 직접 덮으면 회귀 위험이 크다. 반대로 XGENy가 모든 legacy 구조를 흡수하면 미래 구조가 과거 XGEN에 고정된다.
+XGEN은 기존 workflow/SSE/interaction/execution_io 계약과 광범위한 웹·Connector 소비자를 갖는다. 새 XGEN 의미 모델을 기존 응답에 직접 덮으면 회귀 위험이 크다. 반대로 XGEN가 모든 legacy 구조를 흡수하면 미래 구조가 과거 XGEN에 고정된다.
 
 MCP와 A2A는 각각 도구/능력과 장기 agent task의 넓은 생태계 호환성을 제공한다. XGEN 고유 차별 기능은 WorkGraph, 조직 정책, 실행 증거, edge placement다.
 
@@ -31,4 +31,4 @@ MCP와 A2A는 각각 도구/능력과 장기 agent task의 넓은 생태계 호�
 - workflow마다 MCP 도구 하나씩 영구 노출
 - 기존 SSE payload를 즉시 canonical event로 교체
 - UI `ChatEvent`를 canonical protocol로 채택
-- XGENy 내부에 XGEN legacy adapter를 기본 내장
+- XGEN 내부에 XGEN legacy adapter를 기본 내장

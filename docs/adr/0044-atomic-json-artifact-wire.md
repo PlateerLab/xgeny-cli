@@ -6,8 +6,8 @@
 
 ## 9/28 후속: 내부 도메인 schema
 
-호스트는 `XGENY_OPENAI_ARTIFACT_SCHEMA`에 요청별 JSON Schema **본문**을 선택적으로 전달한다.
-help의 `XGENY_OPENAI_ARTIFACT_SCHEMA=atomic-json-schema-v1`은 offline 지원 탐지 marker이며,
+호스트는 `XGEN_OPENAI_ARTIFACT_SCHEMA`에 요청별 JSON Schema **본문**을 선택적으로 전달한다.
+help의 `XGEN_OPENAI_ARTIFACT_SCHEMA=atomic-json-schema-v1`은 offline 지원 탐지 marker이며,
 환경 변수에 `atomic-json-schema-v1` 문자열을 그대로 넣는 설정이 아니다.
 이 옵션은 `json_schema_atomic_json`에서만 허용한다. 모델 ID/profile의 영구 기본값으로 저장하지 않는다.
 
@@ -78,7 +78,7 @@ CLI model check는 작은 completion probe이며, 실제 artifact 작성이나 �
 ## 검증
 
 ```bash
-cargo test -p xgeny-provider-openai -p xgeny-cli --all-targets --locked -j 2
+cargo test -p xgen-provider-openai -p xgen-cli --all-targets --locked -j 2
 ```
 
 offline 검사는 기존 profile digest, 새 옵션 저장/복원, native codec, 혼합 capability 거부,

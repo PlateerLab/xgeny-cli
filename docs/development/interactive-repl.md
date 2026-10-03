@@ -1,32 +1,36 @@
-# XGENy 대화형 REPL
+# XGEN 대화형 REPL
 
 ## 빠른 시작
 
-Model profile을 한 번 설정한 뒤 프로젝트 root에서 subcommand 없이 실행한다. TTY에서 profile이 없으면
-bare `xgeny`가 같은 온보딩을 먼저 시작한다.
+프로젝트 root에서 subcommand 없이 실행한다. TTY에서 profile이 없으면 제공자 선택, 숨김 API key
+입력, model 선택과 연결 검증을 진행한다. DeepSeek와 OpenAI는 preset으로 URL과 wire 옵션을 채우며,
+다른 OpenAI-compatible endpoint는 URL을 직접 입력한다. 저장된 설정은 다음 실행부터 재사용한다.
 
 ```bash
-xgeny model setup
 cd my-project
-xgeny
+xgen
 ```
+
+API key는 OS credential store에 저장한다. 저장소를 쓸 수 없으면 숨김 입력한 key는 현재 process의
+메모리에만 두고 다음 실행 때 다시 묻는다. 평문 key file이나 tool process 환경변수로 옮기지 않는다.
+자동화의 `--store-token`은 여전히 저장 실패를 오류로 반환한다.
 
 기본 approval mode는 모두 `ask`다. Model prompt에는 현재 goal, 직전 durable result와 이후 tool
 observation이 포함될 수 있다. Read, write와 process execute는 각각 별도로 묻는다.
+한 goal을 처리하는 동안 승인한 종류는 이후 continuation에서도 유지하며, 다음 goal이나 명시적인
+`/resume`에서는 다시 기본 approval mode를 적용한다. `deny`는 계속 실행을 차단한다.
 
 ```text
-xgeny> 프로젝트 구조를 보고 테스트 실패를 수정해줘.
+xgen> 프로젝트 구조를 보고 테스트 실패를 수정해줘.
 Allow sending the goal, session context, and tool observations to the model? [y/N] y
-progress: model_call_starting
-progress: plan_committed
-progress: approval_required effect=read
+Thinking… · 2s
 Allow read for this durable continuation? [y/N] y
 ```
 
 줄 끝에 unescaped `\`를 쓰면 다음 줄을 같은 goal로 입력한다.
 
 ```text
-xgeny> src를 탐색하고 \
+xgen> src를 탐색하고 \
 ...> 실패한 테스트만 수정해줘.
 ```
 
@@ -51,13 +55,16 @@ Core authorization을 거친다. Catalog snapshot은 첫 실제 goal에서 만�
 ## 세션과 재개
 
 한 goal은 하나의 durable Run이다. 완료 summary는 다음 goal에 비신뢰 context로 이어지지만 전체 transcript
-또는 장기 memory는 저장하지 않는다. `/clear`는 이 연결과 active/last pointer만 제거하며 SQLite Run을
+또는 장기 memory는 저장하지 않는다. 현재 Core는 새로운 Run에도 receipt-completed Step을 요구하므로,
+직전 응답만으로 답할 수 있는 대화형 후속 질문은 `completion_without_receipt_completed_plan`으로
+거절될 수 있다. 순수 대화 응답을 작업 완료와 구분하는 계약은 후속 설계가 필요하다. `/clear`는 이 연결과 active/last pointer만 제거하며 SQLite Run을
 삭제하지 않는다.
 
-중단 뒤 stderr의 `XGENY_STARTED run_id=...` 값을 사용해 재개한다.
+같은 세션에서는 `/resume`으로 현재/마지막 Run을 재개한다. 다른 process에서 재개하려면 `/status`의
+Run ID를 기록한다. `--debug` 또는 pipe 모드에서는 stderr의 `XGEN_STARTED run_id=...`도 사용할 수 있다.
 
 ```text
-xgeny> /resume run-0123456789abcdef0123456789abcdef
+xgen> /resume run-0123456789abcdef0123456789abcdef
 ```
 
 완료된 Run은 model, workspace 또는 tool effect 없이 summary를 offline replay한다. Approval 대기 Run은
@@ -66,8 +73,19 @@ xgeny> /resume run-0123456789abcdef0123456789abcdef
 
 ## Progress와 Ctrl+C
 
-`progress:` line은 fake spinner나 model token이 아니라 runtime의 redacted lifecycle event다. Strict JSON
-proposal은 검증 전 표시하지 않으며 최종 summary는 durable completion 검증 뒤 출력한다.
+일반 TTY 화면은 요청 처리 중 `Thinking…`과 경과 시간을 표시한다. 이 표시는 model 호출뿐 아니라
+도구 실행과 결과 검증 시간을 포함하며, model의 내부 reasoning text를 뜻하지 않는다. 승인 입력이나
+결과 출력 전에 표시를 지운다. 최종 summary만 durable completion 검증 뒤 control character를 escape해
+출력하며, Run ID는 `/status`에서 확인할 수 있다. 이 검증은 Receipt와 결과 저장의 결합·무결성을
+확인하며, summary의 모든 자연어 설명이 실제 변경과 일치함을 보장하지 않는다.
+
+```bash
+# 기존 durable progress와 Run ID 로그 확인
+xgen --debug
+```
+
+`--debug`와 pipe 입력에서는 기존 `progress:` event 및 `XGEN_STARTED` 계약을 유지하고 ANSI animation을
+출력하지 않는다. Progress는 runtime의 redacted lifecycle event이며 strict JSON proposal은 표시하지 않는다.
 
 Ctrl+C는 다음 안전한 durable 경계에서 멈춘다. Model request나 process outcome이 이미 불확정해졌으면
 `user_cancelled`보다 `model_call_unknown`/`effect_outcome_unknown`이 우선하고 자동 재실행하지 않는다.
@@ -79,8 +97,8 @@ Pipe 입력에서는 first-run hidden prompt를 자동으로 열지 않는다. P
 결정적 smoke script를 실행할 수 있다. Secret은 script text나 argv에 넣지 않는다.
 
 ```bash
-printf '/status\n/exit\n' | xgeny
+printf '/status\n/exit\n' | xgen
 ```
 
-실제 goal을 pipe로 실행할 때 원격 HTTPS credential은 `XGENY_OPENAI_API_KEY` 같은 외부 secret injection을
-사용한다. 일반 자동화는 exit code와 고정 stderr 계약이 더 단순한 기존 `xgeny run/resume`을 권장한다.
+실제 goal을 pipe로 실행할 때 원격 HTTPS credential은 `XGEN_OPENAI_API_KEY` 같은 외부 secret injection을
+사용한다. 일반 자동화는 exit code와 고정 stderr 계약이 더 단순한 기존 `xgen run/resume`을 권장한다.

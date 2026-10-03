@@ -10,7 +10,7 @@
 기존 exact-file mode:
 
 ```bash
-xgeny run \
+xgen run \
   --allow-file README.md \
   --allow-remote-model-egress \
   --allow-read \
@@ -20,7 +20,7 @@ xgeny run \
 Workspace discovery mode:
 
 ```bash
-xgeny run \
+xgen run \
   --workspace . \
   --allow-dir . \
   --allow-remote-model-egress \
@@ -48,7 +48,7 @@ directory/file 목록을 받는다. Constrained provider prompt는 이를 후보
 더 좁은 범위는 directory를 반복 지정하고 필요한 exact file만 추가한다.
 
 ```bash
-xgeny run \
+xgen run \
   --workspace . \
   --allow-dir src \
   --allow-dir tests \
@@ -61,7 +61,7 @@ xgeny run \
 미완료 Run은 동일한 workspace와 catalog를 다시 제공한다.
 
 ```bash
-xgeny resume run-0123456789abcdef0123456789abcdef \
+xgen resume run-0123456789abcdef0123456789abcdef \
   --workspace . \
   --allow-dir src \
   --allow-dir tests \
@@ -112,10 +112,10 @@ invalid UTF-8, oversized 또는 열 수 없는 file을 건너뛰어도 이 값�
 ## 검증
 
 ```bash
-cargo test --locked -p xgeny-adapter-filesystem --all-targets
-cargo test --locked -p xgeny-cli --test workspace_discovery
-cargo test --locked -p xgeny-cli --test public_run_resume
-cargo run --locked --quiet -p xgeny-cli -- protocol check
+cargo test --locked -p xgen-adapter-filesystem --all-targets
+cargo test --locked -p xgen-cli --test workspace_discovery
+cargo test --locked -p xgen-cli --test public_run_resume
+cargo run --locked --quiet -p xgen-cli -- protocol check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 ```
@@ -142,10 +142,10 @@ workspace를 만들고, 모델이 지시된 `list-directory`, `search-text`, `st
 journal 불변까지 검사한다.
 
 ```bash
-XGENY_LIVE_CONFIRM=xgeny-go50902-workspace-discovery-v1 \
-XGENY_LIVE_KNOWN_HOSTS_FILE=/absolute/path/to/dedicated_known_hosts \
-XGENY_LIVE_OPENAI_BASE_URL=http://127.0.0.1:18000/v1 \
-cargo test --locked --release -p xgeny-cli \
+XGEN_LIVE_CONFIRM=xgen-go50902-workspace-discovery-v1 \
+XGEN_LIVE_KNOWN_HOSTS_FILE=/absolute/path/to/dedicated_known_hosts \
+XGEN_LIVE_OPENAI_BASE_URL=http://127.0.0.1:18000/v1 \
+cargo test --locked --release -p xgen-cli \
   --test live_go50902_public \
   public_cli_workspace_discovery_and_offline_replay \
   -- --ignored --exact

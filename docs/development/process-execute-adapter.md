@@ -1,13 +1,13 @@
 # Process execute adapter
 
-`xgeny-adapter-process`는 `xgeny.process/execute@1.0.0`의 shell-free local adapter다. Public CLI는
+`xgen-adapter-process`는 `xgeny.process/execute@1.0.0`의 shell-free local adapter다. Public CLI는
 사용자가 executable catalog를 명시한 Run에서만 이 tool을 등록한다. 다른 host composition도 workspace,
 executable catalog와 환경을 명시적으로 제공해야 한다.
 
 ## Public CLI composition
 
 ```bash
-xgeny run \
+xgen run \
   --workspace . \
   --allow-dir . \
   --allow-executable cargo="$(command -v cargo)" \
@@ -20,7 +20,7 @@ xgeny run \
 `execute_approval_required`로 pause한다. 출력된 Run ID를 사용해 로컬 실행만 별도로 승인할 수 있다.
 
 ```bash
-xgeny resume run-0123456789abcdef0123456789abcdef \
+xgen resume run-0123456789abcdef0123456789abcdef \
   --workspace . \
   --allow-dir . \
   --allow-executable cargo="$(command -v cargo)" \
@@ -36,7 +36,7 @@ turn이 필요하면 같은 인자에 `--base-url`과 `--allow-remote-model-egre
 
 ```rust
 use std::collections::BTreeMap;
-use xgeny_adapter_process::{
+use xgen_adapter_process::{
     ExecutableCatalog, ProcessEnvironment, ProcessWorkspace, ProcessWorkspaceId,
 };
 
@@ -116,9 +116,9 @@ one-shot grant, effect와 idempotency key를 만든다. 반대로 `Executing`/`E
 
 ```text
 cargo fmt --all -- --check
-cargo clippy -p xgeny-adapter-process --all-targets -- -D warnings
-cargo test -p xgeny-adapter-process -- --test-threads=1
-cargo run --quiet -p xgeny-cli -- protocol check
+cargo clippy -p xgen-adapter-process --all-targets -- -D warnings
+cargo test -p xgen-adapter-process -- --test-threads=1
+cargo run --quiet -p xgen-cli -- protocol check
 ```
 
 Platform-specific process group, Job Object, path와 executable 판단은 Linux, macOS, Windows CI의

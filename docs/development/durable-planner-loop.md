@@ -9,7 +9,7 @@
 
 한 Run의 model-owned 작업 부분에 host-selected budget을 고정하고, 한 planning decision이 만든 여러 Step과 각 Step의 secret-free reconstructable input reference를 Memory 또는 embedded SQLite에 원자 저장할 수 있다. Embedded SQLite에서는 process 재시작 뒤에도 accepted Capability/input commitment와 dependency DAG를 검증해 같은 frontier를 복원한다.
 
-현재 구현은 provider-neutral planner port를 호출하기 전에 durable possible-send slot을 예약하고 accepted/rejected/Unknown 상태를 재시작 뒤 복원한다. Fake port와 별도 `xgeny-provider-openai` leaf adapter가 같은 경계를 사용하며, 후자는 OpenAI-compatible model API의 strict structured proposal을 Core validation까지 연결한다. Tool은 자동 실행하지 않으며 dispatcher와 사용자 interaction이 붙기 전까지 이것을 완전한 autonomous CLI로 설명하지 않는다.
+현재 구현은 provider-neutral planner port를 호출하기 전에 durable possible-send slot을 예약하고 accepted/rejected/Unknown 상태를 재시작 뒤 복원한다. Fake port와 별도 `xgen-provider-openai` leaf adapter가 같은 경계를 사용하며, 후자는 OpenAI-compatible model API의 strict structured proposal을 Core validation까지 연결한다. Tool은 자동 실행하지 않으며 dispatcher와 사용자 interaction이 붙기 전까지 이것을 완전한 autonomous CLI로 설명하지 않는다.
 
 ```mermaid
 flowchart TB
@@ -40,7 +40,7 @@ flowchart TB
 | 단계 | 소유자 | durable 여부 | 포함할 수 있는 값 | 포함하면 안 되는 값 |
 |---|---|---:|---|---|
 | `PlanProposal` | model/provider | 아니오 | objective, dependency, Capability 후보, transient argument | grant, policy decision, selected Instance, execution 사실 |
-| Accepted plan | XGENy Core | 예 | Step ID, normalized objective/dependency, Definition/action/input digest, execution profile | raw argument, raw response, credential |
+| Accepted plan | XGEN Core | 예 | Step ID, normalized objective/dependency, Definition/action/input digest, execution profile | raw argument, raw response, credential |
 | `InvocationPlan` 의미 | Admission/Router/Core | effect intent에 commitment 저장 | resolved resource, selected Instance, policy/authorization, verification provenance | 모델이 만든 보안 결정 |
 
 현재 public `InvocationPlanBody`에는 selected Instance, policy decision, candidates, fallback과 verification plan이 필요하다. 따라서 provider output을 이 타입으로 deserialize하지 않는다. 현재 slice는 full `InvocationPlan` document를 저장하지 않으며 `EffectIntent`와 Receipt provenance에 deterministic execution-plan commitment만 둔다.
@@ -369,13 +369,13 @@ Exact UTF-8 summary는 schema 8 local sidecar에만 남고 journal/projection에
 
 ## XGEN과 외부 harness
 
-Core planning/model-call 타입과 store에는 XGEN, Connector, PostgreSQL, MinIO identifier나 client가 없다. 향후 XGEN Model Gateway adapter는 같은 provider-neutral reserved request를 XGEN dialect로 보내고 reservation 하나당 outbound request를 최대 한 번만 수행한 뒤 Proposal을 Core 계약으로 변환한다. XGEN request/interaction ID는 adapter correlation이지 XGENy call identity의 권위가 아니다. 조직 DB/RAG/workflow는 XGEN Capability로 호출되며 local Parent WorkGraph와 별도 bounded child Run을 가진다.
+Core planning/model-call 타입과 store에는 XGEN, Connector, PostgreSQL, MinIO identifier나 client가 없다. 향후 XGEN Model Gateway adapter는 같은 provider-neutral reserved request를 XGEN dialect로 보내고 reservation 하나당 outbound request를 최대 한 번만 수행한 뒤 Proposal을 Core 계약으로 변환한다. XGEN request/interaction ID는 adapter correlation이지 XGEN call identity의 권위가 아니다. 조직 DB/RAG/workflow는 XGEN Capability로 호출되며 local Parent WorkGraph와 별도 bounded child Run을 가진다.
 
 Claude Code, Codex, OpenClaw가 Parent orchestrator인 observer mode에서는 이 agent loop를 호출하지 않는다.
 
 ```text
 external harness owns planning/local tools
-  -> XGENy observer: observed telemetry only
+  -> XGEN observer: observed telemetry only
   -> optional XGEN capability: separate child Run
 ```
 
@@ -386,14 +386,14 @@ Observer는 context assembly, model provider, admission, dispatcher 또는 Paren
 핵심 failure-first suite는 다음 영역을 포함해야 한다.
 
 ```text
-xgeny-workgraph
+xgen-workgraph
   accepted multi-step DAG / forward reference / cycle atomic rejection
   turn, plan, input, capability와 completion invariant
   planned binding과 EffectIntent mismatch before authorization consumption
   model-call reservation/rejection/unknown/discard lifecycle and budget counters
   configured lifecycle missing/wrong/stale modelCallId rejection
 
-xgeny-local-store
+xgen-local-store
   Memory/SQLite plan bundle parity and reopen
   missing/extra/orphan/tampered sidecar audit
   Event/PlannedInvocation/Projection fault rollback
@@ -405,7 +405,7 @@ xgeny-local-store
   shared process-exit/two-handle/cache regressions remain green
   schema 7 tool-output bytes preservation plus schema 8 completion-output addition
 
-xgeny-runtime
+xgen-runtime
   deterministic context/order/round-robin whole-item packing/byte budget/redaction
   omitted Capability/Step guess rejection before materialization
   one-tick/one-action and recovery-first ordering
@@ -429,8 +429,8 @@ Shared store의 process-exit/two-handle/cache 항목은 기존 transaction/cache
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
-cargo run --locked --quiet -p xgeny-cli -- protocol check
-cargo build --locked --release -p xgeny-cli
+cargo run --locked --quiet -p xgen-cli -- protocol check
+cargo build --locked --release -p xgen-cli
 ```
 
 Public protocol schema를 바꾸지 않았으므로 기존 protocol fixture count가 유지돼야 한다. Internal event/store 의미가 바뀌었으므로 WorkGraph/store/restart regression이 이번 slice의 핵심 release gate다.
@@ -438,7 +438,7 @@ Public protocol schema를 바꾸지 않았으므로 기존 protocol fixture coun
 ## 아직 할 수 없는 것
 
 - XGEN Model Gateway, 다른 provider dialect와 다중 provider routing
-- 사용자용 provider 설정·credential 입력과 `xgeny run` composition root
+- 사용자용 provider 설정·credential 입력과 `xgen run` composition root
 - provider request-status/idempotency를 조회해 Unknown을 자동 reconciliation하기
 - 실제 outbound/청구/token/금액/rate-limit/wall-clock을 정확히 정산하기
 - exact tokenizer 실행 기반 token budget과 alias 가능한 response-model identity

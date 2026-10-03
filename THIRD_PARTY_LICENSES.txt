@@ -1,4 +1,4 @@
-XGENy CLI Third-Party License Notices
+XGEN CLI Third-Party License Notices
 
 This file is generated from Cargo.lock with cargo-about. It is provided for attribution and is not legal advice.
 
@@ -6508,7 +6508,7 @@ limitations under the License.
 License: Apache License 2.0
 
 Used by:
-- xgeny-cli 0.1.0-rc.3 (https://github.com/PlateerLab/xgeny-cli)
+- xgen-cli 0.1.0-rc.3 (https://github.com/PlateerLab/xgen-cli)
 
 ==============================================================================
 The LLVM Project is under the Apache License v2.0 with LLVM Exceptions:
@@ -6979,16 +6979,16 @@ limitations under the License.
 License: Apache License 2.0
 
 Used by:
-- xgeny-adapter-filesystem 0.1.0-rc.3 (https://github.com/PlateerLab/xgeny-cli)
-- xgeny-adapter-process 0.1.0-rc.3 (https://github.com/PlateerLab/xgeny-cli)
-- xgeny-adapter-reference 0.1.0-rc.3 (https://github.com/PlateerLab/xgeny-cli)
-- xgeny-domain 0.1.0-rc.3 (https://github.com/PlateerLab/xgeny-cli)
-- xgeny-local-store 0.1.0-rc.3 (https://github.com/PlateerLab/xgeny-cli)
-- xgeny-policy 0.1.0-rc.3 (https://github.com/PlateerLab/xgeny-cli)
-- xgeny-protocol 0.1.0-rc.3 (https://github.com/PlateerLab/xgeny-cli)
-- xgeny-provider-openai 0.1.0-rc.3 (https://github.com/PlateerLab/xgeny-cli)
-- xgeny-runtime 0.1.0-rc.3 (https://github.com/PlateerLab/xgeny-cli)
-- xgeny-workgraph 0.1.0-rc.3 (https://github.com/PlateerLab/xgeny-cli)
+- xgen-adapter-filesystem 0.1.0-rc.3 (https://github.com/PlateerLab/xgen-cli)
+- xgen-adapter-process 0.1.0-rc.3 (https://github.com/PlateerLab/xgen-cli)
+- xgen-adapter-reference 0.1.0-rc.3 (https://github.com/PlateerLab/xgen-cli)
+- xgen-domain 0.1.0-rc.3 (https://github.com/PlateerLab/xgen-cli)
+- xgen-local-store 0.1.0-rc.3 (https://github.com/PlateerLab/xgen-cli)
+- xgen-policy 0.1.0-rc.3 (https://github.com/PlateerLab/xgen-cli)
+- xgen-protocol 0.1.0-rc.3 (https://github.com/PlateerLab/xgen-cli)
+- xgen-provider-openai 0.1.0-rc.3 (https://github.com/PlateerLab/xgen-cli)
+- xgen-runtime 0.1.0-rc.3 (https://github.com/PlateerLab/xgen-cli)
+- xgen-workgraph 0.1.0-rc.3 (https://github.com/PlateerLab/xgen-cli)
 - allocator-api2 0.2.21 (https://github.com/zakarumych/allocator-api2)
 - async-trait 0.1.92 (https://github.com/dtolnay/async-trait)
 - dispatch2 0.3.1 (https://github.com/madsmtm/objc2)

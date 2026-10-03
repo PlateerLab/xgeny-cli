@@ -226,9 +226,9 @@ Open/load audit는 모든 `PlanAccepted` Step에 정확히 하나의 sidecar가 
 
 ### 11. XGEN 독립성과 외부 harness mode를 유지한다
 
-이 계약에는 XGEN workflow/node/interaction ID, PostgreSQL row, MinIO bucket/key 또는 Connector 내부 타입을 넣지 않는다. XGEN을 model provider로 연결할 때도 optional adapter가 provider-neutral planning request/response를 번역할 뿐 XGENy Core가 XGEN package나 저장소에 의존하지 않는다. XGEN capability 실행은 planning과 분리된 Capability/child Run 경계로 들어온다.
+이 계약에는 XGEN workflow/node/interaction ID, PostgreSQL row, MinIO bucket/key 또는 Connector 내부 타입을 넣지 않는다. XGEN을 model provider로 연결할 때도 optional adapter가 provider-neutral planning request/response를 번역할 뿐 XGEN Core가 XGEN package나 저장소에 의존하지 않는다. XGEN capability 실행은 planning과 분리된 Capability/child Run 경계로 들어온다.
 
-XGENy가 `orchestration_authority`인 runtime mode에서만 이 loop가 WorkGraph를 계획·수정한다. Claude Code, Codex, OpenClaw 등 외부 harness가 Parent authority인 observer mode에서는 context assembly, planner, admission, dispatcher와 Parent WorkGraph mutation을 실행하지 않는다. 외부 harness의 local tool과 planning은 해당 harness가 소유하고, XGENy는 관찰 가능한 lifecycle을 telemetry로 정규화하거나 별도 XGEN bounded child capability를 제공할 뿐이다.
+XGEN가 `orchestration_authority`인 runtime mode에서만 이 loop가 WorkGraph를 계획·수정한다. Claude Code, Codex, OpenClaw 등 외부 harness가 Parent authority인 observer mode에서는 context assembly, planner, admission, dispatcher와 Parent WorkGraph mutation을 실행하지 않는다. 외부 harness의 local tool과 planning은 해당 harness가 소유하고, XGEN는 관찰 가능한 lifecycle을 telemetry로 정규화하거나 별도 XGEN bounded child capability를 제공할 뿐이다.
 
 현재 slice에는 external-harness observer adapter나 mode dispatcher가 없으므로 이 분리는 composition-root 요구사항이며 실행 가능한 통합 보장이라고 주장하지 않는다. 실제 observer adapter를 추가하는 PR은 planner API 호출 0회와 Parent store mutation 0회를 contract test로 증명해야 한다.
 

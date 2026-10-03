@@ -190,7 +190,7 @@ Step ID가 이미 immutable occurrence key 역할을 한다. 별도 counter는 s
 
 ## 결과
 
-XGENy는 semantic equality를 버리지 않으면서도 정상적인 관찰·수정·재검증 loop를 수행할 수 있다. 반복
+XGEN는 semantic equality를 버리지 않으면서도 정상적인 관찰·수정·재검증 loop를 수행할 수 있다. 반복
 action은 모델이 만든 nonce가 아니라 Core가 만든 immutable Step occurrence로 권한화되며, 각 반복은 새
 승인과 one-shot budget을 소비한다. 이미 시작된 한 occurrence의 crash recovery는 기존 identity와
 no-replay 규칙을 그대로 유지한다.

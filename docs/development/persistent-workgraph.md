@@ -96,10 +96,10 @@ Schema 5는 이 dependency 의미를 도입한 역사적 fence다. ADR-0015의 s
 핵심 failure-first suite는 다음과 같다.
 
 ```bash
-cargo test -p xgeny-workgraph --test persistent_frontier --locked
-cargo test -p xgeny-runtime --test persistent_workgraph --locked
-cargo test -p xgeny-runtime --test invocation_admission --locked
-cargo test -p xgeny-local-store --locked
+cargo test -p xgen-workgraph --test persistent_frontier --locked
+cargo test -p xgen-runtime --test persistent_workgraph --locked
+cargo test -p xgen-runtime --test invocation_admission --locked
+cargo test -p xgen-local-store --locked
 ```
 
 Merge 전에는 전체 gate를 실행한다.
@@ -108,8 +108,8 @@ Merge 전에는 전체 gate를 실행한다.
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
-cargo run --locked --quiet -p xgeny-cli -- protocol check
-cargo build --locked --release -p xgeny-cli
+cargo run --locked --quiet -p xgen-cli -- protocol check
+cargo build --locked --release -p xgen-cli
 ```
 
 테스트는 diamond release, 독립 branch, transitive failure/manual, partial·malformed legacy Receipt identity, reducer/admission 우회와 unknown dependency의 panic-free rejection, 10,000-Step non-recursive traversal, Memory/SQLite parity, reopen continuity, Receipt transaction fault/process-exit rollback, schema 3/4/5 → 6 성공·실패 원자성과 mixed-version 수렴을 포함한다.

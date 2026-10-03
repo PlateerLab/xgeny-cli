@@ -108,7 +108,7 @@ Index도 constant-memory 구조가 아니다. Duplicate event/Receipt ID와 dura
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
-cargo run --locked --quiet -p xgeny-cli -- protocol check
+cargo run --locked --quiet -p xgen-cli -- protocol check
 cargo build --workspace --release --locked
 ```
 

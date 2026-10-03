@@ -5,7 +5,7 @@
 
 ## 현재 제공 범위
 
-`xgeny-provider-openai`는 synchronous `PlannerPort`를 OpenAI-compatible Chat Completions에 연결한다.
+`xgen-provider-openai`는 synchronous `PlannerPort`를 OpenAI-compatible Chat Completions에 연결한다.
 
 - immutable request profile과 digest
 - non-streaming JSON Schema request
@@ -25,7 +25,7 @@ Configured model은 provider response의 `model`과 exact match해야 한다. Al
 ## 기본 검증
 
 ```bash
-cargo test -p xgeny-provider-openai --all-targets
+cargo test -p xgen-provider-openai --all-targets
 cargo test --workspace --locked
 ```
 
@@ -60,17 +60,17 @@ ssh -N -L 18000:127.0.0.1:8000 go50902
 그다음 repository root에서 opt-in test를 실행한다.
 
 ```bash
-XGENY_LIVE_OPENAI_BASE_URL=http://127.0.0.1:18000/v1 \
-XGENY_LIVE_OPENAI_MODEL=qwen3.8-27b \
-XGENY_LIVE_OPENAI_TOKENIZER=Qwen/Qwen3.8-27B-FP8 \
-cargo test -p xgeny-provider-openai \
+XGEN_LIVE_OPENAI_BASE_URL=http://127.0.0.1:18000/v1 \
+XGEN_LIVE_OPENAI_MODEL=qwen3.8-27b \
+XGEN_LIVE_OPENAI_TOKENIZER=Qwen/Qwen3.8-27B-FP8 \
+cargo test -p xgen-provider-openai \
   --test http_contract live_go50902_plan_smoke \
   -- --ignored --exact
 ```
 
 Live test와 `run`은 health/model-list preflight를 자동 호출하지 않는다. 한 durable reservation에
-inference POST 외의 요청을 더하지 않기 위해서다. 사용자는 그 전에 `xgeny model setup` 또는
-`xgeny model check --compatibility`를 실행할 수 있다. Setup은 catalog와 별도 probe를 확인하지만 실제
+inference POST 외의 요청을 더하지 않기 위해서다. 사용자는 그 전에 `xgen model setup` 또는
+`xgen model check --compatibility`를 실행할 수 있다. Setup은 catalog와 별도 probe를 확인하지만 실제
 planner prompt와 coding loop 품질은 첫 Run 및 live E2E가 증명한다. Endpoint나 model이 잘못됐으면 고정
 failure로 종료하고 raw response를 출력하지 않는다.
 
@@ -83,7 +83,7 @@ failure로 종료하고 raw response를 출력하지 않는다.
 - advertised maximum model length: 524,288
 - result: structured proposal decode와 synthetic idempotent planning fixture의 Core `PlanAccepted` 성공
 
-이 smoke는 모델 연결과 계획 수락만 확인하며 실제 filesystem read/tool execution 검증이 아니다. 당시 smoke는 ReadOnly core profile 도입 전이어서 별도 synthetic idempotent fixture를 썼다. 이후 ADR-0018에서 ReadOnly와 bounded CLI driver 기반을 추가했지만 live smoke 자체를 다시 tool execution까지 확장한 것은 아니다. Advertised model length는 Run 연속성이나 실제 usable context를 보장하는 값이 아니다. XGENy는 bounded PlanningContext와 WorkGraph/journal resume를 사용하며, 장기 작업 성능은 별도 평가 프로토콜로 검증한다.
+이 smoke는 모델 연결과 계획 수락만 확인하며 실제 filesystem read/tool execution 검증이 아니다. 당시 smoke는 ReadOnly core profile 도입 전이어서 별도 synthetic idempotent fixture를 썼다. 이후 ADR-0018에서 ReadOnly와 bounded CLI driver 기반을 추가했지만 live smoke 자체를 다시 tool execution까지 확장한 것은 아니다. Advertised model length는 Run 연속성이나 실제 usable context를 보장하는 값이 아니다. XGEN는 bounded PlanningContext와 WorkGraph/journal resume를 사용하며, 장기 작업 성능은 별도 평가 프로토콜로 검증한다.
 
 ## 안전 경계
 
@@ -101,7 +101,7 @@ failure로 종료하고 raw response를 출력하지 않는다.
 
 ## 이후 연결 범위
 
-ADR-0022/0023에서 사용자용 `xgeny run/resume`, capability-confined filesystem read와 별도
+ADR-0022/0023에서 사용자용 `xgen run/resume`, capability-confined filesystem read와 별도
 model-egress/read 동의가 이 adapter에 연결됐다. 기본 CI는 loopback provider를 사용해 첫 model Plan,
 별도 process의 local read, durable ToolOutput의 두 번째 model turn 전달과 offline completion replay를
 검증한다. 실제 go50902/Qwen을 이용한 같은 2-turn public CLI 증명, process/patch/network Capability와

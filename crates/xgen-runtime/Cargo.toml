@@ -1,0 +1,28 @@
+[package]
+name = "xgen-runtime"
+description = "Deterministic Capability placement and durable effect execution/recovery kernel for XGEN"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+jsonschema.workspace = true
+serde.workspace = true
+serde_jcs.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+time.workspace = true
+xgen-domain = { path = "../xgen-domain" }
+xgen-local-store = { path = "../xgen-local-store" }
+xgen-policy = { path = "../xgen-policy" }
+xgen-protocol = { path = "../xgen-protocol" }
+xgen-workgraph = { path = "../xgen-workgraph" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

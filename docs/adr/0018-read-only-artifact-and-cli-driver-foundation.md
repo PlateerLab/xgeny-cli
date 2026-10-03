@@ -2,7 +2,7 @@
 
 - 상태: 제안 — filesystem 제품 adapter 전의 core/driver 기반 구현
 - 기준일: 2026-08-30
-- 적용 범위: WorkGraph ReadOnly 의미, Core Receipt v2, `xgeny-cli` library driver
+- 적용 범위: WorkGraph ReadOnly 의미, Core Receipt v2, `xgen-cli` library driver
 - 공개 protocol v0.1 schema 변경: 없음
 - local store schema: 6 유지
 
@@ -12,7 +12,7 @@
 
 ## 문맥
 
-ADR-0017은 실제 OpenAI-compatible 모델이 durable reservation 하나에 proposal 요청을 한 번만 보내고 `PlanAccepted`까지 도달하는 경계를 닫았다. 그 다음 단계에서 곧바로 사용자용 `xgeny run`과 파일 읽기를 노출하면 다음 세 가지를 사실과 다르게 주장하게 된다.
+ADR-0017은 실제 OpenAI-compatible 모델이 durable reservation 하나에 proposal 요청을 한 번만 보내고 `PlanAccepted`까지 도달하는 경계를 닫았다. 그 다음 단계에서 곧바로 사용자용 `xgen run`과 파일 읽기를 노출하면 다음 세 가지를 사실과 다르게 주장하게 된다.
 
 1. 공개 protocol의 `read_only`가 내부 WorkGraph에서 별도 의미가 아니라 거부되고 있었다.
 2. Adapter와 verifier는 digest만 전달하므로 파일 내용이 다음 planning turn으로 전달되지 않는다.
@@ -24,7 +24,7 @@ ADR-0017은 실제 OpenAI-compatible 모델이 durable reservation 하나에 pro
 
 ### 1. ReadOnly는 Idempotent의 별칭이 아니다
 
-내부 `xgeny-workgraph::EffectClass`에 `ReadOnly`를 추가하고 wire spelling을 `read_only`로 고정한다. 계획 binding은 effectful local sync profile과 별도로 `LocalSyncReadOnlyV1`을 사용한다.
+내부 `xgen-workgraph::EffectClass`에 `ReadOnly`를 추가하고 wire spelling을 `read_only`로 고정한다. 계획 binding은 effectful local sync profile과 별도로 `LocalSyncReadOnlyV1`을 사용한다.
 
 | 계획 profile | 허용 effect | idempotency key | sink guarantee |
 |---|---|---|---|
@@ -60,7 +60,7 @@ trusted verifier
   output digest + bounded artifact descriptors
                      |
                      v
-XGENy Core
+XGEN Core
   receipt ID + Run/Step/Receipt provenance
                      |
                      v
@@ -79,7 +79,7 @@ Receipt `outputDigest`와 각 Artifact digest는 서로 다른 commitment가 될
 
 ### 3. Driver는 기존 권위를 조합할 뿐 새 권위를 만들지 않는다
 
-`xgeny-cli`에 library target과 bounded `RunDriver::drive_until_pause`를 추가하되 binary command로 노출하지 않는다.
+`xgen-cli`에 library target과 bounded `RunDriver::drive_until_pause`를 추가하되 binary command로 노출하지 않는다.
 
 ```text
 RunDriver
@@ -134,7 +134,7 @@ SQLite Run
 
 ## 제품 filesystem 경로의 후속 단계
 
-Public `xgeny run`을 열기 전 필요한 계약은 한 PR에 묶지 않고 다음 검증 단위로 나눈다.
+Public `xgen run`을 열기 전 필요한 계약은 한 PR에 묶지 않고 다음 검증 단위로 나눈다.
 
 ### A. output durability
 
@@ -146,7 +146,7 @@ Public `xgeny run`을 열기 전 필요한 계약은 한 PR에 묶지 않고 다
 
 ### B. filesystem confinement
 
-1. `xgeny-adapter-filesystem` leaf crate와 한 개의 bounded UTF-8 read contract
+1. `xgen-adapter-filesystem` leaf crate와 한 개의 bounded UTF-8 read contract
 2. trusted composition root가 한 번 여는 workspace directory capability
 3. descriptor-relative component traversal, intermediate/leaf no-follow와 regular-file 검사
 4. empty/absolute/parent/NUL/control/backslash/colon·ADS/Windows device name 거부
@@ -182,7 +182,7 @@ Hard link, mount/bind mount, FUSE/network filesystem, hostile same-UID process, 
 
 ## 비목표
 
-- 사용자용 `xgeny run` command
+- 사용자용 `xgen run` command
 - legacy/unplanned direct ReadOnly Admission
 - 실제 workspace filesystem open/read
 - typed output body와 Artifact content store
@@ -196,4 +196,4 @@ Hard link, mount/bind mount, FUSE/network filesystem, hostile same-UID process, 
 
 ## 결과
 
-XGENy는 planned ReadOnly를 effectful idempotency로 위장하지 않고, 기존 v1 Receipt 의미를 깨지 않으면서 artifact-bearing Receipt를 만들 수 있다. CLI composition은 한 bounded driver로 정리됐지만 제품 파일 읽기와 모델 연속성은 아직 열지 않는다. 다음 구현은 먼저 schema 7 output/completion durability를 닫고, 그다음 filesystem confinement, public composition 순으로 진행한다.
+XGEN는 planned ReadOnly를 effectful idempotency로 위장하지 않고, 기존 v1 Receipt 의미를 깨지 않으면서 artifact-bearing Receipt를 만들 수 있다. CLI composition은 한 bounded driver로 정리됐지만 제품 파일 읽기와 모델 연속성은 아직 열지 않는다. 다음 구현은 먼저 schema 7 output/completion durability를 닫고, 그다음 filesystem confinement, public composition 순으로 진행한다.

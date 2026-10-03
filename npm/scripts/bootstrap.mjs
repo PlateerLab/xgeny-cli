@@ -31,10 +31,10 @@ function manifest(name, specification) {
   return {
     name,
     version: bootstrapVersion,
-    description: 'Non-executable package-name bootstrap for the XGENy npm distribution',
+    description: 'Non-executable package-name bootstrap for the XGEN npm distribution',
     license: 'Apache-2.0',
     repository: { type: 'git', url: repositoryUrl },
-    homepage: 'https://github.com/PlateerLab/xgeny-cli#readme',
+    homepage: 'https://github.com/PlateerLab/xgen-cli#readme',
     engines: { node: nodeEngine },
     ...(specification ? { os: [specification.os], cpu: [specification.cpu] } : {}),
     files: ['README.md', 'LICENSE'],
@@ -53,7 +53,7 @@ async function pack(outputDirectory, name, specification, outputName) {
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
   }
-  const temporary = await mkdtemp(path.join(outputDirectory, '.xgeny-npm-bootstrap.'));
+  const temporary = await mkdtemp(path.join(outputDirectory, '.xgen-npm-bootstrap.'));
   try {
     const stage = path.join(temporary, 'package');
     const packed = path.join(temporary, 'packed');
@@ -67,7 +67,7 @@ async function pack(outputDirectory, name, specification, outputName) {
       path.join(stage, 'README.md'),
       `# \`${name}\` bootstrap\n\n` +
         'This non-executable version only creates the public package name before the first ' +
-        'XGENy npm release. Install a later Developer Preview version instead.\n',
+        'XGEN npm release. Install a later Developer Preview version instead.\n',
       'utf8',
     );
     await copyFile(path.join(repoRoot, 'LICENSE'), path.join(stage, 'LICENSE'));

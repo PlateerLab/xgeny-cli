@@ -16,7 +16,7 @@ For a newly rejected proposal in headless `run`/`resume`, optionally emit one
 additional bounded stderr line (the REPL display is unchanged):
 
 ```text
-XGENY_INVOCATION_DIAGNOSTIC run_id=RUN version=1 category=CATEGORY field=FIELD
+XGEN_INVOCATION_DIAGNOSTIC run_id=RUN version=1 category=CATEGORY field=FIELD
 ```
 
 Both CATEGORY and FIELD are fixed allowlisted constants, never error formatting.

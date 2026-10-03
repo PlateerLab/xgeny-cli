@@ -1,6 +1,6 @@
 # Rust 워크스페이스 개발 환경
 
-이 문서는 XGENy 코어와 프로토콜 검증 기반을 같은 조건으로 재현하기 위한 최소 절차다.
+이 문서는 XGEN 코어와 프로토콜 검증 기반을 같은 조건으로 재현하기 위한 최소 절차다.
 
 ## 범위
 
@@ -8,20 +8,20 @@
 
 ```text
 crates/
-  xgeny-adapter-reference/ publish하지 않는 preopened-handle conformance 기준
-  xgeny-adapter-filesystem/ capability-confined workspace read/list/stat/search/write/patch 제품 adapter
-  xgeny-adapter-process/ shell-free bounded process execute 제품 adapter
-  xgeny-domain/       I/O 없는 정본 Rust 프로토콜 타입
-  xgeny-protocol/     bundled/offline schema·fixture·digest 검증
-  xgeny-workgraph/    model-free RunEvent 상태 전이·재생 실험
-  xgeny-local-store/  메모리 참조 구현과 embedded SQLite 후보
-  xgeny-policy/       concrete resource 해석 경계와 순수 정책 교집합
-  xgeny-runtime/      durable effect 실행·복구와 Capability Registry·Router 기본형
-  xgeny-provider-openai/ OpenAI-compatible 단일 요청 planner leaf adapter
-  xgeny-cli/          protocol check와 public local run/resume를 제공하는 실행 파일·driver library
+  xgen-adapter-reference/ publish하지 않는 preopened-handle conformance 기준
+  xgen-adapter-filesystem/ capability-confined workspace read/list/stat/search/write/patch 제품 adapter
+  xgen-adapter-process/ shell-free bounded process execute 제품 adapter
+  xgen-domain/       I/O 없는 정본 Rust 프로토콜 타입
+  xgen-protocol/     bundled/offline schema·fixture·digest 검증
+  xgen-workgraph/    model-free RunEvent 상태 전이·재생 실험
+  xgen-local-store/  메모리 참조 구현과 embedded SQLite 후보
+  xgen-policy/       concrete resource 해석 경계와 순수 정책 교집합
+  xgen-runtime/      durable effect 실행·복구와 Capability Registry·Router 기본형
+  xgen-provider-openai/ OpenAI-compatible 단일 요청 planner leaf adapter
+  xgen-cli/          protocol check와 public local run/resume를 제공하는 실행 파일·driver library
 ```
 
-`xgeny-workgraph`, `xgeny-local-store`, `xgeny-runtime`의 durable effect, invocation material, Direct Executor, Core verification, VerifiedRunIndex, Persistent dependency frontier, bounded AgentLoop와 model-call lifecycle 계약은 ADR-0008·0010·0011·0012·0013·0014·0015·0016 연구 gate를 위한 내부 실험이다. ADR-0018은 내부 ReadOnly profile, Artifact-bearing Core Receipt v2와 기존 구성요소를 조합하는 bounded CLI library driver를 추가했다. ADR-0019는 event-anchored `ToolOutputRecord`와 SQLite physical schema 7을 추가했고, ADR-0020·0021은 generation-checked planning context와 durable completion을 schema 8에 연결했다. Registry와 Router는 기존 Definition/Instance를 사용한다. `xgeny-policy`의 Allow는 provisional이며 runtime Admission이 exact invocation의 one-shot authority를 Run/Step/action/Instance/material에 결합한다. `xgeny-adapter-reference`는 비제품 conformance 기준이다. 제품 `xgeny-adapter-filesystem`은 exact-file `read-text`와 opt-in directory `list-directory`·`stat`·`search-text`·`write-atomic`·`apply-patch`를 제공한다. `xgeny-adapter-process`는 host-catalogued executable을 shell 없이 bounded 실행한다. Public CLI는 기존 `--allow-file` profile을 보존하면서 `--allow-dir` discovery, 별도 `--allow-write` atomic mutation과 별도 `--allow-execute` process 승인을 제공한다. Bare `xgeny` REPL은 이 composition을 재사용해 interactive 승인, durable progress와 재개를 제공한다. Network adapter, MCP, Connector와 XGEN 원격 연동은 아직 구현하지 않는다.
+`xgen-workgraph`, `xgen-local-store`, `xgen-runtime`의 durable effect, invocation material, Direct Executor, Core verification, VerifiedRunIndex, Persistent dependency frontier, bounded AgentLoop와 model-call lifecycle 계약은 ADR-0008·0010·0011·0012·0013·0014·0015·0016 연구 gate를 위한 내부 실험이다. ADR-0018은 내부 ReadOnly profile, Artifact-bearing Core Receipt v2와 기존 구성요소를 조합하는 bounded CLI library driver를 추가했다. ADR-0019는 event-anchored `ToolOutputRecord`와 SQLite physical schema 7을 추가했고, ADR-0020·0021은 generation-checked planning context와 durable completion을 schema 8에 연결했다. Registry와 Router는 기존 Definition/Instance를 사용한다. `xgen-policy`의 Allow는 provisional이며 runtime Admission이 exact invocation의 one-shot authority를 Run/Step/action/Instance/material에 결합한다. `xgen-adapter-reference`는 비제품 conformance 기준이다. 제품 `xgen-adapter-filesystem`은 exact-file `read-text`와 opt-in directory `list-directory`·`stat`·`search-text`·`write-atomic`·`apply-patch`를 제공한다. `xgen-adapter-process`는 host-catalogued executable을 shell 없이 bounded 실행한다. Public CLI는 기존 `--allow-file` profile을 보존하면서 `--allow-dir` discovery, 별도 `--allow-write` atomic mutation과 별도 `--allow-execute` process 승인을 제공한다. Bare `xgen` REPL은 이 composition을 재사용해 interactive 승인, durable progress와 재개를 제공한다. Network adapter, MCP, Connector와 XGEN 원격 연동은 아직 구현하지 않는다.
 
 ## 준비물
 
@@ -29,7 +29,7 @@ crates/
 - [rustup](https://rustup.rs/)
 - 소스에서 전체 workspace를 빌드할 때 필요한 플랫폼 C build toolchain
 
-저장소의 `rust-toolchain.toml`이 Rust 1.98.0과 `rustfmt`, `clippy`를 고정한다. `rusqlite`의 `bundled` 기능이 SQLite C source를 Rust build에 함께 링크하므로 소스 빌드에는 Linux C compiler, macOS Command Line Tools 또는 Windows MSVC Build Tools가 필요하다. Public `xgeny run/resume` binary는 이 embedded store를 연결하므로 최종 사용자에게 SQLite 실행 파일, DB server 또는 daemon 설치를 요구하지 않는다. PostgreSQL, MinIO, Docker, Kubernetes, Python, Node.js도 기본 실행 의존성이 아니다.
+저장소의 `rust-toolchain.toml`이 Rust 1.98.0과 `rustfmt`, `clippy`를 고정한다. `rusqlite`의 `bundled` 기능이 SQLite C source를 Rust build에 함께 링크하므로 소스 빌드에는 Linux C compiler, macOS Command Line Tools 또는 Windows MSVC Build Tools가 필요하다. Public `xgen run/resume` binary는 이 embedded store를 연결하므로 최종 사용자에게 SQLite 실행 파일, DB server 또는 daemon 설치를 요구하지 않는다. PostgreSQL, MinIO, Docker, Kubernetes, Python, Node.js도 기본 실행 의존성이 아니다.
 
 ## 현재 durable slice 검증 범위
 
@@ -131,11 +131,11 @@ actual OS resource resolver, 사용자용 adapter, sandbox, sealed secret/argume
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
-cargo run --locked --quiet -p xgeny-cli -- protocol check
-cargo build --locked --release -p xgeny-cli
+cargo run --locked --quiet -p xgen-cli -- protocol check
+cargo build --locked --release -p xgen-cli
 ```
 
-마지막 명령의 산출물은 Linux/macOS에서 `target/release/xgeny`, Windows에서 `target/release/xgeny.exe`다.
+마지막 명령의 산출물은 Linux/macOS에서 `target/release/xgen`, Windows에서 `target/release/xgen.exe`다.
 
 `protocol check`는 다음을 검사한다.
 

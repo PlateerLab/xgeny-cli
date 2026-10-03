@@ -1,11 +1,11 @@
 # npm granular token 게시와 provenance 운영
 
-`@xgen/cli`는 native XGENy를 npm으로 설치하기 위한 선택형 배포 계층이다. 직접 GitHub installer를 쓰는
+`@xgen/cli`는 native XGEN를 npm으로 설치하기 위한 선택형 배포 계층이다. 직접 GitHub installer를 쓰는
 사용자는 Node.js가 필요 없고, npm 경로를 고른 사용자는 Node.js 22.14 이상이 필요하다. 두 경로는 같은
 release binary를 실행한다.
 
 이 package 이름은 설치 entrypoint를 뜻하며 화면 구현을 뜻하지 않는다. 현재 가벼운 REPL이나 향후 같은
-`xgeny` binary에 포함될 TUI는 동일한 `@xgen/cli`로 배포할 수 있다. TUI를 별도 제품·release cadence로
+`xgen` binary에 포함될 TUI는 동일한 `@xgen/cli`로 배포할 수 있다. TUI를 별도 제품·release cadence로
 분리할 때만 별도 package naming ADR을 먼저 작성한다.
 
 ## Package 구성
@@ -37,7 +37,7 @@ compile은 없다. Launcher는 현재 platform package가 없으면 종료한다
 
 ```bash
 npm ci --ignore-scripts --prefix npm
-bootstrap_dir=$(mktemp -d "${TMPDIR:-/tmp}/xgeny-npm-bootstrap.XXXXXX")
+bootstrap_dir=$(mktemp -d "${TMPDIR:-/tmp}/xgen-npm-bootstrap.XXXXXX")
 node npm/scripts/bootstrap.mjs --output-dir "$bootstrap_dir"
 ```
 
@@ -49,7 +49,7 @@ node npm/scripts/bootstrap.mjs --output-dir "$bootstrap_dir"
    않는다. Bootstrap에는 실행 파일과 `bin` entry가 없고 GitHub provenance가 없는 package-name 예약용
    version이다.
 6. GitHub repository secret `NPM_TOKEN`이 설정된 것을 확인한 뒤 repository variable
-   `XGENY_NPM_PUBLISH_ENABLED=true`를 설정한다. 이 값은 token의 scope, write 권한과 `bypass 2FA`를 사람이
+   `XGEN_NPM_PUBLISH_ENABLED=true`를 설정한다. 이 값은 token의 scope, write 권한과 `bypass 2FA`를 사람이
    확인했다는 fail-closed acknowledgement다.
 7. RC3 게시와 검증이 끝나면 bootstrap version을 deprecated 처리한다. Package 자체는 unpublish하지
    않는다.

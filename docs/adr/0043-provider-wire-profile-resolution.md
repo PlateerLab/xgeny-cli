@@ -8,7 +8,7 @@
 
 CLI integration of the provider modes defined in ADR-0042.
 
-Keep all planning inside the existing XGENy provider → validated proposal → journal → capability
+Keep all planning inside the existing XGEN provider → validated proposal → journal → capability
 flow. Do not bypass the harness or infer behavior from an endpoint hostname or a model ID.
 
 `model setup`, `model check`, `run`, and `resume` accept two non-secret options:
@@ -16,8 +16,8 @@ flow. Do not bypass the harness or infer behavior from an endpoint hostname or a
 - `--response-format json_schema|json_object` (default `json_schema`)
 - `--thinking default|disabled|enabled` (default `default`, which omits the provider extension)
 
-Resolve each field in order: explicit option, `XGENY_OPENAI_RESPONSE_FORMAT` /
-`XGENY_OPENAI_THINKING`, selected profile, default. Invalid values fail closed; there is no automatic
+Resolve each field in order: explicit option, `XGEN_OPENAI_RESPONSE_FORMAT` /
+`XGEN_OPENAI_THINKING`, selected profile, default. Invalid values fail closed; there is no automatic
 fallback after provider rejection. Profiles persist `responseFormat` and `thinking` with serde defaults,
 so pre-existing format-v1 files still load with the original wire behavior and request digest.
 
@@ -45,11 +45,11 @@ model-call recovery, and capability permissions are unchanged. No token is store
 Use an ephemeral environment credential or `--token-stdin`, never an argument containing a key:
 
 ```sh
-xgeny model setup --name fast --base-url https://api.deepseek.com/v1 \
+xgen model setup --name fast --base-url https://api.deepseek.com/v1 \
   --model deepseek-chat --response-format json_object --thinking disabled
-xgeny model check --profile fast --compatibility
-xgeny run --profile fast --allow-dir . --allow-remote-model-egress 'Inspect this workspace'
-xgeny resume RUN_ID --profile fast --allow-dir . --allow-remote-model-egress
+xgen model check --profile fast --compatibility
+xgen run --profile fast --allow-dir . --allow-remote-model-egress 'Inspect this workspace'
+xgen resume RUN_ID --profile fast --allow-dir . --allow-remote-model-egress
 ```
 
 The endpoint/model above is an example, not a default or a tested live-service claim. A caller must

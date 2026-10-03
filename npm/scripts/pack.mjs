@@ -47,7 +47,7 @@ function parseArguments(argv) {
 
 function platformReadme(specification, version) {
   return `# \`${specification.packageName}\`\n\n` +
-    `Native XGENy CLI ${version} binary for \`${specification.target}\`.\n\n` +
+    `Native XGEN CLI ${version} binary for \`${specification.target}\`.\n\n` +
     'This package is an exact-version optional dependency of `@xgen/cli`. ' +
     'Install the launcher package instead of installing this package directly. ' +
     'It contains no install lifecycle scripts and performs no network download.\n';
@@ -56,7 +56,7 @@ function platformReadme(specification, version) {
 async function stageLauncher(stage) {
   await cp(launcherRoot, stage, { recursive: true, errorOnExist: true });
   await copyFile(path.join(repoRoot, 'LICENSE'), path.join(stage, 'LICENSE'));
-  await chmod(path.join(stage, 'bin', 'xgeny.cjs'), 0o755);
+  await chmod(path.join(stage, 'bin', 'xgen.cjs'), 0o755);
 }
 
 async function stagePlatform(stage, specification, version, binary) {
@@ -72,7 +72,7 @@ async function stagePlatform(stage, specification, version, binary) {
   await writeFile(path.join(stage, 'README.md'), platformReadme(specification, version), 'utf8');
   await copyFile(path.join(repoRoot, 'LICENSE'), path.join(stage, 'LICENSE'));
   await copyFile(
-    path.join(repoRoot, 'crates', 'xgeny-cli', 'licenses', 'NATIVE_RUNTIME_PROVENANCE.md'),
+    path.join(repoRoot, 'crates', 'xgen-cli', 'licenses', 'NATIVE_RUNTIME_PROVENANCE.md'),
     path.join(stage, 'NATIVE_RUNTIME_PROVENANCE.md'),
   );
   await copyFile(
@@ -103,7 +103,7 @@ async function main() {
     if (error.code !== 'ENOENT') throw error;
   }
 
-  const temporary = await mkdtemp(path.join(outputDirectory, '.xgeny-npm-pack.'));
+  const temporary = await mkdtemp(path.join(outputDirectory, '.xgen-npm-pack.'));
   try {
     const stage = path.join(temporary, 'package');
     const packed = path.join(temporary, 'packed');

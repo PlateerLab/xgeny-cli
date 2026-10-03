@@ -1,0 +1,28 @@
+[package]
+name = "xgen-adapter-filesystem"
+description = "Capability-confined local filesystem adapters for XGEN"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+cap-fs-ext.workspace = true
+cap-std.workspace = true
+getrandom.workspace = true
+serde_json.workspace = true
+serde_jcs.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+xgen-domain = { path = "../xgen-domain" }
+xgen-policy = { path = "../xgen-policy" }
+xgen-runtime = { path = "../xgen-runtime" }
+xgen-workgraph = { path = "../xgen-workgraph" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

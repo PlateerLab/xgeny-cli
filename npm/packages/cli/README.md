@@ -1,10 +1,10 @@
 # `@xgen/cli`
 
-`@xgen/cli` is the npm distribution wrapper for the native XGENy CLI.
+`@xgen/cli` is the npm distribution wrapper for the native XGEN CLI.
 
 ```bash
 npm install --global @xgen/cli@0.1.0-rc.3
-xgeny --version
+xgen --version
 ```
 
 The package selects one exact-version, platform-specific optional dependency and executes the
@@ -13,5 +13,5 @@ install lifecycle script. Installing with `--omit=optional` is unsupported becau
 native binary package.
 
 The native binary can also be installed without Node.js from the matching GitHub Release. See the
-[XGENy repository](https://github.com/PlateerLab/xgeny-cli) for model onboarding and security
+[XGEN repository](https://github.com/PlateerLab/xgen-cli) for model onboarding and security
 boundaries.

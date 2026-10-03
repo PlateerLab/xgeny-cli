@@ -55,7 +55,7 @@ function Invoke-InteractiveSmoke([string]$Executable) {
 $Binary = (Resolve-Path -LiteralPath $Binary).Path
 $Installer = (Resolve-Path -LiteralPath $Installer).Path
 $ReportedVersion = (& $Binary --version | Out-String).Trim()
-if ($LASTEXITCODE -ne 0 -or $ReportedVersion -notmatch '^xgeny (.+)$') {
+if ($LASTEXITCODE -ne 0 -or $ReportedVersion -notmatch '^xgen (.+)$') {
     throw "binary version output is invalid"
 }
 $PackageVersion = $Matches[1]
@@ -64,7 +64,7 @@ if ($Tag -notmatch $SemVerTagPattern) {
     throw "binary version is not SemVer"
 }
 
-$TestRoot = Join-Path ([System.IO.Path]::GetTempPath()) "xgeny-installer-smoke-$([Guid]::NewGuid().ToString('N'))"
+$TestRoot = Join-Path ([System.IO.Path]::GetTempPath()) "xgen-installer-smoke-$([Guid]::NewGuid().ToString('N'))"
 $ServerRoot = Join-Path $TestRoot "server"
 $ReleaseRoot = Join-Path $ServerRoot $Tag
 $InstallRoot = Join-Path $TestRoot "install"
@@ -77,10 +77,10 @@ Set-Content -NoNewline -Encoding ascii -LiteralPath (Join-Path $ReleaseRoot "che
 
 $Port = 38191
 $Server = $null
-$PreviousTesting = $env:XGENY_INSTALLER_TESTING
-$PreviousBase = $env:XGENY_DOWNLOAD_BASE_URL
-$PreviousInstall = $env:XGENY_INSTALL_DIR
-$PreviousState = $env:XGENY_STATE_HOME
+$PreviousTesting = $env:XGEN_INSTALLER_TESTING
+$PreviousBase = $env:XGEN_DOWNLOAD_BASE_URL
+$PreviousInstall = $env:XGEN_INSTALL_DIR
+$PreviousState = $env:XGEN_STATE_HOME
 try {
     $Server = Start-Process -FilePath "python" -ArgumentList @(
         "-m", "http.server", "$Port", "--bind", "127.0.0.1"
@@ -100,10 +100,10 @@ try {
         throw "loopback fixture server did not start"
     }
 
-    $env:XGENY_INSTALLER_TESTING = "1"
-    $env:XGENY_DOWNLOAD_BASE_URL = "http://127.0.0.1:$Port"
-    $env:XGENY_INSTALL_DIR = $InstallRoot
-    $env:XGENY_STATE_HOME = $UnexpectedState
+    $env:XGEN_INSTALLER_TESTING = "1"
+    $env:XGEN_DOWNLOAD_BASE_URL = "http://127.0.0.1:$Port"
+    $env:XGEN_INSTALL_DIR = $InstallRoot
+    $env:XGEN_STATE_HOME = $UnexpectedState
 
     $InvalidSemVerRejected = $false
     try {
@@ -143,7 +143,7 @@ try {
 
     & $Installer -Version $Tag -InstallDir $InstallRoot | Out-Null
 
-    $Installed = Join-Path $InstallRoot "xgeny.exe"
+    $Installed = Join-Path $InstallRoot "xgen.exe"
     $InstalledItem = Get-Item -Force -LiteralPath $Installed
     if ($InstalledItem.PSIsContainer) {
         throw "installer did not create one regular binary"
@@ -193,7 +193,7 @@ try {
 
     & $Installer -Version $Tag -InstallDir $InstallRoot | Out-Null
     $InstallEntries = @(Get-ChildItem -Force -LiteralPath $InstallRoot)
-    if ($InstallEntries.Count -ne 1 -or $InstallEntries[0].Name -ne "xgeny.exe") {
+    if ($InstallEntries.Count -ne 1 -or $InstallEntries[0].Name -ne "xgen.exe") {
         throw "installer left temporary or backup files after upgrade"
     }
     $ObservedInstalledVersion = (& $Installed --version | Out-String).Trim()
@@ -205,7 +205,7 @@ try {
         throw "installed protocol check failed"
     }
     $InteractiveResult = Invoke-InteractiveSmoke $Installed
-    $InteractiveBannerPresent = $InteractiveResult.StandardOutput.Contains("XGENy Developer Preview")
+    $InteractiveBannerPresent = $InteractiveResult.StandardOutput.Contains("XGEN Developer Preview")
     $InteractiveStatusPresent = $InteractiveResult.StandardOutput.Contains("status: idle")
     $InteractiveExitPresent = $InteractiveResult.StandardOutput.Contains("bye")
     if (
@@ -227,7 +227,7 @@ try {
     $LicenseOutput = (& $Installed licenses | Out-String)
     if (
         $LASTEXITCODE -ne 0 -or
-        -not $LicenseOutput.Contains("XGENy CLI Third-Party License Notices") -or
+        -not $LicenseOutput.Contains("XGEN CLI Third-Party License Notices") -or
         -not $LicenseOutput.Contains("Copyright notices for The Rust Standard Library") -or
         -not $LicenseOutput.Contains("===== musl C runtime notices =====") -or
         -not $LicenseOutput.Contains("===== LLVM libunwind notices =====")
@@ -255,10 +255,10 @@ try {
     Remove-Item -Recurse -Force -LiteralPath $Installed
     Write-Output "installer smoke passed for $Asset"
 } finally {
-    $env:XGENY_INSTALLER_TESTING = $PreviousTesting
-    $env:XGENY_DOWNLOAD_BASE_URL = $PreviousBase
-    $env:XGENY_INSTALL_DIR = $PreviousInstall
-    $env:XGENY_STATE_HOME = $PreviousState
+    $env:XGEN_INSTALLER_TESTING = $PreviousTesting
+    $env:XGEN_DOWNLOAD_BASE_URL = $PreviousBase
+    $env:XGEN_INSTALL_DIR = $PreviousInstall
+    $env:XGEN_STATE_HOME = $PreviousState
     if ($null -ne $Server -and -not $Server.HasExited) {
         Stop-Process -Id $Server.Id -Force
         $Server.WaitForExit()

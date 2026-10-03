@@ -41,7 +41,7 @@ package의 registry metadata에서 provenance predicate, local tarball SRI와 di
 마지막 순서로 게시한다. 실제 `0.1.0-rc.3`은 immutable GitHub Release bundle을 유일한 입력으로 사용한다.
 이미 존재하는 version은 SRI, dist-tag와 provenance가 모두 같을 때만 재실행에서 건너뛴다.
 
-Repository variable `XGENY_NPM_PUBLISH_ENABLED=true`는 token의 scope, write 권한과 `bypass 2FA`를 관리자가
+Repository variable `XGEN_NPM_PUBLISH_ENABLED=true`는 token의 scope, write 권한과 `bypass 2FA`를 관리자가
 확인했다는 acknowledgement다. Variable이 없거나 secret이 비어 있으면 release는 fail-closed한다.
 
 ## 결과

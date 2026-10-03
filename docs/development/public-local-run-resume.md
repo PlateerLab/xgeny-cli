@@ -10,16 +10,16 @@ workspace mode는 `list-directory`, `stat`, `search-text`, `read-text`, `write-a
 ## 실행
 
 SQLite 실행 파일이나 server는 필요 없다. 기본 state 위치 대신 격리된 위치를 쓰려면
-`XGENY_STATE_HOME`을 설정한다. Model profile 저장소는 별도의 `XGENY_CONFIG_HOME`을 따르며 `XGENY_STATE_HOME`의
+`XGEN_STATE_HOME`을 설정한다. Model profile 저장소는 별도의 `XGEN_CONFIG_HOME`을 따르며 `XGEN_STATE_HOME`의
 영향을 받지 않는다. API token이 필요한 HTTPS endpoint만
-`XGENY_OPENAI_API_KEY`를 사용한다. token을 CLI argument로 전달하지 않는다. 반복 입력을 줄이려면
-base URL, model과 tokenizer identity를 각각 `XGENY_OPENAI_BASE_URL`, `XGENY_OPENAI_MODEL`,
-`XGENY_OPENAI_TOKENIZER`에 둘 수 있다. Tokenizer를 생략하면 model ID를 같은 identity로 사용한다. Planner 호출의 wall-clock 예산과 출력 token 예산은 활성 프로필의 값(ADR-0035, 기본 300초·1024 token)을 따르며 `XGENY_OPENAI_INFERENCE_TIMEOUT`, `XGENY_OPENAI_MAX_OUTPUT_TOKENS`로 덮어쓸 수 있다. 두 값은 request profile digest에 들어가므로 Run 시작과 resume 사이에 바꾸면 `configuration_mismatch`가 된다.
+`XGEN_OPENAI_API_KEY`를 사용한다. token을 CLI argument로 전달하지 않는다. 반복 입력을 줄이려면
+base URL, model과 tokenizer identity를 각각 `XGEN_OPENAI_BASE_URL`, `XGEN_OPENAI_MODEL`,
+`XGEN_OPENAI_TOKENIZER`에 둘 수 있다. Tokenizer를 생략하면 model ID를 같은 identity로 사용한다. Planner 호출의 wall-clock 예산과 출력 token 예산은 활성 프로필의 값(ADR-0035, 기본 300초·1024 token)을 따르며 `XGEN_OPENAI_INFERENCE_TIMEOUT`, `XGEN_OPENAI_MAX_OUTPUT_TOKENS`로 덮어쓸 수 있다. 두 값은 request profile digest에 들어가므로 Run 시작과 resume 사이에 바꾸면 `configuration_mismatch`가 된다.
 
 처음 연결하는 endpoint는 Run state를 만들기 전에 catalog 조회로 확인할 수 있다.
 
 ```bash
-xgeny model check
+xgen model check
 ```
 
 이 명령 자체가 현재 endpoint로 보내는 `GET /v1/models` 1회의 명시적 사용자 요청이다. Prompt와
@@ -27,12 +27,12 @@ inference는 보내지 않으며 `run`/`resume`이 이를 자동 호출하지 �
 뜻하고 strict structured generation은 첫 durable model call이 검증한다.
 
 ```bash
-export XGENY_STATE_HOME=/absolute/private/xgeny-state
-export XGENY_OPENAI_BASE_URL=http://127.0.0.1:18000/v1
-export XGENY_OPENAI_MODEL=qwen3.8-27b
-export XGENY_OPENAI_TOKENIZER=Qwen/Qwen3.8-27B-FP8
+export XGEN_STATE_HOME=/absolute/private/xgen-state
+export XGEN_OPENAI_BASE_URL=http://127.0.0.1:18000/v1
+export XGEN_OPENAI_MODEL=qwen3.8-27b
+export XGEN_OPENAI_TOKENIZER=Qwen/Qwen3.8-27B-FP8
 
-xgeny run \
+xgen run \
   --workspace /absolute/workspace \
   --planner-id xgeny.live.go50902 \
   --allow-file README.md \
@@ -44,7 +44,7 @@ xgeny run \
 프로젝트를 스스로 탐색하게 하려면 directory 권한을 별도로 지정한다.
 
 ```bash
-xgeny run \
+xgen run \
   --workspace /absolute/workspace \
   --planner-id xgeny.live.go50902 \
   --allow-dir . \
@@ -75,7 +75,7 @@ RC3의 chronological PlanningContext v3는 새 immutable request-profile digest�
 offline replay는 provider profile을 재구성하지 않으므로 계속 가능하다.
 
 ```bash
-xgeny resume run-0123456789abcdef0123456789abcdef \
+xgen resume run-0123456789abcdef0123456789abcdef \
   --workspace /absolute/workspace \
   --base-url http://127.0.0.1:18000/v1 \
   --allow-file README.md \
@@ -86,7 +86,7 @@ xgeny resume run-0123456789abcdef0123456789abcdef \
 Discovery Run도 원래와 동일한 directory/file catalog를 제공한다.
 
 ```bash
-xgeny resume run-0123456789abcdef0123456789abcdef \
+xgen resume run-0123456789abcdef0123456789abcdef \
   --workspace /absolute/workspace \
   --base-url http://127.0.0.1:18000/v1 \
   --allow-dir . \
@@ -97,7 +97,7 @@ xgeny resume run-0123456789abcdef0123456789abcdef \
 완료된 Run은 provider와 workspace가 없어도 재생한다.
 
 ```bash
-xgeny resume run-0123456789abcdef0123456789abcdef
+xgen resume run-0123456789abcdef0123456789abcdef
 ```
 
 `--max-ticks`는 한 process가 수행하는 coordination work만 제한한다. Durable model/tool 예산은
@@ -107,7 +107,7 @@ manifest에 별도로 고정된다. 테스트에서 `--max-ticks 6`을 쓰면 To
 읽기 승인을 모델 전송과 분리하려면 provider option 없이 local frontier만 진행할 수 있다.
 
 ```bash
-xgeny resume run-0123456789abcdef0123456789abcdef \
+xgen resume run-0123456789abcdef0123456789abcdef \
   --workspace /absolute/workspace \
   --allow-file README.md \
   --allow-read
@@ -122,15 +122,15 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 cargo build --workspace --release --locked
-cargo run --locked --quiet -p xgeny-cli -- protocol check
+cargo run --locked --quiet -p xgen-cli -- protocol check
 ```
 
 핵심 process proof만 반복할 때는 다음을 사용한다.
 
 ```bash
-cargo test --locked -p xgeny-cli --test public_run_resume
-cargo test --locked -p xgeny-cli --test workspace_discovery
-cargo test --locked -p xgeny-cli --test environment_onboarding
+cargo test --locked -p xgen-cli --test public_run_resume
+cargo test --locked -p xgen-cli --test workspace_discovery
+cargo test --locked -p xgen-cli --test environment_onboarding
 ```
 
 이 세 test는 다음을 실제 child process와 loopback HTTP로 검증한다.
@@ -159,10 +159,10 @@ bounded read해 test-owned `0600` 안전 경로에 복사하고 두 tunnel이 �
 `KnownHostsCommand`, SSHFP/DNS 신뢰와 `UpdateHostKeys`도 끈다.
 
 ```bash
-XGENY_LIVE_CONFIRM=xgeny-go50902-public-cli-v1 \
-XGENY_LIVE_KNOWN_HOSTS_FILE=/absolute/path/to/dedicated_known_hosts \
-XGENY_LIVE_OPENAI_BASE_URL=http://127.0.0.1:18000/v1 \
-cargo test --locked --release -p xgeny-cli \
+XGEN_LIVE_CONFIRM=xgen-go50902-public-cli-v1 \
+XGEN_LIVE_KNOWN_HOSTS_FILE=/absolute/path/to/dedicated_known_hosts \
+XGEN_LIVE_OPENAI_BASE_URL=http://127.0.0.1:18000/v1 \
+cargo test --locked --release -p xgen-cli \
   --test live_go50902_public \
   public_cli_two_turn_read_and_offline_replay \
   -- --ignored --exact
@@ -171,7 +171,7 @@ cargo test --locked --release -p xgeny-cli \
 `--nocapture`, `--show-output`, shell tracing과 `tee`를 붙이지 않는다. Test는 매 실행마다 무작위 상대
 파일명과 파일 내용 marker를 만들고 child stdout/stderr를 메모리에만 보관한다. 상대 파일명은 첫 Plan을
 위해 goal에 포함되지만 marker는 포함되지 않는다. 실패 assertion도 endpoint, SSH forward, Run ID,
-goal, path, marker, request/response와 ToolOutput을 출력하지 않는다. `XGENY_OPENAI_API_KEY`는 public
+goal, path, marker, request/response와 ToolOutput을 출력하지 않는다. `XGEN_OPENAI_API_KEY`는 public
 child에서 제거한다. Test는 URL의 nonzero `127.0.0.1` port만 입력받아 SSH forward를
 `127.0.0.1:<port>:127.0.0.1:8000`으로 직접 구성하고 SSH target을 `go50902`로 고정한다.
 
@@ -188,10 +188,10 @@ Plan/Step/effect/Receipt/completion 각 1개, 원본 삭제 뒤 두 번째 model
 workspace만 `--allow-dir .`로 연다.
 
 ```bash
-XGENY_LIVE_CONFIRM=xgeny-go50902-workspace-discovery-v1 \
-XGENY_LIVE_KNOWN_HOSTS_FILE=/absolute/path/to/dedicated_known_hosts \
-XGENY_LIVE_OPENAI_BASE_URL=http://127.0.0.1:18000/v1 \
-cargo test --locked --release -p xgeny-cli \
+XGEN_LIVE_CONFIRM=xgen-go50902-workspace-discovery-v1 \
+XGEN_LIVE_KNOWN_HOSTS_FILE=/absolute/path/to/dedicated_known_hosts \
+XGEN_LIVE_OPENAI_BASE_URL=http://127.0.0.1:18000/v1 \
+cargo test --locked --release -p xgen-cli \
   --test live_go50902_public \
   public_cli_workspace_discovery_and_offline_replay \
   -- --ignored --exact
@@ -223,11 +223,11 @@ Developer Preview RC3의 실제 코딩 수직 슬라이스는 세 번째 확인 
 않고 logical executable ID `cargo`만 사용한다.
 
 ```bash
-XGENY_LIVE_CONFIRM=xgeny-go50902-coding-loop-v1 \
-XGENY_LIVE_KNOWN_HOSTS_FILE=/absolute/path/to/dedicated_known_hosts \
-XGENY_LIVE_OPENAI_BASE_URL=http://127.0.0.1:18000/v1 \
-XGENY_LIVE_CARGO_PATH=/absolute/path/to/cargo \
-cargo test --locked --release -p xgeny-cli \
+XGEN_LIVE_CONFIRM=xgen-go50902-coding-loop-v1 \
+XGEN_LIVE_KNOWN_HOSTS_FILE=/absolute/path/to/dedicated_known_hosts \
+XGEN_LIVE_OPENAI_BASE_URL=http://127.0.0.1:18000/v1 \
+XGEN_LIVE_CARGO_PATH=/absolute/path/to/cargo \
+cargo test --locked --release -p xgen-cli \
   --test live_go50902_public \
   public_cli_qwen_edits_fixes_and_reverifies_rust_project \
   -- --ignored --exact
@@ -322,7 +322,7 @@ model request/response와 ToolOutput 원문은 이 증거에 남기지 않았다
   취급하고 CLI status/completion 출력이나 manifest로 raw ToolOutput을 복제하지 않는다.
 - allow-file은 ambient absolute path가 아니라 workspace-relative portable path만 받는다.
 - Debug/error 출력으로 내부 path나 provider body를 내보내지 않는다.
-- `XGENY_STATE_HOME`은 넓은 기존 경로나 final symlink를 가리키면 안 되며, 기존 directory 권한을
+- `XGEN_STATE_HOME`은 넓은 기존 경로나 final symlink를 가리키면 안 되며, 기존 directory 권한을
   자동으로 바꾸지 않는다. 정상적인 OS ancestor symlink는 물리 ancestor로 고정한 뒤 새 app-owned
   suffix만 private mode로 생성한다. Windows UNC/device namespace는 거부하며, drive letter로 매핑된
   network volume은 탐지하지 못하므로 지원·검증 대상이 아니다.

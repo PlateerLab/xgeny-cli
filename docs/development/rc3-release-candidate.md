@@ -7,7 +7,7 @@
 
 ## 사용자 결과
 
-RC3 후보는 사용자가 native `xgeny` binary 하나를 설치하고 OpenAI-compatible model을 연결한 뒤 다음
+RC3 후보는 사용자가 native `xgen` binary 하나를 설치하고 OpenAI-compatible model을 연결한 뒤 다음
 코딩 loop를 수행하는 첫 Developer Preview다.
 
 ```text
@@ -20,7 +20,7 @@ workspace search/read
   -> durable completion과 offline replay
 ```
 
-Native installer 경로에서는 Rust, Node.js, Python 또는 SQLite 실행 파일이 XGENy 자체의 설치 의존성이
+Native installer 경로에서는 Rust, Node.js, Python 또는 SQLite 실행 파일이 XGEN 자체의 설치 의존성이
 아니다. npm 설치 경로만 launcher 실행을 위해 Node.js 22.14 이상이 필요하며 Rust compiler나 install
 script는 필요하지 않다. Model endpoint와 사용자가 실행하려는 compiler/test runner는 별도로 존재해야
 하며 executable absolute path를 host catalog에 명시해야 한다.
@@ -30,7 +30,7 @@ script는 필요하지 않다. Model endpoint와 사용자가 실행하려는 co
 | 영역 | RC3 후보의 보장 |
 | --- | --- |
 | 모델 연결 | OpenAI-compatible Chat Completions, exact model ID, strict structured proposal, 별도 egress 동의 |
-| 대화형 UX | bare `xgeny` REPL, multiline, durable progress, 명령·승인·재개, bounded 직전-result context |
+| 대화형 UX | bare `xgen` REPL, multiline, durable progress, 명령·승인·재개, bounded 직전-result context |
 | 파일 관찰 | exact file read 또는 bounded directory list/stat/literal search/read |
 | 파일 변경 | digest-bound `write-atomic`과 strict contextual `apply-patch`, 별도 write 동의 |
 | process | host-catalogued executable, shell 없는 cwd/argv/env, timeout, stdout/stderr byte limit, 별도 execute 동의 |
@@ -74,7 +74,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo build --workspace --release --locked
-cargo run --quiet --locked -p xgeny-cli -- protocol check
+cargo run --quiet --locked -p xgen-cli -- protocol check
 sh scripts/check-third-party-licenses.sh --check
 sh scripts/check-release-workflow.sh
 sh scripts/check-npm-distribution-workflow.sh
@@ -112,7 +112,7 @@ install smoke를 수행한다.
 ## 게시 경계
 
 이 문서를 merge하는 것만으로 release를 게시하지 않는다. Merge 뒤 npm scope/bootstrap, repository secret
-`NPM_TOKEN`과 `XGENY_NPM_PUBLISH_ENABLED=true`를 확인하고, 현재 `origin/main` head와 package version이
+`NPM_TOKEN`과 `XGEN_NPM_PUBLISH_ENABLED=true`를 확인하고, 현재 `origin/main` head와 package version이
 정확히 일치할 때 별도 보호 tag `v0.1.0-rc.3`을 만들면 release workflow가 모든 release gate를 다시
 실행한다. GitHub Release 전 실패한 tag나 asset은 이동·교체·재사용하지 않고 더 높은 새 version으로
 수정한다. Immutable GitHub Release 뒤 동일 npm bundle의 부분 실패만 SRI 검증 아래 재실행한다.

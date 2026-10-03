@@ -7,7 +7,7 @@
 ## 배경
 
 기존 공개 CLI는 `run`과 `model check`마다 base URL과 model을 argument 또는 환경변수로 공급해야 했다.
-이는 자동화에는 명시적이지만, 사용자가 설치 뒤 `xgeny`를 바로 실행하는 대화형 제품의 최초 경험으로는
+이는 자동화에는 명시적이지만, 사용자가 설치 뒤 `xgen`를 바로 실행하는 대화형 제품의 최초 경험으로는
 적합하지 않다. 반대로 API key를 일반 JSON, embedded SQLite, WorkGraph 또는 Run manifest에 저장하면
 백업·진단·도구 출력 경계에 secret이 섞인다. Linux headless server에는 데스크톱 Secret Service가 없을
 수 있으므로 보안 저장소가 없을 때의 동작도 명시해야 한다.
@@ -57,10 +57,10 @@ OS 보안 저장소가 없거나 잠겨 있으면 평문 파일, SQLite, home di
 일반 설정은 field별로 다음 순서다.
 
 1. 명시적 CLI option
-2. `XGENY_OPENAI_BASE_URL`, `XGENY_OPENAI_MODEL`, `XGENY_OPENAI_TOKENIZER`
-3. `--profile`, `XGENY_MODEL_PROFILE`, active profile
+2. `XGEN_OPENAI_BASE_URL`, `XGEN_OPENAI_MODEL`, `XGEN_OPENAI_TOKENIZER`
+3. `--profile`, `XGEN_MODEL_PROFILE`, active profile
 
-Credential은 `--token-stdin`, `XGENY_OPENAI_API_KEY`, 선택 profile의 OS 보안 entry 순서다. Stored
+Credential은 `--token-stdin`, `XGEN_OPENAI_API_KEY`, 선택 profile의 OS 보안 entry 순서다. Stored
 credential은 최종 resolved base URL이 profile의 URL과 byte-exact하게 같을 때만 사용한다. 명시적 URL
 override로 credential을 다른 host에 보내지 않는다. Plaintext HTTP는 literal loopback만 허용하며 ambient
 환경변수와 stored credential을 읽거나 전송하지 않는다. Plaintext endpoint에서 명시한 `--token-stdin`은
@@ -72,7 +72,7 @@ override로 credential을 다른 host에 보내지 않는다. Plaintext HTTP는 
 
 ### 4. 온보딩은 catalog와 실제 inference를 별도로 검증한다
 
-`xgeny model setup`은 Run state를 만들지 않고 다음 두 network request를 순서대로 수행한다.
+`xgen model setup`은 Run state를 만들지 않고 다음 두 network request를 순서대로 수행한다.
 
 1. bounded `GET /v1/models`: model 목록을 bounded하게 decode하고 duplicate/invalid ID를 거부한다.
 2. bounded `POST /v1/chat/completions`: exact model, non-streaming Chat Completions envelope와 strict

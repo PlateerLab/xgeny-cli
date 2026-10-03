@@ -10,11 +10,11 @@ const catalog = JSON.parse(
 const { resolvePlatformBinary, selectPlatform } = require('../packages/cli/lib/platform.cjs');
 
 const expected = [
-  ['linux', 'x64', '@xgen/cli-linux-x64-musl', 'bin/xgeny'],
-  ['linux', 'arm64', '@xgen/cli-linux-arm64-musl', 'bin/xgeny'],
-  ['darwin', 'x64', '@xgen/cli-darwin-x64', 'bin/xgeny'],
-  ['darwin', 'arm64', '@xgen/cli-darwin-arm64', 'bin/xgeny'],
-  ['win32', 'x64', '@xgen/cli-win32-x64', 'bin/xgeny.exe'],
+  ['linux', 'x64', '@xgen/cli-linux-x64-musl', 'bin/xgen'],
+  ['linux', 'arm64', '@xgen/cli-linux-arm64-musl', 'bin/xgen'],
+  ['darwin', 'x64', '@xgen/cli-darwin-x64', 'bin/xgen'],
+  ['darwin', 'arm64', '@xgen/cli-darwin-arm64', 'bin/xgen'],
+  ['win32', 'x64', '@xgen/cli-win32-x64', 'bin/xgen.exe'],
 ];
 
 test('platform catalog selects every supported native package exactly', () => {
@@ -29,8 +29,8 @@ test('unsupported platform fails without a fallback download', () => {
   assert.throws(
     () => selectPlatform(catalog, 'freebsd', 'x64'),
     (error) =>
-      error.code === 'XGENY_UNSUPPORTED_PLATFORM' &&
-      error.message === 'XGENy does not provide a native binary for freebsd/x64',
+      error.code === 'XGEN_UNSUPPORTED_PLATFORM' &&
+      error.message === 'XGEN does not provide a native binary for freebsd/x64',
   );
 });
 
@@ -39,10 +39,10 @@ test('native package resolution uses the exact package subpath', () => {
   const requests = [];
   const resolved = resolvePlatformBinary(selected, (request) => {
     requests.push(request);
-    return '/verified/native/xgeny';
+    return '/verified/native/xgen';
   });
-  assert.equal(resolved, '/verified/native/xgeny');
-  assert.deepEqual(requests, ['@xgen/cli-linux-x64-musl/bin/xgeny']);
+  assert.equal(resolved, '/verified/native/xgen');
+  assert.deepEqual(requests, ['@xgen/cli-linux-x64-musl/bin/xgen']);
 });
 
 test('missing optional dependency produces a bounded recovery message', () => {
@@ -55,9 +55,9 @@ test('missing optional dependency produces a bounded recovery message', () => {
         throw error;
       }),
     (error) =>
-      error.code === 'XGENY_PLATFORM_PACKAGE_MISSING' &&
+      error.code === 'XGEN_PLATFORM_PACKAGE_MISSING' &&
       error.message ===
-        'The required XGENy native package @xgen/cli-linux-x64-musl is not installed. ' +
+        'The required XGEN native package @xgen/cli-linux-x64-musl is not installed. ' +
           'Reinstall @xgen/cli without --omit=optional.' &&
       !error.message.includes('host-specific'),
   );

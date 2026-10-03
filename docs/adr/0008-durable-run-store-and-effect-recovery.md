@@ -81,7 +81,7 @@ effect_unknown
 ## 제안 물리 구조
 
 ```text
-~/.xgeny/projects/<project-id>/
+~/.xgen/projects/<project-id>/
   runs/<run-id>/
     run.db                 # 후보: event, projection, intent, receipt index
     artifacts/

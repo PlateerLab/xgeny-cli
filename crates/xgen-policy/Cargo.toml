@@ -1,0 +1,18 @@
+[package]
+name = "xgen-policy"
+description = "Pure permission resolution and policy composition kernel for XGEN"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+thiserror.workspace = true
+xgen-domain = { path = "../xgen-domain" }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

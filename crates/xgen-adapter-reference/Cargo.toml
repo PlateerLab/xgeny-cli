@@ -1,0 +1,28 @@
+[package]
+name = "xgen-adapter-reference"
+description = "Non-production preopened-handle reference adapter for XGEN conformance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_jcs.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+xgen-domain = { path = "../xgen-domain" }
+xgen-runtime = { path = "../xgen-runtime" }
+xgen-workgraph = { path = "../xgen-workgraph" }
+
+[dev-dependencies]
+jsonschema.workspace = true
+tempfile.workspace = true
+xgen-local-store = { path = "../xgen-local-store" }
+xgen-policy = { path = "../xgen-policy" }
+
+[lints]
+workspace = true

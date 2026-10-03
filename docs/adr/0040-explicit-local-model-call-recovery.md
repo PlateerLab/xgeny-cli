@@ -18,8 +18,8 @@ partial output, or starting a replacement Run would evade the durable boundary.
 Expose a separate offline command:
 
 ```text
-xgeny recover RUN_ID
-xgeny recover RUN_ID --discard-model-call EXACT_CALL_ID
+xgen recover RUN_ID
+xgen recover RUN_ID --discard-model-call EXACT_CALL_ID
 ```
 
 The first form verifies the manifest and journal under the exclusive Run lease

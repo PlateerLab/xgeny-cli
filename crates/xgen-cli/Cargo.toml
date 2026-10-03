@@ -1,0 +1,48 @@
+[package]
+name = "xgen-cli"
+description = "Local-first general-purpose XGEN agent CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "xgen"
+path = "src/main.rs"
+
+[dependencies]
+cap-fs-ext.workspace = true
+cap-std.workspace = true
+clap.workspace = true
+ctrlc.workspace = true
+getrandom.workspace = true
+keyring.workspace = true
+rpassword.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_jcs.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+time.workspace = true
+url.workspace = true
+xgen-adapter-filesystem = { path = "../xgen-adapter-filesystem" }
+xgen-adapter-process = { path = "../xgen-adapter-process" }
+xgen-domain = { path = "../xgen-domain" }
+xgen-local-store = { path = "../xgen-local-store" }
+xgen-policy = { path = "../xgen-policy" }
+xgen-protocol = { path = "../xgen-protocol" }
+xgen-provider-openai = { path = "../xgen-provider-openai" }
+xgen-runtime = { path = "../xgen-runtime" }
+xgen-workgraph = { path = "../xgen-workgraph" }
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[build-dependencies]
+sha2.workspace = true
+
+[lints]
+workspace = true

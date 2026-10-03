@@ -127,7 +127,7 @@ Schema 3에서 migration된 pending intent에는 Receipt provenance가 없다. �
 
 ## Reference adapter 실증
 
-비제품 `xgeny-adapter-reference`는 실행 때 preopened file에 bounded evidence를 쓰고, 별도 verifier는 같은 handle을 read-only로 다시 읽어 digest를 비교한다. 파일이 effect 이후 검증 전에 바뀌면 failed Receipt가 생기며 effect는 반복하지 않는다. SQLite를 `Validating`에서 닫고 다시 열어도 verifier만 실행한다.
+비제품 `xgen-adapter-reference`는 실행 때 preopened file에 bounded evidence를 쓰고, 별도 verifier는 같은 handle을 read-only로 다시 읽어 digest를 비교한다. 파일이 effect 이후 검증 전에 바뀌면 failed Receipt가 생기며 effect는 반복하지 않는다. SQLite를 `Validating`에서 닫고 다시 열어도 verifier만 실행한다.
 
 Reference verifier의 `outputDigest`는 현재 typed output이 없음을 나타내는 고정 empty-object commitment다. 일반 tool adapter는 실제 bounded typed output의 digest를 반환해야 하며 raw output을 Receipt에 넣지 않는다.
 
@@ -168,6 +168,6 @@ Reference verifier의 `outputDigest`는 현재 typed output이 없음을 나타�
 
 ## 결과
 
-Trusted XGENy composition root의 정상 경로에서 성공은 adapter의 자기보고가 아니라 durable intent에 결합된 Core verification과 protocol Receipt가 함께 있을 때만 dependency를 해제할 수 있다. 이 연구 gate는 hostile Rust caller가 public store API를 호출했다는 사실까지 인증하지 않는다. 동시에 XGENy Core는 XGEN, Connector 또는 외부 DB에 의존하지 않고, 향후 외부 harness에는 versioned Receipt/event contract만 제공할 수 있다.
+Trusted XGEN composition root의 정상 경로에서 성공은 adapter의 자기보고가 아니라 durable intent에 결합된 Core verification과 protocol Receipt가 함께 있을 때만 dependency를 해제할 수 있다. 이 연구 gate는 hostile Rust caller가 public store API를 호출했다는 사실까지 인증하지 않는다. 동시에 XGEN Core는 XGEN, Connector 또는 외부 DB에 의존하지 않고, 향후 외부 harness에는 versioned Receipt/event contract만 제공할 수 있다.
 
 다음 큰 수직 slice는 이 terminal gate 위에 Tracked/Persistent WorkGraph dependency와 runnable frontier를 연결하는 것이다. Failure/unknown Receipt와 typed output/Artifact는 그와 분리된 후속 연구 gate로 유지한다.

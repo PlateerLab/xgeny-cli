@@ -1,13 +1,13 @@
-# XGENy Durable Agent Runtime 평가 프로토콜
+# XGEN Durable Agent Runtime 평가 프로토콜
 
 - 기준일: 2026-08-28 (Asia/Seoul)
 - 상태: 사전등록 초안 — 구현 전 검토 대상
-- 대상: XGENy local-first runtime, WorkGraph, RunEvent store, effect recovery, memory, XGEN/Connector compatibility
+- 대상: XGEN local-first runtime, WorkGraph, RunEvent store, effect recovery, memory, XGEN/Connector compatibility
 - 관련 근거: `2026-08-28-durable-agent-runtime-evidence.md`
 
 ## 1. 목적
 
-이 문서는 구현 결과에 맞춰 성공 기준을 바꾸지 않기 위한 평가 계약이다. XGENy가 실제로 다음 주장을 할 수 있는지 검증한다.
+이 문서는 구현 결과에 맞춰 성공 기준을 바꾸지 않기 위한 평가 계약이다. XGEN가 실제로 다음 주장을 할 수 있는지 검증한다.
 
 1. 제한된 model context와 process restart를 넘어 장기 작업을 이어 간다.
 2. crash와 응답 유실이 있어도 외부 effect를 무조건 재실행하지 않는다.
@@ -46,7 +46,7 @@
 
 ### RQ5. 모델과 하네스의 상호작용
 
-`H5`: XGENy harness의 효과는 한 모델에만 종속되지 않지만 크기는 모델별로 다르며, Qwen3.6-27B에서도 통계적·실용적으로 의미 있는 개선을 보인다.
+`H5`: XGEN harness의 효과는 한 모델에만 종속되지 않지만 크기는 모델별로 다르며, Qwen3.6-27B에서도 통계적·실용적으로 의미 있는 개선을 보인다.
 
 `H5-null`: 개선이 특정 모델·task에만 나타나거나 Qwen3.6-27B에서 재현되지 않는다.
 
@@ -94,7 +94,7 @@
 - 동일 또는 유사 context의 다른 open-weight model 1개
 - 예산이 허용되면 frontier hosted model 1개
 
-Evo-Bench의 Qwen3.6-27B 결과는 harness를 변경한 evolver 역할의 증거이지, 해당 27B 모델을 XGENy policy로 사용했을 때의 성능 증거가 아니다. 따라서 XGENy에서 직접 측정한다.
+Evo-Bench의 Qwen3.6-27B 결과는 harness를 변경한 evolver 역할의 증거이지, 해당 27B 모델을 XGEN policy로 사용했을 때의 성능 증거가 아니다. 따라서 XGEN에서 직접 측정한다.
 
 ### 4.3 저장 구현
 
@@ -354,8 +354,8 @@ X1 이상은 B1 대비 safe task completion의 신뢰구간이 실용적 개선 
 최종 보고서는 다음을 명시적으로 구분한다.
 
 - 논문·공식 문서가 직접 보인 사실
-- XGENy 설계에 대한 추론
-- XGENy 실험으로 관찰한 결과
+- XGEN 설계에 대한 추론
+- XGEN 실험으로 관찰한 결과
 - 아직 검증하지 못한 주장
 
 부정 결과도 보존한다. 특정 모델·OS·filesystem에서만 통과한 결과는 전체 제품 보장으로 확대하지 않는다.

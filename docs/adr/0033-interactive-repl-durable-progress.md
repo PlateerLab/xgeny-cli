@@ -2,11 +2,11 @@
 
 - 상태: Accepted
 - 날짜: 2026-09-02
-- 적용 범위: bare `xgeny`, terminal input/output, 승인 UI, cooperative cancellation
+- 적용 범위: bare `xgen`, terminal input/output, 승인 UI, cooperative cancellation
 
 ## 배경
 
-기존 `xgeny run/resume`은 자동화와 복구에는 명시적이지만, 일반 사용자가 매번 workspace scope,
+기존 `xgen run/resume`은 자동화와 복구에는 명시적이지만, 일반 사용자가 매번 workspace scope,
 executable catalog와 승인 flag를 조합해야 했다. 반대로 별도 TUI agent loop를 만들면 CLI와 Core가 서로
 다른 승인·저장·복구 의미를 갖게 된다. OpenAI adapter도 자유 형식 chat이 아니라 strict JSON plan을
 생성한다. 검증 전 raw model token을 terminal에 표시하면 구조화 proposal 일부, escape sequence 또는
@@ -20,7 +20,7 @@ process를 끊으면 실제 결과를 모를 수 있으며, 이를 cancelled로 
 
 ### 1. REPL은 새 orchestrator가 아니라 `run/resume`의 표현 계층이다
 
-Subcommand 없이 `xgeny`를 실행하면 현재 directory를 workspace root로 하는 terminal REPL을 시작한다.
+Subcommand 없이 `xgen`를 실행하면 현재 directory를 workspace root로 하는 terminal REPL을 시작한다.
 TTY에서 model profile이 없으면 기존 `model setup` 온보딩을 먼저 실행한다. Headless pipe에서는 자동
 prompt를 열지 않고 기존 환경변수/profile 해석을 사용한다.
 
@@ -101,7 +101,7 @@ progress와 오류는 고정 code만 사용한다. Windows PowerShell 5.1의 red
 ## 검증
 
 - pure REPL test: multiline, command parse, permission mode, clear, bounded input, context carry, terminal escape
-- mock provider process E2E: bare `xgeny` → model/read/execute 각각 승인 → read → shell-free Git 실행 →
+- mock provider process E2E: bare `xgen` → model/read/execute 각각 승인 → read → shell-free Git 실행 →
   completion → provider 없는 `/resume`, receipt 수 불변
 - Unix SIGINT process E2E: in-flight model request가 끊기면 `model_call_unknown`, effect 0회, 자동 replay 없음
 - 기존 `run/resume` 전체 회귀와 Linux/macOS/Windows release process test

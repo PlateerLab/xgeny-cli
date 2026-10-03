@@ -1,24 +1,24 @@
 {
   "name": "@xgen/cli",
   "version": "0.1.0-rc.3",
-  "description": "Local-first XGENy agent CLI and harness",
+  "description": "Local-first XGEN agent CLI and harness",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/PlateerLab/xgeny-cli.git"
+    "url": "git+https://github.com/PlateerLab/xgen-cli.git"
   },
-  "homepage": "https://github.com/PlateerLab/xgeny-cli#readme",
+  "homepage": "https://github.com/PlateerLab/xgen-cli#readme",
   "bugs": {
-    "url": "https://github.com/PlateerLab/xgeny-cli/issues"
+    "url": "https://github.com/PlateerLab/xgen-cli/issues"
   },
   "engines": {
     "node": ">=22.14.0"
   },
   "bin": {
-    "xgeny": "bin/xgeny.cjs"
+    "xgen": "bin/xgen.cjs"
   },
   "files": [
-    "bin/xgeny.cjs",
+    "bin/xgen.cjs",
     "lib/platform.cjs",
     "platforms.json",
     "README.md",

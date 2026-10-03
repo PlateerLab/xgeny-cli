@@ -35,7 +35,7 @@ assert.equal(launcher.version, version);
 assert.equal(launcher.license, 'Apache-2.0');
 assert.deepEqual(launcher.repository, { type: 'git', url: repositoryUrl });
 assert.deepEqual(launcher.engines, { node: nodeEngine });
-assert.deepEqual(launcher.bin, { xgeny: 'bin/xgeny.cjs' });
+assert.deepEqual(launcher.bin, { xgen: 'bin/xgen.cjs' });
 assert.equal(launcher.scripts, undefined, 'published launcher must not have lifecycle scripts');
 assert.deepEqual(launcher.publishConfig, {
   access: 'public',
@@ -43,7 +43,7 @@ assert.deepEqual(launcher.publishConfig, {
   registry: 'https://registry.npmjs.org/',
 });
 assert.deepEqual(launcher.files, [
-  'bin/xgeny.cjs',
+  'bin/xgen.cjs',
   'lib/platform.cjs',
   'platforms.json',
   'README.md',
@@ -62,15 +62,15 @@ const expectedOptionalDependencies = {};
 for (const specification of catalog.platforms) {
   assert.match(specification.target, /^[A-Za-z0-9_-]+$/);
   assert.match(specification.packageName, /^@xgen\/cli-[a-z0-9-]+$/);
-  assert.match(specification.asset, /^xgeny-[A-Za-z0-9_.-]+$/);
-  assert.match(specification.binaryPath, /^bin\/xgeny(?:\.exe)?$/);
+  assert.match(specification.asset, /^xgen-[A-Za-z0-9_.-]+$/);
+  assert.match(specification.binaryPath, /^bin\/xgen(?:\.exe)?$/);
   assert.match(specification.tarball, /^xgen-cli-[a-z0-9-]+\.tgz$/);
   assert.ok(['linux', 'darwin', 'win32'].includes(specification.os));
   assert.ok(['x64', 'arm64'].includes(specification.cpu));
   if (specification.os === 'win32') {
-    assert.equal(specification.binaryPath, 'bin/xgeny.exe');
+    assert.equal(specification.binaryPath, 'bin/xgen.exe');
   } else {
-    assert.equal(specification.binaryPath, 'bin/xgeny');
+    assert.equal(specification.binaryPath, 'bin/xgen');
   }
   expectedOptionalDependencies[specification.packageName] = version;
   const generated = platformPackageJson(specification, version);
@@ -86,7 +86,7 @@ for (const relative of [
   'package.json',
   'README.md',
   'platforms.json',
-  'bin/xgeny.cjs',
+  'bin/xgen.cjs',
   'lib/platform.cjs',
 ]) {
   const entry = await lstat(path.join(launcherRoot, relative));
@@ -100,7 +100,7 @@ for (const relative of ['Cargo.toml', 'LICENSE', 'THIRD_PARTY_LICENSES.txt']) {
   assert.equal(entry.isSymbolicLink(), false, `${relative} must not be a symbolic link`);
 }
 
-const launcherSource = await readFile(path.join(launcherRoot, 'bin', 'xgeny.cjs'), 'utf8');
+const launcherSource = await readFile(path.join(launcherRoot, 'bin', 'xgen.cjs'), 'utf8');
 assert.ok(launcherSource.startsWith('#!/usr/bin/env node\n'));
 assert.equal(/\b(?:fetch|https?\.request|https?\.get)\b/.test(launcherSource), false);
 assert.equal(/postinstall|preinstall/.test(JSON.stringify(launcher)), false);

@@ -12,7 +12,7 @@
     "runId": {"$ref": "common.schema.json#/$defs/identifier"},
     "revision": {"type": "integer", "minimum": 0},
     "authority": {
-      "description": "Only XGENy local devices or XGEN may own a canonical WorkGraph. External A2A agents execute through XGEN authority.",
+      "description": "Only XGEN local devices or XGEN may own a canonical WorkGraph. External A2A agents execute through XGEN authority.",
       "type": "string",
       "pattern": "^(local|xgen):[A-Za-z0-9._:-]+$"
     },

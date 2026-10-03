@@ -66,7 +66,7 @@ Adapter `prepare`는 contract와 bounded material만 검증하며 filesystem mut
 
 1. preopened root에서 각 parent를 no-follow handle로 열고 Windows reparse point를 거부한다.
 2. 대상이 regular non-reparse file인지 확인하고 현재 bytes digest로 precondition을 검사한다.
-3. 같은 parent에 cryptographically random한 `.xgeny-write-<hex>.tmp`를 `create_new`로 만든다.
+3. 같은 parent에 cryptographically random한 `.xgen-write-<hex>.tmp`를 `create_new`로 만든다.
 4. 기존 file이면 permission을 temporary file에 복사하고, content 전체 기록 뒤 file `sync_all`을 한다.
 5. 대상 bytes digest나 permission이 처음 관찰과 달라졌으면 temporary file을 지우고 conflict로 끝낸다.
 6. 같은 opened parent handle 안에서 temporary entry를 target entry로 rename한다.
@@ -133,7 +133,7 @@ test/clippy/release build를 PR CI gate로 사용한다. Linux host의 MSVC cros
 
 ## 결과와 다음 단계
 
-XGENy는 이제 workspace를 관찰하고, 별도 승인을 받은 한 file을 partial content 없이 생성·교체하며,
+XGEN는 이제 workspace를 관찰하고, 별도 승인을 받은 한 file을 partial content 없이 생성·교체하며,
 그 결과를 durable WorkGraph/Receipt와 다음 model turn에 연결할 수 있다. 다음 slice는 이 primitive 위에
 `patch`를 추가해 small edit와 multi-file 변경 표현을 줄이고, 그 다음 `process execute`로 test/lint/build
 결과를 다시 WorkGraph에 넣는다.

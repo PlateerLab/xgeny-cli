@@ -1,0 +1,29 @@
+[package]
+name = "xgen-provider-openai"
+description = "Bounded OpenAI-compatible planner provider adapter for XGEN"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+jsonschema.workspace = true
+serde.workspace = true
+serde_jcs.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+ureq.workspace = true
+url.workspace = true
+xgen-domain = { path = "../xgen-domain" }
+xgen-runtime = { path = "../xgen-runtime" }
+
+[dev-dependencies]
+xgen-local-store = { path = "../xgen-local-store" }
+xgen-policy = { path = "../xgen-policy" }
+xgen-workgraph = { path = "../xgen-workgraph" }
+
+[lints]
+workspace = true

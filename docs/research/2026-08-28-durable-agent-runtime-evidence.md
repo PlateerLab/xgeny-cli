@@ -1,14 +1,14 @@
-# XGENy 장기 실행 런타임 근거 조사
+# XGEN 장기 실행 런타임 근거 조사
 
 - 기준일: 2026-08-28 (Asia/Seoul)
-- 조사 기준 XGENy: `7b8ce472412c8ea1ff6817ae6d7baecf3282c0dc`
+- 조사 기준 XGEN: `7b8ce472412c8ea1ff6817ae6d7baecf3282c0dc`
 - 상태: 구현 전 연구 메모
 - 범위: 장기 작업 연속성, WorkGraph, RunJournal, 외부 효과 복구, 메모리, 하네스 효과, XGEN 호환
 - 비범위: 이 문서는 구현 승인이 아니며 제품 성능을 보장하지 않는다.
 
 ## 1. 요약 결론
 
-XGENy는 단순한 대화 저장 CLI가 아니라 **증거로 통제되는 로컬 Capability 런타임**으로 설계해야 한다. 모델이 계획과 도구 호출을 제안하되, 장기 상태·권한·실행 사실·완료 판정은 모델 밖의 런타임이 소유한다.
+XGEN는 단순한 대화 저장 CLI가 아니라 **증거로 통제되는 로컬 Capability 런타임**으로 설계해야 한다. 모델이 계획과 도구 호출을 제안하되, 장기 상태·권한·실행 사실·완료 판정은 모델 밖의 런타임이 소유한다.
 
 이번 조사에서 기존 설계의 큰 방향은 유지됐지만, 다음 한 가지는 구현 전에 수정해야 한다.
 
@@ -46,7 +46,7 @@ XGENy는 단순한 대화 저장 CLI가 아니라 **증거로 통제되는 로�
 
 ### RQ4. Qwen3.6-27B 같은 로컬 모델에 하네스가 유효한가?
 
-- 성공 기준: Qwen3.6-27B를 policy model로 고정한 holdout에서 XGENy 구성요소의 ablation이 반복 가능한 상승을 만든다.
+- 성공 기준: Qwen3.6-27B를 policy model로 고정한 holdout에서 XGEN 구성요소의 ablation이 반복 가능한 상승을 만든다.
 - 현재 상태: **UNKNOWN**. 직접적인 policy-model 실험은 아직 없다.
 
 ### RQ5. XGEN 비의존성과 XGEN 호환을 동시에 보장할 수 있는가?
@@ -59,23 +59,23 @@ XGENy는 단순한 대화 저장 CLI가 아니라 **증거로 통제되는 로�
 - `VERIFIED`: 논문 본문, 공식 문서 또는 고정 commit 코드에서 직접 확인
 - `RECALCULATED`: 공개 artifact 또는 로컬 실험으로 다시 계산
 - `AUTHOR_CLAIM`: 저자 결과를 확인했으나 독립 재현하지 않음
-- `INFERENCE`: 여러 근거를 XGENy에 적용한 설계 추론
+- `INFERENCE`: 여러 근거를 XGEN에 적용한 설계 추론
 - `UNKNOWN`: 현재 근거로 결론을 낼 수 없음
 
-논문 주장, 공개 코드의 실제 구현, XGENy에 대한 채택 판단은 서로 같은 근거로 취급하지 않는다.
+논문 주장, 공개 코드의 실제 구현, XGEN에 대한 채택 판단은 서로 같은 근거로 취급하지 않는다.
 
 ## 4. 핵심 근거 매트릭스
 
-| 근거 | 확인 내용 | 한계 | XGENy 판단 |
+| 근거 | 확인 내용 | 한계 | XGEN 판단 |
 |---|---|---|---|
 | Durable Functions semantics, OOPSLA 2021 | 약한 환경의 at-least-once trigger 위에서 state와 outgoing message를 atomic commit하고, deterministic history replay 동안 effect를 억제한다. | 논문도 orchestration 밖의 external call duplication을 완전히 해결하지 않는다. | `ADOPT_WITH_GATES`: pure projection replay와 effect 실행을 분리한다. |
 | Netherite, PVLDB 2022 + 공개 코드 | persisted outbox, durability 이후 send, recovery resend, receiver dedup cursor, replay effect suppression을 실제 구현한다. | 분산 서버 워크플로 런타임이며 로컬 CLI와 비용 구조가 다르다. | `ADOPT`: intent/outbox/dedup/replay-suppression 의미를 축소 이식한다. |
 | Sagas, SIGMOD 1987 | long-lived transaction을 작은 transaction과 semantic compensation으로 구성한다. | compensation은 물리 rollback이나 exactly-once가 아니다. | `ADOPT`: `compensatable`에는 명시적 보상 계약·권한·receipt가 필요하다. |
-| Boki, SOSP 2021 / Beldi | serverless workflow가 log와 idempotence/transaction protocol로 fault tolerance를 구성한다. | XGENy의 로컬 UX와 다른 배포 모델이다. | `ADOPT_WITH_GATES`: protocol 원칙만 사용한다. |
+| Boki, SOSP 2021 / Beldi | serverless workflow가 log와 idempotence/transaction protocol로 fault tolerance를 구성한다. | XGEN의 로컬 UX와 다른 배포 모델이다. | `ADOPT_WITH_GATES`: protocol 원칙만 사용한다. |
 | CapLease preprint, 2026 | 동일 승인으로 fresh token을 다시 발급하는 semantic replay를 정의하고 durable `(canonical action, confirmation, budget)` ledger와 Issue→Prepare→Commit을 제안한다. | v1 preprint이며 trusted canonicalization, non-rollback ledger, idempotent sink를 가정한다. | `ADOPT_WITH_GATES`: critical action 승인도 durable consumption budget을 가져야 한다. |
 | All File Systems Are Not Created Equal, OSDI 2014 | application update protocol의 atomicity·ordering·durability 가정이 파일시스템별로 다르고 recovery code가 취약하다는 것을 보인다. | 2014년 파일시스템 대상이며 최신 OS 전부를 직접 측정하지 않는다. | `ADOPT`: custom multi-file crash protocol을 최소화하고 OS별 fault test를 둔다. |
 | SQLite 공식 WAL/transaction 문서 | embedded WAL transaction을 제공한다. WAL `NORMAL`은 일관성은 유지해도 전원 장애에서 최근 commit durability를 잃을 수 있고 `FULL`이 더 강하다. | 설정, filesystem, hardware에 따라 성능과 durability가 달라진다. | `ADOPT_WITH_GATES`: critical state는 `FULL` 후보, 3개 OS 실험 후 확정한다. |
-| Codex `6be2a6c` | embedded SQLite WAL/NORMAL을 여러 state DB에 사용하고 DB별 corruption backup을 둔다. conversation rollout은 별도 JSONL이며 torn tail 복구가 있다. | Codex JSONL은 transactional external-effect journal이라는 근거가 아니다. `NORMAL` 선택도 XGENy critical-effect durability에 그대로 적용할 수 없다. | `ADOPT_WITH_GATES`: embedded DB, corruption blast-radius와 backup 방식을 참고한다. |
+| Codex `6be2a6c` | embedded SQLite WAL/NORMAL을 여러 state DB에 사용하고 DB별 corruption backup을 둔다. conversation rollout은 별도 JSONL이며 torn tail 복구가 있다. | Codex JSONL은 transactional external-effect journal이라는 근거가 아니다. `NORMAL` 선택도 XGEN critical-effect durability에 그대로 적용할 수 없다. | `ADOPT_WITH_GATES`: embedded DB, corruption blast-radius와 backup 방식을 참고한다. |
 | Qwen Code `1482739` | JSONL session에 writer lease, file/directory sync, identity check, bounded recovery, degraded-history 분류, dangling tool result 합성, 대규모 compaction/recovery test가 있다. | 견고한 JSONL도 상당한 복잡성을 요구하며 transcript recovery와 external effect recovery는 다르다. | `ADOPT`: recovery 분류·bounded context·untrusted persisted input 원칙. `DO_NOT_ADOPT`: transcript를 effect 원장으로 간주. |
 | Goose `caf5951` | persisted conversation state를 매 loop 다시 읽는 ordered re-entrant pipeline과 effect handler 분리가 있다. | transactional exactly-once external effect 근거는 없다. | `ADOPT_WITH_GATES`: re-entrant step/effect 구조만 참고한다. |
 | AgentRewind preprint, 2026 | context와 workspace 상태의 aligned checkpoint를 복원하고 실패 경험을 유지해 장기 engineering task 성능을 높인다. prefix tool 결과는 replay하되 실행하지 않는다. | workspace 밖 network/service effect는 되돌리지 못한다고 명시한다. 검증 실패가 rewind trigger다. | `ADOPT_LATER`: MVP 복구와 분리한 semantic rewind 기능으로 둔다. |
@@ -87,10 +87,10 @@ XGENy는 단순한 대화 저장 CLI가 아니라 **증거로 통제되는 로�
 | APEX-MEM, ACL 2026 | append-only event와 retrieval-time temporal resolution, evidence-linked fact, graph/SQL/search 도구 조합을 평가한다. | graph construction 비용, ontology/error propagation, base model의 SQL/tool 능력 의존이 크다. | `ADOPT_WITH_GATES`: fact를 overwrite하지 않고 supersession과 evidence를 보존한다. Graph 전체는 MVP 제외. |
 | EvoMemBench preprint, 2026 + `aa4cea8` | memory를 in/cross-episode × knowledge/execution으로 나눠 15개 방식을 비교한다. long context가 강하고, memory는 constrained context·어려운 task·맞는 procedure에서 유리하며 mismatch면 해친다. | 단일 통합 backbone 중심이고 반복/분산 보고가 명확하지 않다. | `ADOPT`: memory를 하나의 backend 점수로 평가하지 않고 4분면과 negative transfer를 측정한다. |
 | SWE-agent, 2024 | agent-computer interface가 같은 모델의 repository task 성능을 크게 바꾸며, 전체 history보다 제한된 최근 observation이 나은 ablation도 있다. | SWE-bench 코딩 작업에 한정된다. | `ADOPT`: typed interface, feedback, compact context가 모델 크기만큼 중요하다. |
-| Evo-Bench preprint, 2026 + `e1dc938` | executable harness 개선을 validation/holdout과 고정 policy로 분리한다. Qwen3.6-27B가 evolver일 때 고정 policy의 overall을 29.7→39.4로 개선했다. | harness-sensitive task를 선택했고 main run은 모델당 1회다. 27B가 policy일 때의 직접 결과가 아니다. | `ADOPT`: harness A/B 방법론. `UNKNOWN`: XGENy가 Qwen3.6-27B policy를 얼마나 높이는지. |
+| Evo-Bench preprint, 2026 + `e1dc938` | executable harness 개선을 validation/holdout과 고정 policy로 분리한다. Qwen3.6-27B가 evolver일 때 고정 policy의 overall을 29.7→39.4로 개선했다. | harness-sensitive task를 선택했고 main run은 모델당 1회다. 27B가 policy일 때의 직접 결과가 아니다. | `ADOPT`: harness A/B 방법론. `UNKNOWN`: XGEN가 Qwen3.6-27B policy를 얼마나 높이는지. |
 | AI Agents That Matter, 2024 | accuracy와 cost를 같이 보고 Pareto와 holdout/reproducibility를 강조한다. | 특정 runtime 설계를 제공하지 않는다. | `ADOPT`: quality/cost/latency/tool count를 함께 보고한다. |
 | AgentS4D preprint, 2026 | 20 harness-model 조합 6,560 run에서 unsafe signal과 task completion이 함께 발생할 수 있음을 보여준다. | 각 case를 한 번 실행했고 현재 arXiv판에는 code/data가 없다. | `ADOPT_WITH_GATES`: 완료와 안전을 별도 verdict로 평가하고 lifecycle evidence를 남긴다. |
-| Failing Tools, 2026 | stale, silent no-op, corrupt output, schema mismatch 상황에서 최종 답이 아니라 postcondition 추적과 recovery trajectory를 평가한다. | 공개된 결과는 저자 benchmark 주장이고 XGENy에서 재현하지 않았다. | `ADOPT`: tool failure injection과 required/forbidden recovery action을 test에 추가한다. |
+| Failing Tools, 2026 | stale, silent no-op, corrupt output, schema mismatch 상황에서 최종 답이 아니라 postcondition 추적과 recovery trajectory를 평가한다. | 공개된 결과는 저자 benchmark 주장이고 XGEN에서 재현하지 않았다. | `ADOPT`: tool failure injection과 required/forbidden recovery action을 test에 추가한다. |
 | CRDTs, SSS 2011 | strong eventual consistency 조건과 concurrent graph update의 application-specific semantics를 정리한다. | 협업 data type 이론이며 effect orchestration 해법이 아니다. | `DO_NOT_ADOPT`: effectful WorkGraph를 multi-master CRDT로 만들지 않는다. |
 
 ## 5. Qwen3.6-27B에 대한 정확한 답
@@ -99,21 +99,21 @@ XGENy는 단순한 대화 저장 CLI가 아니라 **증거로 통제되는 로�
 
 `VERIFIED`: 같은 논문의 Qwen3.6 계열 policy transfer는 **Qwen3.6-35B-A3B**를 대상으로 했으며 baseline 13.9가 두 evolved harness에서 27.9와 29.2가 됐다.
 
-`UNKNOWN`: Qwen3.6-27B를 실제 XGENy policy model로 고정했을 때의 상승 폭은 측정되지 않았다. 그러므로 다음 주장은 아직 하면 안 된다.
+`UNKNOWN`: Qwen3.6-27B를 실제 XGEN policy model로 고정했을 때의 상승 폭은 측정되지 않았다. 그러므로 다음 주장은 아직 하면 안 된다.
 
-- “XGENy를 붙이면 Qwen3.6-27B가 Claude/Codex와 동급이다.”
+- “XGEN를 붙이면 Qwen3.6-27B가 Claude/Codex와 동급이다.”
 - “WorkGraph와 memory가 있으면 어떤 장기 작업도 성공한다.”
 - “큰 context가 없어도 품질 손실이 없다.”
 
 논문 근거가 지지하는 더 정확한 가설은 다음과 같다.
 
-> typed capability, progressive disclosure, compact evidence, feedback, deterministic verification, recovery를 갖춘 하네스는 같은 모델의 성공률과 비용 효율을 유의미하게 개선할 수 있다. 효과 크기와 작업별 편차는 XGENy holdout에서 측정해야 한다.
+> typed capability, progressive disclosure, compact evidence, feedback, deterministic verification, recovery를 갖춘 하네스는 같은 모델의 성공률과 비용 효율을 유의미하게 개선할 수 있다. 효과 크기와 작업별 편차는 XGEN holdout에서 측정해야 한다.
 
 ## 6. 연속성을 구성하는 네 상태면
 
 ```mermaid
 flowchart TB
-  User[User or external agent] --> Kernel[XGENy kernel]
+  User[User or external agent] --> Kernel[XGEN kernel]
   Model[Model provider] -->|proposal only| Kernel
 
   subgraph Durable[Durable local authority]
@@ -245,12 +245,12 @@ canonical action + authenticated confirmation event + execution budget
 권장 후보 layout은 다음과 같다.
 
 ```text
-~/.xgeny/projects/<project-id>/runs/<run-id>/
+~/.xgen/projects/<project-id>/runs/<run-id>/
   run.db            # events, projection, effects, receipts, schema metadata
   artifacts/        # immutable content-addressed files
   export/           # optional deterministic JSONL export
 
-~/.xgeny/projects/<project-id>/memory/
+~/.xgen/projects/<project-id>/memory/
   MEMORY.md         # user-reviewed project knowledge
   topics/
   index.sqlite3     # optional derived search index; rebuildable
@@ -361,7 +361,7 @@ semantic rewind는 workspace 밖 효과를 되돌리지 못하므로 MVP crash r
 
 ```mermaid
 flowchart LR
-  LocalDB[(per-Run embedded store)] --> Core[XGENy core]
+  LocalDB[(per-Run embedded store)] --> Core[XGEN core]
   Core --> Wire[versioned Run/Event/Receipt contract]
   Wire --> XAdapter[optional XGEN adapter]
   XAdapter --> Gateway[XGEN Agent Gateway]
@@ -372,10 +372,10 @@ flowchart LR
 ```
 
 - XGEN과 Connector는 로컬 `run.db`를 열지 않는다.
-- XGENy는 XGEN DB와 MinIO를 알지 못한다.
+- XGEN는 XGEN DB와 MinIO를 알지 못한다.
 - wire event의 의미와 conformance fixture만 공유한다.
 - local Run은 local authority이며 XGEN mirror가 될 수 있다.
-- XGEN Run은 XGEN authority이고 XGENy는 leased edge executor다.
+- XGEN Run은 XGEN authority이고 XGEN는 leased edge executor다.
 - authority handoff에는 fencing epoch와 expected revision이 필요하다.
 - 외부 agent가 XGEN을 도구처럼 사용해도 XGEN policy와 receipt path를 우회하지 않는다.
 
@@ -402,8 +402,8 @@ flowchart LR
 - WorkGraph만 적용
 - WorkGraph + evidence retrieval
 - WorkGraph + evidence + procedure memory
-- full XGENy + effect/receipt verifier
-- 같은 XGENy에 다른 model을 사용한 model/harness interaction
+- full XGEN + effect/receipt verifier
+- 같은 XGEN에 다른 model을 사용한 model/harness interaction
 
 ### 주요 metric
 
@@ -419,7 +419,7 @@ flowchart LR
 
 task completion과 runtime safety는 별도 verdict로 보고한다. 한 번의 score만으로 결론을 내리지 않고 model/configuration별 반복 실행, confidence interval, cost Pareto를 제공한다.
 
-## 14. XGENy 현 상태와 채택 분류
+## 14. XGEN 현 상태와 채택 분류
 
 ### ALREADY_PRESENT
 
@@ -544,7 +544,7 @@ task completion과 runtime safety는 별도 verdict로 보고한다. 한 번의 
 
 ## 19. 최종 판정
 
-`INFERENCE`: XGENy가 지향하는 차별점은 “또 하나의 ReAct loop”가 아니다.
+`INFERENCE`: XGEN가 지향하는 차별점은 “또 하나의 ReAct loop”가 아니다.
 
 > 모델과 실행 위치가 바뀌어도 장기 작업의 권위, 외부 효과의 불확실성, 사용자 승인 budget, 검증 증거, 메모리 provenance를 유지하는 local-first durable capability runtime.
 

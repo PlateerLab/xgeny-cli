@@ -1,16 +1,16 @@
 [workspace]
 members = [
-    "crates/xgeny-adapter-filesystem",
-    "crates/xgeny-adapter-process",
-    "crates/xgeny-adapter-reference",
-    "crates/xgeny-cli",
-    "crates/xgeny-domain",
-    "crates/xgeny-local-store",
-    "crates/xgeny-policy",
-    "crates/xgeny-provider-openai",
-    "crates/xgeny-protocol",
-    "crates/xgeny-runtime",
-    "crates/xgeny-workgraph",
+    "crates/xgen-adapter-filesystem",
+    "crates/xgen-adapter-process",
+    "crates/xgen-adapter-reference",
+    "crates/xgen-cli",
+    "crates/xgen-domain",
+    "crates/xgen-local-store",
+    "crates/xgen-policy",
+    "crates/xgen-provider-openai",
+    "crates/xgen-protocol",
+    "crates/xgen-runtime",
+    "crates/xgen-workgraph",
 ]
 resolver = "3"
 
@@ -19,7 +19,7 @@ version = "0.1.0-rc.3"
 edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"
-repository = "https://github.com/PlateerLab/xgeny-cli"
+repository = "https://github.com/PlateerLab/xgen-cli"
 
 [workspace.dependencies]
 cap-fs-ext = "4.0.3"

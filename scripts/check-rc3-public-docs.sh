@@ -35,8 +35,8 @@ require(
     (
         "## 5분 빠른 시작",
         "@xgen/cli@0.1.0-rc.3",
-        "xgeny model setup",
-        "xgeny model check --compatibility",
+        "xgen model setup",
+        "xgen model check --compatibility",
         "## 업데이트와 RC2 rollback",
         "v0.1.0-rc.2",
         "npm uninstall --global @xgen/cli",

@@ -6,7 +6,7 @@
 
 ## 배경
 
-Public CLI는 planner 호출의 wall-clock 예산과 출력 token 예산을 `xgeny-cli` 상수
+Public CLI는 planner 호출의 wall-clock 예산과 출력 token 예산을 `xgen-cli` 상수
 `MODEL_TIMEOUT = 60s`, `MAX_OUTPUT_TOKENS = 1024`로 고정한다. Compatibility probe도 같은 값을 쓴다.
 
 Production 기준과 같은 계열인 Qwen3.8 27B(Q4_K_M)를 Ollama로 로컬 실행해 측정한 결과, planner 호출
@@ -26,10 +26,10 @@ Timeout은 model 크기, quantization, hardware, provider의 prefill 처리량�
 ### 1. 두 값은 비밀이 아닌 프로필 설정이다
 
 `ModelProfile`에 `inferenceTimeoutSeconds`와 `maxOutputTokens`를 추가한다. 둘 다 credential이
-아니며 `model-profiles.json`에 일반 설정으로 저장된다. `xgeny model setup`은
+아니며 `model-profiles.json`에 일반 설정으로 저장된다. `xgen model setup`은
 `--inference-timeout <초>`와 `--max-output-tokens <토큰>`으로 받아 프로필에 기록하고,
-`xgeny model list`와 setup 결과가 두 값을 표시한다. 해석 순서는 ADR-0032와 같다: setup의 명시적
-option, `XGENY_OPENAI_INFERENCE_TIMEOUT`/`XGENY_OPENAI_MAX_OUTPUT_TOKENS` 환경변수, 프로필, 기본값.
+`xgen model list`와 setup 결과가 두 값을 표시한다. 해석 순서는 ADR-0032와 같다: setup의 명시적
+option, `XGEN_OPENAI_INFERENCE_TIMEOUT`/`XGEN_OPENAI_MAX_OUTPUT_TOKENS` 환경변수, 프로필, 기본값.
 `run`/`resume`/`check`는 별도 option 없이 환경변수와 프로필로 해석한다. 범위 밖 값은
 `inference_limits_invalid`(exit 64)로 닫는다.
 
@@ -85,5 +85,5 @@ ADR-0031/getting-started의 rollback 절차대로 별도 install directory를 �
 
 - 프로필 round-trip: 새 필드 저장·로드, 필드 없는 기존 파일 로드 시 기본값, 범위 밖 값 거부.
 - `planner_config`/`compatibility_probe_config`가 프로필 값을 쓰고 두 digest가 같다.
-- 실측: Qwen3.8 27B(Ollama)에서 쓰기 시나리오가 `XGENY_COMPLETED`, 읽기 시나리오와 8B 회귀 없음,
+- 실측: Qwen3.8 27B(Ollama)에서 쓰기 시나리오가 `XGEN_COMPLETED`, 읽기 시나리오와 8B 회귀 없음,
   probe PASS.

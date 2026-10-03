@@ -24,13 +24,13 @@ prefix를 비교하고 다시 파일을 여는 구현은 검사와 사용 사이
 > 승인된 한 workspace의 bounded UTF-8 일반 파일을 local adapter가 실제로 한 번 읽고, 그
 > 관찰을 Receipt와 durable output에 결합해 다음 planning turn 및 SQLite 재개에 전달한다.
 
-이 결정은 아직 사용자용 `xgeny run/resume` command나 live `go50902` tool call을 열지 않는다.
+이 결정은 아직 사용자용 `xgen run/resume` command나 live `go50902` tool call을 열지 않는다.
 
 ## 결정
 
 ### 1. 제품 adapter는 독립 leaf crate다
 
-새 `xgeny-adapter-filesystem` crate가 기존 공개 port만 구현한다.
+새 `xgen-adapter-filesystem` crate가 기존 공개 port만 구현한다.
 
 ```text
 trusted composition root
@@ -39,7 +39,7 @@ trusted composition root
        ├─ ReadTextAdapter -> EffectAdapter
        └─ ReadTextVerifier -> EffectVerifier
 
-XGENy Core
+XGEN Core
   ├─ PermissionRequestResolver
   ├─ DirectExecutor
   ├─ ToolOutputRecord
@@ -47,7 +47,7 @@ XGENy Core
 ```
 
 Core, WorkGraph, protocol과 local store는 `cap-std`, OS path 또는 filesystem adapter에
-의존하지 않는다. 비제품 write marker인 `xgeny-adapter-reference`도 이름·의미를 바꾸지 않는다.
+의존하지 않는다. 비제품 write marker인 `xgen-adapter-reference`도 이름·의미를 바꾸지 않는다.
 
 구현은 Bytecode Alliance의 `cap-std 4.0.3`과 `cap-fs-ext 4.0.3`을 사용한다. `cap-std::Dir`은
 ambient path가 아니라 열린 directory capability를 기준으로 접근하며 Linux, macOS와 Windows를
@@ -214,7 +214,7 @@ Linux, macOS와 Windows의 `cargo test --workspace --locked`가 동일 gate를 �
 
 ## 비목표와 잔여 위험
 
-- public `xgeny run/resume`, interactive approval UI와 packaged install smoke
+- public `xgen run/resume`, interactive approval UI와 packaged install smoke
 - live `go50902` model-to-tool-to-next-turn 실행
 - 같은 Workspace ID를 다른 root에 재사용하는 trusted-host 구성 오류의 자동 탐지
 - hard link가 root 밖 inode와 같은 경우, bind mount/mount point, FUSE/network filesystem 의미
@@ -227,7 +227,7 @@ Linux, macOS와 Windows의 `cargo test --workspace --locked`가 동일 gate를 �
 
 ## 결과
 
-XGENy의 기존 fake ReadOnly 경계를 실제 3-OS workspace file 관찰로 대체할 제품 leaf adapter가 생겼다.
+XGEN의 기존 fake ReadOnly 경계를 실제 3-OS workspace file 관찰로 대체할 제품 leaf adapter가 생겼다.
 경로 권한, 실행 순서, output durability와 verifier 의미는 Core에 filesystem 의존성을 넣지 않고
 연결된다. 다음 slice는 이 composition을 public CLI lifecycle과 실제 `go50902` 두 planning turn에
 연결하고, workspace ID mapping 및 remote egress 결정을 사용자-facing configuration으로 닫는다.

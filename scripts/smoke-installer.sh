@@ -26,7 +26,7 @@ installer=$3
 
 reported_version=$("$binary" --version)
 case "$reported_version" in
-    "xgeny "*) package_version=${reported_version#xgeny } ;;
+    "xgen "*) package_version=${reported_version#xgen } ;;
     *) printf '%s\n' "binary version output is invalid" >&2; exit 2 ;;
 esac
 tag="v$package_version"
@@ -35,7 +35,7 @@ printf '%s' "$tag" \
     | grep -Eq "$semver_tag_regex" \
     || { printf '%s\n' "binary version is not SemVer" >&2; exit 2; }
 
-test_root=$(mktemp -d "${TMPDIR:-/tmp}/xgeny-installer-smoke.XXXXXX")
+test_root=$(mktemp -d "${TMPDIR:-/tmp}/xgen-installer-smoke.XXXXXX")
 server_root="$test_root/server"
 release_root="$server_root/$tag"
 install_root="$test_root/install"
@@ -72,17 +72,17 @@ done
 
 run_installer() {
     HOME="$test_home" \
-    XGENY_INSTALLER_TESTING=1 \
-    XGENY_DOWNLOAD_BASE_URL="http://127.0.0.1:$port" \
-    XGENY_INSTALL_DIR="$install_root" \
-    XGENY_STATE_HOME="$unexpected_state" \
+    XGEN_INSTALLER_TESTING=1 \
+    XGEN_DOWNLOAD_BASE_URL="http://127.0.0.1:$port" \
+    XGEN_INSTALL_DIR="$install_root" \
+    XGEN_STATE_HOME="$unexpected_state" \
         sh "$installer" --version "$tag" >/dev/null
 }
 
 if HOME="$test_home" \
-    XGENY_INSTALLER_TESTING=1 \
-    XGENY_DOWNLOAD_BASE_URL="http://127.0.0.1:$port" \
-    XGENY_INSTALL_DIR="$install_root" \
+    XGEN_INSTALLER_TESTING=1 \
+    XGEN_DOWNLOAD_BASE_URL="http://127.0.0.1:$port" \
+    XGEN_INSTALL_DIR="$install_root" \
         sh "$installer" --version v1.2.3-01 >/dev/null 2>&1; then
     printf '%s\n' "installer accepted a non-SemVer numeric prerelease" >&2
     exit 1
@@ -90,7 +90,7 @@ fi
 
 run_installer
 
-installed="$install_root/xgeny"
+installed="$install_root/xgen"
 if [ ! -f "$installed" ] || [ -L "$installed" ]; then
     printf '%s\n' "installer did not create one regular binary" >&2
     exit 1
@@ -109,22 +109,22 @@ cp "$binary" "$release_root/$asset"
 run_installer
 [ "$("$installed" --version)" = "$reported_version" ] \
     || { printf '%s\n' "installed version is wrong" >&2; exit 1; }
-XGENY_STATE_HOME="$unexpected_state" "$installed" protocol check >/dev/null \
+XGEN_STATE_HOME="$unexpected_state" "$installed" protocol check >/dev/null \
     || { printf '%s\n' "installed protocol check failed" >&2; exit 1; }
 repl_output="$test_root/repl.txt"
 printf '/status\n/exit\n' \
-    | XGENY_STATE_HOME="$unexpected_state" "$installed" > "$repl_output" \
+    | XGEN_STATE_HOME="$unexpected_state" "$installed" > "$repl_output" \
     || { printf '%s\n' "installed interactive smoke failed" >&2; exit 1; }
-grep -Fq 'XGENy Developer Preview' "$repl_output" \
+grep -Fq 'XGEN Developer Preview' "$repl_output" \
     || { printf '%s\n' "installed interactive banner is missing" >&2; exit 1; }
 grep -Fq 'status: idle' "$repl_output" \
     || { printf '%s\n' "installed interactive status is missing" >&2; exit 1; }
 grep -Fq 'bye' "$repl_output" \
     || { printf '%s\n' "installed interactive exit is missing" >&2; exit 1; }
 licenses_output="$test_root/licenses.txt"
-XGENY_STATE_HOME="$unexpected_state" "$installed" licenses > "$licenses_output" \
+XGEN_STATE_HOME="$unexpected_state" "$installed" licenses > "$licenses_output" \
     || { printf '%s\n' "installed license notice command failed" >&2; exit 1; }
-grep -Fq 'XGENy CLI Third-Party License Notices' "$licenses_output" \
+grep -Fq 'XGEN CLI Third-Party License Notices' "$licenses_output" \
     || { printf '%s\n' "installed binary is missing Cargo dependency notices" >&2; exit 1; }
 grep -Fq 'Copyright notices for The Rust Standard Library' "$licenses_output" \
     || { printf '%s\n' "installed binary is missing Rust library notices" >&2; exit 1; }

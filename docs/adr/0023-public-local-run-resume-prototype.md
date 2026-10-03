@@ -2,13 +2,13 @@
 
 - 상태: Accepted
 - 날짜: 2026-08-31
-- 적용 범위: `xgeny-cli`, `xgeny-adapter-filesystem`, `xgeny-local-store`, local Run lease
+- 적용 범위: `xgen-cli`, `xgen-adapter-filesystem`, `xgen-local-store`, local Run lease
 - 선행 결정: ADR-0010, ADR-0016, ADR-0020, ADR-0021, ADR-0022
 
 ## 배경
 
 ADR-0022까지는 실제 workspace 파일을 읽고 그 `ToolOutput`을 다음 planning turn에 전달한
-수직 경로가 library test에만 존재했다. 사용자는 설치된 `xgeny` binary에서 Run을 만들고,
+수직 경로가 library test에만 존재했다. 사용자는 설치된 `xgen` binary에서 Run을 만들고,
 별도 process에서 SQLite 상태를 다시 열어 이어가며, 완료 뒤에는 모델과 workspace 없이 결과를
 재생할 수 없었다.
 
@@ -129,13 +129,13 @@ Run layout은 OS state directory 아래 고정한다.
   run.lock
 ```
 
-`XGENY_STATE_HOME`은 headless test/server에서 state root를 명시할 때만 사용한다. 공개 명령에는
+`XGEN_STATE_HOME`은 headless test/server에서 state root를 명시할 때만 사용한다. 공개 명령에는
 임의 DB/lock 경로 옵션이 없다.
 
 기존 state root에는 절대 `chmod`하지 않는다. filesystem root, home/config base 자체처럼 넓은
 경로, `.`/`..`, final state-root symlink, non-directory와 Unix group/other-accessible root는
 거부한다. macOS `/var`처럼 정상적인 기존 ancestor symlink는 deepest existing ancestor를 한 번
-canonicalize한 뒤 app-owned missing suffix만 no-follow로 생성한다. XGENy가 새로 만드는 directory만
+canonicalize한 뒤 app-owned missing suffix만 no-follow로 생성한다. XGEN가 새로 만드는 directory만
 생성 시점부터 `0700`으로 만든다. Windows state root는 drive-letter와 verbatim drive-letter
 namespace만 허용하며 명시적 UNC/device namespace는 SQLite WAL/locking 계약 밖이라 거부한다.
 Drive letter로 숨겨진 mapped network volume은 표준 path syntax만으로 판별하지 못하므로 지원·검증
@@ -197,11 +197,11 @@ recovery 상태를 반복 반환한다. Effect `Started` 뒤 결과가 없는 �
 
 stdout은 성공 summary 전용이다. 상태와 fixed reason code는 stderr에만 출력하며 내부 error chain,
 endpoint, path와 provider response body를 출력하지 않는다. 새 Run ID는 OS random source로 만들고
-manifest, DB와 `RunCreated`를 durable commit한 뒤 외부 호출 전에 `XGENY_STARTED`로 알린다.
+manifest, DB와 `RunCreated`를 durable commit한 뒤 외부 호출 전에 `XGEN_STARTED`로 알린다.
 
 ## 검증 기준
 
-기본 CI는 실제 외부 모델 대신 loopback OpenAI-compatible HTTP server와 실제 `xgeny` child
+기본 CI는 실제 외부 모델 대신 loopback OpenAI-compatible HTTP server와 실제 `xgen` child
 process를 사용한다.
 
 1. process 1이 model Plan 뒤 read approval에서 멈춤

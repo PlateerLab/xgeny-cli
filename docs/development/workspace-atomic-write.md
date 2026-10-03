@@ -8,11 +8,11 @@
 ## 사용
 
 ```bash
-xgeny run \
+xgen run \
   --workspace . \
   --allow-dir src \
-  --base-url "$XGENY_OPENAI_BASE_URL" \
-  --model "$XGENY_OPENAI_MODEL" \
+  --base-url "$XGEN_OPENAI_BASE_URL" \
+  --model "$XGEN_OPENAI_MODEL" \
   --allow-remote-model-egress \
   --allow-read \
   --allow-write \
@@ -30,7 +30,7 @@ xgeny run \
 Flag를 빼면 action 직전에 pause한다. Write 계획 뒤에는 다음처럼 local I/O만 먼저 승인할 수 있다.
 
 ```bash
-xgeny resume <run-id> \
+xgen resume <run-id> \
   --workspace . \
   --allow-dir src \
   --allow-write
@@ -50,16 +50,16 @@ Content는 최대 64 KiB다. Parent directory는 미리 존재해야 한다. `--
 
 Approval pause를 복원하기 위해 path/content/digest는 private `materials.sqlite3`에 저장된다. Manifest,
 status/error, Receipt와 write tool output에는 content를 넣지 않는다. Local state는 암호화되지 않으므로
-`XGENY_STATE_HOME` 전체를 source code와 같은 민감도로 관리한다.
+`XGEN_STATE_HOME` 전체를 source code와 같은 민감도로 관리한다.
 
 ## 검증
 
 ```bash
-cargo test --locked -p xgeny-adapter-filesystem --all-targets
-cargo test --locked -p xgeny-cli --test workspace_discovery
-cargo test --locked -p xgeny-runtime --test direct_executor
-cargo test --locked -p xgeny-local-store
-cargo run --locked --quiet -p xgeny-cli -- protocol check
+cargo test --locked -p xgen-adapter-filesystem --all-targets
+cargo test --locked -p xgen-cli --test workspace_discovery
+cargo test --locked -p xgen-runtime --test direct_executor
+cargo test --locked -p xgen-local-store
+cargo run --locked --quiet -p xgen-cli -- protocol check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 ```

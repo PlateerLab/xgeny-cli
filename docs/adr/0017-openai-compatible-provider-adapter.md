@@ -2,7 +2,7 @@
 
 - 상태: 제안 — 첫 실제 모델 Provider engineering slice 구현
 - 기준일: 2026-08-30
-- 적용 범위: PlanningContext production bound, internal planner failure taxonomy, `xgeny-provider-openai`
+- 적용 범위: PlanningContext production bound, internal planner failure taxonomy, `xgen-provider-openai`
 - 공개 protocol v0.1 schema 변경: 없음
 - local store schema: 6 유지
 
@@ -10,20 +10,20 @@
 
 ADR-0016은 provider 호출 전에 possible-send slot을 journal에 예약하고, reservation 하나에 `PlannerPort::plan` 한 번만 결합했다. 실제 HTTP adapter가 retry, redirect, fallback 또는 사전 health check를 숨기면 Core의 durable call budget보다 많은 outbound 요청이 발생한다. 또한 기존 context assembler는 최종 payload byte만 제한하고 전체 Capability schema를 먼저 clone·digest했으므로 실제 network egress 앞의 CPU와 peak-memory 상한이 불완전했다.
 
-첫 engineering target은 `go50902`에서 vLLM 0.27.1로 제공되는 `qwen3.8-27b`다. 이 target은 OpenAI-compatible Chat Completions와 JSON Schema structured output을 제공한다. XGENy Core는 이 서버나 XGEN Model Gateway에 의존하지 않아야 하며, 이후 XGEN gateway도 같은 `PlannerPort`를 구현하는 별도 adapter가 되어야 한다.
+첫 engineering target은 `go50902`에서 vLLM 0.27.1로 제공되는 `qwen3.8-27b`다. 이 target은 OpenAI-compatible Chat Completions와 JSON Schema structured output을 제공한다. XGEN Core는 이 서버나 XGEN Model Gateway에 의존하지 않아야 하며, 이후 XGEN gateway도 같은 `PlannerPort`를 구현하는 별도 adapter가 되어야 한다.
 
 ## 결정
 
 ### 1. Provider는 Core 바깥의 leaf crate다
 
-`xgeny-provider-openai`가 `xgeny-runtime`의 `PlannerPort`를 구현한다. Runtime, WorkGraph, local store는 HTTP, OpenAI, vLLM, Qwen 타입을 import하지 않는다.
+`xgen-provider-openai`가 `xgen-runtime`의 `PlannerPort`를 구현한다. Runtime, WorkGraph, local store는 HTTP, OpenAI, vLLM, Qwen 타입을 import하지 않는다.
 
 ```text
-xgeny-runtime
+xgen-runtime
   PlannerPort / reserved PlannerCallRequest / PlanProposal
                          ▲
                          │ implements
-xgeny-provider-openai
+xgen-provider-openai
   immutable profile -> one HTTP POST -> strict proposal codec
 ```
 
@@ -48,7 +48,7 @@ SSH tunnel 주소, API URL, bearer credential, raw prompt/context/response는 di
 
 Adapter는 `/v1/chat/completions`에 non-streaming POST 하나만 보낸다. `plan()` 안에서 `/v1/models`, health check, repair request 또는 fallback provider를 호출하지 않는다.
 
-사용자가 직접 실행하는 `xgeny model check`는 이 durable lifecycle 밖에서 bounded
+사용자가 직접 실행하는 `xgen model check`는 이 durable lifecycle 밖에서 bounded
 `GET /v1/models` 하나로 catalog 접근·exact model 광고와 그 endpoint가 강제한 인증만 확인한다.
 Prompt/inference와 Run state는 만들지 않으며 `run` 또는 `resume`이 자동 호출하지 않는다. 따라서
 catalog PASS가 Chat Completions의 인증·권한이나 strict structured generation 호환성을 뜻하지 않고,
@@ -128,7 +128,7 @@ Adapter 자체는 logging/tracing을 추가하지 않으며 Config/Planner `Debu
 2026-08-30에 다음 경로를 실제 검증했다.
 
 ```text
-XGENy PlanningContext
+XGEN PlanningContext
   -> durable ModelCallReserved
   -> SSH tunnel
   -> go50902 vLLM 0.27.1 / qwen3.8-27b
@@ -141,7 +141,7 @@ XGENy PlanningContext
 
 ## 비목표
 
-- 사용자용 `xgeny run` composition root와 자동 continuation
+- 사용자용 `xgen run` composition root와 자동 continuation
 - streaming/partial response와 hidden reasoning 저장
 - provider-side request status, billing 또는 idempotency reconciliation
 - retry/backoff/fallback과 multi-provider routing
@@ -170,4 +170,4 @@ XGENy PlanningContext
 
 ## 결과
 
-실제 모델 연결이 Core의 독립성과 durable safety를 우회하지 않는다. Provider가 바뀌어도 WorkGraph, journal, permission과 execution authority는 XGENy에 남고, XGEN은 이후 동일 계약의 호환 adapter로 연결할 수 있다.
+실제 모델 연결이 Core의 독립성과 durable safety를 우회하지 않는다. Provider가 바뀌어도 WorkGraph, journal, permission과 execution authority는 XGEN에 남고, XGEN은 이후 동일 계약의 호환 adapter로 연결할 수 있다.

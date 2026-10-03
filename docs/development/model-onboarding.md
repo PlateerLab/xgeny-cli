@@ -1,23 +1,27 @@
 # 모델 프로필과 최초 온보딩
 
-`xgeny model setup`은 모델 목록 조회와 실제 Chat Completions compatibility probe를 통과한 profile만
+`xgen model setup`은 모델 목록 조회와 실제 Chat Completions compatibility probe를 통과한 profile만
 활성화한다. Workspace나 Run SQLite는 만들지 않는다.
 
 ## 대화형 설정
 
-터미널에서 실행하면 누락된 URL, API key와 model을 순서대로 묻는다. API key 입력은 화면에 표시되지
+터미널에서 URL이나 기존 설정이 없으면 제공자를 먼저 선택하고, 누락된 API key와 model을 묻는다.
+DeepSeek preset은 `json_object`와 `thinking disabled`, OpenAI preset은 `json_schema`와 provider 기본
+thinking을 사용한다. Custom endpoint는 URL을 직접 입력한다. API key 입력은 화면에 표시되지
 않으며 HTTPS provider에서만 허용된다.
 
 ```bash
-xgeny model setup
-xgeny model list
-xgeny model check --compatibility
+xgen
+# 설정만 별도로 진행할 수도 있다.
+xgen model setup --provider deepseek
+xgen model list
+xgen model check --compatibility
 ```
 
 설정 뒤에는 URL과 model 환경변수 없이 기존 명령을 실행할 수 있다.
 
 ```bash
-xgeny run \
+xgen run \
   --workspace . \
   --allow-dir . \
   --allow-remote-model-egress \
@@ -30,7 +34,7 @@ xgeny run \
 나타나지 않으며 첫 줄만 bounded하게 읽는다.
 
 ```bash
-secret-manager-command | xgeny model setup \
+secret-manager-command | xgen model setup \
   --name qwen-xgen \
   --base-url https://provider.example/v1 \
   --model served-model-id \
@@ -40,13 +44,18 @@ secret-manager-command | xgeny model setup \
 OS 보안 저장소에 명시적으로 보존하려면 `--store-token`을 함께 사용한다.
 
 ```bash
-secret-manager-command | xgeny model setup \
+secret-manager-command | xgen model setup \
   --name qwen-xgen \
   --base-url https://provider.example/v1 \
   --model served-model-id \
   --token-stdin \
   --store-token
 ```
+
+대화형 숨김 입력에서 OS 보안 저장소를 쓸 수 없으면 검증한 profile은 key reference 없이 저장하고,
+key는 현재 process 메모리에만 둔다. Bare `xgen`는 다음 실행 때 key를 다시 숨김 입력받는다.
+Endpoint가 byte-exact하게 일치할 때만 session key를 사용하며 tool process에 전달하지 않는다.
+`model setup`만 실행하고 종료했다면 session key도 소멸한다.
 
 Linux headless host에 Secret Service가 없으면 `credential_store_unavailable`이 정상적인 fail-closed
 결과다. `--store-token`을 빼고 실행 때마다 secret manager의 environment 또는 stdin을 주입한다. 평문
@@ -55,26 +64,27 @@ credential file fallback은 없다.
 ## Profile 관리
 
 ```bash
-xgeny model list
-xgeny model use qwen-xgen
-xgeny model check
-xgeny model check --compatibility
-xgeny model logout qwen-xgen
-xgeny model remove qwen-xgen
+xgen model list
+xgen model use qwen-xgen
+xgen model check
+xgen model check --compatibility
+xgen model logout qwen-xgen
+xgen model remove qwen-xgen
 ```
 
 `logout`은 일반 model 설정은 유지하고 OS 보안 저장소의 credential만 지운다. `remove`는 둘 다 지운다.
-명시적 option, 환경변수, selected/active profile 순서로 일반 설정을 해석한다. Credential은
-`--token-stdin`, `XGENY_OPENAI_API_KEY`, profile secure store 순서다. Profile credential은 profile URL과
+명시적 option, 환경변수, selected/active profile, 제공자 preset 순서로 일반 설정을 해석한다.
+Preset은 `model setup`에만 적용하고 실행 중 hostname이나 model 이름으로 옵션을 추론하지 않는다. Credential은
+`--token-stdin`, `XGEN_OPENAI_API_KEY`, endpoint-bound interactive session key, profile secure store 순서다. Profile credential은 profile URL과
 최종 URL이 정확히 같을 때만 사용한다.
 
 Profile 파일 `model-profiles.json`은 platform config directory 아래 app-owned private directory에 둔다.
-Linux는 `$XDG_CONFIG_HOME/xgeny` 또는 `$HOME/.config/xgeny`, macOS는
-`$HOME/Library/Application Support/XGENy`, Windows는 `%APPDATA%\XGENy`다. `XGENY_CONFIG_HOME`으로 위치를
+Linux는 `$XDG_CONFIG_HOME/xgen-cli` 또는 `$HOME/.config/xgen-cli`, macOS는
+`$HOME/Library/Application Support/XGEN CLI`, Windows는 `%APPDATA%\XGEN CLI`다. `XGEN_CONFIG_HOME`으로 위치를
 바꿀 수 있으며 state root와 같은 규칙(절대경로, home/config base directory 자체와 `.`/`..` 거부, Unix
-`0700`)을 적용한다. `XGENY_STATE_HOME`은 Run state만 옮기므로, 격리된 test나 measurement에서
-`XGENY_STATE_HOME`만 설정하고 `model setup`/`use`/`remove`를 실행하면 사용자의 실제 profile 저장소가
-바뀐다. 저장소를 건드리지 않으려면 `XGENY_CONFIG_HOME`을 함께 설정하거나 `run`/`model check`에
+`0700`)을 적용한다. `XGEN_STATE_HOME`은 Run state만 옮기므로, 격리된 test나 measurement에서
+`XGEN_STATE_HOME`만 설정하고 `model setup`/`use`/`remove`를 실행하면 사용자의 실제 profile 저장소가
+바뀐다. 저장소를 건드리지 않으려면 `XGEN_CONFIG_HOME`을 함께 설정하거나 `run`/`model check`에
 `--base-url`, `--model`, `--tokenizer`를 명시한다.
 
 Compatibility probe는 production planner와 같은 proposal JSON Schema와 프로필의 출력 token 예산·inference timeout(ADR-0035, 기본 1024 token·300초)을 사용하고 응답을 production과 같은 document 규칙으로 검증한다. Probe는 model에게 schema 밖의 top-level field를 하나 더 넣으라고 요구하므로, strict schema를 실제로 강제하는 provider만 통과한다. Schema를 받아들이지만 강제하지 못하는 provider(예: 문법 컴파일에 실패하고도 200을 반환하는 서버)는 첫 planner call 대신 `model setup`에서 실패한다. Catalog GET만 더 짧은 timeout을 유지한다. Reasoning을 많이 쓰는 model이 최종 JSON 전에 예산을 소진하면 `provider_output_truncated`로 닫으며, rate limit과 구분한다.
@@ -85,10 +95,10 @@ Chat Completions POST를 한 번 추가한다. `model setup`은 profile commit �
 ## 로컬 검증
 
 ```bash
-cargo test -p xgeny-provider-openai --lib
-cargo test -p xgeny-cli --lib
-cargo test -p xgeny-cli --test environment_onboarding
-cargo test -p xgeny-cli --test model_profiles
+cargo test -p xgen-provider-openai --lib
+cargo test -p xgen-cli --lib
+cargo test -p xgen-cli --test environment_onboarding
+cargo test -p xgen-cli --test model_profiles
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 

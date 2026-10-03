@@ -2,7 +2,7 @@
 
 - 상태: Accepted
 - 날짜: 2026-08-30
-- 적용 범위: `xgeny-local-store`, `xgeny-runtime`, `xgeny-provider-openai`, CLI driver 검증
+- 적용 범위: `xgen-local-store`, `xgen-runtime`, `xgen-provider-openai`, CLI driver 검증
 
 > 후속 상태: [ADR-0030](0030-chronological-planning-context-v3.md)은 Step ID 사전순이 장기 작업의
 > 관찰 chronology를 보존하지 못한다는 실제 Qwen gate 결과에 따라 provider payload를 v3로 올렸다.
@@ -26,7 +26,7 @@ journal head를 바꿔 서로 다른 generation의 state와 output을 섞을 수
 
 최종 completion summary의 durable 복원은
 [ADR-0021](0021-durable-completion-output-and-schema-8.md)에서 닫는다. 제품 filesystem
-adapter와 public `xgeny run`은 별도 변경이다.
+adapter와 public `xgen run`은 별도 변경이다.
 
 ## 결정
 
@@ -137,7 +137,7 @@ provider로 보내도 된다는 권한을 부여하지 않는다.
 
 ## 호환성
 
-- Public XGEN/XGENy protocol v0.1은 바뀌지 않는다.
+- Public XGEN/XGEN protocol v0.1은 바뀌지 않는다.
 - SQLite physical schema는 7을 유지한다.
 - `ToolOutputRecord`와 기존 journal/projection/Receipt bytes를 다시 쓰지 않는다.
 - OpenAI request-profile digest는 의도적으로 변경된다.

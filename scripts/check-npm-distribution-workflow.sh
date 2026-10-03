@@ -56,7 +56,7 @@ required_job_fragments = (
     "    needs: publish",
     "      contents: read",
     "      id-token: write",
-    "XGENY_NPM_PUBLISH_ENABLED",
+    "XGEN_NPM_PUBLISH_ENABLED",
     "test \"$NPM_PUBLISH_ENABLED\" = \"true\"",
     "node-version: 24.20.0",
     "actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38",

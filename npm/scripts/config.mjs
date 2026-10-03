@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 export const npmRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const repoRoot = path.resolve(npmRoot, '..');
 export const launcherRoot = path.join(npmRoot, 'packages', 'cli');
-export const repositoryUrl = 'git+https://github.com/PlateerLab/xgeny-cli.git';
+export const repositoryUrl = 'git+https://github.com/PlateerLab/xgen-cli.git';
 export const nodeEngine = '>=22.14.0';
 export const npmPackageManager = 'npm@11.19.0';
 
@@ -39,11 +39,11 @@ export function platformPackageJson(specification, version) {
   return {
     name: specification.packageName,
     version,
-    description: `Native XGENy CLI binary for ${specification.target}`,
+    description: `Native XGEN CLI binary for ${specification.target}`,
     license: 'Apache-2.0',
     repository: { type: 'git', url: repositoryUrl },
-    homepage: 'https://github.com/PlateerLab/xgeny-cli#readme',
-    bugs: { url: 'https://github.com/PlateerLab/xgeny-cli/issues' },
+    homepage: 'https://github.com/PlateerLab/xgen-cli#readme',
+    bugs: { url: 'https://github.com/PlateerLab/xgen-cli/issues' },
     engines: { node: nodeEngine },
     os: [specification.os],
     cpu: [specification.cpu],

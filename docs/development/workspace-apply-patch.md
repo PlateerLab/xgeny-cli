@@ -7,11 +7,11 @@
 ## 사용자 흐름
 
 ```bash
-xgeny run \
+xgen run \
   --workspace . \
   --allow-dir src \
-  --base-url "$XGENY_OPENAI_BASE_URL" \
-  --model "$XGENY_OPENAI_MODEL" \
+  --base-url "$XGEN_OPENAI_BASE_URL" \
+  --model "$XGEN_OPENAI_MODEL" \
   --allow-remote-model-egress \
   --allow-read \
   --allow-write \
@@ -35,7 +35,7 @@ xgeny run \
 접속 없이 local patch만 먼저 재개할 수 있다.
 
 ```bash
-xgeny resume <run-id> \
+xgen resume <run-id> \
   --workspace . \
   --allow-dir src \
   --allow-write
@@ -59,12 +59,12 @@ xgeny resume <run-id> \
 ## 검증
 
 ```bash
-cargo test --locked -p xgeny-adapter-filesystem --all-targets
-cargo test --locked -p xgeny-cli --test workspace_discovery
-cargo run --locked --quiet -p xgeny-cli -- protocol check
+cargo test --locked -p xgen-adapter-filesystem --all-targets
+cargo test --locked -p xgen-cli --test workspace_discovery
+cargo run --locked --quiet -p xgen-cli -- protocol check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
-cargo build --locked --release -p xgeny-cli
+cargo build --locked --release -p xgen-cli
 ```
 
 PR CI는 Linux x86/ARM, macOS x86/ARM, Windows native runner에서 공유 atomic commit과 전체 CLI 회귀를

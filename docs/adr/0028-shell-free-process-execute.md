@@ -68,7 +68,7 @@ nofollow 방식으로 확인한 뒤 같은 workspace의 canonical ambient path�
 사용한다.
 
 이 검사는 실수와 model path escape를 막지만, 같은 OS 계정이 검사와 spawn 사이에 filesystem을
-교체하는 공격까지 격리하는 sandbox는 아니다. Developer Preview에서는 XGENy와 사용자를 같은 local
+교체하는 공격까지 격리하는 sandbox는 아니다. Developer Preview에서는 XGEN와 사용자를 같은 local
 trust boundary로 두며, 강한 hostile-code isolation은 별도 설계 없이는 주장하지 않는다.
 
 ### 4. timeout과 정상 종료 모두 process tree를 닫는다

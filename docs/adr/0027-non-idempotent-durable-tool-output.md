@@ -110,4 +110,4 @@ Output profile을 가진 effect에서 reconciliation이 applied 사실만 증명
 
 ## 결과
 
-XGENy는 NonIdempotent라는 정직한 effect 분류를 유지하면서도 실행 결과를 장기 WorkGraph에 전달할 수 있다. 작은 모델이 여러 turn에 걸쳐 test 결과를 읽고 다음 행동을 계획하는 기반이 생기지만, 결과 연속성이 중복 실행 안전성으로 오해되지 않도록 no-replay 경계는 그대로 유지된다.
+XGEN는 NonIdempotent라는 정직한 effect 분류를 유지하면서도 실행 결과를 장기 WorkGraph에 전달할 수 있다. 작은 모델이 여러 turn에 걸쳐 test 결과를 읽고 다음 행동을 계획하는 기반이 생기지만, 결과 연속성이 중복 실행 안전성으로 오해되지 않도록 no-replay 경계는 그대로 유지된다.

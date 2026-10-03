@@ -2,7 +2,7 @@
 
 - 상태: Accepted
 - 날짜: 2026-09-01
-- 적용 범위: `xgeny-local-store`, `xgeny-runtime`, `xgeny-provider-openai`
+- 적용 범위: `xgen-local-store`, `xgen-runtime`, `xgen-provider-openai`
 
 ## 배경
 
@@ -62,7 +62,7 @@ v2 이름을 유지한 채 조용히 순서만 바꾸지 않는다.
 
 ## 호환성과 보안
 
-- Public XGEN/XGENy protocol v0.1과 SQLite physical schema 8은 바뀌지 않는다.
+- Public XGEN/XGEN protocol v0.1과 SQLite physical schema 8은 바뀌지 않는다.
 - 기존 journal, projection, ToolOutput, Receipt bytes를 다시 쓰지 않는다.
 - 완료된 legacy Run의 offline replay에는 provider context가 필요하지 않아 영향이 없다.
 - 미완료 v2 Run의 manifest는 이전 immutable request-profile digest를 고정한다. 이미 journal에 계획된

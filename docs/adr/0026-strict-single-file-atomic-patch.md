@@ -15,7 +15,7 @@ material recipe에 반복한다. Coding agent에는 앞서 읽은 일부 문맥�
 덮어쓰지 않는 patch가 필요하다. 범용 unified diff parser와 fuzzy hunk placement를 첫 구현에 넣으면
 line-ending, offset 보정, 중복 문맥과 부분 적용의 의미가 커지고 모델 편의를 위해 안전 경계가 흐려진다.
 
-Patch 자체가 별도 orchestrator가 되거나 `write-atomic` Capability를 내부 호출해서도 안 된다. XGENy Core는
+Patch 자체가 별도 orchestrator가 되거나 `write-atomic` Capability를 내부 호출해서도 안 된다. XGEN Core는
 계속 단일 orchestrator이고, filesystem adapter 내부에서 두 mutation Capability가 같은 물리 commit
 primitive만 공유해야 한다.
 
@@ -120,6 +120,6 @@ CI의 test/clippy/release build를 병합 조건으로 사용한다.
 
 ## 결과와 다음 단계
 
-XGENy는 안전한 whole-file create/replace와 strict small edit를 동일한 물리 보장 아래 제공한다. 다음
+XGEN는 안전한 whole-file create/replace와 strict small edit를 동일한 물리 보장 아래 제공한다. 다음
 vertical slice는 bounded `process-execute`로 test/lint/build 결과를 WorkGraph와 다음 model turn에 넣는
 것이다. Shell 문법, interactive PTY와 background daemon은 첫 process slice에 포함하지 않는다.
